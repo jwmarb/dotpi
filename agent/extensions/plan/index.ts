@@ -208,6 +208,22 @@ interface PlanItem {
 	 * the Review Budget is spent the route ratchets to `user` (docs/adr/0032).
 	 */
 	reviews?: number;
+	/**
+	 * The Run ID of a **Rework** currently working this Item, if any.
+	 *
+	 * Set before the worker is spawned and cleared when it ends, so it is the one
+	 * fact a *different* process can use to know the Item is being edited right
+	 * now. Without it, a re-review dispatched while a worker is running judges the
+	 * pre-fix code, and its stale `fail` spends the last **Review Budget** unit and
+	 * ratchets the route to `user` — irreversibly demoting an Item the worker had
+	 * actually fixed. That was reproduced, not theorised (docs/adr/0041).
+	 *
+	 * On the Item rather than in the Run sidecar because `run.json` records the Run
+	 * but not which Item it serves, so it cannot answer "is anyone reworking p1?".
+	 * A stale value (host killed mid-Rework) is handled by treating the Run's own
+	 * recorded outcome as the source of truth, not this field's presence.
+	 */
+	reworkRunId?: string;
 }
 
 /** Status colors per state, mapped to the theme vocabulary the other
@@ -497,6 +513,10 @@ async function loadPlan(file: string): Promise<PlanItem[]> {
 					reviews:
 						typeof obj.reviews === "number" && Number.isFinite(obj.reviews)
 							? obj.reviews
+							: undefined,
+					reworkRunId:
+						typeof obj.reworkRunId === "string" && obj.reworkRunId !== ""
+							? obj.reworkRunId
 							: undefined,
 				});
 			}
@@ -959,6 +979,31 @@ async function ensureBoard(file: string): Promise<void> {
 }
 
 /**
+ * Whether a Rework Run is still working, according to the Run itself.
+ *
+ * The Item's `reworkRunId` says a Rework was *started*; only the Run's own
+ * `run.json` says whether it is still going. Trusting the marker alone would let
+ * a host killed mid-Rework leave an Item permanently unreviewable, turning an
+ * interlock into a stall — so an unreadable or absent sidecar reads as "not
+ * running", i.e. proceed. Refusing to review is the cautious answer only while
+ * there is positive evidence a writer is live (docs/adr/0041).
+ */
+async function reworkStillRunning(runId: string): Promise<boolean> {
+	try {
+		const meta = JSON.parse(
+			await readFile(
+				path.join(getAgentDir(), "subagent-sessions", runId, "run.json"),
+				"utf-8",
+			),
+		) as { outcome?: unknown };
+		return meta.outcome === "running";
+	} catch {
+		// No sidecar, unreadable, or corrupt: do not block the review.
+		return false;
+	}
+}
+
+/**
  * Dispatch an autonomous oracle review of one Item and apply the **Verdict**.
  *
  * Fire-and-forget: the caller does not await this, because a review takes
@@ -989,6 +1034,40 @@ async function dispatchReview(
 		const item = items.find((i) => i.id === id);
 		// The Item may have moved on while the review was being set up.
 		if (!item || item.status !== "review" || routeOf(item) !== "oracle") return;
+
+		// Refuse to review an Item a Rework worker is still editing. Judging code
+		// mid-change produces a stale Verdict, and a stale `fail` spends the last
+		// Review Budget unit and ratchets the route to `user` for good — reproduced,
+		// not theorised (docs/adr/0041). The worker's own recorded outcome decides,
+		// not the marker's mere presence, so a marker orphaned by a killed host
+		// cannot stall the Item forever.
+		if (item.reworkRunId && (await reworkStillRunning(item.reworkRunId))) {
+			await mutatePlan(file, (cur) => {
+				const target = cur.find((i) => i.id === id);
+				if (!target || target.status !== "review") return cur;
+				target.note = [
+					target.note,
+					`[review not started: a rework (\`/run ${item.reworkRunId}\`) is still` +
+						` working this item. Re-submit it once that finishes.]`,
+				]
+					.filter(Boolean)
+					.join("\n\n");
+				return cur;
+			});
+			return;
+		}
+
+		/**
+		 * Set inside the Verdict transaction when the Item goes back for Rework.
+		 *
+		 * The spawn happens AFTER the transaction: holding the plan lock across a
+		 * child process that runs for minutes would block every other plan writer
+		 * (docs/adr/0035), and the Rework worker itself needs the lock-free plan.
+		 */
+		// A holder object rather than a `let`: the assignment happens inside the
+		// mutatePlan callback, and the compiler does not track writes made through a
+		// closure, so a plain `let` narrows to `never` at the read below.
+		const pending: { rework?: { text: string; findings: string } } = {};
 
 		// Give the review a Run directory in the shared on-disk layout, so it shows
 		// up in /runs, on the Board and in a Mirror Pane like any subagent Run
@@ -1047,12 +1126,130 @@ async function dispatchReview(
 				return cur;
 			}
 
-			applyVerdict(target, verdict, reviewFindings(outcome.output, verdict));
+			const findings = reviewFindings(outcome.output, verdict);
+			const applied = applyVerdict(target, verdict, findings);
+			// Captured while the locked item is in hand: reading it again after the
+			// transaction would race the user accepting or re-routing the Item.
+			if (!applied.cleared && !applied.escalated) {
+				pending.rework = { text: target.text, findings };
+			}
 			return cur;
 		});
+
+		// A failed Verdict returns the Item to `active` carrying findings, and
+		// something has to pick it up or the loop stalls there. A FRESH Run does it,
+		// never the agent whose work was just rejected — that agent believed the work
+		// was correct when it moved the Item to `review` (docs/adr/0041).
+		//
+		// Deliberately NOT dispatched once the Review Budget has escalated the Item
+		// to the user: two Verdicts have then failed, the machine has had its turn,
+		// and spawning another writer is the runaway the Budget exists to stop.
+		if (pending.rework) {
+			await dispatchRework(
+				file,
+				id,
+				cwd,
+				pending.rework.text,
+				pending.rework.findings,
+			);
+		}
 	} catch {
 		// Swallowed by design: this runs detached, so a throw here would be an
 		// unhandled rejection that kills the host. The plan file is the report.
+	}
+}
+
+/**
+ * Spawn a fresh Run to carry out the **Rework** of a rejected Plan Item.
+ *
+ * The counterpart of {@link dispatchReview} and deliberately its twin: same
+ * interlock, same Run directory, same slot discipline. The difference is what it
+ * spawns — a `worker`, which can `write`, `edit` and `bash` — and that is why
+ * every guard here is load-bearing rather than ceremonial. This is the only place
+ * in the system where a machine's judgement causes a machine to modify the
+ * repository with no human in the loop.
+ *
+ * Four properties make that acceptable, and all four had to exist first
+ * (docs/adr/0041): the Run is observable as a `pln-` Run with a `/runs` row and a
+ * Mirror Pane (0039); it claims a slot from the one shared spawn cap (0040); its
+ * edits are revertable because the repo is under git; and it is bounded by the
+ * **Review Budget**, so an Item cannot be reworked forever.
+ *
+ * Never throws: a rejection here is detached and would kill the host.
+ *
+ * @param file - The plan file the Item lives in.
+ * @param id - The Item being reworked.
+ * @param cwd - Where the worker should run, i.e. the repo it may modify.
+ * @param itemText - What the step is; unchanged by the failed review.
+ * @param findings - What the reviewer objected to. The worker's only context.
+ */
+async function dispatchRework(
+	file: string,
+	id: string,
+	cwd: string,
+	itemText: string,
+	findings: string,
+): Promise<void> {
+	// Checked here as well as by the spawner, for the same reason the review
+	// interlock is doubled: a guard only at the call site is one a new caller can
+	// forget, which is how the fork bomb escaped (docs/adr/0037).
+	if (dispatchSuppressed()) return;
+	try {
+		const runId = `pln-${randomBytes(4).toString("hex")}-1`;
+		const runDir = await createRunDir(getAgentDir(), runId, "worker");
+		// Publish the in-flight marker BEFORE spawning, so a re-review cannot slip
+		// between the spawn and the mark and judge code the worker is mid-way through
+		// changing. The plan file is the only channel another process reads.
+		await mutatePlan(file, (cur) => {
+			const target = cur.find((i) => i.id === id);
+			if (target) target.reworkRunId = runId;
+			return cur;
+		});
+		let outcome: Awaited<ReturnType<typeof runReview>>;
+		try {
+			outcome = await runReview({
+				agentFile: path.join(getAgentDir(), "agents", "worker.md"),
+				itemText,
+				note: findings,
+				cwd,
+				runDir,
+				runId,
+				purpose: "rework",
+			});
+		} finally {
+			void finalizeRunDir(
+				runDir,
+				runId,
+				"worker",
+				outcome! && !outcome!.deadReason ? "completed" : "failed",
+			);
+		}
+
+		// The worker's report is APPENDED to the note, not substituted for it:
+		// oracle's findings are why the Rework happened and must survive it, or the
+		// next reader sees a fix with no statement of what it was fixing.
+		await mutatePlan(file, (cur) => {
+			const target = cur.find((i) => i.id === id);
+			if (!target) return cur;
+			// Cleared unconditionally, even when the Item has moved on and gets no
+			// report below: a marker left set would block every future review of this
+			// Item, turning a safety interlock into a permanent stall.
+			if (target.reworkRunId === runId) target.reworkRunId = undefined;
+			// The user may have accepted, re-routed or finished the Item during the
+			// minutes the worker took. Their hand wins, as with a late Verdict.
+			if (target.status !== "active") return cur;
+			target.note = [
+				target.note,
+				outcome.deadReason
+					? `[rework did not complete: ${outcome.deadReason}. The findings above still stand.]`
+					: `[rework attempted by a fresh run — see \`/run ${runId}\` for what it did. Re-review to judge it.]`,
+			]
+				.filter(Boolean)
+				.join("\n\n");
+			return cur;
+		});
+	} catch {
+		// Swallowed by design, as in dispatchReview: the plan file is the report.
 	}
 }
 

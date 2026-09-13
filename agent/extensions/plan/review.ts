@@ -47,8 +47,33 @@ export const REVIEW_ENV_FLAG = "PI_PLAN_IN_REVIEW";
  */
 export const REVIEW_TIMEOUT_MS = 25 * 60 * 1000;
 
-/** Grace between SIGTERM and SIGKILL when abandoning a review. */
-const KILL_GRACE_MS = 2000;
+/**
+ * Abandon deadline for a **Rework**, which is longer than a review's.
+ *
+ * A reviewer reads; a worker reads, edits, builds, tests and commits, so it has
+ * strictly more to do. Measured on this repo's own history, a real worker Run
+ * took 15.3 minutes — uncomfortably close to the 25-minute review deadline, and
+ * that Run was not also running a test suite.
+ *
+ * Forty minutes is chosen to sit clear of that observed work plus pi's ~10.6
+ * minute retry ladder, and it inherits ADR 0033's coupling caveat: raising
+ * `retry.maxRetries` or `retry.maxDelayMs` means raising this too.
+ */
+export const REWORK_TIMEOUT_MS = 40 * 60 * 1000;
+
+/**
+ * Grace between SIGTERM and SIGKILL when abandoning a child.
+ *
+ * Two seconds for a reader, which holds nothing worth flushing — a killed
+ * reviewer loses only its own opinion. A writer gets far longer, because SIGKILL
+ * during `git commit` can leave `.git/index.lock` behind and a half-staged
+ * index, turning the contract's "exactly one commit" into no commit plus a dirty
+ * tree that nothing describes. Thirty seconds is not a guarantee — nothing short
+ * of not killing it is — but it clears a commit that has actually started.
+ */
+function killGraceFor(purpose: ChildPurpose): number {
+	return purpose === "rework" ? 30_000 : 2_000;
+}
 
 // The concurrency cap lives in the shared spawn limit (docs/adr/0040), not here.
 // A private counter bounded reviews only, so reviews plus subagent Tasks could
@@ -184,6 +209,64 @@ export function parseAgentFile(raw: string): {
 }
 
 /**
+ * What a spawned child is for.
+ *
+ * `review` reads and judges; `rework` edits the repo to address a judgement.
+ * They share one spawner (see {@link runReview}) and differ only in their
+ * prompt, their spawn-slot kind, and the wording of a failure.
+ */
+export type ChildPurpose = "review" | "rework";
+
+/**
+ * The instruction appended to the worker's own prompt for an autonomous Rework.
+ *
+ * The worker gets the Item's text and oracle's findings and nothing else — no
+ * session history, no memory of how the rejected attempt was reasoned about.
+ * That absence is the point (docs/adr/0032): the agent whose work was rejected
+ * already believed it was correct, so a fresh Run is asked to satisfy the
+ * findings rather than to defend the approach.
+ *
+ * It is told to commit, because an autonomous edit that is not a commit is an
+ * unattributable change in the working tree, and one commit per Rework is what
+ * makes a bad one revertable on its own.
+ */
+export function reworkContract(
+	itemText: string,
+	findings: string | undefined,
+): string {
+	return [
+		"## Autonomous rework",
+		"",
+		"A reviewer rejected the previous attempt at this task. You are a fresh",
+		"run: you did not write it, and you are not being asked to defend it.",
+		"Address the findings below and leave the work in a state a reviewer would",
+		"pass.",
+		"",
+		"### The task",
+		"",
+		itemText,
+		"",
+		"### What the reviewer found",
+		"",
+		findings?.trim()
+			? findings.trim()
+			: "(no findings were recorded — treat the task as not yet done)",
+		"",
+		"### How to work",
+		"",
+		"- Fix the cause, not the symptom. The findings say what was wrong; they",
+		"  are not necessarily a complete specification of the fix.",
+		"- Verify your change by running it. You have `bash`: build it, test it,",
+		"  execute the thing you changed. An unverified fix is what got rejected.",
+		"- Commit your work when it is done, as ONE commit, with a message saying",
+		"  what you changed and why. Do not amend or rebase existing commits, and",
+		"  do not commit unrelated files that were already dirty.",
+		"- If the findings are wrong or impossible, say so plainly in your reply",
+		"  and change nothing rather than forcing a fix you cannot defend.",
+	].join("\n");
+}
+
+/**
  * The instruction appended to oracle's own prompt for an autonomous review.
  *
  * States the Verdict contract in the exact form {@link parseVerdict} accepts.
@@ -248,8 +331,27 @@ export async function runReview(opts: {
 	runDir?: string;
 	runId?: string;
 	spawnFn?: typeof spawn;
+	/**
+	 * What this child is for, which decides its prompt, its slot kind and how a
+	 * failure is worded. Defaults to a review.
+	 *
+	 * A **Rework** child is a *writer* — it edits the repo — while a review is
+	 * read-only, so it would be reasonable to give it its own spawner. It
+	 * deliberately does not get one. Everything dangerous here is shared: proving
+	 * the spawn target is really pi, the recursion interlock enforced at the
+	 * spawner rather than the caller, claiming a slot synchronously before any
+	 * await, the non-empty plan-key sentinel, the abandon deadline and the
+	 * SIGTERM/SIGKILL escalation. Each of those was a bug once (docs/adr/0037,
+	 * 0040), and a second copy of this function is exactly how the first one got
+	 * bypassed — a harness called the spawner directly and never met the caller's
+	 * guard. One spawner, two prompts.
+	 */
+	purpose?: ChildPurpose;
 }): Promise<ReviewOutcome> {
-	const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+	const purpose = opts.purpose ?? "review";
+	const timeoutMs =
+		opts.timeoutMs ??
+		(purpose === "rework" ? REWORK_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
 	const spawnImpl = opts.spawnFn ?? spawn;
 
 	// The interlock is enforced HERE, at the only place that actually spawns, not
@@ -260,7 +362,7 @@ export async function runReview(opts: {
 		return {
 			output: "",
 			deadReason:
-				"refused to spawn: this process is itself an autonomous review, and a review must not review",
+				`refused to spawn: this process is itself an autonomous child, so it must not spawn a ${purpose}`,
 			exitCode: null,
 		};
 	}
@@ -268,7 +370,7 @@ export async function runReview(opts: {
 	// precisely so the check and the claim cannot be separated: the previous
 	// version incremented at the spawn, three awaits later, and 12 concurrent
 	// callers all passed a cap of 3 (docs/adr/0040).
-	const claim = claimSlot("review");
+	const claim = claimSlot(purpose);
 	if (!claim.ok) {
 		return { output: "", deadReason: claim.reason, exitCode: null };
 	}
@@ -282,7 +384,7 @@ export async function runReview(opts: {
 		releaseSlot();
 		return {
 			output: "",
-			deadReason: `could not read the oracle agent file at ${opts.agentFile}: ${
+			deadReason: `could not read the ${purpose} agent file at ${opts.agentFile}: ${
 				(err as Error).message
 			}`,
 			exitCode: null,
@@ -294,11 +396,16 @@ export async function runReview(opts: {
 	// review prompt embeds arbitrary findings text.
 	let tmpDir: string | null = null;
 	try {
-		tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-plan-review-"));
+		tmpDir = await mkdtemp(path.join(os.tmpdir(), `pi-plan-${purpose}-`));
 		const promptPath = path.join(tmpDir, "prompt.md");
 		await writeFile(
 			promptPath,
-			[agent.body, reviewContract(opts.itemText, opts.note)].join(
+			[
+				agent.body,
+				purpose === "rework"
+					? reworkContract(opts.itemText, opts.note)
+					: reviewContract(opts.itemText, opts.note),
+			].join(
 				"\n\n---\n\n",
 			),
 			"utf-8",
@@ -316,7 +423,11 @@ export async function runReview(opts: {
 		}
 		if (agent.model) args.push("--model", agent.model);
 		if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
-		args.push("Review the Plan Item described in your system prompt.");
+		args.push(
+			purpose === "rework"
+				? "Carry out the rework described in your system prompt."
+				: "Review the Plan Item described in your system prompt.",
+		);
 
 		const invocation = getPiInvocation(args);
 		// No identifiable pi: report it instead of executing a guess. Executing the
@@ -376,10 +487,10 @@ export async function runReview(opts: {
 					} catch {
 						// Already gone.
 					}
-				}, KILL_GRACE_MS);
+				}, killGraceFor(purpose));
 				finish({
 					output,
-					deadReason: `the review produced no verdict within ${
+					deadReason: `the ${purpose} did not finish within ${
 						timeoutMs >= 60000
 							? `${Math.round(timeoutMs / 60000)} minutes`
 							: `${timeoutMs}ms`
