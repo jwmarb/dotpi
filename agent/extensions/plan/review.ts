@@ -20,6 +20,8 @@ import * as fs from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+// The shared admission cap: one machine, one budget (docs/adr/0040).
+import { claimSlot } from "../subagent/spawnlimit.js";
 
 /**
  * Environment flag marking a pi process as *being* an autonomous review.
@@ -48,19 +50,10 @@ export const REVIEW_TIMEOUT_MS = 25 * 60 * 1000;
 /** Grace between SIGTERM and SIGKILL when abandoning a review. */
 const KILL_GRACE_MS = 2000;
 
-/**
- * Hard ceiling on reviews running at once, per process.
- *
- * A backstop, not a scheduler. The recursion interlock and the pi-resolution
- * check should each already make runaway spawning impossible; this exists
- * because they were *also* believed sufficient before a fork bomb took 31GB of
- * the user's RAM. A cap turns any future fault of that class into a handful of
- * wasted processes instead of an unbounded one.
- */
-const MAX_CONCURRENT_REVIEWS = 3;
-
-/** Reviews currently in flight in this process. */
-let activeReviews = 0;
+// The concurrency cap lives in the shared spawn limit (docs/adr/0040), not here.
+// A private counter bounded reviews only, so reviews plus subagent Tasks could
+// reach nine children while each cap separately reported healthy — and there is
+// one machine, not one per spawner.
 
 /**
  * Sentinel written into a review child's `PI_PLAN_KEY`.
@@ -271,27 +264,15 @@ export async function runReview(opts: {
 			exitCode: null,
 		};
 	}
-	if (activeReviews >= MAX_CONCURRENT_REVIEWS) {
-		return {
-			output: "",
-			deadReason: `refused to spawn: ${activeReviews} reviews are already running (cap ${MAX_CONCURRENT_REVIEWS})`,
-			exitCode: null,
-		};
+	// Claim a slot from the shared cap BEFORE any await. claimSlot is synchronous
+	// precisely so the check and the claim cannot be separated: the previous
+	// version incremented at the spawn, three awaits later, and 12 concurrent
+	// callers all passed a cap of 3 (docs/adr/0040).
+	const claim = claimSlot("review");
+	if (!claim.ok) {
+		return { output: "", deadReason: claim.reason, exitCode: null };
 	}
-	// The slot is claimed HERE, synchronously with the check above and before any
-	// await. Incrementing later (at the spawn) left three awaits — readFile,
-	// mkdtemp, writeFile — between test and set, so N concurrent callers all
-	// passed the check before any of them counted: a caught regression where 12
-	// callers produced 12 spawns against a cap of 3.
-	activeReviews++;
-	/** Release the slot exactly once, however this call ends. */
-	let released = false;
-	const releaseSlot = () => {
-		if (released) return;
-		released = true;
-		activeReviews = Math.max(0, activeReviews - 1);
-	};
-
+	const releaseSlot = () => claim.slot.release();
 
 	let raw: string;
 	try {

@@ -58,6 +58,8 @@ import { reapSessions, thawRun } from "./reaper.js";
 import { formatRunIndex, scanRunDirs } from "./runindex.js";
 import type { RunOutcome } from "./rundir.js";
 import { mirrorPaneLabel, shortRunId, writeRunSidecar } from "./rundir.js";
+// The shared admission cap: one machine, one budget (docs/adr/0040).
+import { claimSlot, MAX_SPAWNED_CHILDREN } from "./spawnlimit.js";
 import { matchTaskRunDirs } from "./taskdirs.js";
 import {
 	aggregateUsage,
@@ -81,8 +83,15 @@ import { formatPreloadedSkills, MAX_SKILL_BYTES, resolveSkills } from "./skills.
 
 /** Maximum Runs in one parallel Task. */
 const MAX_PARALLEL_TASKS = 8;
-/** Concurrent Runs within a single Task. There is no cross-Task limit; the
- * ceiling on total load is MAX_ACTIVE_TASKS instead. */
+/**
+ * Concurrent Runs within a single Task.
+ *
+ * This is a within-Task shaping limit, NOT a limit on load. The real ceiling on
+ * concurrent child processes is the shared spawn cap, claimed per Run at the
+ * spawn site (docs/adr/0040). This comment previously claimed the ceiling was
+ * MAX_ACTIVE_TASKS, which was false in a way that mattered: Tasks are not
+ * processes, and six Tasks running four Runs apiece is twenty-four children.
+ */
 const MAX_CONCURRENCY = 4;
 /** Cap on retained stderr per Run. A chatty or looping child would otherwise
  * grow this string for the life of the session. */
@@ -898,6 +907,49 @@ async function executeAttempt(
 	onProgress: () => void,
 	planKey: string,
 ): Promise<void> {
+	// Claim a slot from the shared cap before anything else, synchronously, so the
+	// check and the claim cannot be separated by an await (docs/adr/0040).
+	//
+	// The cap belongs HERE, at the one place a child is actually spawned, and not
+	// at Task admission where MAX_ACTIVE_TASKS sits. A Task is not a process: a
+	// parallel Task runs up to MAX_CONCURRENCY Runs at once, so six admitted Tasks
+	// could mean twenty-four children, plus plan reviews on top — while every
+	// individual cap reported healthy. Counting Runs is counting processes.
+	const claim = claimSlot("task");
+	if (!claim.ok) {
+		runResult.stopReason = "error";
+		runResult.errorMessage = claim.reason;
+		return;
+	}
+	try {
+		await executeAttemptWithSlot(
+			defaultCwd,
+			agent,
+			model,
+			runResult,
+			skillNames,
+			cwd,
+			signal,
+			onProgress,
+			planKey,
+		);
+	} finally {
+		claim.slot.release();
+	}
+}
+
+/** The body of {@link executeAttempt}, running with a spawn slot already held. */
+async function executeAttemptWithSlot(
+	defaultCwd: string,
+	agent: AgentConfig,
+	model: string | undefined,
+	runResult: RunResult,
+	skillNames: string[] | undefined,
+	cwd: string | undefined,
+	signal: AbortSignal,
+	onProgress: () => void,
+	planKey: string,
+): Promise<void> {
 	// Runs get a real session file so herdr's sidebar can show a browsable live
 	// session, and so the Mirror Pane has something to render (docs/adr/0019,
 	// docs/adr/0020). Sessions live in a per-Run directory under the agent dir so
@@ -1694,7 +1746,7 @@ export default function (pi: ExtensionAPI) {
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 			'Pass skills: ["name", ...] to preload skill content into the subagent\'s system prompt — subagents cannot discover skills themselves, so name them explicitly when the task should follow a skill.',
 			"If any requested skill cannot be preloaded the delegation fails immediately without starting a task: fix the list and call again.",
-			`At most ${MAX_ACTIVE_TASKS} tasks may be active at once.`,
+			`At most ${MAX_ACTIVE_TASKS} tasks may be active at once, and at most ${MAX_SPAWNED_CHILDREN} child processes may run at once across every kind of spawn (a parallel task uses one per concurrent run, and autonomous plan reviews draw from the same budget). A run refused for lack of a slot fails with a message saying so, and is worth retrying once something finishes.`,
 		].join(" "),
 		parameters: SubagentParams,
 
