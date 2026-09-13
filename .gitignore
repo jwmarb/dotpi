@@ -1,0 +1,62 @@
+# This repo is a pi *configuration*: extensions, agents, skills, docs and the
+# decisions behind them. Everything a pi session GENERATES is ignored, because
+# it is machine-written, changes on every run, and would bury the config it sits
+# beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
+
+# ---- Secrets ----------------------------------------------------------------
+# mcp.json carries a live litellm bearer token inline, so it is ignored whole
+# rather than templated. If you clone this, recreate it by hand: it is a
+# mcpServers map, and the gateway entry needs an "x-litellm-api-key" header.
+agent/mcp.json
+# litellm.ts hardcodes a second, different API key at the top of the file. Its
+# own doc comments claim LITELLM_API_KEY is read from the environment, which the
+# code does not do — so if you ever make that true, this line can go and the
+# extension becomes committable.
+agent/extensions/litellm.ts
+# Credential stores. Empty right now, which is exactly why they are easy to
+# commit by accident and then hard to notice when they fill up.
+agent/auth.json
+agent/models-store.json
+# Never commit a backup of a config that may contain a key.
+*.bak
+*.orig-backup
+
+# ---- Dependencies -----------------------------------------------------------
+node_modules/
+# bun's lockfile is binary; the text lockfile is committed instead if present.
+bun.lockb
+
+# ---- Session and transcript data --------------------------------------------
+# Full conversation transcripts. Large, constantly rewritten, and they contain
+# whatever the agents happened to read — including file contents from anywhere
+# on this machine.
+agent/sessions/
+agent/subagent-sessions/
+agent/pi-blackhole/
+# Plans are per-session working state keyed by session id, and the archive grows
+# without bound. The decisions worth keeping end up in docs/adr and CONTEXT.md.
+agent/plans/
+# Exported single-session HTML, megabytes each.
+pi-session-*.html
+
+# ---- Logs, scratch and crash output ----------------------------------------
+agent/run-history.jsonl
+agent/pi-tui-crash.log
+herdr.jsonl
+*.log
+# Loose scratch files from debugging sessions.
+g.jsonl
+o3.raw
+
+# ---- Local caches -----------------------------------------------------------
+agent/fff/
+agent/npm/
+agent/bin/
+agent/git/
+
+# ---- Editor and OS noise ----------------------------------------------------
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

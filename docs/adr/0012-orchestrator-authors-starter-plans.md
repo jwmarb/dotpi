@@ -1,0 +1,7 @@
+# The orchestrator authors each subagent's Starter Plan and never reads it back
+
+Subagents run models that are not as strong as the orchestrator's, so the SOTA orchestrator's guidance is the highest-leverage thing it can hand down: before delegating, it writes the child's **Starter Plan** — both as text in the delegation prompt and as the child's plan file (keyed by the **Task ID**, with a run ordinal for multi-run Tasks). From that moment the child owns the plan: it maintains its own file, and the orchestrator never reads it back.
+
+**Considered.** Summarizing the child's plan into its **Write-up** was rejected: it breaks the **Result**/**Transcript** boundary the delegation ADRs drew — the orchestrator consumes results, not the child's internals. Context-only child plans (no file) were rejected because the discipline would be uneven across agent kinds and children would lose their plan to compaction on long runs. Children authoring their own starter plans was rejected outright: that is the guidance we are trying to give them.
+
+**Consequences.** The subagent spawn must pass the plan key to the child process (an env var, since `--no-session` children have no durable session id of their own to key on). Plan files of children live alongside the orchestrator's own plan files — the folder is a mixed population, and anything that assumes "one plan file = the main session's plan" must key explicitly.

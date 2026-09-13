@@ -1,0 +1,26 @@
+{
+  "lastChangelogVersion": "0.85.1",
+  "defaultProvider": "litellm",
+  "defaultModel": "qwen/qwen3.8-27b",
+  "extensions": [],
+  "images": {
+    "autoResize": true
+  },
+  "theme": "tokyo-night",
+  "retry": {
+    "enabled": true,
+    "maxRetries": 10,
+    "baseDelayMs": 2000,
+    "provider": {
+      "maxRetries": 0,
+      "maxRetryDelayMs": 60000
+    },
+    "maxDelayMs": 128000
+  },
+  "packages": [
+    "git:github.com/samfoy/pi-lsp-extension",
+    "npm:@ff-labs/pi-fff",
+    "git:github.com/k0valik/pi-blackhole",
+    "npm:pi-better-edit"
+  ]
+}

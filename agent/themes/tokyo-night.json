@@ -1,0 +1,111 @@
+{
+  "$schema": "../../../.bun/install/global/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme-schema.json",
+  "name": "tokyo-night",
+  "vars": {
+    "bg": "#1a1b26",
+    "bgDark": "#16161e",
+    "bgHighlight": "#292e42",
+    "bgVisual": "#283457",
+    "fg": "#c0caf5",
+    "fgDark": "#a9b1d6",
+    "fgGutter": "#3b4261",
+    "comment": "#565f89",
+    "dark3": "#545c7e",
+    "dark5": "#737aa2",
+    "blue": "#7aa2f7",
+    "blue0": "#3d59a1",
+    "blue1": "#2ac3de",
+    "blue5": "#89ddff",
+    "blue7": "#394b70",
+    "cyan": "#7dcfff",
+    "teal": "#1abc9c",
+    "green": "#9ece6a",
+    "green1": "#73daca",
+    "green2": "#41a6b5",
+    "magenta": "#bb9af7",
+    "purple": "#9d7cd8",
+    "orange": "#ff9e64",
+    "yellow": "#e0af68",
+    "red": "#f7768e",
+    "red1": "#db4b4b",
+    "diffAdd": "#243e4a",
+    "diffDelete": "#4a272f",
+    "terminalBlack": "#414868"
+  },
+  "colors": {
+    "accent": "blue",
+    "border": "blue7",
+    "borderAccent": "blue",
+    "borderMuted": "fgGutter",
+
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+
+    "text": "fg",
+    "muted": "dark5",
+    "dim": "comment",
+    "thinkingText": "comment",
+
+    "scrollbarTrack": "fgGutter",
+    "scrollbarThumb": "dark5",
+
+    "selectedBg": "bgHighlight",
+    "searchMatchBg": "bgVisual",
+    "searchMatchText": "fg",
+
+    "userMessageBg": "bgDark",
+    "userMessageText": "fg",
+
+    "customMessageBg": "bgDark",
+    "customMessageText": "fgDark",
+    "customMessageLabel": "magenta",
+
+    "toolPendingBg": "",
+    "toolSuccessBg": "",
+    "toolErrorBg": "",
+    "toolTitle": "fgDark",
+    "toolOutput": "comment",
+
+    "mdHeading": "blue",
+    "mdLink": "cyan",
+    "mdLinkUrl": "comment",
+    "mdCode": "green1",
+    "mdCodeBlock": "fgDark",
+    "mdCodeBlockBorder": "fgGutter",
+    "mdQuote": "dark5",
+    "mdQuoteBorder": "blue7",
+    "mdHr": "fgGutter",
+    "mdListBullet": "blue",
+
+    "toolDiffAdded": "green",
+    "toolDiffRemoved": "red",
+    "toolDiffContext": "comment",
+
+    "syntaxComment": "comment",
+    "syntaxKeyword": "magenta",
+    "syntaxFunction": "blue",
+    "syntaxVariable": "fg",
+    "syntaxString": "green",
+    "syntaxNumber": "orange",
+    "syntaxType": "green1",
+    "syntaxOperator": "blue5",
+    "syntaxPunctuation": "fgDark",
+
+    "thinkingOff": "fgGutter",
+    "thinkingMinimal": "dark3",
+    "thinkingLow": "blue7",
+    "thinkingMedium": "blue0",
+    "thinkingHigh": "blue",
+    "thinkingXhigh": "magenta",
+    "thinkingMax": "orange",
+
+    "bashMode": "green"
+  },
+
+  "export": {
+    "pageBg": "#16161e",
+    "cardBg": "#1a1b26",
+    "infoBg": "#292e42"
+  }
+}
