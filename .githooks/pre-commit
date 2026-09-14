@@ -6,6 +6,11 @@
 #
 #     git config core.hooksPath .githooks
 #
+#
+# pi does that for you: agent/extensions/git-hooks.ts self-arms this hook on
+# every startup (and warns loudly when core.hooksPath points elsewhere), so a
+# fresh clone is guarded from its first commit. The manual command remains for
+# shells that never go through pi.
 # That indirection is the point. A hook in `.git/hooks/` is not version
 # controlled, so it silently does not exist on a fresh clone — the failure mode
 # being guarded against here is *silence*, so the guard must not itself be
@@ -30,12 +35,10 @@ root=$(git rev-parse --show-toplevel)
 check="$root/scripts/check.sh"
 [ -x "$check" ] || exit 0
 
-# NOTE: this checks the working tree, not the staged content. A partially staged
-# file can therefore pass here and still be broken as committed. That is an
-# accepted limit — the failure this exists to stop was a whole-file syntax error,
-# and stashing to check the index exactly would risk the user's work to catch a
-# rarer case.
-if ! "$check"; then
+# CHECK_STAGED=1: check.sh materialises the index in a scratch dir and checks
+# that — what the commit records — not the working tree. A partially staged
+# file can therefore not pass here and ship broken.
+if ! CHECK_STAGED=1 "$check"; then
 	echo
 	echo "Commit refused: the checks above failed."
 	echo "A file that cannot load takes pi's startup with it — fix it, or use --no-verify."
