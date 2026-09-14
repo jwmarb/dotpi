@@ -2,6 +2,7 @@
   "lastChangelogVersion": "0.85.1",
   "defaultProvider": "litellm",
   "defaultModel": "qwen/qwen3.8-27b",
+  "hideThinkingBlock": true,
   "extensions": [],
   "images": {
     "autoResize": true
@@ -14,8 +15,7 @@
     "provider": {
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
-    },
-    "maxDelayMs": 128000
+    }
   },
   "packages": [
     "git:github.com/samfoy/pi-lsp-extension",

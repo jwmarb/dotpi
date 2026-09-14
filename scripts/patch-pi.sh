@@ -67,13 +67,57 @@ else
 	then ok 'ladder capped at retry.maxDelayMs'
 	else bad 'ladder formula anchor not found'
 	fi
+
+	# 3. setHiddenThinkingLabel broadcasts to EVERY assistant message in the
+	#    transcript, so "Thought for 12s" is stamped onto every earlier turn too.
+	#    The label is already stored per-component; only this setter fans it out.
+	#
+	#    Patched semantics:
+	#      - label given  -> applies to ONE component only: the streaming message,
+	#        or the newest assistant message if the stream already ended (pi clears
+	#        streamingComponent at message_end, before an extension's own handler
+	#        can run). Never touches older turns.
+	#      - no argument  -> unchanged: restores the default and clears every
+	#        component. pi itself calls it bare on /reload, so this must keep
+	#        working exactly as before.
+	#
+	#    this.hiddenThinkingLabel is deliberately NOT updated for a per-message
+	#    label: it seeds newly constructed components, so persisting a duration
+	#    there would make the NEXT message start life labelled "Thought for 12s"
+	#    while it is still thinking.
+	if grep -q 'PI_PER_MESSAGE_THINKING_LABEL' "$CHUNK"; then
+		skip 'per-message hidden thinking label'
+	elif python3 - "$CHUNK" <<-'PY'
+		import sys
+		p = sys.argv[1]; s = open(p).read()
+		old = ('setHiddenThinkingLabel(label){this.hiddenThinkingLabel=label??this.defaultHiddenThinkingLabel;'
+		       'for(let child of this.chatContainer.children)child instanceof AssistantMessageComponent&&child.setHiddenThinkingLabel(this.hiddenThinkingLabel);'
+		       'this.streamingComponent&&this.streamingComponent.setHiddenThinkingLabel(this.hiddenThinkingLabel),this.ui.requestRender()}')
+		# PI_PER_MESSAGE_THINKING_LABEL: marker for the idempotency check above.
+		new = ('setHiddenThinkingLabel(label){/*PI_PER_MESSAGE_THINKING_LABEL*/'
+		       'if(label!==void 0){'
+		       'let target=this.streamingComponent;'
+		       'if(target===void 0)for(let child of this.chatContainer.children)child instanceof AssistantMessageComponent&&(target=child);'
+		       'target&&target.setHiddenThinkingLabel(label),this.ui.requestRender();return}'
+		       'this.hiddenThinkingLabel=this.defaultHiddenThinkingLabel;'
+		       'for(let child of this.chatContainer.children)child instanceof AssistantMessageComponent&&child.setHiddenThinkingLabel(this.hiddenThinkingLabel);'
+		       'this.streamingComponent&&this.streamingComponent.setHiddenThinkingLabel(this.hiddenThinkingLabel),this.ui.requestRender()}')
+		if s.count(old) != 1: sys.exit(1)
+		open(p, "w").write(s.replace(old, new)); sys.exit(0)
+	PY
+	then ok 'per-message hidden thinking label'
+	else bad 'setHiddenThinkingLabel anchor not found'
+	fi
 fi
 
 echo
 if (( fail )); then
 	cat <<-'EOF'
-	One or more patches did not apply. pi will run, but a litellm "Upstream
-	request failed" will end the session permanently instead of retrying.
+	One or more patches did not apply. Check which line above says FAILED.
+	A missing retry patch means a litellm "Upstream request failed" will end the
+	session permanently instead of retrying. A missing thinking-label patch is
+	cosmetic only: "Thought for Ns" will appear on every assistant turn instead
+	of the one it measured.
 	Read docs/adr/0034-local-pi-patches.md and re-derive the anchors.
 	EOF
 	exit 1

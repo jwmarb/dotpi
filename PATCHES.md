@@ -19,17 +19,43 @@ instead of retrying, with no message explaining why.
 |---|---|
 | `"upstream request failed"` added to the retryable-error list | A litellm gateway blip (HTTP 400) ends the session for good — no retry |
 | Retry ladder capped at `retry.maxDelayMs` | 10 retries reach 8.5- and 17-minute waits; 34 min worst case instead of 10.6 |
+| `setHiddenThinkingLabel` scoped to one message | "Thought for 12s" is stamped onto *every* assistant turn in the transcript, not the one it measured |
 
-Neither is reachable from an extension: no pi hook can influence retry
-classification. See [docs/adr/0034](./docs/adr/0034-local-pi-patches.md) for the
-full reasoning, the rejected alternatives, and the trap that cost an evening —
-the file that *looks* like the right target (`pi-ai/dist/utils/retry.js`) is
-never loaded, because the pattern is inlined into a bundled chunk.
+None of these is reachable from an extension. The first two: no pi hook can
+influence retry classification. The third: the label setter fans out to every
+`AssistantMessageComponent` in the chat container, and an extension can only
+hand it a string — it cannot choose a target. See
+[docs/adr/0034](./docs/adr/0034-local-pi-patches.md) for the full reasoning, the
+rejected alternatives, and the trap that cost an evening — the file that *looks*
+like the right target (`pi-ai/dist/utils/retry.js`) is never loaded, because the
+pattern is inlined into a bundled chunk.
+
+The thinking-label patch keeps the no-argument call — which pi itself makes on
+`/reload` — behaving exactly as before, resetting every component to the default
+`"Thinking..."`. Only a call *with* a label is narrowed, and it deliberately does
+not persist into `hiddenThinkingLabel`, since that field seeds newly created
+components and would make the next turn open already labelled with the previous
+turn's duration. `agent/extensions/thinking-indicator.ts` is the consumer.
 
 `scripts/patch-pi.sh` is safe to run repeatedly: it skips patches already
 present, finds the chunk by content rather than by its per-release hash, and
 **exits non-zero** if an anchor no longer matches — that means upstream changed
 the code and the ADR needs revisiting.
+
+## Verifying the thinking-label patch
+
+The two retry patches are verified by the snippet the script prints. The
+thinking-label patch has a behavioural check:
+
+```sh
+node scripts/check-thinking-label-patch.mjs
+```
+
+It extracts the patched setter out of the installed bundle and exercises it, so
+it tests what is actually installed rather than a copy that can drift. It prints
+`UNPATCHED` and exits 0 when the patch is absent (patch 3 is cosmetic and
+optional), and exits non-zero when the installed behaviour is wrong — including
+the case where a future patch carries the right marker but still broadcasts.
 
 ## Native subagent Runs require a linked herdr plugin
 
