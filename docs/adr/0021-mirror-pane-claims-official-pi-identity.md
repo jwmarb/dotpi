@@ -1,5 +1,7 @@
 # A Mirror Pane claims herdr's official pi identity to get a browsable session
 
+> **Superseded in part by [0044](./0044-native-runs-herdr-owns-the-process.md).** The `HERDR_AGENT=pi` shim below exists because a Bun viewer is not a pi process and herdr refuses a session it did not detect. A **Native Run** *is* a pi process, so it self-reports through the installed `herdr-agent-state.ts` and the shim becomes dead weight — the compatibility risk this ADR warned about is retired with it. Note also that the probe recorded here, that a resuming pi appends to the session file, is now the *intended* behaviour of **Resume** rather than corruption to be avoided.
+
 A **Mirror Pane** launches its viewer with `HERDR_AGENT=pi` and reports its session using herdr's official `herdr:pi` / `pi` source-agent pair. Both are required, and neither is obvious:
 
 1. **Detection.** Herdr only attaches a session to a pane where it *detected* an agent process. Our pane runs a Bun viewer, so nothing is detected and the session is refused. `HERDR_AGENT=pi` is herdr's documented hint for a foreground wrapper that hides the real agent, and it makes detection fire.

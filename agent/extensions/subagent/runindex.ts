@@ -228,7 +228,7 @@ async function scanRunDir(
 		};
 	}
 
-if (archived.length > 0) {
+	if (archived.length > 0) {
 		// Do not decompress during a scan: thawing would make listing as
 		// expensive as opening, and the index only promises *that* a Run is
 		// archived, not its contents (docs/adr/0022).

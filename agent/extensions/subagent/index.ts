@@ -24,9 +24,11 @@
 import { spawn } from "node:child_process";
 import {
 	closeTab,
+	closePane,
 	createTab,
 	findPaneByLabel,
 	herdrAvailable,
+	herdrContext,
 	HERDR_PI_AGENT,
 	nextSeq,
 	releaseAgent,
@@ -36,6 +38,13 @@ import {
 	runInPane,
 	splitPane,
 } from "../herdr/client.js";
+// The socket client, for what the CLI cannot do: open a plugin pane and
+// subscribe to pane lifecycle events (docs/adr/0044).
+import {
+	herdrSocketAvailable,
+	openPluginPane,
+} from "../herdr/socket.js";
+import { watchNativeRun } from "./watcher.js";
 import * as fs from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -56,10 +65,27 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { extractResult } from "./results.js";
 import { reapSessions, thawRun } from "./reaper.js";
 import { formatRunIndex, scanRunDirs } from "./runindex.js";
+import { DONE_TOOL_NAME } from "./child-done.js";
+import {
+	buildLaunchPlan,
+	buildSubagentToolAllowlist,
+	RUN_ENTRYPOINT,
+	RUN_PLUGIN_ID,
+} from "./native.js";
 import type { RunOutcome } from "./rundir.js";
-import { mirrorPaneLabel, shortRunId, writeRunSidecar } from "./rundir.js";
-// The shared admission cap: one machine, one budget (docs/adr/0040).
-import { claimSlot, MAX_SPAWNED_CHILDREN } from "./spawnlimit.js";
+import {
+	mirrorPaneLabel,
+	runsRoot,
+	shortRunId,
+	writeRunSidecar,
+} from "./rundir.js";
+// The shared admission cap: one machine, one budget (docs/adr/0040), counted
+// across every pi in this tree since native Runs can spawn (docs/adr/0044).
+import {
+	claimSlot,
+	MAX_SPAWNED_CHILDREN,
+	setSpawnCapRoot,
+} from "./spawnlimit.js";
 import { matchTaskRunDirs } from "./taskdirs.js";
 import {
 	aggregateUsage,
@@ -327,6 +353,49 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	if (!isGenericRuntime) return { command: process.execPath, args };
 
 	return { command: "pi", args };
+}
+
+/**
+ * How a **Native Run**'s wrapper should invoke `pi`, as a full argv prefix.
+ *
+ * Separate from {@link getPiInvocation} because the two answer different
+ * questions. That one re-invokes *this* process and may legitimately return a
+ * runtime plus `process.argv[1]`; here the command is written into a shell script
+ * that herdr runs later, in another process, where `argv[1]` means nothing. Using
+ * it directly is what produced `node: bad option: --session-dir` — the runtime
+ * arrived without its script.
+ *
+ * So resolution goes from most to least self-describing:
+ *
+ * 1. `PI_BIN`, when the user has said explicitly which `pi` to run.
+ * 2. A `pi` on `PATH`. The installed launcher carries its own `#!/usr/bin/env
+ *    node` shebang, so it needs no runtime prefix and cannot be split from its
+ *    script — which is exactly the failure this avoids.
+ * 3. This process's own runtime plus its entry script, for a pi run from a
+ *    checkout with nothing installed on PATH. Correct only because the child is
+ *    the same program as the parent.
+ *
+ * @returns argv words to invoke pi, never empty.
+ */
+function nativePiCommand(): string[] {
+	const explicit = process.env.PI_BIN;
+	if (explicit) return [explicit];
+
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		const candidate = path.join(dir, "pi");
+		try {
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return [candidate];
+		} catch {
+			// Not here, or not executable: keep looking.
+		}
+	}
+
+	const script = process.argv[1];
+	if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script))
+		return [process.execPath, script];
+	return ["pi"];
 }
 
 /** The write-up contract, appended to every subagent's system prompt so it
@@ -683,25 +752,37 @@ async function readRunAgentFile(runDir: string): Promise<string> {
 }
 
 /**
- * Reopen every Run of a finished Task in Mirror Panes (docs/adr/0028).
+ * **Resume** every Run of a finished Task in real `pi` sessions (docs/adr/0044).
+ *
+ * This replaces `reopenTask`. **Reopen** meant *read a finished transcript* and
+ * is retired: there is deliberately no read-only path any more, so revisiting a
+ * Run means continuing it. Each Run is opened as a real interactive `pi` on its
+ * own session file, which **appends** new turns to that transcript. ADR 0021
+ * measured exactly this append and treated it as corruption to be avoided; it is
+ * now the intended behaviour, which is why a Run's **Transcript** is a living
+ * document rather than a record.
+ *
+ * The consequence to hold onto: a resumed Run can no longer be *merely looked
+ * at*. A stray keystroke becomes a turn in that Run's history, and there is no
+ * pristine copy to fall back to.
  *
  * The shared resolver: the `subagent_tasks` `open` action and the `/run`
  * command are thin callers of this, so the two surfaces cannot drift.
  *
- * Reopening is addressed by Task ID and resolves the Task's whole family of
+ * Resuming is addressed by Task ID and resolves the Task's whole family of
  * Runs from disk — `sub-6748` → `sub-6748-1`, `-2`, … — because the registry
  * is memory-only and cannot see past sessions. A Run that already has a pane
- * is reused, not opened twice; an archived Run is thawed by openMirrorPane
- * (docs/adr/0022).
+ * is focused, not opened twice; an archived Run is **Thawed** first, so age is
+ * invisible to the reader (docs/adr/0022).
  *
- * Best-effort throughout: reopening must never throw into its caller, so
+ * Best-effort throughout: resuming must never throw into its caller, so
  * every failure is reported as an `error` string.
  *
- * @param taskId - The Task ID to reopen (e.g. `sub-6748`).
+ * @param taskId - The Task ID to resume (e.g. `sub-6748`).
  * @returns How many Runs were newly opened and how many were already open,
  *          plus an error when not all Runs could be shown.
  */
-async function reopenTask(
+async function resumeTask(
 	taskId: string,
 ): Promise<{ opened: number; alreadyOpen: number; error?: string }> {
 	try {
@@ -779,27 +860,31 @@ async function reopenTask(
 			}
 		}
 
-		// Launch the viewer through openMirrorPane — the same path live Runs
-		// take — so a re-opened transcript renders, thaws, and reports
-		// identically to one that ran.
+		// Each Run is resumed as a real `pi` on its own session file. Thaw first:
+		// `pi --session` cannot read a zstd-compressed transcript, and age must be
+		// invisible to the reader (docs/adr/0022).
 		let opened = 0;
 		for (let i = 0; i < toOpen.length; i++) {
 			const paneId = paneIds[i];
 			const entry = toOpen[i];
 			if (!paneId || !entry) continue; // herdr refused this pane; skip
-			const run: RunResult = {
-				agent: entry.agent,
-				runId: entry.runId,
-				agentSource: "unknown",
-				task: "",
-				exitCode: 0,
-				messages: [],
-				stderr: "",
-				usage: emptyUsage(),
-				multiRun,
-			};
-			void openMirrorPane(run, paneId, entry.sessionDir);
-			opened++;
+
+			const sessionFile = await thawRun(entry.sessionDir);
+			if (!sessionFile) continue; // Nothing to resume: no transcript on disk.
+
+			await renamePane(
+				paneId,
+				mirrorPaneLabel({ runId: entry.runId, agent: entry.agent, multiRun }),
+			);
+			// `pi --session <file>` continues that session in place, appending. No
+			// `--fork`: a fork would show a *copy*, which is a different Run wearing
+			// this one's clothes and would not be the transcript the Board and Run
+			// Index read (docs/adr/0044).
+			const invocation = getPiInvocation(["--session", sessionFile]);
+			const command = [invocation.command, ...invocation.args]
+				.map((a) => `'${a.replaceAll("'", `'\\''`)}'`)
+				.join(" ");
+			if (await runInPane(paneId, command)) opened++;
 		}
 
 		if (opened + alreadyOpen < runDirs.length) {
@@ -811,19 +896,19 @@ async function reopenTask(
 		}
 		return { opened, alreadyOpen };
 	} catch {
-		// Reopening must never take its caller down with it.
+		// Resuming must never take its caller down with it.
 		return {
 			opened: 0,
 			alreadyOpen: 0,
-			error: `could not reopen ${taskId}`,
+			error: `could not resume ${taskId}`,
 		};
 	}
 }
 
 /**
- * One reopened Task's outcome, worded the way its callers report it.
+ * One resumed Task's outcome, worded the way its callers report it.
  */
-function describeReopen(
+function describeResume(
 	id: string,
 	r: { opened: number; alreadyOpen: number; error?: string },
 ): string {
@@ -860,13 +945,37 @@ async function closeMirrorReporting(run: RunResult): Promise<void> {
  * Close the Tab hosting a finished Task's Mirror Panes.
  *
  * Called when the Reminder lands, not when the Runs end: the Reminder is
- * where the user learns the Task finished and how to reopen it, so the Tab
+ * where the user learns the Task finished and how to resume it, so the Tab
  * survives until that hint is in hand (docs/adr/0028). Best-effort — a Tab
  * that will not close must never affect the Task.
  */
 async function closeTaskTab(task: Task): Promise<void> {
 	const tabId = task.tabId;
 	if (!tabId) return;
+
+	// A Task whose Runs hosted themselves keeps its Tab when anything went wrong.
+	// ADR 0028 could close unconditionally because a pane was only a viewport, so
+	// closing cost nothing; a **Run Pane** holds the failure's own output, and
+	// herdr destroys a pane's scrollback with it — so closing here would delete the
+	// only readable evidence, and **Reopen** no longer exists to get it back
+	// (docs/adr/0044). Successes still close: nobody needs to dismiss a Run that
+	// worked.
+	const nativeTask = task.runs.some((r) => r.runPaneId);
+	// A **Dismissed** Run is excluded deliberately. It counts as failed for the
+	// purposes of "did this produce a Result?", but it leaves *nothing to read*:
+	// the user closed that pane themselves, so herdr has already destroyed it.
+	// Holding the Tab open for it strands an empty shell the user must close by
+	// hand — evidence preservation with no evidence (docs/adr/0044).
+	const hasReadableFailure = task.runs.some(
+		(r) => runFailed(r) && !r.dismissed,
+	);
+	if (nativeTask && hasReadableFailure) {
+		// Released, not closed: the user closes it when they have read it. Cleared so
+		// no later collection path closes it behind their back.
+		task.tabId = undefined;
+		return;
+	}
+
 	// Claim the Tab *before* awaiting. It is now closed from several places — the
 	// Reminder, and each of the three Result-collection paths — which can overlap
 	// in one turn; clearing after the await let two callers both call closeTab.
@@ -938,6 +1047,186 @@ async function executeAttempt(
 	}
 }
 
+/**
+ * Run one attempt as a **Native Run**: a real interactive `pi` TUI in a herdr
+ * **Run Pane** the user can watch and type into (docs/adr/0044).
+ *
+ * Returns `false` rather than throwing when the pane cannot be opened, so the
+ * caller falls through to the **Fallback path**. Throwing is reserved for
+ * unexpected faults, which the caller also treats as a reason to fall back — the
+ * rule is that no failure of this function may fail the Run outright, because the
+ * old path can always still run it.
+ *
+ * The differences from the fallback are all consequences of losing the pipes:
+ * there is no `--mode json`, so no NDJSON to parse; the **Result** comes from the
+ * child's own transcript via the **Done signal**; and termination is observed from
+ * herdr's socket plus sidecars rather than from a process handle.
+ *
+ * @returns Whether the Run was executed natively.
+ */
+async function executeNativeAttempt(
+	defaultCwd: string,
+	agent: AgentConfig,
+	model: string | undefined,
+	runResult: RunResult,
+	skillNames: string[] | undefined,
+	cwd: string | undefined,
+	signal: AbortSignal,
+	onProgress: () => void,
+	planKey: string,
+	sessionDir: string,
+): Promise<boolean> {
+	// Skills resolve exactly as they do on the fallback path: they were validated
+	// before the Task was created, and a late failure is reported, not ignored.
+	const resolution = skillNames?.length
+		? resolveSkills(cwd ?? defaultCwd, skillNames)
+		: null;
+	if (resolution) {
+		runResult.skills = resolution.loaded.map((s) => s.name);
+		if (resolution.missing.length > 0)
+			runResult.missingSkills = resolution.missing.map((m) => m.name);
+		if (resolution.skipped.length > 0)
+			runResult.skippedSkills = resolution.skipped;
+	}
+
+	// No RESULT_CONTRACT. The <result> tag existed so a Result could be scraped
+	// out of prose; a Native Run's payload is its last assistant message, read
+	// from the transcript, so the contract is no longer load-bearing (docs/adr/0044).
+	const promptParts = [
+		agent.systemPrompt.trim(),
+		resolution ? formatPreloadedSkills(resolution.loaded).trim() : "",
+	].filter(Boolean);
+
+	let tmpPromptDir: string | null = null;
+	let paneOpened = false;
+	try {
+		const tmp = await writePromptToTempFile(
+			agent.name,
+			promptParts.join("\n\n---\n\n"),
+		);
+		tmpPromptDir = tmp.dir;
+
+		const piInvocation = nativePiCommand();
+		const plan = buildLaunchPlan({
+			runId: runResult.runId,
+			sessionDir,
+			cwd: cwd ?? defaultCwd,
+			piCommand: piInvocation,
+			doneExtensionPath: path.join(
+				path.dirname(new URL(import.meta.url).pathname),
+				"child-done.ts",
+			),
+			// Always includes the done tool, so no agent file needs editing and a
+			// tool-restricted child can still report completion.
+			tools: buildSubagentToolAllowlist(agent.tools, DONE_TOOL_NAME) ?? [],
+			model,
+			systemPromptPath: tmp.filePath,
+			task: runResult.task,
+			planKey,
+		});
+
+		await fs.promises.mkdir(sessionDir, { recursive: true });
+		await fs.promises.writeFile(plan.wrapperPath, plan.wrapperSource, {
+			encoding: "utf-8",
+			mode: 0o700,
+		});
+
+		const pane = await openPluginPane({
+			pluginId: RUN_PLUGIN_ID,
+			entrypoint: RUN_ENTRYPOINT,
+			placement: "split",
+			// The Task's Tab when it has one (one Tab per Task), else beside the
+			// orchestrator so a Run still gets a pane when Tab creation failed.
+			targetPaneId: runResult.paneTarget ?? herdrContext()?.paneId,
+			direction: "right",
+			// Never steal focus: a Run starting must not yank the user out of whatever
+			// they are typing (docs/adr/0044).
+			focus: false,
+			cwd: cwd ?? defaultCwd,
+			env: plan.paneEnv,
+		});
+		if (!pane) return false; // No pane: let the fallback run it.
+		paneOpened = true;
+		runResult.runPaneId = pane.paneId;
+		onProgress();
+
+		// Cancelling a Native Run means closing its pane: the pane *is* the process's
+		// home, so there is no other handle to kill it by. The parent still owns
+		// termination — only its instrument changed (docs/adr/0033, docs/adr/0044).
+		const closeOnCancel = () => {
+			void closePane(pane.paneId);
+		};
+		if (signal.aborted) closeOnCancel();
+		else signal.addEventListener("abort", closeOnCancel, { once: true });
+
+		const result = await watchNativeRun({
+			runId: runResult.runId,
+			sessionDir,
+			paneId: pane.paneId,
+			signal,
+		});
+		signal.removeEventListener("abort", closeOnCancel);
+
+		// Map the watcher's verdict onto the shape every downstream reader already
+		// understands, so the Board, Run Index, Reminders and chains need no special
+		// case for a Native Run.
+		runResult.exitCode =
+			result.exitCode ?? (result.outcome === "completed" ? 0 : 1);
+		runResult.stopReason =
+			result.outcome === "completed"
+				? "stop"
+				: signal.aborted
+					? "aborted"
+					: "error";
+		if (result.outcome === "dismissed") {
+			runResult.dismissed = true;
+			runResult.stopReason = "aborted";
+		}
+		if (result.outcome !== "completed") runResult.errorMessage = result.detail;
+		if (result.stopReason === "error" && result.errorMessage)
+			runResult.errorMessage = result.errorMessage;
+
+		// The transcript's last assistant message *is* the Result. Synthesised into
+		// the messages array so `getFinalOutput`/chain interpolation keep working
+		// unchanged, rather than teaching every consumer a second shape.
+		if (result.lastAssistantText) {
+			runResult.messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: result.lastAssistantText }],
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: result.outcome === "completed" ? "stop" : "error",
+				timestamp: Date.now(),
+			} as unknown as Message);
+		}
+		return true;
+	} finally {
+		if (paneOpened) {
+			// Record the outcome for readers with no handle on the child, exactly as
+			// the fallback does — and in a `finally` for the same reason: a thrown Run
+			// must not be left reading "running" forever (docs/adr/0036).
+			void writeRunMeta(
+				sessionDir,
+				runResult,
+				runResult.dismissed
+					? "dismissed"
+					: runFailed(runResult)
+						? "failed"
+						: "completed",
+			);
+			onProgress();
+		}
+		if (tmpPromptDir)
+			await fs.promises.rm(tmpPromptDir, { recursive: true, force: true });
+	}
+}
+
 /** The body of {@link executeAttempt}, running with a spawn slot already held. */
 async function executeAttemptWithSlot(
 	defaultCwd: string,
@@ -959,6 +1248,36 @@ async function executeAttemptWithSlot(
 	// itself never names the agent, and the Board reads these directories without
 	// any access to the Task's in-memory state (docs/adr/0026).
 	void writeRunMeta(sessionDir, runResult);
+
+	// A Native Run is preferred whenever herdr can host one: a real interactive pi
+	// TUI the user can watch and steer (docs/adr/0044). Any failure here — no herdr,
+	// the plugin not linked, a pane that would not open — falls through to the
+	// Fallback path below, which is retained permanently for exactly these cases and
+	// is left byte-for-byte as it was. The fallback must never become unreachable,
+	// so this branch returns only on success.
+	if (herdrSocketAvailable()) {
+		try {
+			const ran = await executeNativeAttempt(
+				defaultCwd,
+				agent,
+				model,
+				runResult,
+				skillNames,
+				cwd,
+				signal,
+				onProgress,
+				planKey,
+				sessionDir,
+			);
+			if (ran) return;
+		} catch (err) {
+			// Deliberately swallowed: a native launch that fails is a reason to run the
+			// Run the old way, not a reason to fail it. Recorded on the Run so the
+			// silent-downgrade case is diagnosable rather than invisible.
+			runResult.nativeFallbackReason =
+				err instanceof Error ? err.message : String(err);
+		}
+	}
 	const args: string[] = [
 		"--mode",
 		"json",
@@ -1404,7 +1723,7 @@ const TasksParams = Type.Object({
 		["list", "status", "result", "wait", "cancel", "open"] as const,
 		{
 			description:
-			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; wait = block until the given tasks finish; cancel = kill running tasks; open = reopen a finished task's transcript in a pane.",
+			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view).",
 		},
 	),
 	taskIds: Type.Optional(
@@ -1457,6 +1776,12 @@ interface ReminderDetails {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Point the spawn cap at the shared token directory before anything can claim a
+	// slot. Tree-wide rather than per-process because a Native Run is a full pi that
+	// can itself spawn, so a module-level counter would mean six children *per
+	// process*, recursively (docs/adr/0044, amending 0040).
+	setSpawnCapRoot(runsRoot(getAgentDir()));
+
 	const registry = new TaskRegistry();
 	/** Captured so background progress can update the footer outside a tool call. */
 	let ui: ExtensionUIContext | undefined;
@@ -1525,7 +1850,7 @@ export default function (pi: ExtensionAPI) {
 								"",
 								formatTaskResults(task),
 								"",
-								`Reopen its transcript with /run ${task.id}`,
+								`Resume it with /run ${task.id}`,
 							].join("\n"),
 						},
 					],
@@ -1624,6 +1949,13 @@ export default function (pi: ExtensionAPI) {
 		// Runs get panes: subagent children inherit no pane identity, so the gate
 		// closes for nested delegations automatically. Failure to build any of this
 		// leaves the Task completely unaffected.
+		//
+		// A **Native Run** hosts itself, so it must NOT be given a pre-allocated
+		// Mirror Pane: that pane would sit empty while the real work ran in the Run
+		// Pane herdr opens later. The Tab is still created — one Tab per Task holds
+		// either kind of pane — and native Runs split into it from its root
+		// (docs/adr/0044).
+		const nativeRuns = herdrSocketAvailable();
 		if (herdrAvailable()) {
 			try {
 				// The Tab names the Task by the agent doing the work, not the bare ID:
@@ -1634,18 +1966,26 @@ export default function (pi: ExtensionAPI) {
 				if (tab) {
 					// Retained so the Reminder can close the Tab once it lands (docs/adr/0028).
 					task.tabId = tab.tabId;
-					task.runs[0].mirrorPaneId = tab.paneId;
-					// The tab's root pane hosts run 1; each further Run splits off it.
-					for (let i = 1; i < task.runs.length; i++) {
-						const paneId = await splitPane({
-							target: tab.paneId,
-							// Stack runs vertically: a fan-out of narrow columns is
-							// unreadable, and herdr's own guidance warns against repeated
-							// same-direction splits.
-							direction: "down",
-							cwd: items[i]?.cwd ?? defaultCwd,
-						});
-						if (paneId) task.runs[i].mirrorPaneId = paneId;
+					// Every Run needs somewhere to be split from; native Runs open their
+					// own pane against this root rather than adopting it.
+					task.tabRootPaneId = tab.paneId;
+					// Tell every Run where its pane belongs, so a Native Run opens inside
+					// its Task's Tab instead of splitting the orchestrator's own pane.
+					for (const run of task.runs) run.paneTarget = tab.paneId;
+					if (!nativeRuns) {
+						task.runs[0].mirrorPaneId = tab.paneId;
+						// The tab's root pane hosts run 1; each further Run splits off it.
+						for (let i = 1; i < task.runs.length; i++) {
+							const paneId = await splitPane({
+								target: tab.paneId,
+								// Stack runs vertically: a fan-out of narrow columns is
+								// unreadable, and herdr's own guidance warns against repeated
+								// same-direction splits.
+								direction: "down",
+								cwd: items[i]?.cwd ?? defaultCwd,
+							});
+							if (paneId) task.runs[i].mirrorPaneId = paneId;
+						}
 					}
 				}
 			} catch {
@@ -2034,7 +2374,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Tasks",
 		description: [
 			"Inspect and control background subagent tasks started with the subagent tool.",
-			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (reopen a finished task\'s transcript in a pane).',
+			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (resume a finished task in a live pi pane — this CONTINUES the session and appends to its transcript; there is no read-only view).',
 			"Task ids look like sub-a3f1 and are returned when you start a task.",
 		].join(" "),
 		parameters: TasksParams,
@@ -2102,7 +2442,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				const lines: string[] = [];
 				for (const id of openIds) {
-					lines.push(describeReopen(id, await reopenTask(id)));
+					lines.push(describeResume(id, await resumeTask(id)));
 				}
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
@@ -2414,22 +2754,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/**
-	 * `/run <taskId>` — reopen a finished Task's Runs (docs/adr/0028).
+	 * `/run <taskId>` — resume a finished Task's Runs in live pi panes (docs/adr/0044).
 	 *
-	 * Thin over the shared `reopenTask` resolver: the completion Reminder tells
+	 * Thin over the shared `resumeTask` resolver: the completion Reminder tells
 	 * the user exactly this command with a bare Task ID, and the tool's
 	 * `open` action is the same resolver, so all three surfaces agree.
 	 */
 	pi.registerCommand("run", {
-		description: "Reopen a finished task's transcript: /run sub-a3f1",
+		description: "Resume a finished task in a live pi pane: /run sub-a3f1",
 		async handler(args, ctx) {
 			const id = (args ?? "").trim();
 			if (!id) {
 				ctx.ui?.notify("Usage: /run <taskId> — list runs with /runs", "info");
 				return;
 			}
-			const r = await reopenTask(id);
-			ctx.ui?.notify(describeReopen(id, r), r.error ? "warning" : "info");
+			const r = await resumeTask(id);
+			ctx.ui?.notify(describeResume(id, r), r.error ? "warning" : "info");
 		},
 	});
 

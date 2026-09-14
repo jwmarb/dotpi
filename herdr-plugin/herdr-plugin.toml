@@ -1,0 +1,21 @@
+# herdr plugin: pi-subagents
+# Launches native `pi` TUI subagent Runs into herdr panes.
+# See ../docs/adr/0044-native-runs-herdr-owns-the-process.md
+
+id = "pi-subagents"
+name = "Pi Subagents"
+version = "0.1.0"
+description = "Launch a subagent Run (a native pi TUI) into a new pane; per-Run variation rides on --env"
+min_herdr_version = "0.8.2"
+platforms = ["linux"]
+
+# One pane entrypoint. The `bash -c` exists ONLY so $HERDR_PLUGIN_ROOT expands
+# at launch time: herdr execs the argv verbatim (no shell), so without the
+# indirection layer the variable would be passed to the kernel unexpanded.
+# A direct-argv entrypoint (["bash", "dispatch.sh"]) was also verified working
+# against herdr 0.9.0; the shell indirection buys per-Run variation (the
+# dispatcher reads PI_RUN_WRAPPER, set via --env), nothing else.
+[[panes]]
+id = "run"
+title = "Subagent run"
+command = ["bash", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/dispatch.sh\""]

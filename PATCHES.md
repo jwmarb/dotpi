@@ -30,3 +30,24 @@ never loaded, because the pattern is inlined into a bundled chunk.
 present, finds the chunk by content rather than by its per-release hash, and
 **exits non-zero** if an anchor no longer matches — that means upstream changed
 the code and the ADR needs revisiting.
+
+## Native subagent Runs require a linked herdr plugin
+
+**Run once, separately from the patches above:**
+
+```sh
+herdr plugin link ./herdr-plugin
+```
+
+`herdr plugin list` should then show `pi-subagents`; remove it with
+`herdr plugin unlink pi-subagents`.
+
+Why: a Run is now a native `pi` TUI that herdr spawns into its own pane, and
+the launch must not type a command into an interactive shell — it goes through
+the plugin's static argv entrypoint with the per-Run wrapper passed via
+`--env PI_RUN_WRAPPER`. Without the link, native Runs cannot be launched at
+all (the JSON spawn path remains the fallback when herdr is absent). See
+[herdr-plugin/README.md](./herdr-plugin/README.md) for the contract and the
+two hard-won pane-lifecycle facts, and
+[docs/adr/0044](./docs/adr/0044-native-runs-herdr-owns-the-process.md) for the
+reasoning.

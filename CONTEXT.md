@@ -96,15 +96,27 @@ A herdr layout container holding one or more **Panes**. A **Tab** never hosts a 
 _Avoid_: agent tab (a **Tab** groups panes; the agent lives in a **Pane**)
 
 **Mirror Pane**:
-The **Pane** that displays one **Run**'s output, live while the **Run** writes and historical once it has finished. The orchestrator's extension still owns the child process; the **Mirror Pane** only renders the session file that child writes. It is a viewport, never the process's home. Given its **Run**'s session *directory*, it resolves and latches onto the session file itself rather than being told a filename that may not exist yet (ADR 0025). Its output is append-only, so the terminal's own scrollback holds the history and nothing is pinned (ADR 0029). It self-reports to herdr via `pane report-agent`, so the **Run** appears in herdr's agent list with its own session. **Reopening** a finished **Run** produces a **Mirror Pane** too: one viewer, two lifecycles (ADR 0028).
-_Avoid_: agent pane, subagent tab, run pane, replay pane (a reopened Run is still a **Mirror Pane**)
+The **Pane** that displays one **Run**'s output, live while the **Run** writes and historical once it has finished. The orchestrator's extension still owns the child process; the **Mirror Pane** only renders the session file that child writes. It is a viewport, never the process's home. Given its **Run**'s session *directory*, it resolves and latches onto the session file itself rather than being told a filename that may not exist yet (ADR 0025). Its output is append-only, so the terminal's own scrollback holds the history and nothing is pinned (ADR 0029). It self-reports to herdr via `pane report-agent`, so the **Run** appears in herdr's agent list with its own session. Belongs to the **Fallback path** alone: a **Native Run** has no **Mirror Pane** because it renders itself, and with **Reopen** retired nothing displays a *finished* **Run** either — so this term now describes the fallback and nothing else. It was not deleted with the native path's arrival, because the fallback is permanent (ADR 0044).
+_Avoid_: agent pane, subagent tab, run pane, replay pane; **Run Pane** (that is the opposite thing — the process's home, not a viewport)
+
+**Run Pane**:
+The **Pane** a **Native Run** *lives in* — a real interactive `pi` TUI that the user watches, types into and steers, exactly as they steer the orchestrator. The inverse of a **Mirror Pane** in the one way that matters: it is the process's home, so closing it ends the **Run**. Launched by herdr rather than by the orchestrator, because `pi` is a TUI only when stdin and stdout are both TTYs and a piped child can never satisfy that. Because it *is* the process's terminal, herdr destroys it the instant that process exits and its scrollback dies with it — so a failing Run's wrapper deliberately stays alive to hold the pane, which is the only reason a failure's output is still readable (ADR 0044).
+_Avoid_: mirror pane (the opposite), native pane, agent pane
+
+**Native Run**:
+A **Run** executing as a real interactive `pi` session in its own **Run Pane**, as opposed to the **Fallback path**'s piped JSON-mode child. Its **Result** is signalled by a **Done signal** and read from its own **Transcript**, not parsed from stdout — the parent holds no pipes to it at all. Chosen automatically whenever herdr is available — including for an autonomous review or **Rework**, which take the same path so the one Run type that executes without a human is not the one a human cannot watch (ADR 0044). **Nesting** is allowed for a delegated Run: a **Native Run** carries `subagent`/`subagent_tasks`, so its own delegations are native too, each a full `pi` with its own context window and pane. It is withheld from a review or Rework, which must not be able to route around ADR 0037's recursion interlock via a different spawner — and whose verdict is meant to be its own reading of the work. That grant is safe only because the **Spawn slot** budget is tree-wide — it is the exact capability ADR 0040 named as the thing to guard, so it was enabled last, after the guard was measured (ADR 0044).
+_Avoid_: interactive run, TUI run, herdr run
+
+**Fallback path**:
+The original spawn mechanism — a `--mode json` child on pipes, its **Result** parsed from `message_end` events — retained permanently for every context herdr cannot host: headless, CI, `--mode json`. Not deprecated and not removable, so two spawn paths exist indefinitely and may drift; that drift is the standing cost of ADR 0044.
+_Avoid_: legacy path, old path (it is current, not superseded), JSON mode (that is the flag, not the path)
 
 **Run Meta**:
 The `run.json` written beside a **Run**'s session, recording which subagent the **Run** is and its lifecycle `outcome`. It exists because a session file records what a child *did* but never which specialist it was, and the **Board** reads these directories from a separate process with no view of the **Task** (ADR 0026). Written **twice** — `running` at the start, then a terminal outcome from a `finally` — because the parent is the only party that knows a **Run** died before writing a transcript, which on disk is indistinguishable from one about to start (ADR 0036, ADR 0039).
 _Avoid_: manifest, metadata file, run info
 
 **Spawn slot**:
-A unit of the single shared budget for concurrently running child processes, capped at six and claimed per child rather than per **Task** — because a **Task** is not a process, and a parallel one runs several **Runs** at once. Delegated **Runs** and autonomous plan reviews compete for the same pool, so a full budget refuses whichever asks next, naming the holders. Claimed synchronously with its check so no caller can slip through the gap, and released from a `finally`. A **Run** refused a slot fails with the refusal as its error rather than waiting, and a refused review is a **Dead review** (ADR 0040).
+A unit of the single shared budget for concurrently running child processes, capped at six and claimed per child rather than per **Task** — because a **Task** is not a process, and a parallel one runs several **Runs** at once. Delegated **Runs** and autonomous plan reviews compete for the same pool, so a full budget refuses whichever asks next, naming the holders. Claimed synchronously with its check so no caller can slip through the gap, and released from a `finally`. A **Run** refused a slot fails with the refusal as its error rather than waiting, and a refused review is a **Dead review** (ADR 0040). The budget is **tree-wide**: shared by every `pi` in the orchestrator's descent through a lock directory of pid-stamped tokens, in the shape ADR 0035 uses for the plan lock. It had to stop being per-process the moment a **Native Run** — a full `pi` that can itself spawn — became possible, exactly as ADR 0040 predicted in its own closing sentence; six per process, recursively, is not a cap. Liveness is decided by probing a holder's pid, never by age, because a Run may legitimately hold a slot for hours while a user steers it (ADR 0044). A Run whose pane is being **held open** after failure releases its slot as soon as its exit code lands, since the pane outliving the work is presentation, not work.
 _Avoid_: task limit (that is `MAX_ACTIVE_TASKS`, which bounds work in flight, not processes), quota, semaphore
 
 **Run directory contract**:
@@ -112,16 +124,16 @@ The published on-disk layout `<agentDir>/subagent-sessions/<runId>/` — a **Tra
 _Avoid_: session folder, run store, the registry (that is the in-memory **Task** list, deliberately not shared)
 
 **Run Index**:
-The listing of **Tasks** available to open, merged from two sources: the in-memory registry for the current session, and a scan of the **Run** session directories on disk for everything older. Neither source alone is enough — the registry dies with the orchestrator (ADR 0001), and disk does not record a **Task**'s **Mode** (ADR 0028). Grouped by **Task**, one row each, because `/run` opens a whole **Task** and so a row per **Run** gave a parallel **Task** three identical rows offering three ways to do one thing; a multi-**Run** **Task** adds an indented child line per **Run** and its header state is pessimistic, reading `failed` if any single **Run** failed (ADR 0038). Read by the user with `/runs` and by the orchestrator with the `list` action; a row is **Reopened** by its **Task ID**.
+The listing of **Tasks** available to open, merged from two sources: the in-memory registry for the current session, and a scan of the **Run** session directories on disk for everything older. Neither source alone is enough — the registry dies with the orchestrator (ADR 0001), and disk does not record a **Task**'s **Mode** (ADR 0028). Grouped by **Task**, one row each, because `/run` opens a whole **Task** and so a row per **Run** gave a parallel **Task** three identical rows offering three ways to do one thing; a multi-**Run** **Task** adds an indented child line per **Run** and its header state is pessimistic, reading `failed` if any single **Run** failed (ADR 0038). Read by the user with `/runs` and by the orchestrator with the `list` action; a row is **Resumed** by its **Task ID** — which, since **Reopen** retired, means continuing that **Run** rather than reading it (ADR 0044).
 _Avoid_: task list (that means **Plan**), history, run log
 
 **Attach**:
 Recording on a **Plan Item** the **Task ID** of the delegation executing it. A separate act from creating the Item, because an Item always exists before the delegation that runs it — and the only thing that makes a **Task**'s progress visible on the **Board** (ADR 0026, ADR 0030).
 _Avoid_: link, bind, assign
 
-**Reopen**:
-Opening a finished **Run**'s session in a **Mirror Pane** to read its **Transcript**. Addressed by **Task ID**, which opens every **Run** of that Task. **Archived** sessions are **Thawed** on reopen, so age is invisible to the reader.
-_Avoid_: replay, restore (that is what **Thaw** does), resume (a reopened **Run** never continues)
+**Resume**:
+Opening a finished **Run**'s session in a real `pi` and *continuing* it — new turns appended to the existing **Transcript**. Addressed by **Task ID**. **Archived** sessions are **Thawed** first, so age is invisible. This retires **Reopen**, which meant reading a finished **Run** without continuing it: there is deliberately no read-only path, so a **Run**'s **Transcript** is a living document rather than a record, and every revisit can alter it (ADR 0044, superseding the ADR 0021 finding that treated the same append as corruption).
+_Avoid_: reopen (retired — it promised a read that no longer exists), replay, restore (that is what **Thaw** does)
 
 **Board Pane**:
 The **Pane** that renders the **Board**. Exactly one per session, spawned at session start. It occupies the alternate screen, so it keeps its own display buffer rather than sharing the pane's scrollback, and is scrolled with keys (ADR 0031).
@@ -147,7 +159,7 @@ A **Run** session compressed to cold storage (zstd). Nothing is lost, but an **A
 _Avoid_: compressed (that is the mechanism), backed up, cold (that is the state, not the name)
 
 **Thaw**:
-Restoring an **Archived** session to plain JSONL so it can be read again. Opening a Run is what thaws it; a thaw is idempotent and, if interrupted, leaves the readable copy authoritative.
+Restoring an **Archived** session to plain JSONL so it can be read again. **Resuming** a **Run** is what thaws it; a thaw is idempotent and, if interrupted, leaves the readable copy authoritative.
 _Avoid_: decompress (that is the mechanism), restore, unarchive
 
 ### Results and notification
@@ -160,8 +172,16 @@ _Avoid_: output, response
 A subagent's final message, formatted to a fixed contract so the **Result** can be extracted programmatically rather than by prose-reading.
 
 **Transcript**:
-The full message stream of a **Run** — every assistant turn and tool call. Rendered for the human; not fed to the orchestrator.
+The full message stream of a **Run** — every assistant turn and tool call. Rendered for the human; not fed to the orchestrator. For a **Native Run** it is also where the **Result** is read from, which makes it load-bearing rather than merely evidence, and it is no longer read-only: **Resume** appends to it. Locating the Result inside it is not simply "the last thing said" — the turn carrying the **Done signal** is authoritative, because a child often answers *in* that turn and pi may add a courtesy turn after the tool returns (ADR 0044).
 _Avoid_: history, log, messages
+
+**Done signal**:
+How a **Native Run** declares it has finished, since the parent holds no pipes to watch. Two sources, both writing the same `<session>.exit` sidecar: a `subagent_done` tool the child calls deliberately, and an automatic write when the child's last turn ends cleanly — the second exists so a child that answers well but forgets the tool is not mistaken for one that wedged. The sidecar says *when*; the **Transcript** says *what*, read from the turn that carried the signal. Auto-injected into every **Native Run**'s tool allowlist, so no subagent definition has to declare it and a tool-restricted child can still finish. Distinct from the `<runId>.exitcode` sidecar, which the wrapper writes and which reports how the *process* ended: a **Done signal** is a claim about the work, an exit code is a fact about the process, and a Run can have either without the other (ADR 0044).
+_Avoid_: exit sidecar (that is the file, one of two things the signal is), completion marker, done marker
+
+**Dismissed**:
+The outcome of a **Native Run** whose **Run Pane** the user closed before it finished. A fourth **Run Meta** `outcome` beside `running`, `completed` and `failed`, and deliberately not folded into `failed`: a **Run** the user waved away is not a **Run** that went wrong, and conflating them would repeat the error CONTEXT.md's **"Failed"** flag already warns about for **Plan Items** (ADR 0044).
+_Avoid_: cancelled (that is `subagent_tasks` `cancel`, a different act with a different cause), closed, aborted, failed
 
 **Reminder**:
 The message injected into the orchestrator's session when a **Task** reaches a terminal state, waking it to collect the **Result**. Not a user message: it is attributed to the system. Delivered when the orchestrator next goes idle rather than the moment the **Task** lands, because a **Reminder** queued mid-turn cannot be recalled if the orchestrator collects the **Result** itself first (ADR 0027).
@@ -189,9 +209,9 @@ _Avoid_: variable, template, interpolation
 
 **"Task list"** means **Plan**. A **Task** is a subagent delegation and its ID names that delegated unit of work; a **Plan** is the agent's own ordered step list. A **Plan Item** may record the **Task ID** of the delegation executing it — but a **Task** is never itself a **Plan Item**.
 
-**"Tab"** means a herdr layout container, not an agent. The request "one agent tab per subagent" resolves to: one **Tab** per **Task**, one **Mirror Pane** per **Run**. An agent never occupies a **Tab** directly.
+**"Tab"** means a herdr layout container, not an agent. The request "one agent tab per subagent" resolves to: one **Tab** per **Task**, one pane per **Run** — a **Mirror Pane** on the **Fallback path**, a **Run Pane** for a **Native Run**. An agent never occupies a **Tab** directly.
 
-**"Blocked"** is now overloaded across two models and they are not the same thing. Herdr's `blocked` is normally a *detected* pane state — herdr recognised an approval or question UI on screen. A **Plan Item**'s `blocked` is a *declared* state meaning the work cannot proceed. A **Run** can be herdr-blocked while its **Plan Item** is `active`, and an Item can be `blocked` with no pane at all. For a **Mirror Pane** the herdr state is *also* declared rather than detected (see ADR 0019), since a JSON-mode child shows no recognisable UI.
+**"Blocked"** is now overloaded across two models and they are not the same thing. Herdr's `blocked` is normally a *detected* pane state — herdr recognised an approval or question UI on screen. A **Plan Item**'s `blocked` is a *declared* state meaning the work cannot proceed. A **Run** can be herdr-blocked while its **Plan Item** is `active`, and an Item can be `blocked` with no pane at all. For a **Mirror Pane** the herdr state is *also* declared rather than detected (see ADR 0019), since a JSON-mode child shows no recognisable UI — whereas a **Native Run** is a real `pi` TUI, so herdr *detects* its state the ordinary way and the declaration shim is not needed at all (ADR 0044).
 
 **"Done"** means **Accepted** — the Item's **Review Route** was satisfied — not "the agent finished". What that costs varies by route: a `user`-routed Item (the default) still reaches `done` only by the user's hand, and the plan tool refuses an agent's attempt to set it; `oracle` and `skip` routes let an Item be cleared without the user ever seeing it. `done` is therefore not a single claim, and must be read together with the Item's route (ADR 0023, superseding 0017).
 
@@ -199,7 +219,11 @@ _Avoid_: variable, template, interpolation
 
 **"Unsure"** is two different things and only one is a **Verdict**. An orchestrator unsure whether work is *trivial* does not skip: it routes to `oracle`, and triviality is never referred out. An oracle unsure whether work is *correct* returns the `unsure` **Verdict**, which sends the Item back for **Rework** exactly as `fail` does, and reaches the user only once the **Review Budget** is spent. Judging triviality is the orchestrator's alone; oracle only ever judges correctness. The three tokens are still distinct even though two share a destination: `unsure` says the work may be right but oracle could not establish it, which is worth telling a reviser, and a *missing* token is not `unsure` at all but a dead review — which leaves the Item in `review` to be retried and spends no **Review Budget**.
 
-**"Closing a Mirror Pane"** means you stopped watching, not that you stopped the work. The **Run** continues, its **Result** still lands, and its **Reminder** still fires. Cancelling is `subagent_tasks` `cancel` — never a pane close. Closing is now also something the *system* does: a **Task**'s **Tab** closes when its **Reminder** is delivered (ADR 0028). Either way no evidence is lost — the session file outlives every pane, and the **Run** can be **Reopened**.
+**"Closing a pane"** now means two opposite things, and which one depends on the kind of pane. Closing a **Mirror Pane** means you stopped watching, not that you stopped the work: the **Run** continues, its **Result** still lands, its **Reminder** still fires, and cancelling is `subagent_tasks` `cancel` — never a pane close. Closing a **Run Pane** *ends the **Run***, because that pane is the process's home rather than a viewport; the outcome is **Dismissed**, distinct from both `completed` and `failed` (ADR 0044). So the old blanket guarantee — "closing is always safe" — is gone, and the safe-to-close pane is now the exception rather than the rule.
+
+Closing is also something the *system* does, and its rule changed too: ADR 0028 closed a **Task**'s **Tab** when its **Reminder** was delivered, which was harmless for viewports. A **Task** whose **Runs** are native instead auto-closes on clean completion and *holds the pane open on failure*, so evidence of what went wrong stays on screen and a pane you are typing into is never yanked (ADR 0044). Evidence loss is no longer fully recoverable either: with **Reopen** retired there is no read-only path back to a finished **Run**, only **Resume**, which appends.
+
+**"The subagent's Result"** is no longer necessarily the subagent's own work. A **Native Run** is interactive, so the user may have typed into it and shaped its final message — and the **Result** the orchestrator consumes is that message either way. Nothing marks the difference: flagging a steered **Result** as human-influenced was considered and declined (ADR 0044), on the grounds that a **Run** is a **Run** and the **Transcript** records the truth. The consequence to hold in mind is that in a `chain`, one **Run**'s **Result** is fed to the next as though a specialist produced it, when a human may have written it.
 
 ## Example dialogue
 

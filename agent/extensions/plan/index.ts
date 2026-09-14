@@ -34,7 +34,12 @@ import { randomBytes } from "node:crypto";
 import { dispatchSuppressed, runReview } from "./review.js";
 // The shared Run-directory contract, so a plan-spawned Run is discoverable by
 // exactly the readers that already scan the subagent layout (docs/adr/0039).
-import { createRunDir, finalizeRunDir } from "../subagent/rundir.js";
+import {
+	createRunDir,
+	finalizeRunDir,
+	runsRoot,
+} from "../subagent/rundir.js";
+import { setSpawnCapRoot } from "../subagent/spawnlimit.js";
 import { Text } from "@earendil-works/pi-tui";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
@@ -1272,6 +1277,12 @@ function reviewFindings(output: string, verdict: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// This process spawns children too — autonomous reviews and Rework workers — so
+	// it must count against the same tree-wide budget as delegated Runs. Without
+	// this call the plan extension would keep its own in-memory six and the shared
+	// cap would bound nothing (docs/adr/0044, amending 0040).
+	setSpawnCapRoot(runsRoot(getAgentDir()));
+
 	/** The plan file key for the *current* session: a subagent child is keyed
 	 * by the Task ID its spawner passed in the environment (docs/adr/0012);
 	 * a main session is keyed by its session id (docs/adr/0011). */

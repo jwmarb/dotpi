@@ -21,7 +21,19 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 // The shared admission cap: one machine, one budget (docs/adr/0040).
+import { closePane } from "../herdr/client.js";
+import { herdrSocketAvailable, openPluginPane } from "../herdr/socket.js";
+import { DONE_TOOL_NAME } from "../subagent/child-done.js";
+// The launch planner and its pane contract, shared with delegated Runs so a
+// review's wrapper cannot drift from theirs (docs/adr/0044).
+import {
+	buildLaunchPlan,
+	buildSubagentToolAllowlist,
+	RUN_ENTRYPOINT,
+	RUN_PLUGIN_ID,
+} from "../subagent/native.js";
 import { claimSlot } from "../subagent/spawnlimit.js";
+import { watchNativeRun } from "../subagent/watcher.js";
 
 /**
  * Environment flag marking a pi process as *being* an autonomous review.
@@ -304,6 +316,156 @@ export function reviewContract(itemText: string, note: string | undefined): stri
 }
 
 /**
+ * Run a review or rework as a **Native Run** — a real `pi` TUI in a herdr pane.
+ *
+ * Returns null when a pane could not be opened, so the caller falls through to
+ * the piped path. Never throws for an expected failure, for the same reason the
+ * subagent extension's native branch does not: no failure of the *display*
+ * mechanism may cost a review its chance to run.
+ *
+ * ## Why the Verdict can come from the transcript
+ *
+ * ADR 0037 made the Verdict contract strict — the token must be the last
+ * non-empty line, with no prose fallback, because "guessing a conclusion gets
+ * read as one". That contract is about *parsing*, not about the channel, so it
+ * survives the move: this returns the child's last assistant text as `output`,
+ * and `parseVerdict` applies exactly the same rule to it. A child that never
+ * emits a token still yields no Verdict, which is still a **Dead review**.
+ *
+ * One hazard is inherited from the delegated path and must not be re-learned
+ * here: a child often states its conclusion *in the same turn* as its
+ * `subagent_done` call, and pi may then add a courtesy turn. Reading "the last
+ * thing said" would therefore capture the epilogue and lose the token — so the
+ * transcript reader treats the turn carrying the **Done signal** as
+ * authoritative, and the done tool is injected here for that reason as much as
+ * for termination.
+ *
+ * @returns The outcome, or null to fall back to the piped path.
+ */
+async function runReviewNatively(opts: {
+	purpose: ChildPurpose;
+	cwd: string;
+	runDir: string;
+	runId: string;
+	promptPath: string;
+	model?: string;
+	tools?: string[];
+	timeoutMs: number;
+}): Promise<ReviewOutcome | null> {
+	// Reuse this module's own hardened resolution rather than re-deriving it: it
+	// refuses to guess, which is the guard ADR 0037 added after a guessed target
+	// re-ran the calling script and exhausted the machine. Prefer a `pi` on PATH,
+	// because that launcher carries its own shebang and so is a single word that
+	// cannot be split from its script inside a wrapper another process runs later
+	// (docs/adr/0044).
+	const onPath = findPiOnPath();
+	const invocation = onPath ? { command: onPath, args: [] } : getPiInvocation([]);
+	if (!invocation) return null;
+	const piCommand = [invocation.command, ...invocation.args];
+
+	const doneExtension = path.join(
+		path.dirname(new URL(import.meta.url).pathname),
+		"..",
+		"subagent",
+		"child-done.ts",
+	);
+
+	const plan = buildLaunchPlan({
+		runId: opts.runId,
+		sessionDir: opts.runDir,
+		cwd: opts.cwd,
+		piCommand,
+		doneExtensionPath: doneExtension,
+		// allowNesting=false: an autonomous child must not be able to delegate
+		// (docs/adr/0037).
+		tools: buildSubagentToolAllowlist(opts.tools, DONE_TOOL_NAME, false) ?? [],
+		model: opts.model,
+		systemPromptPath: opts.promptPath,
+		task:
+			opts.purpose === "rework"
+				? "Carry out the rework described in your system prompt."
+				: "Review the Plan Item described in your system prompt.",
+		// NOT the reviewed plan's key. A review must not load that plan — including
+		// its autonomous mode — as its own, and the sentinel must stay non-empty or
+		// the plan extension treats the child as a main session and spawns a Board
+		// inside it (docs/adr/0037).
+		planKey: REVIEW_PLAN_KEY,
+	});
+
+	// The recursion interlock has to reach the child through the pane's env, since
+	// a herdr-launched process inherits the herdr *server's* environment and not
+	// this one's (docs/adr/0044). Without it a review could dispatch reviews of its
+	// own, which is the fork bomb ADR 0037 exists to prevent.
+	const paneEnv = { ...plan.paneEnv, [REVIEW_ENV_FLAG]: "1" };
+
+	await fs.promises.mkdir(opts.runDir, { recursive: true });
+	await fs.promises.writeFile(plan.wrapperPath, plan.wrapperSource, {
+		encoding: "utf-8",
+		mode: 0o700,
+	});
+
+	const pane = await openPluginPane({
+		pluginId: RUN_PLUGIN_ID,
+		entrypoint: RUN_ENTRYPOINT,
+		// Its own Tab, not a split: a review is not part of any Task's pane family,
+		// and splitting the orchestrator's pane would shrink the window the user is
+		// working in every time an item reached review. Deliberately NO `direction`
+		// — a Tab has no pane to split from, and herdr rejects the combination
+		// outright (measured: `placement:"tab"` with a direction returns null, which
+		// silently sent every native review down the piped fallback).
+		placement: "tab",
+		// Never steal focus: a review starting must not pull the user out of what
+		// they are typing.
+		focus: false,
+		cwd: opts.cwd,
+		env: paneEnv,
+	});
+	if (!pane) return null;
+
+	const abort = new AbortController();
+	const deadline = setTimeout(() => abort.abort(), opts.timeoutMs);
+	let result: Awaited<ReturnType<typeof watchNativeRun>>;
+	try {
+		result = await watchNativeRun({
+			runId: opts.runId,
+			sessionDir: opts.runDir,
+			paneId: pane.paneId,
+			signal: abort.signal,
+		});
+	} finally {
+		clearTimeout(deadline);
+	}
+
+	// A review is transient: it has no findings worth leaving on screen once its
+	// Verdict is recorded on the Plan Item, so its pane closes either way. This
+	// differs deliberately from a delegated Run, whose failure pane is held open
+	// because its error text is the only diagnosis available.
+	void closePane(pane.paneId);
+
+	if (result.outcome === "completed") {
+		return {
+			output: result.lastAssistantText ?? "",
+			deadReason: null,
+			exitCode: result.exitCode ?? 0,
+		};
+	}
+
+	// Everything else is a Dead review: no Verdict, no Review Budget spent, and
+	// worth simply running again (docs/adr/0037, docs/adr/0040).
+	const reason =
+		result.outcome === "dismissed"
+			? `the ${opts.purpose}'s pane was closed before it reached a verdict`
+			: result.outcome === "stalled"
+				? `the ${opts.purpose} ${result.detail} and was abandoned as wedged`
+				: `the ${opts.purpose} ${result.detail}`;
+	return {
+		output: result.lastAssistantText ?? "",
+		deadReason: reason,
+		exitCode: result.exitCode ?? null,
+	};
+}
+
+/**
  * Spawn one oracle review and collect its transcript.
  *
  * Never throws: a failure to spawn, a timeout and a crash all come back as a
@@ -428,6 +590,43 @@ export async function runReview(opts: {
 				? "Carry out the rework described in your system prompt."
 				: "Review the Plan Item described in your system prompt.",
 		);
+
+		// A **Native Run** for the review, when herdr can host one: the same real
+		// interactive `pi` TUI a delegated Run gets, in its own pane, watchable and
+		// steerable (docs/adr/0044). ADR 0044 originally scoped reviews out of the
+		// native path, and the consequence was exactly the invisibility this whole
+		// change set out to remove: an autonomous review left no pane and no tab, so
+		// the one Run type that runs *without a human* was the one a human could not
+		// watch.
+		//
+		// The **Verdict** now comes from the child's own transcript rather than its
+		// stdout, because a TUI has none. `parseVerdict` and `reviewFindings` are
+		// unchanged: this fills the same `output` field they already read, so the
+		// strict trailing-token contract of ADR 0037 still decides the Verdict and a
+		// missing token is still a **Dead review** rather than a guess.
+		//
+		// Every guard above is upstream of this branch by construction — the
+		// recursion interlock, the synchronous slot claim, the non-empty sentinel plan
+		// key — so going native cannot bypass one. On any failure here we fall through
+		// to the piped path below, which is retained permanently.
+		if (herdrSocketAvailable() && opts.runDir && opts.runId) {
+			try {
+				const native = await runReviewNatively({
+					purpose,
+					cwd: opts.cwd,
+					runDir: opts.runDir,
+					runId: opts.runId,
+					promptPath,
+					model: agent.model,
+					tools: agent.tools,
+					timeoutMs,
+				});
+				if (native) return native;
+			} catch {
+				// Deliberately swallowed: a pane that would not open is a reason to run
+				// the review the old way, never a reason to fail it.
+			}
+		}
 
 		const invocation = getPiInvocation(args);
 		// No identifiable pi: report it instead of executing a guess. Executing the

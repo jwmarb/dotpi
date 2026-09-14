@@ -1,5 +1,7 @@
 # The Mirror Pane renders the session file; no PTY
 
+> **Superseded in part by [0044](./0044-native-runs-herdr-owns-the-process.md).** The measurement below — that a JSON-mode child emits zero ANSI escapes, so a PTY buys nothing — remains correct, but its premise is gone for a **Native Run**: the child is a real `pi` TUI, so the pane is a genuine terminal with genuine styling and herdr allocates the PTY. This ADR now describes the **Fallback path** only.
+
 Supersedes the PTY mechanism chosen in [0016](./0016-mirror-pane-displays-never-owns-the-run.md). That ADR's ownership model stands unchanged — the extension owns the child process, the pane only displays it — but the *transport* is replaced. There is no `script(1)`, no per-Run socket, and no byte replay. The Mirror Pane renders the **Run**'s session file (which [0019](./0019-runs-get-real-session-files.md) already causes to be written) with a small viewer process.
 
 **Measured, not argued.** `script -q -e -f` was run against a real Run before anything was built on it. The PTY works, and it delivers **zero ANSI escape sequences**: `pi --mode json` emits pure JSON and nothing else. The only thing the PTY contributed was 24 carriage returns, one per line. The premise of the PTY decision — "so herdr can show the real terminal", "real colours" — is empty for a JSON-mode child. It would have cost `script(1)`, a Linux-shaped portability constraint, a socket per Run, and a replay client, to deliver a wall of raw JSON with `\r` line endings.

@@ -299,7 +299,13 @@ export async function openPluginPane(
   if (options.cwd !== undefined) params.cwd = options.cwd;
   if (options.placement !== undefined) params.placement = options.placement;
   if (options.targetPaneId !== undefined) params.target_pane_id = options.targetPaneId;
-  if (options.direction !== undefined) params.direction = options.direction;
+  // `direction` describes how to split an existing pane, so it is meaningful only
+  // for a split. Sending it with any other placement is rejected outright by the
+  // server rather than ignored — measured: `placement:"tab"` plus a direction
+  // returns null, which silently routed every native review to the piped
+  // fallback. Dropped here rather than left to each caller to remember.
+  if (options.direction !== undefined && options.placement === "split")
+    params.direction = options.direction;
   if (options.focus !== undefined) params.focus = options.focus;
   if (options.workspaceId !== undefined) params.workspace_id = options.workspaceId;
 

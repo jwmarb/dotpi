@@ -1,8 +1,10 @@
 ---
-status: amended by ADR-0028
+status: amended by ADR-0028; superseded in part by ADR-0044
 ---
 
 # A Mirror Pane displays a Run; it never owns it
+
+> **Superseded in part by [0044](./0044-native-runs-herdr-owns-the-process.md).** The ownership model below is reversed for a **Native Run**: herdr owns the process and the pane *is* its home. The rejection recorded here — that letting herdr own the run would force the **Result** to be scraped from a terminal — was true of the mechanism available in 2026-06 and is false now; a child extension declares completion via a sidecar and the Result is read from the child's own session file. The model below still governs the **Fallback path**, which is retained permanently for contexts herdr cannot host.
 
 > **Amended by [0028](./0028-tabs-close-on-reminder-runs-reopen-from-index.md).** The core decision stands — a Mirror Pane displays a Run and never owns it. What changed is the pane's lifetime: panes no longer linger after their Run ends, and the "reaped when the next Task starts" rule below was never implemented. A Task's Tab now closes when its Reminder is delivered, and finished Runs are reopened from the Run Index instead of being left on screen.
 

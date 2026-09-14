@@ -166,6 +166,16 @@ export async function reapSessions(
 	const now = Date.now();
 
 	for (const runId of runIds) {
+		// Bookkeeping directories share this root but are not Runs, and must never be
+		// reaped: the tree-wide spawn cap keeps its live slot tokens in `.spawn-cap`,
+		// which has no session file and so would otherwise look exactly like an empty
+		// Run directory and be deleted out from under running children
+		// (docs/adr/0044). No runId is ever dot-prefixed.
+		if (runId.startsWith(".")) {
+			report.skipped++;
+			continue;
+		}
+
 		// A Run still writing its session is untouchable.
 		if (inFlight.has(runId)) {
 			report.skipped++;

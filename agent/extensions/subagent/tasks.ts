@@ -99,8 +99,43 @@ export interface RunResult {
 	skippedSkills?: string[];
 	/** Absolute path of this Run's session file, once known. */
 	sessionFile?: string;
-	/** Mirror Pane displaying this Run, if one was created. */
+	/** Mirror Pane displaying this Run, if one was created (Fallback path only). */
 	mirrorPaneId?: string;
+	/**
+	 * Run Pane *hosting* this Run, when it is a **Native Run** (docs/adr/0044).
+	 *
+	 * The inverse of `mirrorPaneId` in the way that matters: a Mirror Pane is a
+	 * viewport whose closure means "stopped watching", whereas this pane is the
+	 * process's home and closing it ends the Run. Both are never set at once —
+	 * which of the two is populated is how a reader tells a Native Run from a
+	 * Fallback Run after the fact.
+	 */
+	runPaneId?: string;
+	/**
+	 * Pane a **Native Run**'s **Run Pane** should be split from: its Task's Tab.
+	 *
+	 * Carried on the Run rather than passed down the call chain because the Run is
+	 * already threaded through every layer between the Task and the spawn site,
+	 * and one Tab per Task means the target is a property of where the Run belongs
+	 * — not of how it is executed.
+	 */
+	paneTarget?: string;
+	/**
+	 * Whether the user closed this Run's **Run Pane** before it finished.
+	 *
+	 * A distinct outcome rather than a flavour of failure: a Run waved away is not
+	 * a Run that went wrong (docs/adr/0044). It still *fails* its Task — no Result
+	 * was produced, so a chain must not continue — but it reports the true cause.
+	 */
+	dismissed?: boolean;
+	/**
+	 * Why this Run fell back to the piped **Fallback path** despite herdr being up.
+	 *
+	 * Set only on the silent-downgrade case, which is otherwise invisible: the Run
+	 * still succeeds, just without a **Run Pane**, and without this the user would
+	 * have no way to tell a deliberate fallback from a broken plugin link.
+	 */
+	nativeFallbackReason?: string;
 	/** Note attached when the Run violated the <result> write-up contract. */
 	resultWarning?: string;
 }
@@ -116,12 +151,19 @@ export interface RunResult {
  *
  * An `errorMessage` therefore fails the Run on its own, whatever the exit code
  * and stop reason say.
+ *
+ * A **dismissed** Run fails too, and that is not a contradiction of ADR 0044's
+ * insistence that dismissal is not failure: the *outcome* recorded on disk stays
+ * `dismissed` so the true cause is never lost, while this predicate answers a
+ * narrower question — did the Run produce a Result? A dismissed Run did not, so a
+ * chain must not feed its silence to the next step (docs/adr/0044).
  */
 export function runFailed(run: RunResult): boolean {
 	return (
 		run.exitCode !== 0 ||
 		run.stopReason === "error" ||
 		run.stopReason === "aborted" ||
+		run.dismissed === true ||
 		typeof run.errorMessage === "string"
 	);
 }
@@ -152,6 +194,14 @@ export interface Task {
 	 * reopenable from the Run Index instead (docs/adr/0028).
 	 */
 	tabId?: string;
+	/**
+	 * The Tab's root pane, which every Run's pane is positioned against.
+	 *
+	 * On the **Fallback path** run 1 adopts this pane as its Mirror Pane. For a
+	 * **Native Run** nothing adopts it — herdr opens each Run Pane by splitting
+	 * from it — so it is retained separately from `mirrorPaneId` (docs/adr/0044).
+	 */
+	tabRootPaneId?: string;
 }
 
 /** Snapshot of a Task safe to hand to renderers without exposing internals. */
@@ -465,7 +515,12 @@ export function summarizeRun(run: RunResult): RunSummary {
 		...base,
 		state: "done",
 		text: extracted.text,
-		warning: extracted.warning,
+		// A **Native Run** is not held to the `<result>` contract: ADR 0044 retired it
+		// for that path, because the payload is read from the child's transcript
+		// instead of scraped out of its prose. Warning here would scold every native
+		// Run for obeying its own design, and would train the reader to ignore a
+		// warning that still means something on the Fallback path.
+		warning: run.runPaneId ? undefined : extracted.warning,
 	};
 }
 
@@ -563,7 +618,10 @@ export function formatTaskResults(task: Task): string {
 		lines.push(`── ${label}`);
 		const note = formatFallbackNote(run);
 		if (note) lines.push(note);
-		if (extracted.warning) lines.push(`[warning] ${extracted.warning}`);
+		// Suppressed for a Native Run, which is exempt from the `<result>` contract
+		// (docs/adr/0044) — see the matching note in `runSummary`.
+		if (extracted.warning && !run.runPaneId)
+			lines.push(`[warning] ${extracted.warning}`);
 		lines.push(extracted.text || "(no output)");
 	}
 
