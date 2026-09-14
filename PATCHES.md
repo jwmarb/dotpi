@@ -57,6 +57,24 @@ it tests what is actually installed rather than a copy that can drift. It prints
 optional), and exits non-zero when the installed behaviour is wrong — including
 the case where a future patch carries the right marker but still broadcasts.
 
+## The pre-commit hook needs enabling once per clone
+
+**Run once:**
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`git config core.hooksPath` should then print `.githooks`.
+
+Why: `.githooks/pre-commit` runs `scripts/check.sh`, which loads every module
+under `agent/extensions/` and runs the tests, refusing a commit whose sources
+cannot even parse — a file that fails to load takes pi's startup with it, which
+is how a `ParseError` once greeted a restart. The hook itself is tracked, but
+`core.hooksPath` is local git config and is **not**, so a fresh clone has the
+hook file and does not use it. Run `./scripts/check.sh` by hand to verify
+anything at any time.
+
 ## Native subagent Runs require a linked herdr plugin
 
 **Run once, separately from the patches above:**
