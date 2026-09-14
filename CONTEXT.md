@@ -167,6 +167,20 @@ _Avoid_: history, log, messages
 The message injected into the orchestrator's session when a **Task** reaches a terminal state, waking it to collect the **Result**. Not a user message: it is attributed to the system. Delivered when the orchestrator next goes idle rather than the moment the **Task** lands, because a **Reminder** queued mid-turn cannot be recalled if the orchestrator collects the **Result** itself first (ADR 0027).
 _Avoid_: notification, callback, ping
 
+### Configuration and credentials
+
+**Env file**:
+The single file holding this installation's live credentials, at `agent/.env`, read by a **Credential loader** into the process environment. Gitignored and machine-local, so it is the one file here with no version history. Its committed companion `agent/.env.example` names every variable required without holding a value, so the repo states its own requirements (ADR 0042).
+_Avoid_: dotenv, secrets file, config — the last is any config, most of which is committed.
+
+**Credential loader**:
+The one module (`agent/extensions/dotenv.ts`) that reads the **Env file**. Deliberately singular: two parsers of the same file drift, and drift is how the interlock of ADR 0037 was bypassed. Fills only variables that are *not* already set, so the real environment always wins — a one-off override works, and a spawned child never has an inherited value replaced by a file it did not choose.
+_Avoid_: dotenv loader, env parser
+
+**Placeholder**:
+A `${VAR}` reference inside `agent/mcp.json`, expanded from the environment when the config is read. What lets a config file that needs a credential be committed, since it names the variable rather than carrying the value. An unset variable refuses to start that server rather than expanding to empty or staying literal — a literal `Bearer ${VAR}` reaches the gateway and returns a 401 that looks like a network fault (ADR 0042).
+_Avoid_: variable, template, interpolation
+
 ### Flagged ambiguities
 
 **"Background"** means the orchestrator's turn does not block on the **Task**, and the task outlives a failed turn, an aborted tool call, and an idle prompt. It does *not* mean the task outlives the `pi` process — a task dies with its orchestrator.

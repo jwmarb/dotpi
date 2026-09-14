@@ -4,15 +4,20 @@
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
 
 # ---- Secrets ----------------------------------------------------------------
-# mcp.json carries a live litellm bearer token inline, so it is ignored whole
-# rather than templated. If you clone this, recreate it by hand: it is a
-# mcpServers map, and the gateway entry needs an "x-litellm-api-key" header.
-agent/mcp.json
-# litellm.ts hardcodes a second, different API key at the top of the file. Its
-# own doc comments claim LITELLM_API_KEY is read from the environment, which the
-# code does not do — so if you ever make that true, this line can go and the
-# extension becomes committable.
-agent/extensions/litellm.ts
+# The real .env: the ONLY file here holding live credentials. Both keys are
+# read from it (docs/adr/0042) — LITELLM_API_KEY for the litellm provider and
+# LITELLM_MCP_KEY for the mcp.json gateway header. agent/.env.example IS
+# committed, so the repo states which variables it needs without holding one.
+# Losing this file means re-minting two keys from the gateway; losing a key to
+# git history would mean rotating them under pressure.
+agent/.env
+agent/.env.*
+!agent/.env.example
+# NOTE: agent/mcp.json and agent/extensions/litellm.ts used to be ignored here,
+# each because it hardcoded a key. Both now read from agent/.env, so both are
+# committed — mcp.json via a "Bearer ${LITELLM_MCP_KEY}" placeholder. This is
+# the change the old comment on litellm.ts anticipated: its doc comments always
+# claimed LITELLM_API_KEY came from the environment, and now that is true.
 # Credential stores. Empty right now, which is exactly why they are easy to
 # commit by accident and then hard to notice when they fill up.
 agent/auth.json

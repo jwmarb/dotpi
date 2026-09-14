@@ -33,6 +33,7 @@ import { Type } from "typebox";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { loadDotenv } from "../lib/dotenv.js";
 
 // --- Configuration -----------------------------------------------------------
 
@@ -82,6 +83,58 @@ function resolveConfigPath(): string | null {
 }
 
 /**
+ * Expand `${VAR}` placeholders in every string of a parsed config.
+ *
+ * pi does no expansion of its own, so this is what lets mcp.json reference a
+ * credential by name instead of embedding it — which is what allows the file to
+ * be committed at all (docs/adr/0042).
+ *
+ * An unset variable THROWS rather than expanding to empty or staying literal.
+ * A literal `Bearer ${LITELLM_MCP_KEY}` would be sent to the gateway and come
+ * back as a 401 that looks like a network or gateway fault; naming the missing
+ * variable locally is the difference between a five-second fix and a hunt.
+ *
+ * Escape a literal dollar-brace with `$${...}` if a value ever needs one.
+ *
+ * @param value Any parsed JSON value; objects and arrays are walked.
+ * @param where Path of the config file, for error messages.
+ * @param trail Key path walked so far, so an error can point at the exact field.
+ * @throws When a referenced variable is unset or empty.
+ */
+function expandPlaceholders(value: unknown, where: string, trail: string[] = []): unknown {
+	if (typeof value === "string") {
+		return value.replace(/\$\$\{|\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name) => {
+			if (match === "$${") return "${"; // escaped
+			const v = process.env[name as string];
+			if (v === undefined || v === "") {
+				const field = trail.length ? trail.join(".") : "(root)";
+				throw new Error(
+					`${where}: ${field} references \${${name}}, which is not set.\n` +
+					`  Set ${name} in the environment or in ${path.join(getAgentDirSafe(), ".env")}.`,
+				);
+			}
+			return v;
+		});
+	}
+	if (Array.isArray(value)) return value.map((v, i) => expandPlaceholders(v, where, [...trail, String(i)]));
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value)) out[k] = expandPlaceholders(v, where, [...trail, k]);
+		return out;
+	}
+	return value;
+}
+
+/** getAgentDir() that cannot throw, for use inside error messages. */
+function getAgentDirSafe(): string {
+	try {
+		return getAgentDir();
+	} catch {
+		return path.join(os.homedir(), ".pi", "agent");
+	}
+}
+
+/**
  * Parse the mcp.json file into a map of server configs.
  * Accepts the standard { "mcpServers": { ... } } shape as well as a
  * top-level { "<name>": { ... } } map.
@@ -101,6 +154,11 @@ function loadConfig(configPath: string): Map<string, McpServerConfig> {
 		if (err instanceof SyntaxError) throw err;
 		throw new Error(`cannot read ${configPath}: ${err instanceof Error ? err.message : String(err)}`);
 	}
+	// Fill in credentials from agent/.env before expanding, so a placeholder can
+	// resolve from the file as well as from the real environment (docs/adr/0042).
+	loadDotenv();
+	raw = expandPlaceholders(raw, configPath);
+
 	const file = raw as { mcpServers?: McpConfigFile } | McpConfigFile;
 	const servers =
 		(typeof file === "object" && file !== null && "mcpServers" in (file as object) &&
