@@ -127,7 +127,7 @@ _Avoid_: replay, restore (that is what **Thaw** does), resume (a reopened **Run*
 The **Pane** that renders the **Board**. Exactly one per session, spawned at session start. It occupies the alternate screen, so it keeps its own display buffer rather than sharing the pane's scrollback, and is scrolled with keys (ADR 0031).
 
 **Board**:
-The live kanban projection of a **Plan**, drawn as columns in the **Board Pane**. Unlike other readers, the **Board** may also write: see **Column**. It reads more than the plan: a card carrying a **Task ID** shows that **Task**'s live progress, read from its **Runs**' sessions and **Run Meta** (ADR 0026).
+The live kanban projection of a **Plan**, drawn as columns in the **Board Pane**. Unlike other readers, the **Board** may also write: see **Column**. It reads more than the plan: a card carrying a **Task ID** shows that **Task**'s live progress, read from its **Runs**' sessions and **Run Meta** (ADR 0026). A card's title is the item's whole text — wrapped or multi-line, every line keeps title styling — so the item's note is the card's only dimmed element (ADR 0043).
 _Avoid_: kanban, plan view (the **Board** is writable, so it is not merely a view)
 
 **Column**:

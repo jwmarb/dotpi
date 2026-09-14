@@ -395,12 +395,16 @@ function render(
 				// The route glyph rides between the state glyph and the id, so the
 				// column tells you where the work is and the glyph who will clear it.
 				const routeMark = item.route ? ROUTE_GLYPH[item.route] : undefined;
+				// The whole text is the card's title: every wrapped line keeps
+				// title styling, so a long or multi-line title is never half-dimmed
+				// (docs/adr/0043).
+				const title = (s: string) => (col === "active" ? bold(fg(c, s)) : s);
 				out.push(
 					`      ${fg(c, GLYPH[col])} ${
 						routeMark ? `${fg("221", routeMark)} ` : ""
-					}${dim(item.id)} ${col === "active" ? bold(fg(c, lines[0])) : lines[0]}`,
+					}${dim(item.id)} ${title(lines[0])}`,
 				);
-				for (const extra of lines.slice(1)) out.push(`         ${dim(extra)}`);
+				for (const extra of lines.slice(1)) out.push(`         ${title(extra)}`);
 				// A card with a Task shows that Task's live progress: which specialist
 				// is on it and how far it has got. The Task ID alone tells the user
 				// nothing about whether anything is happening (docs/adr/0026).

@@ -1,0 +1,9 @@
+# A card's title is the whole item text
+
+The **Board** used to word-wrap a **Plan Item**'s text and print only the first wrapped line bright, dimming every continuation line. A long title — or a title written across several lines — therefore rendered half-gray: one bright line followed by a quiet remainder, reading as a title with a detail section it never had. The dimming assumed line 1 *was* the title; in fact the whole text is. A long title is not one line plus details, it is the same title wrapped.
+
+The split was an accident of one rendering convenience: `wrap()` collapses newlines into word separators, so explicit line breaks in the text never reach the screen — the text is re-wrapped to the column width and the reader sees one continuous title. The card has no title/details split at all, so there was nothing the dimming was distinguishing.
+
+**Considered.** *Splitting at the first blank line* — first paragraph bright as title, later paragraphs dim as details — keeps a bright/dim distinction for genuinely long text and was rejected because it invents a **details** concept the card expresses nowhere else, makes a blank line a styling control users must learn, and still dims a one-paragraph title that happens to contain one. *Keeping the split but dropping the dim* — line 1 special, the rest plain — was rejected as preserving a special-cased first line that is not actually special.
+
+**Consequences.** Title styling now runs over every wrapped line: in the `active` column the whole title is bold and coloured, in the other columns it is plain foreground. The item's **note** (the `·` line) is the card's only dimmed element, which is deliberate — a note is an annotation, and quietness is how it tells apart from the title. The **outcomes** footer and the plan widget in chat are unchanged: they dim for different reasons (terminal items; inactive items) and perform no title/details split.
