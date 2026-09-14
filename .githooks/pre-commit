@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit whose extension sources cannot load.
+#
+# Installed by pointing git at this tracked directory:
+#
+#     git config core.hooksPath .githooks
+#
+# That indirection is the point. A hook in `.git/hooks/` is not version
+# controlled, so it silently does not exist on a fresh clone — the failure mode
+# being guarded against here is *silence*, so the guard must not itself be
+# silently absent.
+#
+# Why a hook rather than a habit: a commit once shipped `dynamic-prompt.ts` with
+# bare backticks inside a template literal, which made the file unparseable and
+# stopped pi from starting the extension. The rest of that commit had been
+# checked thoroughly. The file edited last was never loaded even once. Relying on
+# remembering to run a script has exactly the same weakness as the habit it
+# replaces.
+#
+# Bypass a single commit with `git commit --no-verify` when you genuinely need to.
+set -uo pipefail
+
+# Only worth running when a TypeScript source is actually part of this commit.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '^agent/extensions/.*\.ts$'; then
+	exit 0
+fi
+
+root=$(git rev-parse --show-toplevel)
+check="$root/scripts/check.sh"
+[ -x "$check" ] || exit 0
+
+# NOTE: this checks the working tree, not the staged content. A partially staged
+# file can therefore pass here and still be broken as committed. That is an
+# accepted limit — the failure this exists to stop was a whole-file syntax error,
+# and stashing to check the index exactly would risk the user's work to catch a
+# rarer case.
+if ! "$check"; then
+	echo
+	echo "Commit refused: the checks above failed."
+	echo "A file that cannot load takes pi's startup with it — fix it, or use --no-verify."
+	exit 1
+fi
