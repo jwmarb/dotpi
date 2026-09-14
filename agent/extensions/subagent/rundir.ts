@@ -112,6 +112,14 @@ export async function writeRunSidecar(
 				...(run.step !== undefined ? { step: run.step } : {}),
 				// The Run's lifecycle, for readers holding no handle on the child.
 				outcome,
+				// Deliberately NO pid here. A terminal outcome is a fact that stays true,
+				// but `running` is a *claim about now*, and it is tempting to stamp the
+				// writer's pid so a reader can probe it. That is wrong for a **Native
+				// Run**: herdr owns the child process (docs/adr/0044), so it outlives the
+				// spawner, and a dead spawner would be misread as "the work stopped" while
+				// the child is still editing. Liveness must come from evidence the child
+				// itself writes — its **Done signal**, its `.exitcode`, or its transcript's
+				// mtime — never from whoever launched it.
 			}),
 		);
 	} catch {

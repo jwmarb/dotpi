@@ -310,8 +310,15 @@ export function reviewContract(itemText: string, note: string | undefined): stri
 		"discarded as a dead review and the work is reviewed again, wasting the",
 		"whole run, so put your reasoning ABOVE the line.",
 		"",
+		"**This overrides your agent file's output format.** If your instructions",
+		"tell you to wrap your write-up in `<result>` tags, or to state your",
+		"conclusion under a `## Verdict` heading, do NOT do so here. Write your",
+		"findings as plain prose and end with the bare verdict line. A closing",
+		"`</result>` tag after the verdict discards it just as surely as omitting",
+		"the verdict altogether, because only the last non-empty line is read.",
+		"",
 		"Before the verdict, state your findings plainly: if you fail the Item,",
-		"what you write is the only thing a fresh implementer will receive.",
+		"what you write is the only thing a fresh implementer will receive."
 	].join("\n");
 }
 
@@ -377,8 +384,19 @@ async function runReviewNatively(opts: {
 		piCommand,
 		doneExtensionPath: doneExtension,
 		// allowNesting=false: an autonomous child must not be able to delegate
-		// (docs/adr/0037).
-		tools: buildSubagentToolAllowlist(opts.tools, DONE_TOOL_NAME, false) ?? [],
+		// (docs/adr/0037). The flag both withholds the nesting tools and strips any an
+		// agent file declares, so the boundary does not depend on agent configuration.
+		//
+		// The `??` fallback is the other half of that boundary. A null allowlist means
+		// "unrestricted", which for a Native Run means no `--tools` flag at all — i.e.
+		// *every* tool, `subagent` included. So an agent file that merely omitted its
+		// `tools:` line would silently hand a review the delegation it was just denied.
+		// Falling back to the done tool alone keeps the Run restricted by construction:
+		// a review that cannot be described in tools is given the minimum, never the
+		// maximum. Every agent file declares tools today; this does not rely on that.
+		tools: buildSubagentToolAllowlist(opts.tools, DONE_TOOL_NAME, false) ?? [
+			DONE_TOOL_NAME,
+		],
 		model: opts.model,
 		systemPromptPath: opts.promptPath,
 		task:
@@ -431,6 +449,11 @@ async function runReviewNatively(opts: {
 			sessionDir: opts.runDir,
 			paneId: pane.paneId,
 			signal: abort.signal,
+			// Match the purpose's own deadline. Left unset, the watcher applies its
+			// default 20-minute stall threshold, which would abandon a rework at 20
+			// minutes despite the 40 it was promised — and a rework can legitimately
+			// sit silent inside one long build or test.
+			stallTimeoutMs: opts.timeoutMs,
 		});
 	} finally {
 		clearTimeout(deadline);

@@ -211,6 +211,7 @@ export function buildWrapperScript(
 	piArgv: string[],
 ): string {
 	const exitcodePath = path.join(opts.sessionDir, `${opts.runId}.exitcode`);
+	const pidPath = path.join(opts.sessionDir, `${opts.runId}.pid`);
 	return [
 		"#!/usr/bin/env bash",
 		"# Generated per Run by agent/extensions/subagent/native.ts (docs/adr/0044).",
@@ -226,6 +227,13 @@ export function buildWrapperScript(
 		`export PI_PLAN_KEY=${sq(opts.planKey)}`,
 		`export PI_SUBAGENT_RUN_ID=${sq(opts.runId)}`,
 		`export PI_SUBAGENT_SESSION_DIR=${sq(opts.sessionDir)}`,
+		"",
+		"# Who to probe to learn whether this Run is still working. Written by the",
+		"# wrapper because the wrapper IS the child's process tree: a reader that",
+		"# probes the spawner learns nothing, since herdr owns this process and it",
+		"# outlives whoever asked for it (docs/adr/0044). Written BEFORE pi starts,",
+		"# so a child that dies during startup still leaves a probeable record.",
+		`printf '%s\\n' "$$" > ${sq(pidPath)} 2>/dev/null || true`,
 		"",
 		[...opts.piCommand.map(sq), ...piArgv.map(sq)].join(" "),
 		"code=$?",

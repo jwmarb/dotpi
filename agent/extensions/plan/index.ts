@@ -26,12 +26,24 @@
  * @module plan
  */
 
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	readdir,
+	readFile,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { randomBytes } from "node:crypto";
-import { dispatchSuppressed, runReview } from "./review.js";
+import {
+	dispatchSuppressed,
+	REWORK_TIMEOUT_MS,
+	runReview,
+} from "./review.js";
 // The shared Run-directory contract, so a plan-spawned Run is discoverable by
 // exactly the readers that already scan the subagent layout (docs/adr/0039).
 import {
@@ -993,7 +1005,7 @@ async function ensureBoard(file: string): Promise<void> {
  * running", i.e. proceed. Refusing to review is the cautious answer only while
  * there is positive evidence a writer is live (docs/adr/0041).
  */
-async function reworkStillRunning(runId: string): Promise<boolean> {
+export async function reworkStillRunning(runId: string): Promise<boolean> {
 	try {
 		const meta = JSON.parse(
 			await readFile(
@@ -1001,7 +1013,76 @@ async function reworkStillRunning(runId: string): Promise<boolean> {
 				"utf-8",
 			),
 		) as { outcome?: unknown };
-		return meta.outcome === "running";
+		if (meta.outcome !== "running") return false;
+		// `running` is a claim about now, and whoever would have corrected it may be
+		// gone. Two wrong answers are possible and they are not equally bad: saying
+		// "still running" when it is not wedges the Item (annoying, recoverable),
+		// while saying "finished" when it is not runs a review against a tree the
+		// rework is still editing (silently wrong findings). So the order below moves
+		// from strongest evidence to weakest, and only ever gives up on a bound.
+		const runDir = path.join(getAgentDir(), "subagent-sessions", runId);
+		const entries = await readdir(runDir).catch(() => [] as string[]);
+
+		// 1. The **Done signal** or the wrapper's exit code. Both are written by the
+		// child's own side, so they survive the orchestrator and are proof the work
+		// is over no matter who else is alive.
+		if (entries.some((e) => e.endsWith(".exit") || e.endsWith(".exitcode"))) {
+			return false;
+		}
+
+		// 2. The child's own pid, written by its wrapper before pi starts. This is the
+		// only *affirmative* liveness evidence available, and it must be the CHILD's
+		// pid rather than the spawner's: herdr owns a **Native Run**, so the child
+		// outlives whoever launched it (docs/adr/0044) and a dead spawner proves
+		// nothing. An earlier attempt probed the spawner and was rejected for exactly
+		// that. A live pid here means the rework is genuinely still working, however
+		// long it has been silent — which is the case transcript age gets wrong.
+		const pidFile = entries.find((e) => e.endsWith(".pid"));
+		if (pidFile) {
+			const raw = await readFile(path.join(runDir, pidFile), "utf-8").catch(
+				() => "",
+			);
+			const pid = Number.parseInt(raw.trim(), 10);
+			if (Number.isInteger(pid) && pid > 0) {
+				try {
+					// Signal 0 tests existence without delivering anything. EPERM means a
+					// live process owned by someone else, so it counts as alive.
+					process.kill(pid, 0);
+					return true;
+				} catch (err) {
+					if ((err as NodeJS.ErrnoException).code === "EPERM") return true;
+					// The child is gone and wrote no Done signal: killed with its pane, or
+					// crashed hard. Either way it is not still working.
+					return false;
+				}
+			}
+		}
+
+		// 3. No pid file: a **Fallback path** rework (its wrapper never ran) or one
+		// launched before the wrapper wrote pids. Fall back to transcript staleness,
+		// which is weaker — it detects absence of progress, not termination — so the
+		// bound is generous and is a backstop, not the primary signal.
+		const sessions = entries.filter((e) => e.endsWith(".jsonl"));
+		const mtimes = await Promise.all(
+			sessions.map((s) =>
+				stat(path.join(runDir, s))
+					.then((st) => st.mtimeMs)
+					.catch(() => 0),
+			),
+		);
+		// A Run dir with neither pid nor transcript: the spawner died between creating
+		// run.json and the child producing anything. Age the *directory* rather than
+		// believing `running` forever — believing it unconditionally is the original
+		// wedge bug, just relocated to a narrower window.
+		const newest = mtimes.length > 0 ? Math.max(...mtimes) : 0;
+		const reference =
+			newest > 0
+				? newest
+				: await stat(runDir)
+						.then((st) => st.mtimeMs)
+						.catch(() => 0);
+		if (reference === 0) return false;
+		return Date.now() - reference < REWORK_TIMEOUT_MS;
 	} catch {
 		// No sidecar, unreadable, or corrupt: do not block the review.
 		return false;
