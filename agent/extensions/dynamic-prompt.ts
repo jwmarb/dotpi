@@ -417,7 +417,10 @@ what is left, and what has landed. You maintain it with the \`${PLAN_TOOL}\` too
 - The plan is session-wide: it accumulates across requests. New work appends
   items; do not discard the running list.
 - Keep at most one item active: mark an item active before you start it, and
-  done or failed before you move on.
+  review or failed before you move on.
+- Groom an item to `ready` when it is specified enough to start, rather than
+  jumping `backlog` → `active`. Grooming is where a Review Route is normally
+  chosen, and it is the moment to notice an item is vaguer than it looked.
 - When you delegate a step, record the returned Task ID on that plan item and
   mark the item done (or failed) when the Task's Result arrives.
 - Before delegating, write the child's Starter Plan into the delegation text

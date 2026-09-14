@@ -43,7 +43,7 @@ A single JSON object at the head of a plan file carrying `kind: "plan-meta"` and
 _Avoid_: header, frontmatter, config line
 
 **Plan Item**:
-One step in a **Plan**: what to do, plus its state as the work progresses. A **Plan Item** may be executed by a **Task** it spawns; the Item records the **Task ID** and reaches its terminal state when that **Task** lands.
+One step in a **Plan**: what to do, plus its state as the work progresses. A **Plan Item** may be executed by a **Task** it spawns; the Item records the **Task ID** and reaches its terminal state when that **Task** lands. An Item created by mistake can be **deleted** outright, but only while non-terminal — once terminal it is the record of what happened, so abandoning work is `dropped` (visible) rather than deleted (erased), and the ids of surviving Items are never renumbered because notes, **Task IDs** and **Run** directories may already name them.
 _Avoid_: subtask, step (a **step** is what you do; a **Plan Item** is the tracked entry for it)
 
 **Starter Plan**:
@@ -59,11 +59,11 @@ The resting place for plans whose **Plan Items** have all reached a terminal sta
 _Avoid_: history, log
 
 **Review Route**:
-The per-**Plan Item** setting naming who may clear that Item: `user`, `oracle`, or `skip`. Chosen when the Item is **Groomed**, and thereafter only ever escalated, never lowered. An Item with no **Review Route** is routed to `user` — unless the plan is in **Autonomous Mode**, which changes only that default.
+The per-**Plan Item** setting naming who may clear that Item: `user`, `oracle`, or `skip`. An Item that has **explicitly** stated a route may thereafter only have it escalated, never lowered; an Item that has stated *none* is unconstrained, because absent is an inferred default rather than anybody's decision. An Item with no **Review Route** is treated as routed to `user` wherever the route is *enforced* — unless the plan is in **Autonomous Mode**, which supplies `oracle` as the default instead. The distinction between absent and explicitly-`user` is the difference between the two readings `routeOf` and `chosenRouteOf`, and reaching for the wrong one is a silent bug in either direction (ADR 0032).
 _Avoid_: reviewer, review level, rigour, review mode
 
 **Escalation**:
-Raising an Item's **Review Route** toward more scrutiny — `skip` → `oracle` → `user`. The only direction a **Review Route** may move. An agent may escalate its own Item; nothing may lower one.
+Raising an Item's **Review Route** toward more scrutiny — `skip` → `oracle` → `user`. The only direction an **explicitly** routed Item's **Review Route** may move. An agent may escalate its own Item; nothing may lower one it once chose. Setting the *first* route on an Item that never had one is not an **Escalation** and is unrestricted — there is no earlier choice to lower.
 _Avoid_: re-routing, downgrade (there is no downward move to name)
 
 **Verdict**:
@@ -75,7 +75,7 @@ A dispatched oracle review that reached no **Verdict** — it emitted no parsabl
 _Avoid_: failed review (that is a `fail` **Verdict**, the opposite — a real judgement), timeout, error
 
 **Autonomous Mode**:
-A per-plan setting under which a **Groomed** **Plan Item** defaults to the `oracle` **Review Route** instead of `user`. It changes only the default: an Item explicitly routed `user` still waits for the user's hand, and existing Items are never re-routed when the mode is turned on. Set with plan op `autonomous` and stored as the plan file's **plan-meta line**, so it survives restarts and shows as `◇ autonomous` on the **Board**. _[the review is dispatched automatically and runs detached, reporting through the Item's note and route — and, since ADR 0039, also as a `pln-`prefixed **Run** with its own `/runs` row, **Board** progress and **Mirror Pane**.]_
+A per-plan setting under which a **Plan Item** with no **Review Route** of its own picks up `oracle` instead of `user`, on **any non-terminal state change** rather than only when **Groomed** — it was gated on grooming alone for one session, and since the natural path to work is `backlog` → `active` → `review`, the mode did nothing at all while displaying its banner (ADR 0032). Terminal transitions never adopt a route, or an Item could award itself the route that permits its own completion. It changes only the default: an Item explicitly routed `user` still waits for the user's hand. Set with plan op `autonomous` and stored as the plan file's **plan-meta line**, so it survives restarts and shows as `◇ autonomous` on the **Board**. _[the review is dispatched automatically and runs detached, reporting through the Item's note and route — and, since ADR 0039, also as a `pln-`prefixed **Run** with its own `/runs` row, **Board** progress and **Mirror Pane**.]_
 _Avoid_: auto mode, unattended mode, headless (that is pi's no-UI mode, a different thing)
 
 **Rework**:
@@ -147,7 +147,7 @@ One lane of the **Board**, corresponding exactly to one **Plan Item** state. The
 _Avoid_: lane, swimlane, board position (there is no position independent of state)
 
 **Groomed**:
-What moves a **Plan Item** from `backlog` to `ready`: the item is specified well enough to be started as written, and nothing is blocking it. Grooming is also when the Item's **Review Route** is chosen. Grooming is a judgement, not a computed property — the model has no dependency edges between Items.
+What moves a **Plan Item** from `backlog` to `ready`: the item is specified well enough to be started as written, and nothing is blocking it. Grooming is the natural moment to choose the Item's **Review Route**, but no longer the only one — under **Autonomous Mode** an unrouted Item adopts the default on any non-terminal transition, because relying on grooming alone meant work that went straight to `active` was never routed at all (ADR 0032). Grooming is a judgement, not a computed property — the model has no dependency edges between Items.
 _Avoid_: refined, unblocked (an item can be unblocked and still too vague to start)
 
 **Accepted**:

@@ -152,9 +152,34 @@ type ReviewRoute = "user" | "oracle" | "skip";
  */
 const ROUTE_ORDER: readonly ReviewRoute[] = ["skip", "oracle", "user"];
 
-/** The route an item is on, treating an absent route as `user`. */
+/**
+ * The route an item is on, treating an absent route as `user`.
+ *
+ * This collapse is what makes `user` the safe default: an Item nobody routed is
+ * cleared by nobody but the user. Every *enforcement* site wants that reading.
+ *
+ * The one place that must NOT use it is the ratchet in {@link setRoute}, which
+ * needs to tell "nobody ever chose" apart from "the user chose `user`" — see
+ * {@link chosenRouteOf}.
+ */
 function routeOf(item: PlanItem): ReviewRoute {
 	return item.route ?? "user";
+}
+
+/**
+ * The route an Item *explicitly states*, or `null` when it never stated one.
+ *
+ * The ratchet exists so an agent cannot award itself less scrutiny once it
+ * discovers how painful review would be. That argument only applies to a route
+ * somebody actually chose. An Item with no route is on an inferred default, and
+ * inferring `user` then refusing to move it to `oracle` — because that reads as
+ * de-escalation — is how Autonomous Mode ended up unable to adopt the very Items
+ * it was switched on for.
+ *
+ * So: absent means unconstrained, explicit means ratcheted (docs/adr/0032).
+ */
+function chosenRouteOf(item: PlanItem): ReviewRoute | null {
+	return item.route ?? null;
 }
 
 /**
@@ -190,13 +215,48 @@ function isPlanMeta(obj: unknown): obj is PlanMeta {
 }
 
 /**
- * The default Review Route for a newly groomed Item under the given meta.
+ * The default Review Route for an Item under the given meta.
  *
  * Autonomous Mode changes only this default — never an Item that stated its own
  * preference, which is what keeps ADR 0023's per-Item granularity intact.
  */
 function defaultRoute(meta: PlanMeta | null): ReviewRoute {
 	return meta?.autonomous ? "oracle" : "user";
+}
+
+/**
+ * Whether a state change should adopt Autonomous Mode's default route, and which.
+ *
+ * Pure and exported for the same reason as {@link setRoute}: the live tool cannot
+ * be trusted to exercise on-disk code, because an extension is loaded once at pi
+ * startup and stays resident. The rule this encodes was wrong for an entire
+ * session while looking right, so it is tested directly.
+ *
+ * The rule: an Item with no route of its own adopts the mode's default on any
+ * **non-terminal** state change.
+ *
+ * Grooming to `ready` is the natural moment, but it used to be the *only* one,
+ * and that made Autonomous Mode silently inert — an orchestrator marks work
+ * `active` when it starts it, so `backlog` → `active` → `review` never touched
+ * the gate and every Item stayed on `user` while the Board advertised the mode as
+ * on (docs/adr/0032).
+ *
+ * Terminal states are excluded deliberately. The `done` guard decides whether an
+ * agent may clear an Item by reading its route, so allowing a terminal
+ * transition to backfill one would let an Item award itself the very route that
+ * permits its own completion, in the same call.
+ *
+ * @returns The route to adopt, or `null` to leave the Item's route alone.
+ */
+export function routeToAdopt(
+	item: Pick<PlanItem, "route">,
+	nextState: PlanState,
+	meta: PlanMeta | null,
+): ReviewRoute | null {
+	if (item.route !== undefined) return null;
+	if (TERMINAL.includes(nextState)) return null;
+	const route = defaultRoute(meta);
+	return route === "user" ? null : route;
 }
 
 /** One line of a plan file: one Plan Item. */
@@ -346,9 +406,14 @@ export function attachTaskId(
  * be trusted to exercise on-disk code, since an extension is loaded once at pi
  * startup and stays resident.
  *
- * A route may only move toward more scrutiny (`skip` → `oracle` → `user`). An
- * attempt to lower one is refused rather than ignored, because silently doing
- * nothing would let an agent believe it had de-escalated its own review.
+ * An Item that has **explicitly** stated a route may only move toward more
+ * scrutiny (`skip` → `oracle` → `user`). An attempt to lower one is refused
+ * rather than ignored, because silently doing nothing would let an agent believe
+ * it had de-escalated its own review.
+ *
+ * An Item with **no** route is unconstrained — there is no prior choice to lower,
+ * so the first assignment may be any route, including `oracle` or `skip`. Absent
+ * is an inferred default, not a decision (docs/adr/0032).
  *
  * @param items - The item list to mutate in place.
  * @param key - The plan key, used in the refusal messages.
@@ -376,16 +441,73 @@ export function setRoute(
 			error: `Cannot route ${id} in ${key}: it is already ${item.status}, and terminal items are immutable.`,
 		};
 
+	// An Item that never stated a route is unconstrained: there is no earlier
+	// choice to lower, so any route may be set. `routeOf` would report `user`
+	// here and turn the first assignment into a refusal (docs/adr/0032).
+	const chosen = chosenRouteOf(item);
 	const from = routeOf(item);
-	if (from === route) return { ok: true, from, unchanged: true };
-	if (ROUTE_ORDER.indexOf(route) < ROUTE_ORDER.indexOf(from))
+	if (chosen === null) {
+		item.route = route;
+		return { ok: true, from, unchanged: false };
+	}
+
+	if (chosen === route) return { ok: true, from, unchanged: true };
+	if (ROUTE_ORDER.indexOf(route) < ROUTE_ORDER.indexOf(chosen))
 		return {
 			ok: false,
-			error: `Cannot lower ${id} in ${key} from "${from}" to "${route}": a Review Route only ever escalates (skip → oracle → user). Ask for more scrutiny, never less.`,
+			error: `Cannot lower ${id} in ${key} from "${chosen}" to "${route}": a Review Route only ever escalates (skip → oracle → user). Ask for more scrutiny, never less.`,
 		};
 
 	item.route = route;
 	return { ok: true, from, unchanged: false };
+}
+
+/**
+ * Whether a Plan Item may be deleted, and why not when it may not.
+ *
+ * Pure and exported for the same reason as {@link setRoute}: an extension is
+ * loaded once at pi startup and stays resident, so the live tool cannot be
+ * trusted to exercise the code on disk.
+ *
+ * Delete is for an Item created **by mistake** or made irrelevant — not for
+ * tidying away work that was attempted. A terminal Item is the record of what
+ * happened, and where `revise` would rewrite that record, delete erases it, so
+ * the same rule as ADR 0014 applies and for a stronger reason. `dropped` already
+ * exists for abandoning work visibly, which is why refusing here never leaves the
+ * caller stuck.
+ *
+ * The **liveness** check is the one that matters for safety. A Rework is a writer
+ * editing the repository on this Item's behalf, so deleting the Item under it
+ * would leave a child committing changes that nothing describes (docs/adr/0041).
+ * Liveness is asked of the caller rather than looked up here, so this stays pure.
+ *
+ * @param item - The item to delete, or `undefined` when the id matched nothing.
+ * @param id - The requested id, used in the refusal messages.
+ * @param key - The plan key, used in the refusal messages.
+ * @param reworkAlive - Whether this Item's Rework Run is still running.
+ */
+export function canDelete(
+	item: PlanItem | undefined,
+	id: string,
+	key: string,
+	reworkAlive: boolean,
+): { ok: true } | { ok: false; error: string } {
+	if (!item)
+		return {
+			ok: false,
+			error: `Unknown item id "${id}" in ${key}. Use op "show" to list items.`,
+		};
+	if (TERMINAL.includes(item.status))
+		return {
+			ok: false,
+			error: `Cannot delete ${item.id} in ${key}: it is already ${item.status}, and terminal items are the record of what happened. Delete is for an item created by mistake, not for erasing work that was attempted.`,
+		};
+	if (reworkAlive)
+		return {
+			ok: false,
+			error: `Cannot delete ${item.id} in ${key}: a rework (\`/run ${item.reworkRunId}\`) is still running and is editing the repo for this item. Wait for it or cancel it first.`,
+		};
+	return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -865,14 +987,15 @@ const PlanItemParam = Type.Object({
 });
 
 const PlanParams = Type.Object({
-	op: StringEnum(["add", "status", "revise", "seed", "attach", "route", "autonomous", "archive", "show"] as const, {
+	op: StringEnum(["add", "status", "revise", "delete", "seed", "attach", "route", "autonomous", "archive", "show"] as const, {
 		description: [
 			"add = append a new item (requires text).",
 			"status = move an item to a new state (requires id and state); the plan archives itself when every item is terminal.",
 			"revise = rewrite an existing item's text in place, keeping its id, position and taskId (requires id and text). Use it when the work changes shape; terminal items cannot be revised.",
+			'delete = remove an item from the plan entirely (requires id). For an item created by mistake or made irrelevant. Only non-terminal items: a terminal item is the record of what happened, so use "dropped" to abandon work visibly rather than erasing it.',
 			"attach = record the Task ID of the subagent delegation executing an item (requires id and taskId).",
-			'route = set who may clear an item: "user" (you cannot clear it), "oracle" (a pass Verdict clears it), or "skip" (it never enters review). Requires id and route. Routes only ever escalate skip → oracle → user: you may always ask for more scrutiny, never less.',
-			'autonomous = turn Autonomous Mode on or off for the whole plan (requires "on"). While on, an item you groom to "ready" defaults to the "oracle" route instead of "user", so it is reviewed without the user. Items already routed keep their route.',
+			'route = set who may clear an item: "user" (you cannot clear it), "oracle" (a pass Verdict clears it), or "skip" (it never enters review). Requires id and route. An item with no route yet may be set to any route; once a route is explicit it only ever escalates skip → oracle → user, so you may always ask for more scrutiny, never less.',
+			'autonomous = turn Autonomous Mode on or off for the whole plan (requires "on"). While on, an item that has no route of its own picks up the "oracle" route on its next state change, so it is reviewed without the user. Items already routed keep their route.',
 			'seed = create a fresh plan for another plan key — the way you write a subagent\'s Starter Plan after delegating (requires for and items). Never clobbers an existing plan.',
 			"archive = move the plan file to the archive (all items must be terminal; a no-op report if already archived).",
 			"show = read the current plan back.",
@@ -888,7 +1011,7 @@ const PlanParams = Type.Object({
 		}),
 	),
 	id: Type.Optional(
-		Type.String({ description: "Item id, e.g. p3 (op status / op revise / op attach; archive of a single item is not supported — archive moves the whole plan)." }),
+		Type.String({ description: "Item id, e.g. p3 (op status / op revise / op delete / op attach / op route; archive of a single item is not supported — op delete removes one item, archive moves the whole plan)." }),
 	),
 	state: Type.Optional(
 		StringEnum(
@@ -1584,13 +1707,17 @@ export default function (pi: ExtensionAPI) {
 							'op "status" requires "id" and "state".',
 							undefined,
 						);
+					// Captured after the guard above so the type is narrowed: the
+					// optional `params.state` stays `PlanState | undefined` across the
+					// awaits below, and this is read inside the locked callback.
+					const nextState: PlanState = params.state;
 					// `done` means the item's Review Route was satisfied (docs/adr/0023,
 					// superseding 0017's "only the user"). The guard is therefore no
 					// longer judgeable from the target state alone — it needs the item's
 					// route in hand, so the legality check moves below the lookup.
 					if (
 						params.state !== "done" &&
-						!(AGENT_SETTABLE as readonly string[]).includes(params.state)
+						!(AGENT_SETTABLE as readonly string[]).includes(nextState)
 					)
 						return result(
 							`Cannot set "${params.state}": it is not an agent-settable state.`,
@@ -1620,7 +1747,7 @@ export default function (pi: ExtensionAPI) {
 					let demoted: string | null = null;
 					// Read the mode before the mutation: the default it supplies is
 					// applied inside the locked callback below.
-					const autoRoute = defaultRoute(await loadMeta(file));
+					const meta = await loadMeta(file);
 					let routedByMode: ReviewRoute | null = null;
 					const updated = await mutatePlan(file, (cur) => {
 						for (const other of cur) {
@@ -1634,18 +1761,13 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 						const target = cur.find((i) => i.id === item.id)!;
-						// Grooming is when an Item's Review Route is chosen, so this is
-						// where Autonomous Mode supplies its default. Only an Item that
-						// never stated a preference is affected — a route already set
-						// wins, which is what keeps the mode a default rather than the
-						// override ADR 0023 rejected (docs/adr/0032).
-						if (
-							params.state === "ready" &&
-							target.route === undefined &&
-							autoRoute !== "user"
-						) {
-							target.route = autoRoute;
-							routedByMode = autoRoute;
+						// Autonomous Mode's default route, decided by `routeToAdopt` so
+						// the rule lives in one tested place rather than inline here — it
+						// was wrong for a whole session while looking right.
+						const adopt = routeToAdopt(target, nextState, meta);
+						if (adopt !== null) {
+							target.route = adopt;
+							routedByMode = adopt;
 						}
 						target.status = params.state;
 						if (params.note !== undefined) target.note = params.note;
@@ -1738,6 +1860,36 @@ export default function (pi: ExtensionAPI) {
 					view.file = file;
 					return result(
 						`Revised ${item.id} in ${key}: "${before}" → "${params.text}".`,
+					);
+				}
+
+				case "delete": {
+					if (!params.id)
+						return result('op "delete" requires "id".', undefined);
+					const items = await loadPlan(file);
+					const item = items.find((i) => i.id === params.id);
+					// Liveness is resolved here and the rule applied in `canDelete`, which
+					// stays pure so it can be tested directly.
+					const reworkAlive =
+						item?.reworkRunId !== undefined &&
+						(await reworkStillRunning(item.reworkRunId));
+					const allowed = canDelete(item, params.id, key, reworkAlive);
+					if (!allowed.ok) return result(allowed.error, undefined);
+					// Narrowed by `canDelete`, which refuses an absent item.
+					const doomed = item!;
+					const gone = doomed.text;
+					const wasStatus = doomed.status;
+					// Ids are NOT renumbered: p3 disappearing leaves p2 and p4 alone.
+					// A Task ID, a note or a Run directory may already reference an id,
+					// and shifting ids under those references would silently repoint
+					// them at a different step (docs/adr/0030).
+					const updated = await mutatePlan(file, (cur) =>
+						cur.filter((i) => i.id !== doomed.id),
+					);
+					view.items = updated;
+					view.file = file;
+					return result(
+						`Deleted ${doomed.id} (${wasStatus}) from ${key}: "${gone}". ${updated.length} item${updated.length === 1 ? "" : "s"} remain; ids are not renumbered.`,
 					);
 				}
 
