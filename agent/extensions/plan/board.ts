@@ -187,22 +187,31 @@ async function readRunProgress(
 	let unfinished = 0;
 	for (const dir of dirs.sort()) {
 		const runDir = path.join(root, dir);
-		if (!agent) {
-			try {
-				const meta = JSON.parse(
-					await readFile(path.join(runDir, "run.json"), "utf-8"),
-				) as { agent?: unknown };
-				if (typeof meta.agent === "string") agent = meta.agent;
-			} catch {
-				// Older Runs predate the sidecar; the turn count still works.
-			}
+		// The sidecar's outcome, when terminal, is the parent's record of the
+		// Run's lifecycle and wins over the session scan: a dismissed Run (its
+		// pane closed mid-Run, docs/adr/0044) never settles, so the session
+		// alone would keep reporting it in flight.
+		let outcome: string | undefined;
+		try {
+			const meta = JSON.parse(
+				await readFile(path.join(runDir, "run.json"), "utf-8"),
+			) as { agent?: unknown; outcome?: unknown };
+			if (!agent && typeof meta.agent === "string") agent = meta.agent;
+			if (typeof meta.outcome === "string") outcome = meta.outcome;
+		} catch {
+			// Older Runs predate the sidecar; the session scan still works.
 		}
+		const finished =
+			outcome === "completed" ||
+			outcome === "failed" ||
+			outcome === "dismissed";
 		try {
 			const names = (await readdir(runDir))
 				.filter((n) => n.endsWith(".jsonl"))
 				.sort();
 			if (!names.length) {
-				unfinished++;
+				// A terminal outcome settles a Run with no transcript; nothing else does.
+				if (!finished) unfinished++;
 				continue;
 			}
 			const raw = await readFile(
@@ -234,16 +243,22 @@ async function readRunProgress(
 			}
 			// Only a settled outcome finishes a Run. "toolUse" means the child is
 			// mid-turn, and an absent stop reason means it never settled at all.
+			// A terminal outcome in run.json overrides this session derivation:
+			// it is the parent's word, and the session cannot express a dismissal
+			// (docs/adr/0036 promoted run.json to real state; docs/adr/0044 adds
+			// the dismissed case).
 			if (
-				lastStopReason === undefined ||
-				!TERMINAL_STOP_REASONS.includes(lastStopReason)
+				!finished &&
+				(lastStopReason === undefined ||
+					!TERMINAL_STOP_REASONS.includes(lastStopReason))
 			)
 				unfinished++;
 		} catch {
 			// A Run must never be *assumed* finished: a directory that is briefly
 			// unreadable, removed mid-scan, or fails to read counts as unfinished,
-			// because its terminal state was never positively established.
-			unfinished++;
+			// because its terminal state was never positively established — unless
+			// the sidecar already recorded one (docs/adr/0036).
+			if (!finished) unfinished++;
 		}
 	}
 	return { agent, turns, finished: unfinished === 0 };

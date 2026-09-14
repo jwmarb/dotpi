@@ -43,7 +43,7 @@ export interface RunIndexEntry {
 	agent: string;
 	/** Count of assistant messages in the session. */
 	turns: number;
-	/** `"completed" | "failed" | "running" | "unknown"`. */
+	/** `"completed" | "failed" | "running" | "dismissed" | "unknown"`. */
 	state: string;
 	/** ms epoch, from the session's first timestamp. */
 	startedAt?: number;
@@ -210,22 +210,36 @@ async function scanRunDir(
 			//   Since the retry patch (ADR 0034) made mid-Run errors routine, this is
 			//   now the common case, not an edge one.
 			//
+			// - A dismissed Run (pane closed before it finished, docs/adr/0044)
+			//   never settles: the session's last stopReason stays `toolUse` or is
+			//   absent, so the session alone reads "running" for a Run the user
+			//   ended. `dismissed` is terminal and must not fall through to it.
+			//
 			// So an explicit outcome is authoritative whatever it says, and only a
 			// sidecar predating the field (or missing entirely) falls back to the
 			// session derivation (docs/adr/0036 promoted run.json to real state).
 			state:
 				outcome === "completed" ||
 				outcome === "failed" ||
-				outcome === "running"
+				outcome === "running" ||
+				outcome === "dismissed"
 					? outcome
 					: scanned.state,
 		};
 	}
 
-	if (archived.length > 0) {
+if (archived.length > 0) {
 		// Do not decompress during a scan: thawing would make listing as
 		// expensive as opening, and the index only promises *that* a Run is
 		// archived, not its contents (docs/adr/0022).
+		//
+		// The sidecar's terminal outcome is still authoritative here: run.json
+		// keeps its state after the transcript is compressed, and reporting
+		// "unknown" would lose a terminal state the parent already recorded.
+		// `running` is deliberately not honoured: an archived file is cold
+		// storage by definition, so a sidecar still reading `running` is stale
+		// (the parent never finalized it), and "running" next to
+		// `archived: true` would be self-contradictory.
 		return {
 			taskId,
 			runId: runDirName,
@@ -233,7 +247,10 @@ async function scanRunDir(
 			archived: true,
 			live: false,
 			turns: 0,
-			state: "unknown",
+			state:
+				outcome === "completed" || outcome === "failed" || outcome === "dismissed"
+					? outcome
+					: "unknown",
 		};
 	}
 
@@ -253,7 +270,9 @@ async function scanRunDir(
 		live: false,
 		turns: 0,
 		state:
-			outcome === "completed" || outcome === "failed" ? outcome : "running",
+			outcome === "completed" || outcome === "failed" || outcome === "dismissed"
+				? outcome
+				: "running",
 	};
 }
 
@@ -280,6 +299,10 @@ export async function scanRunDirs(agentDir: string): Promise<RunIndexEntry[]> {
 	const entries: RunIndexEntry[] = [];
 	for (const dirent of dirents) {
 		if (!dirent.isDirectory()) continue;
+		// Skip bookkeeping directories that share this root but are not Runs. The
+		// tree-wide spawn cap keeps its tokens here (docs/adr/0044), and a dot-prefixed
+		// name can never be a Run since every runId is `sub-`/`pln-` prefixed.
+		if (dirent.name.startsWith(".")) continue;
 		try {
 			entries.push(await scanRunDir(path.join(root, dirent.name), dirent.name));
 		} catch {
@@ -323,8 +346,9 @@ function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
  * total turns, then one indented child line per Run identified by its ordinal.
  *
  * The aggregate state is deliberately pessimistic: `failed` if any Run failed,
- * else `running` if any is still going, else `completed` only when all are.
- * Reporting a Task as completed while one of its Runs failed would hide exactly
+ * The aggregate state is deliberately pessimistic: `failed` if any Run failed,
+ * else `running` if any is still going, else `dismissed` if any Run was waved
+ * away, else `completed` only when all are.
  * what someone scanning this list is looking for.
  *
  * No cost column: session files record `cost.total: 0` throughout, and a
@@ -410,10 +434,13 @@ function ordinalOf(e: RunIndexEntry): number {
  *
  * Pessimistic by design: a Task with a failed Run reads `failed` even if its
  * siblings succeeded, because a partial failure is the thing worth surfacing.
+ * A dismissed Run is terminal like a failure but names the user's decision,
+ * not a fault: it loses to any live or failed Run and wins over `completed`.
  */
 function aggregateState(runs: RunIndexEntry[]): string {
 	if (runs.some((r) => r.state === "failed")) return "failed";
 	if (runs.some((r) => r.state === "running")) return "running";
+	if (runs.some((r) => r.state === "dismissed")) return "dismissed";
 	if (runs.every((r) => r.state === "completed")) return "completed";
 	return runs.some((r) => r.state === "unknown") ? "unknown" : runs[0]!.state;
 }

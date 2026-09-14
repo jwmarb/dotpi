@@ -341,8 +341,15 @@ async function terminalWithoutSession(): Promise<string | null> {
 		const meta = JSON.parse(
 			await readFile(path.join(sessionDir, "run.json"), "utf-8"),
 		) as { outcome?: unknown; stopReason?: unknown };
-		if (typeof meta.outcome === "string" && meta.outcome !== "running")
-			return `run ended (${meta.outcome}) without writing a session — there is no transcript to show.`;
+			// Only the terminal outcomes this build knows: an unknown value (a future
+			// sidecar) degrades to silence rather than a made-up announcement.
+			if (
+				typeof meta.outcome === "string" &&
+				(meta.outcome === "completed" ||
+					meta.outcome === "failed" ||
+					meta.outcome === "dismissed")
+			)
+				return `run ended (${meta.outcome}) without writing a session — there is no transcript to show.`;
 	} catch {
 		// No sidecar, or it predates the outcome field: stay silent rather than
 		// guess. An older Run with no metadata is indistinguishable from a slow one.

@@ -29,8 +29,15 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 
-/** A Run's lifecycle as recorded in `run.json` by whoever spawned it. */
-export type RunOutcome = "running" | "completed" | "failed";
+/**
+ * A Run's lifecycle as recorded in `run.json` by whoever spawned it.
+ *
+ * `dismissed` is terminal, like `completed` and `failed`, but deliberately a
+ * separate value: it names a Run whose pane the user closed before it
+ * finished. A Run the user waved away is not a Run that went wrong, so folding
+ * it into `failed` would conflate a user decision with a fault (docs/adr/0044).
+ */
+export type RunOutcome = "running" | "completed" | "failed" | "dismissed";
 
 /** The directory holding all Run session directories. */
 export function runsRoot(agentDir: string): string {
