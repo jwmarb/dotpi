@@ -318,24 +318,25 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 }
 
 /**
- * Write the agent's system prompt to a temporary file for `--append-system-prompt`.
+ * Write a Run's **Injected prompt** into its Run directory as `prompt.md`
+ * (docs/adr/0045). The returned path is what crosses `--append-system-prompt`,
+ * so the file on disk is byte-for-byte what the child was started with.
+ *
+ * Left unarchived, like `run.json`: archiving compresses only the session
+ * JSONL, and the prompt is small evidence, not history.
  */
-async function writePromptToTempFile(
-	agentName: string,
+async function writePromptToRunDir(
+	runDir: string,
 	prompt: string,
-): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(
-		path.join(os.tmpdir(), "pi-subagent-"),
-	);
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
+): Promise<string> {
+	const filePath = path.join(runDir, "prompt.md");
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.writeFile(filePath, prompt, {
 			encoding: "utf-8",
 			mode: 0o600,
 		});
 	});
-	return { dir: tmpDir, filePath };
+	return filePath;
 }
 
 /**
@@ -1097,14 +1098,15 @@ async function executeNativeAttempt(
 		resolution ? formatPreloadedSkills(resolution.loaded).trim() : "",
 	].filter(Boolean);
 
-	let tmpPromptDir: string | null = null;
 	let paneOpened = false;
 	try {
-		const tmp = await writePromptToTempFile(
-			agent.name,
+		// The prompt.md sidecar (docs/adr/0045): this same file crosses
+		// --append-system-prompt, so what a Run started with stays inspectable.
+		await fs.promises.mkdir(sessionDir, { recursive: true });
+		const promptPath = await writePromptToRunDir(
+			sessionDir,
 			promptParts.join("\n\n---\n\n"),
 		);
-		tmpPromptDir = tmp.dir;
 
 		const piInvocation = nativePiCommand();
 		const plan = buildLaunchPlan({
@@ -1120,12 +1122,11 @@ async function executeNativeAttempt(
 			// tool-restricted child can still report completion.
 			tools: buildSubagentToolAllowlist(agent.tools, DONE_TOOL_NAME) ?? [],
 			model,
-			systemPromptPath: tmp.filePath,
+			systemPromptPath: promptPath,
 			task: runResult.task,
 			planKey,
 		});
 
-		await fs.promises.mkdir(sessionDir, { recursive: true });
 		await fs.promises.writeFile(plan.wrapperPath, plan.wrapperSource, {
 			encoding: "utf-8",
 			mode: 0o700,
@@ -1240,8 +1241,6 @@ async function executeNativeAttempt(
 			);
 			onProgress();
 		}
-		if (tmpPromptDir)
-			await fs.promises.rm(tmpPromptDir, { recursive: true, force: true });
 	}
 }
 
@@ -1309,9 +1308,6 @@ async function executeAttemptWithSlot(
 	if (agent.tools && agent.tools.length > 0)
 		args.push("--tools", agent.tools.join(","));
 
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
 	// Skills were validated before the Task was created, so resolution here is
 	// expected to succeed; a late failure is still reported rather than ignored.
 	const resolution = skillNames?.length
@@ -1334,13 +1330,16 @@ async function executeAttemptWithSlot(
 			// its own write-up.
 			agent.systemPrompt.includes("<result>") ? "" : RESULT_CONTRACT,
 		].filter(Boolean);
-		const tmp = await writePromptToTempFile(
-			agent.name,
-			promptParts.join("\n\n---\n\n"),
+		// The prompt.md sidecar (docs/adr/0045). The writeRunMeta above is
+		// fire-and-forget, so ensure the directory exists before writing it.
+		await fs.promises.mkdir(sessionDir, { recursive: true });
+		args.push(
+			"--append-system-prompt",
+			await writePromptToRunDir(
+				sessionDir,
+				promptParts.join("\n\n---\n\n"),
+			),
 		);
-		tmpPromptDir = tmp.dir;
-		tmpPromptPath = tmp.filePath;
-		args.push("--append-system-prompt", tmpPromptPath);
 
 		args.push(`Task: ${runResult.task}`);
 		let wasAborted = false;
@@ -1539,18 +1538,6 @@ async function executeAttemptWithSlot(
 			runFailed(runResult) ? "failed" : "completed",
 		);
 		onProgress();
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
 	}
 }
 
@@ -1738,16 +1725,16 @@ const SubagentParams = Type.Object({
 
 const TasksParams = Type.Object({
 	action: StringEnum(
-		["list", "status", "result", "wait", "cancel", "open"] as const,
+		["list", "status", "result", "prompt", "wait", "cancel", "open"] as const,
 		{
 			description:
-			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view).",
+			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; prompt = the injected system prompt each run was started with (recorded at spawn); wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view).",
 		},
 	),
 	taskIds: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				'Task IDs (e.g. ["sub-a3f1"]). Required for status, result, wait, cancel, and open. Ignored by list.',
+				'Task IDs (e.g. ["sub-a3f1"]). Required for status, result, prompt, wait, cancel, and open. Ignored by list.',
 		}),
 	),
 	timeoutSeconds: Type.Optional(
@@ -2392,7 +2379,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Tasks",
 		description: [
 			"Inspect and control background subagent tasks started with the subagent tool.",
-			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (resume a finished task in a live pi pane — this CONTINUES the session and appends to its transcript; there is no read-only view).',
+			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), prompt (the injected system prompt each run was started with), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (resume a finished task in a live pi pane — this CONTINUES the session and appends to its transcript; there is no read-only view).',
 			"Task ids look like sub-a3f1 and are returned when you start a task.",
 		].join(" "),
 		parameters: TasksParams,
@@ -2503,6 +2490,36 @@ export default function (pi: ExtensionAPI) {
 
 			const missingNote =
 				missing.length > 0 ? `\n\n(unknown task id(s): ${missing.join(", ")})` : "";
+
+			if (params.action === "prompt") {
+				// Read-only: the prompt is recorded at spawn (docs/adr/0045) and lives
+				// on disk, so this claims no notification and closes no tab.
+				const lines: string[] = [];
+				for (const task of found) {
+					lines.push(`${task.id}:`);
+					for (const run of task.runs) {
+						lines.push(
+							`─── ${run.step ? `step ${run.step}: ` : ""}${run.agent}`,
+						);
+						const promptPath = path.join(
+							runsRoot(getAgentDir()),
+							run.runId,
+							"prompt.md",
+						);
+						let text: string;
+						try {
+							text = await fs.promises.readFile(promptPath, "utf-8");
+						} catch {
+							text = "(no prompt recorded — the Run predates prompt recording, or was refused before spawn)";
+						}
+						lines.push(text.trimEnd());
+					}
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n\n") + missingNote }],
+					details: detailsFor(found),
+				};
+			}
 
 			if (params.action === "status") {
 				const text = found.map(formatTaskStatus).join("\n\n");

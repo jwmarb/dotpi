@@ -28,6 +28,10 @@ _Avoid_: step (that is a run's ordinal position within a chain), invocation
 **Mode**:
 How a **Task**'s runs relate: `single` (one run), `parallel` (independent runs, concurrent), `chain` (sequential runs, each fed the previous run's **Result**).
 
+**Injected prompt**:
+The content the orchestrator assembles and hands to a **Run**: the subagent's own system prompt, any preloaded skills, and — on the **Fallback path** only — the conditional result contract; a **Native Run** never receives it, because its **Result** is read from the **Transcript** rather than scraped from a fenced tag. It is exactly what crosses `--append-system-prompt`, and it is recorded in the **Run** directory as `prompt.md` at spawn, left unarchived like **Run Meta**. Distinct from the child's *final* system prompt, which also includes pi's own base prompt: capturing that would require patching pi itself, and it would go stale on every pi release.
+_Avoid_: system prompt (overloaded — the child's final prompt includes pi's base), append prompt, delegation brief (that is the task text)
+
 ### Planning
 
 > Terms marked **[design only]** are decided but **not implemented**. They name
@@ -124,7 +128,7 @@ A unit of the single shared budget for concurrently running child processes, cap
 _Avoid_: task limit (that is `MAX_ACTIVE_TASKS`, which bounds work in flight, not processes), quota, semaphore
 
 **Run directory contract**:
-The published on-disk layout `<agentDir>/subagent-sessions/<runId>/` — a **Transcript** plus its **Run Meta** — shared by both producers of **Runs** and read by three consumers that hold no handle on the producing process: the **Run Index**, **Board** progress and the **Mirror Pane**. The subagent extension mints `sub-` **Run** IDs, the plan extension mints `pln-` ones for its autonomous reviews, and both write through one module so the twice-written sidecar cannot be forgotten by one of them (ADR 0039). A `pln-` prefix in `/runs` is how to tell a plan-spawned **Run** from a delegated one.
+The published on-disk layout `<agentDir>/subagent-sessions/<runId>/` — a **Transcript**, its **Run Meta**, and, for delegated `sub-` **Runs**, its **Injected prompt** recorded at spawn as `prompt.md` — shared by both producers of **Runs** and read by three consumers that hold no handle on the producing process: the **Run Index**, **Board** progress and the **Mirror Pane**. Plan-spawned `pln-` **Runs** (autonomous reviews, rework) still route their prompt through a temp file, so their directories carry no `prompt.md` (ADR 0045). The subagent extension mints `sub-` **Run** IDs, the plan extension mints `pln-` ones for its autonomous reviews, and both write the twice-written **Run Meta** sidecar through one module so it cannot be forgotten by one of them (ADR 0039). A `pln-` prefix in `/runs` is how to tell a plan-spawned **Run** from a delegated one.
 _Avoid_: session folder, run store, the registry (that is the in-memory **Task** list, deliberately not shared)
 
 **Run Index**:
