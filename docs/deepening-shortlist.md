@@ -18,13 +18,13 @@ note — the seventh (herdr transports) was added when the report was written.
 
 | # | Candidate | Deletion test | Verdict |
 |---|-----------|---------------|---------|
-| 1 | Spawn-path seam (`subagent/index.ts`) | Complexity reappears in two permanent, already-diverging implementations | **Keep — Strong** |
-| 2 | Plan-mutation transaction module | Complexity reappears across 13+ mutation sites and a second process writer | **Keep — Strong** |
+| 1 | Spawn-path seam (`subagent/index.ts`) | Skill resolution and the `prompt.md` sidecar are genuinely duplicated across two permanent implementations | **Keep — Strong** |
+| 2 | Plan-mutation transaction module | One implementation behind one interface today; the second adapter (Board writer) does not exist | **Keep — Worth exploring** |
 | 3 | Run outcome / liveness module | Complexity reappears across four consumers; the ADR log is a bug ledger for exactly this drift | **Keep — Strong** |
 | 4 | Plan-file format module (cross-process) | Complexity reappears in both processes; hand-sync is already the documented burden | **Keep — Worth exploring** |
 | 5 | `getPiInvocation` "interlock duplication" | Deletion restores today's state, which is deliberate, not drift | **Reject** |
 | 6 | "pi is patched" predicate | No such predicate exists; zero callers — complexity vanishes | **Reject** |
-| 7 | Reconcile the two herdr transports | Convention layer reappears in both, but the bodies share no implementation | **Keep — Speculative** |
+| 7 | Reconcile the two herdr transports | The transports are complementary by design; only conventions overlap, and a unified interface would be wide and shallow | **Reject** |
 
 ## 1 · Spawn-path seam — keep (Strong)
 
@@ -36,11 +36,22 @@ close-on-cancel, herdr-socket observation, `.exitcode` sidecar) and the
 **fallback** JSON path (1298+: `--mode json` spawn, NDJSON parse, stall
 watchdog, TERM→KILL reaping, Mirror Pane).
 
-**Evidence of drift already present.** The prelude is duplicated verbatim
-across the two branches: skill resolution and `runResult` population appear
-identically in both (1083–1095 native, 1304–1316 fallback); the `prompt.md`
-sidecar (ADR 0045) is written in both; `sessionDir` mkdir happens in both.
-Every new Run concern since ADR 0044 has had to be added twice.
+**Evidence of drift already present — narrowed.** Three things are duplicated
+verbatim across the two branches: skill resolution and `runResult` population
+(1084 native, 1315 fallback), the `sessionDir` mkdir (1106, 1336), and the
+`prompt.md` sidecar write (1107, 1339; ADR 0045).
+
+**What is *not* evidence** (corrected after review):
+
+- *Prompt assembly* differs **deliberately**, not by drift: only the fallback
+  appends `RESULT_CONTRACT`, because a Native Run's Result is read from its
+  Transcript rather than scraped from a fenced tag (ADR 0044). A seam must
+  preserve that divergence, not erase it.
+- *The spawn cap and the opening Run Meta write already sit above both paths* —
+  `claimSlot` at 1029 in `executeAttempt`, `writeRunMeta` at 1268 before the
+  native attempt is tried. So "every new Run concern has to be added twice" is
+  false as stated: the two most recent ones were added once. What must still be
+  added twice is anything in the per-branch prelude.
 
 **Two real adapters.** Both are live, and ADR 0044 records that the JSON path
 "cannot be deleted … **two spawn paths exist indefinitely** and may drift —
@@ -57,7 +68,7 @@ prelude behind the interface.
 implementations; the seam's value is locality for the implementations, not
 call-site count.
 
-## 2 · Plan-mutation transaction — keep (Strong)
+## 2 · Plan-mutation transaction — keep (Worth exploring)
 
 **Current state.** Inlined in `plan/index.ts`: the in-process
 `withFileMutationQueue`, the cross-process `acquirePlanLock` (owner token,
@@ -68,19 +79,28 @@ temp-file write and atomic `rename` — all inside `mutatePlan` (1030–1094).
 **Callers.** 13 `mutatePlan` call sites and 12 `loadPlan` call sites in
 `plan/index.ts` alone.
 
-**Two real writers.** The plan extension (in-process) and the **Board**
-(standalone process; ADR 0015 permits it to write "directly under the shared
-lock", writer stub at the end of `board.ts`, lock protocol acknowledged at
-`board.ts:825–826`). The lock exists for exactly this second writer
-(ADR 0035: "the contending writer is another process").
+**One implementation, one hypothetical adapter** (corrected after review). The
+Board is **not** a second writer today: `board.ts:10-13` states it is
+"Read-only for now" and that card movement "is not yet implemented", and the
+"writer" at `board.ts:819-830` is a comment explaining why it was deferred —
+precisely because the lock protocol would have to be duplicated. Calling these
+"two real writers" was factually wrong. ADR 0015 *intends* a Board writer, so
+the second adapter is planned, not live — and one adapter means a hypothetical
+seam.
 
-**Deletion test.** Deleting the transaction reappears it across 13+ mutation
-sites *and* in the Board's future writer: lock acquisition and token
-ownership, refusal semantics, meta preservation, atomic rename. The bugs it
-prevents are all documented, not hypothetical: cross-process lost update
-(ADR 0035), stale-snapshot `attach` (ADR 0035), and a refused mutation that
-silently destroyed data (the `NO_WRITE` fix, commit `6ad9831` "Make a refused
-plan mutation write nothing at all").
+**Deletion test — corrected.** The 13 call sites do **not** support this
+candidate: they already call the single `mutatePlan` interface, so deleting an
+*extracted* module would not scatter transaction logic across 13 callers. It
+would simply return to its present local implementation in `plan/index.ts`.
+That is a move, not a concentration — the test's own failure condition.
+
+What the transaction genuinely earns is unchanged and real: it already
+concentrates lock acquisition, token ownership, refusal semantics, meta
+preservation and atomic rename in one place, and the bugs it prevents are
+documented rather than hypothetical — cross-process lost update and
+stale-snapshot `attach` (ADR 0035), and a refused mutation that silently
+destroyed data (`NO_WRITE`, commit `6ad9831`). But that is an argument that
+`mutatePlan` is *already* the right shape, not that extracting it pays.
 
 **Deepening.** Extract the transaction as a dependency-free module so the
 Board can share it without importing the pi host (the Board is a bare pane by
@@ -198,7 +218,7 @@ standalone scripts already own, per ADR 0034.
 **Rejected.** The original six-item note shortlisted this item in
 contradiction of the deletion test; the shortlist above removes it.
 
-## 7 · Reconcile the two herdr transports — keep (Speculative)
+## 7 · Reconcile the two herdr transports — reject
 
 **Current state.** Two live transports: `herdr/client.ts` (394 lines; CLI
 `execFile` + JSON reply; importers: `herdr-names.ts`, `plan/index.ts`,
@@ -206,35 +226,55 @@ contradiction of the deletion test; the shortlist above removes it.
 JSON-lines request/response + event subscription; importers: `plan/review.ts`,
 `subagent/index.ts`, `subagent/native.ts`, `subagent/watcher.ts`).
 
-**Evidence.** The duplication is the *convention layer*, and it is
-acknowledged in the code: socket.ts comments say it "Mirrors client.ts's
-pick exactly", applies "client.ts's rule" (never throws, null on any
-failure), and gates availability "matching how client.ts gates on
-`herdrContext()`". The availability checks, request framing,
-pick-from-response, and endpoint resolution are each written twice.
+**Evidence — narrowed.** The overlap is the *convention layer* and nothing
+wider: socket.ts says it "Mirrors client.ts's pick exactly", applies
+"client.ts's rule" (never throws, null on any failure), and gates availability
+"matching how client.ts gates on `herdrContext()`". So `pick`, the error/null
+discipline, and the timeout constant are genuinely written twice. Request
+framing and endpoint resolution are **transport-specific** — `execFile` argv
+versus JSON-lines over a socket — so the earlier claim that they are duplicated
+was wrong.
 
-**Deletion test.** Deleting a merged transport reappears the convention
-layer in both modules. But the two transports' bodies share no
-implementation (CLI exec vs socket framing), and a unified interface would
-expose the union of ~15 CLI operations plus plugin-pane open plus
-subscription — a wide interface over thin per-operation implementations,
-i.e. a shallow-module risk.
+**Deletion test — fails.** The two transports are **complementary by design**,
+not two adapters behind one interface: `socket.ts:1-11` states the CLI "cannot
+listen", that the subscribe-to-events protocol "exists only on the server
+socket", and that "the two are complementary; this file neither replaces nor is
+replaced by client.ts." There is no single behaviour with two implementations —
+there are two capabilities with one implementation each. A unified interface
+would expose the union of ~15 CLI operations plus plugin-pane open plus
+subscription: a wide interface over thin per-operation implementations, which is
+the definition of a shallow module. Deleting it would concentrate nothing.
 
-**Kept at Speculative** — two real adapters exist and the convention
-duplication is real, but the depth payoff is unproven.
+**Rejected.** What remains real is small and worth recording separately: the
+convention layer (`pick`, the never-throw/null rule, the timeout) could move to
+one tiny shared module used by both transports. That is a modest
+duplication fix with two real callers, not a deepening of the herdr seam, and it
+should not be sold as one.
 
 ## Top recommendation
 
-**Candidate 1 (spawn-path seam).** It is the only candidate where the drift
-cost is *already material* (the duplicated prelude), the two adapters are
-both permanent by ADR decision, and the next Run concern (spawn cap,
-planKey env, prompt sidecar — all recent) will have to be added twice again
-until the seam exists.
+**Candidate 3 (Run outcome / liveness).** Promoted over candidate 1 after
+review, because it is the one candidate whose evidence survived scrutiny intact:
+four consumers derive "what state is this Run in?" independently
+(`runindex.ts:160-244`, `board.ts:156-265`, `plan/index.ts:1371-1460`,
+`mirror.ts:341-353`), `TERMINAL_STOP_REASONS` is declared twice
+(`runindex.ts:34`, `board.ts:125`), and the ADR log is a ledger of bugs born
+from exactly that per-consumer derivation (ADR 0033, 0036, 0039, 0044). Deleting
+a shared module reappears the derivation in all four — a concentration, not a
+move. `rundir.ts` is the precedent: the same extraction was already made for
+*writing* the sidecar.
+
+**Candidate 1 (spawn-path seam)** remains Strong and a close second, but its
+rationale is narrower than first claimed: the duplication is skill resolution,
+the `sessionDir` mkdir and the `prompt.md` sidecar — three items, not "every new
+Run concern". The spawn cap and opening Run Meta write already sit above both
+paths, and the prompt-assembly difference is deliberate. It is a real seam with
+two permanent adapters; it is not the one with the most material drift.
 
 ## Effect on the HTML report
 
-The report (`/tmp/architecture-review-20260915-004037.html`, item p5) must
-be regenerated from this shortlist: cards 5 and 6 move to a
-"considered and rejected" section with the reasons above, and card 7 keeps
-its Speculative badge. Report regeneration is item p5's scope, not this
-rework's.
+The report (`/tmp/architecture-review-20260915-004037.html`, item p5) now needs
+a second correction pass: candidate 7 joins 5 and 6 in "Considered and
+rejected", candidate 2's badge drops from Strong to Worth exploring, and the top
+recommendation moves from candidate 1 to candidate 3. Three live candidates
+remain: 1 and 3 Strong, 2 and 4 Worth exploring.

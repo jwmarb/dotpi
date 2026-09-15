@@ -16,6 +16,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { fittedWidget } from "./lib/widget.js";
 
 /** Git porcelain status prefix to our display label. */
 const GIT_STATUS_MAP = {
@@ -206,13 +207,9 @@ export default function (pi: ExtensionAPI) {
 
 		const files = Array.from(toolTrackedFiles.values());
 
-		ctx.ui.setWidget(WIDGET_KEY, (_tui, t) => {
-			const lines = renderFileList(files, t);
-			return {
-				render: () => lines,
-				invalidate: () => {},
-			};
-		});
+		ctx.ui.setWidget(WIDGET_KEY, (_tui, t) =>
+			fittedWidget(() => renderFileList(files, t)),
+		);
 	}
 
 	/**
@@ -298,12 +295,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(`  ${theme.fg("dim", `${files.length} file(s) changed`)}`);
 			lines.push("");
 
-			ctx.ui.setWidget(WIDGET_KEY, (_tui, t) => {
-				return {
-					render: () => lines,
-					invalidate: () => {},
-				};
-			});
+			ctx.ui.setWidget(WIDGET_KEY, (_tui, _t) => fittedWidget(() => lines));
 
 			ctx.ui.notify(`Changed files: ${files.length} file(s)`, "info");
 		},

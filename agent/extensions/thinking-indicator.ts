@@ -53,6 +53,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { fitLines } from "./lib/widget.js";
 
 const FRAMES = ["◐", "◓", "◑", "◒"] as const;
 const TICK_MS = 120;
@@ -193,7 +194,10 @@ class ThinkingIndicator implements Component {
 				}
 			}
 		}
-		return lines;
+		// The header is hand-built rather than wrapped, so nothing above has
+		// measured it: a narrow Run Pane makes "▸ ◐ Thinking… 12s" wider than the
+		// terminal, and pi kills the process over it rather than clipping.
+		return fitLines(lines, width);
 	}
 }
 

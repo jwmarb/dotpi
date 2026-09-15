@@ -34,6 +34,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadDotenv } from "../lib/dotenv.js";
+import { fittedWidget } from "../lib/widget.js";
 
 // --- Configuration -----------------------------------------------------------
 
@@ -286,10 +287,7 @@ export default async function (pi: ExtensionAPI) {
 						: t.fg("error", ` failed: ${s.error ?? "unknown"}`);
 			lines.push(`${icon} mcp: ${t.fg("text", s.name)}${detail}`);
 		}
-		ctx.ui.setWidget(WIDGET_KEY, (_tui, _theme) => ({
-			render: () => lines,
-			invalidate: () => {},
-		}));
+		ctx.ui.setWidget(WIDGET_KEY, (_tui, _theme) => fittedWidget(() => lines));
 	}
 
 	/** Register pi tools for one connected server. Safe to re-register after refresh. */
