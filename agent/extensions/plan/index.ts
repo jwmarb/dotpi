@@ -201,7 +201,7 @@ const REVIEW_BUDGET = 2;
  */
 interface PlanMeta {
 	kind: "plan-meta";
-	/** When true, a newly groomed Item defaults to the `oracle` route. */
+	/** When true, an unrouted Item adopts the `oracle` route on any non-terminal state change, never on a terminal one (docs/adr/0032). */
 	autonomous?: boolean;
 }
 
