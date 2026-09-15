@@ -1086,6 +1086,72 @@ const PlanParams = Type.Object({
  */
 let boardPaneId: string | null = null;
 
+// ---------------------------------------------------------------------------
+// Rework notification
+// ---------------------------------------------------------------------------
+
+/**
+ * What a finished **Rework** tells the orchestrator.
+ *
+ * Deliberately small and transcript-free: `details` is persisted to the session
+ * file, so putting the worker's message stream here would grow it without bound
+ * for data only the TUI reads (the shape delegated Tasks settled on, docs/adr/0006).
+ */
+interface ReworkDoneDetails {
+	itemId: string;
+	runId: string;
+	/** Whether the worker reached a normal end, as opposed to dying or wedging. */
+	completed: boolean;
+}
+
+/**
+ * How a detached **Rework** reaches the orchestrator's message stream.
+ *
+ * Module-level for the same reason `boardPaneId` is: `dispatchRework` runs
+ * detached and outside the extension factory, so it has no `pi` in scope. This is
+ * set once at registration and read when a Rework lands.
+ *
+ * Null in a session that never registered — a review or rework child loads this
+ * same extension — and in that case a Rework's report survives only in the plan
+ * file, which is the durable record either way.
+ */
+let notifyReworkDone:
+	| ((details: ReworkDoneDetails, text: string) => void)
+	| null = null;
+
+/**
+ * Reworks that finished while the orchestrator was mid-turn.
+ *
+ * A `followUp` message sent mid-turn is queued and **cannot be recalled**, so
+ * sending one the moment a Rework lands would re-inject a report the orchestrator
+ * may deal with itself before the turn ends. Delivery therefore waits for idle,
+ * exactly as delegated Task Reminders do (docs/adr/0027).
+ */
+const pendingReworkReports: { details: ReworkDoneDetails; text: string }[] = [];
+
+/** Whether the orchestrator is mid-turn, so a report must be held. */
+let turnInFlight = false;
+
+/**
+ * Hand a finished Rework to the orchestrator, or hold it until the turn ends.
+ *
+ * Never throws: it is called from a detached path where a rejection would be an
+ * unhandled one.
+ */
+function reportReworkDone(details: ReworkDoneDetails, text: string): void {
+	const deliver = notifyReworkDone;
+	if (!deliver) return; // No orchestrator listening: the plan file is the report.
+	if (turnInFlight) {
+		pendingReworkReports.push({ details, text });
+		return;
+	}
+	try {
+		deliver(details, text);
+	} catch {
+		// A stale runtime (mid-reload) must not take the host down over a message.
+	}
+}
+
 /** Pane label the Board claims, and the marker used to re-find it. */
 const BOARD_PANE_LABEL = "Board";
 
@@ -1437,6 +1503,9 @@ async function dispatchRework(
 		// The worker's report is APPENDED to the note, not substituted for it:
 		// oracle's findings are why the Rework happened and must survive it, or the
 		// next reader sees a fix with no statement of what it was fixing.
+		// Captured inside the lock so the message below describes what actually
+		// happened to the Item, not what was assumed.
+		let reported = false;
 		await mutatePlan(file, (cur) => {
 			const target = cur.find((i) => i.id === id);
 			if (!target) return cur;
@@ -1447,6 +1516,7 @@ async function dispatchRework(
 			// The user may have accepted, re-routed or finished the Item during the
 			// minutes the worker took. Their hand wins, as with a late Verdict.
 			if (target.status !== "active") return cur;
+			reported = true;
 			target.note = [
 				target.note,
 				outcome.deadReason
@@ -1457,6 +1527,39 @@ async function dispatchRework(
 				.join("\n\n");
 			return cur;
 		});
+
+		// Tell the orchestrator. Without this the loop ends here: the note says
+		// "Re-review to judge it" and nothing reads notes, so a Rework that fixed the
+		// code left its Item sitting in `active` with no one aware it was waiting.
+		// That is a stall, not a state — the machine did the work and then failed to
+		// mention it.
+		//
+		// Skipped when the Item moved on (`reported` false): the user or another
+		// agent already took it somewhere, so there is nothing to decide.
+		//
+		// The re-review is deliberately NOT automatic. A Rework worker holds `write`,
+		// `edit` and `bash`, so this is the one place a reader can look at what a
+		// machine changed before another machine judges it — and re-reviewing without
+		// reading is how a bad fix gets blessed twice.
+		if (reported) {
+			reportReworkDone(
+				{ itemId: id, runId, completed: !outcome.deadReason },
+				outcome.deadReason
+					? [
+							`Rework of plan item ${id} did NOT complete: ${outcome.deadReason}.`,
+							"",
+							"The item is back in `active` and oracle's findings still stand.",
+							`Inspect it with \`/run ${runId}\`, then either fix the item yourself or move it to \`review\` again.`,
+						].join("\n")
+					: [
+							`Rework of plan item ${id} finished.`,
+							"",
+							`A fresh worker addressed oracle's findings and committed its work. Inspect it with \`/run ${runId}\`, or read the commit it made.`,
+							"",
+							`The item is in \`active\` and is NOT being re-judged on its own. Decide: move ${id} to \`review\` to have oracle judge the rework, revise it if the findings were wrong, or take the work over yourself.`,
+						].join("\n"),
+			);
+		}
 	} catch {
 		// Swallowed by design, as in dispatchReview: the plan file is the report.
 	}
@@ -2077,6 +2180,49 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// Session lifecycle
 	// -----------------------------------------------------------------------
+
+	// Bridge the detached Rework path to this session's message stream, and hold a
+	// report that lands mid-turn until the turn ends.
+	//
+	// Registered unconditionally, including in a review or rework child that loads
+	// this same extension: such a child never dispatches a Rework (the interlock
+	// refuses), so the callback is simply never invoked there.
+	notifyReworkDone = (details, text) => {
+		// A system message, never a simulated user message: the transcript is read
+		// again by compaction and by an agent reasoning about what the user actually
+		// asked for, and machine text attributed to the user corrupts both
+		// (docs/adr/0006).
+		pi.sendMessage<ReworkDoneDetails>(
+			{
+				customType: "plan_rework_done",
+				content: [{ type: "text", text }],
+				display: true,
+				details,
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+	};
+
+	pi.on("agent_start", () => {
+		turnInFlight = true;
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		// `isIdle` distinguishes a real settle from an intermediate one, the same
+		// check delegated Task Reminders make before delivering.
+		if (ctx?.isIdle?.() !== true) return;
+		turnInFlight = false;
+		// Drained rather than iterated: a report must be delivered exactly once, and
+		// `sendMessage` here starts a new turn, which re-enters `agent_start`.
+		const queued = pendingReworkReports.splice(0);
+		for (const report of queued) {
+			try {
+				notifyReworkDone?.(report.details, report.text);
+			} catch {
+				// One undeliverable report must not strand the others.
+			}
+		}
+	});
 
 	/**
 	 * On session start: restore the UI for an existing plan and re-inject it
