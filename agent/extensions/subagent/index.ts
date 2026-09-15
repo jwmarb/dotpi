@@ -1148,6 +1148,24 @@ async function executeNativeAttempt(
 		if (!pane) return false; // No pane: let the fallback run it.
 		paneOpened = true;
 		runResult.runPaneId = pane.paneId;
+
+		// Name the pane. The herdr plugin manifest gives every pane it opens the
+		// static title `Subagent run`, so without this a fan-out of six Runs is six
+		// identical panes and the user cannot tell which agent is which.
+		//
+		// `mirrorPaneLabel` is reused rather than reimplemented so a native Run and
+		// the Mirror Pane of the same Run read identically — the label is also the
+		// `findPaneByLabel` key, and two spellings of one Run's name is how a
+		// re-opener ends up opening a duplicate pane.
+		//
+		// Not awaited: the Run is already launched and being watched, and a label is
+		// cosmetic. `renamePane` never throws or rejects (every herdr failure
+		// resolves to null), so there is nothing to catch. Renaming the Tab is
+		// deliberately NOT done here — a Tab belongs to the whole Task and was
+		// already named for it upstream; each Run relabelling it would leave
+		// whichever spawned last as the name.
+		void renamePane(pane.paneId, mirrorPaneLabel(runResult));
+
 		onProgress();
 
 		// Cancelling a Native Run means closing its pane: the pane *is* the process's
