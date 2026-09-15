@@ -190,6 +190,20 @@ export async function renamePane(
 	return (await herdrCall(["pane", "rename", paneId, title])) !== null;
 }
 
+/**
+ * Rename a tab so the tab bar shows something meaningful.
+ *
+ * A tab created by `createTab` is labelled at creation, but a tab herdr made for
+ * a session it launched carries only its ordinal (`1`, `2`, …), so a session
+ * that wants a name has to set one itself.
+ */
+export async function renameTab(
+	tabId: string,
+	title: string,
+): Promise<boolean> {
+	return (await herdrCall(["tab", "rename", tabId, title])) !== null;
+}
+
 /** Run a command in a pane. Sends the text and Enter atomically. */
 export async function runInPane(
 	paneId: string,

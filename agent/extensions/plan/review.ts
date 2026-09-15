@@ -21,7 +21,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 // The shared admission cap: one machine, one budget (docs/adr/0040).
-import { closePane } from "../herdr/client.js";
+import { closePane, renamePane, renameTab } from "../herdr/client.js";
 import { herdrSocketAvailable, openPluginPane } from "../herdr/socket.js";
 import { DONE_TOOL_NAME } from "../subagent/child-done.js";
 // The launch planner and its pane contract, shared with delegated Runs so a
@@ -32,6 +32,7 @@ import {
 	RUN_ENTRYPOINT,
 	RUN_PLUGIN_ID,
 } from "../subagent/native.js";
+import { shortRunId } from "../subagent/rundir.js";
 import { claimSlot } from "../subagent/spawnlimit.js";
 import { watchNativeRun } from "../subagent/watcher.js";
 
@@ -228,6 +229,18 @@ export function parseAgentFile(raw: string): {
  * prompt, their spawn-slot kind, and the wording of a failure.
  */
 export type ChildPurpose = "review" | "rework";
+
+/**
+ * The agent name a purpose runs under.
+ *
+ * Kept beside {@link ChildPurpose} because it must agree with the `agent` passed
+ * to `createRunDir` in `index.ts` — that name is what `/runs` and the Run Index
+ * display, so a pane labelled differently from its own Run row would be worse
+ * than an unlabelled one.
+ */
+export function agentForPurpose(purpose: ChildPurpose): string {
+	return purpose === "rework" ? "worker" : "oracle";
+}
 
 /**
  * The instruction appended to the worker's own prompt for an autonomous Rework.
@@ -439,6 +452,26 @@ async function runReviewNatively(opts: {
 		env: paneEnv,
 	});
 	if (!pane) return null;
+
+	// Name the Tab and pane herdr just made. Without this both carry defaults — an
+	// ordinal in the tab bar and no pane label at all — so an autonomous review
+	// appearing unbidden is indistinguishable from any other session, which is
+	// exactly when knowing what it is matters most.
+	//
+	// The format matches a delegated Run's (`oracle (#44da80f1)`) rather than
+	// inventing a second convention: the two kinds of Run sit side by side in the
+	// same tab bar, and `plan-review 44da80f1` next to `explorer (#6748)` would
+	// read as a different kind of thing when it is not.
+	//
+	// Best-effort by design: a rename failing must not abandon a review that has
+	// already been spawned and is about to be watched.
+	const paneLabel = `${agentForPurpose(opts.purpose)} (#${shortRunId(opts.runId)})`;
+	try {
+		await renameTab(pane.tabId, paneLabel);
+		await renamePane(pane.paneId, paneLabel);
+	} catch {
+		// A label is cosmetic; the review is not.
+	}
 
 	const abort = new AbortController();
 	const deadline = setTimeout(() => abort.abort(), opts.timeoutMs);
