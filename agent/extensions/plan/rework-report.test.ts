@@ -151,77 +151,138 @@ describe("rework report delivery", () => {
  * because it was composed when the Rework landed and delivered later. So the
  * Item's state is re-read at delivery and the report dropped unless it is still
  * `active`. A message asking for settled work to be redone is worse than silence.
+ *
+ * The re-read is an **async** read: the settle handler drains the queue and then
+ * re-reads in a fire-and-forget task, yielding to the event loop. In that gap a
+ * new user turn can start — and a `followUp` sent mid-turn cannot be recalled,
+ * so delivering there would re-queue the very staleness this file pins. The drain
+ * therefore re-checks for a mid-turn delivery *after* the read and hands the
+ * report back to the queue. The fixture's `onRead` hook fires inside that gap so
+ * tests can exercise exactly that window.
  */
 describe("stale report suppression", () => {
-	/** The delivery rule, with the freshness re-check from `index.ts`. */
-	function makeQueue(planStatus: () => string) {
+	/**
+	 * The delivery rule plus the freshness re-check from `index.ts`, modelling
+	 * the production ordering: settle marks idle, the drain re-reads the plan
+	 * (an async read that yields), and delivery happens only if the re-read
+	 * still says `active` **and** no turn has started in the gap.
+	 */
+	function makeQueue(planStatus: (id: string) => string) {
 		const delivered: string[] = [];
 		const pending: string[] = [];
 		let turnInFlight = false;
 		return {
 			delivered,
+			pendingCount: () => pending.length,
 			startTurn: () => {
 				turnInFlight = true;
 			},
 			report(id: string) {
 				if (turnInFlight) pending.push(id);
-				else if (planStatus() === "active") delivered.push(id);
+				else if (planStatus(id) === "active") delivered.push(id);
 			},
-			settle() {
+			async settle(onRead: () => void = () => {}) {
 				turnInFlight = false;
 				for (const id of pending.splice(0)) {
 					// `reportStillStands`: re-read, not the state captured at landing.
-					if (planStatus() === "active") delivered.push(id);
+					const status = planStatus(id);
+					// The plan read yields to the event loop. `onRead` runs while the
+					// read is pending — the window in which a new `agent_start` can
+					// land in production.
+					await Promise.resolve();
+					onRead();
+					if (status !== "active") continue;
+					// A turn began while the re-read was pending: deliver nothing now,
+					// put the report back, let the next genuine settle re-check it.
+					if (turnInFlight) {
+						pending.push(id);
+						continue;
+					}
+					delivered.push(id);
 				}
 			},
 		};
 	}
 
-	test("drops a report whose item was moved on during the delaying turn", () => {
+	test("drops a report whose item was moved on during the delaying turn", async () => {
 		let status = "active";
 		const q = makeQueue(() => status);
 		q.startTurn();
 		q.report("p10");
 		// The orchestrator inspects the rework and acts, inside the same turn.
 		status = "review";
-		q.settle();
+		await q.settle();
 		expect(q.delivered).toEqual([]);
 	});
 
-	test("delivers a report whose item is still awaiting a decision", () => {
+	test("delivers a report whose item is still awaiting a decision", async () => {
 		const q = makeQueue(() => "active");
 		q.startTurn();
 		q.report("p10");
-		q.settle();
+		await q.settle();
 		expect(q.delivered).toEqual(["p10"]);
 	});
 
-	test("drops a report whose item was accepted outright", () => {
+	test("drops a report whose item was accepted outright", async () => {
 		let status = "active";
 		const q = makeQueue(() => status);
 		q.startTurn();
 		q.report("p10");
 		status = "done";
-		q.settle();
+		await q.settle();
 		expect(q.delivered).toEqual([]);
 	});
 
-	test("drops a report whose item no longer exists", () => {
+	test("drops a report whose item no longer exists", async () => {
 		let status = "active";
 		const q = makeQueue(() => status);
 		q.startTurn();
 		q.report("p10");
 		// Deleted: `reportStillStands` finds no item and returns false.
 		status = "(missing)";
-		q.settle();
+		await q.settle();
 		expect(q.delivered).toEqual([]);
 	});
 
-	test("one stale report does not block a fresh one behind it", () => {
+	test("one stale report does not block a fresh one behind it", async () => {
 		const statuses: Record<string, string> = { p10: "review", p11: "active" };
-		const delivered: string[] = [];
-		const pending = ["p10", "p11"];
-		for (const id of pending) if (statuses[id] === "active") delivered.push(id);
-		expect(delivered).toEqual(["p11"]);
+		const q = makeQueue((id) => statuses[id]);
+		q.startTurn();
+		q.report("p10");
+		q.report("p11");
+		await q.settle();
+		expect(q.delivered).toEqual(["p11"]);
+	});
+
+	test("does not deliver when a new turn starts while the re-read is pending (regression)", async () => {
+		// The race the first fix missed: settle drains the queue and starts the
+		// plan re-read, and a new user turn begins before the read resolves.
+		// A followUp sent mid-turn cannot be recalled — delivering there would
+		// re-create the stale notification this file exists to prevent. The
+		// report must go back to the queue, not out.
+		const q = makeQueue(() => "active");
+		q.startTurn();
+		q.report("p10");
+		await q.settle(() => {
+			q.startTurn();
+		});
+		expect(q.delivered).toEqual([]);
+		expect(q.pendingCount()).toBe(1);
+	});
+
+	test("re-checks a report re-queued by a mid-read turn at the next genuine settle (regression)", async () => {
+		let status = "active";
+		const q = makeQueue(() => status);
+		q.startTurn();
+		q.report("p10");
+		// A new turn starts while the re-read is pending: the report goes back.
+		await q.settle(() => {
+			q.startTurn();
+		});
+		// The turn that began mid-read deals with the rework itself.
+		status = "review";
+		await q.settle();
+		expect(q.delivered).toEqual([]);
+		expect(q.pendingCount()).toBe(0);
 	});
 });

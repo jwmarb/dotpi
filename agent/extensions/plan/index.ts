@@ -2386,6 +2386,16 @@ export default function (pi: ExtensionAPI) {
 					// turn that delayed the report. A message asking for a decision
 					// already taken is worse than silence.
 					if (!(await reportStillStands(report.details))) continue;
+					// The re-read just yielded to the event loop, and a new user turn can have
+					// started in that gap. `sendMessage` enqueues a `followUp` that cannot be
+					// recalled, so delivering mid-turn would re-queue the very staleness this
+					// queue exists to prevent: the message would announce a state the
+					// orchestrator has already handled. Hand the report back and let the next
+					// genuine idle re-check it.
+					if (turnInFlight) {
+						pendingReworkReports.push(report);
+						continue;
+					}
 					notifyReworkDone?.(report.details, report.text);
 				} catch {
 					// One undeliverable report must not strand the others.
