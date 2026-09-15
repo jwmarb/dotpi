@@ -553,6 +553,73 @@ export function canDelete(
 	return { ok: true };
 }
 
+/**
+ * Delete an Item from a plan file.
+ *
+ * The lookup and the {@link canDelete} policy run INSIDE the locked
+ * read-modify-write of {@link mutatePlan}, against the very snapshot that is
+ * rewritten: validating a pre-read snapshot would let a concurrent writer
+ * move the Item to a terminal state — or start a Rework — between the check
+ * and the delete, and the delete would then erase a record ADR 0014 keeps
+ * (docs/adr/0035). The liveness probe is re-run on that same snapshot, so a
+ * Rework started *after* the request is refused just like one already
+ * recorded (docs/adr/0041).
+ *
+ * A refusal persists nothing: the file is left exactly as the locked read saw
+ * it.
+ *
+ * @param file - Absolute path of the plan file.
+ * @param key - The plan key, used in the refusal messages.
+ * @param id - The id of the item to delete.
+ * @returns The deleted item's text and former state plus the surviving items
+ *          (ids are not renumbered, docs/adr/0030), or the refusal with its
+ *          error string.
+ * @throws {PlanLockTimeoutError} When the file stays locked past the wait
+ *         budget. Nothing is written; the caller reports it and the user or
+ *         agent retries (docs/adr/0035).
+ */
+export async function deletePlanItem(
+	file: string,
+	key: string,
+	id: string,
+): Promise<
+	| { ok: true; text: string; wasStatus: PlanState; remaining: PlanItem[] }
+	| { ok: false; error: string }
+> {
+	let outcome:
+		| { ok: true; text: string; wasStatus: PlanState }
+		| { ok: false; error: string }
+		| undefined;
+	const updated = await mutatePlan(file, async (cur) => {
+		const item = cur.find((i) => i.id === id);
+		const reworkAlive =
+			item?.reworkRunId !== undefined &&
+			(await reworkStillRunning(item.reworkRunId));
+		const allowed = canDelete(item, id, key, reworkAlive);
+		if (!allowed.ok) {
+			outcome = { ok: false, error: allowed.error };
+			return cur; // Refused: persist nothing changed.
+		}
+		const doomed = item!;
+		outcome = { ok: true, text: doomed.text, wasStatus: doomed.status };
+		// Ids are NOT renumbered: p3 disappearing leaves p2 and p4 alone.
+		// A Task ID, a note or a Run directory may already reference an id,
+		// and shifting ids under those references would silently repoint
+		// them at a different step (docs/adr/0030).
+		return cur.filter((i) => i.id !== doomed.id);
+	});
+	if (!outcome || !outcome.ok)
+		return {
+			ok: false,
+			error: outcome?.error ?? `Could not delete ${id} from ${key}.`,
+		};
+	return {
+		ok: true,
+		text: outcome.text,
+		wasStatus: outcome.wasStatus,
+		remaining: updated,
+	};
+}
 // ---------------------------------------------------------------------------
 // Plan file store
 // ---------------------------------------------------------------------------
@@ -2010,32 +2077,19 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "delete": {
-					if (!params.id)
+					const id = params.id;
+					if (!id)
 						return result('op "delete" requires "id".', undefined);
-					const items = await loadPlan(file);
-					const item = items.find((i) => i.id === params.id);
-					// Liveness is resolved here and the rule applied in `canDelete`, which
-					// stays pure so it can be tested directly.
-					const reworkAlive =
-						item?.reworkRunId !== undefined &&
-						(await reworkStillRunning(item.reworkRunId));
-					const allowed = canDelete(item, params.id, key, reworkAlive);
-					if (!allowed.ok) return result(allowed.error, undefined);
-					// Narrowed by `canDelete`, which refuses an absent item.
-					const doomed = item!;
-					const gone = doomed.text;
-					const wasStatus = doomed.status;
-					// Ids are NOT renumbered: p3 disappearing leaves p2 and p4 alone.
-					// A Task ID, a note or a Run directory may already reference an id,
-					// and shifting ids under those references would silently repoint
-					// them at a different step (docs/adr/0030).
-					const updated = await mutatePlan(file, (cur) =>
-						cur.filter((i) => i.id !== doomed.id),
-					);
-					view.items = updated;
+					// The policy runs inside the locked read-modify-write, not against a
+					// pre-read snapshot: a writer that moves the item to a terminal state
+					// (or starts a Rework) after the request must not see it erased
+					// (docs/adr/0035, docs/adr/0041).
+					const deleted = await deletePlanItem(file, key, id);
+					if (!deleted.ok) return result(deleted.error, undefined);
+					view.items = deleted.remaining;
 					view.file = file;
 					return result(
-						`Deleted ${doomed.id} (${wasStatus}) from ${key}: "${gone}". ${updated.length} item${updated.length === 1 ? "" : "s"} remain; ids are not renumbered.`,
+						`Deleted ${id} (${deleted.wasStatus}) from ${key}: "${deleted.text}". ${deleted.remaining.length} item${deleted.remaining.length === 1 ? "" : "s"} remain; ids are not renumbered.`,
 					);
 				}
 
