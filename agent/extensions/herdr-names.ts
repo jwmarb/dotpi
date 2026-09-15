@@ -56,10 +56,16 @@ function isChildRun(): boolean {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, _ctx) => {
-		// `startup` only: a resumed or compacted session is the same pane, already
-		// named, and renaming it again would fight a label the user has since set
-		// by hand.
-		if (event.reason !== "startup") return;
+		// `startup` and `reload` only. Both mean "this pane may not carry its name":
+		// a fresh session has never been named, and a reload is how this extension
+		// arrives in a pane that predates it — which is the common case for an
+		// existing session, and the one a `startup`-only guard silently missed.
+		//
+		// `new`, `resume` and `fork` are deliberately excluded. Those swap the
+		// session inside a pane that is already named, so relabelling would fight a
+		// name the user may have set by hand, and none of them can be the moment
+		// this extension first sees the pane.
+		if (event.reason !== "startup" && event.reason !== "reload") return;
 		try {
 			// A Run's tab and pane are named by whoever spawned it, and that naming
 			// is better than anything this file could produce — it knows the Task,
