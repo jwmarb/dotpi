@@ -22,7 +22,7 @@
  * them going missing would silently re-open that hole.
  */
 import { describe, expect, test } from "bun:test";
-import { isChildRun, namesOnReason } from "./herdr-names.ts";
+import { isChildRun, namesOnReason } from "../herdr-names.ts";
 
 /** A herdr-hosted session with no child-Run markers: a plain orchestrator. */
 const ORCHESTRATOR = {

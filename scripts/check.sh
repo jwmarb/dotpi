@@ -105,7 +105,24 @@ echo "${bold}Checking every extension source file${off} ${dim}(a parse error her
 # refactor can make a formatting-sensitive regex misclassify both ways. A new
 # entrypoint without a shebang is imported and "fails" the check; the fix is to
 # add the shebang it needs to be executable anyway.
+# A test file directly under agent/extensions/ is a bug in its own right: pi
+# auto-discovers every top-level `.ts` there as an extension, so `foo.test.ts`
+# is loaded at startup, fails on `bun:test`, and pi refuses to start — the same
+# startup-fatal shape this script exists to catch. Tests belong in a
+# subdirectory (`plan/`, `subagent/`, `herdr/`), which pi enters only via
+# `index.ts`. Checked before the loop so the message names the cause.
 while IFS= read -r file; do
+	case "$file" in
+	agent/extensions/*.test.ts)
+		if [ "$(dirname "$file")" = "agent/extensions" ]; then
+			fails=$((fails + 1))
+			note "$red" "FAIL" "$file"
+			printf '        %s\n' "a top-level test file is auto-loaded as an extension and will break pi's startup"
+			printf '        %s\n' "move it into a subdirectory, e.g. agent/extensions/herdr/names.test.ts"
+		fi
+		continue
+		;;
+	esac
 	case "$file" in
 	*.test.ts | *.d.ts) continue ;;
 	*.ts) ;;
