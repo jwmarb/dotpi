@@ -259,6 +259,49 @@ export function routeToAdopt(
 	return route === "user" ? null : route;
 }
 
+/**
+ * Adopt Autonomous Mode's default onto the Items that never stated a route.
+ *
+ * Mutates in place and returns the Items it changed, so the caller can say which
+ * ones moved and re-queue the ones already sitting in `review`.
+ *
+ * ## Why this exists
+ *
+ * `routeToAdopt` only fires on a *transition*, so an Item already parked in
+ * `review` when the mode is switched on never adopts anything — it waits for a
+ * reviewer that is never dispatched. That stranded five real Items, and "turn on
+ * Autonomous Mode" plainly reads as applying to the plan rather than only to work
+ * that happens to move afterwards.
+ *
+ * ## Why this is not the override ADR 0023 rejected
+ *
+ * 0023 rejected a plan-level route that *overrides per-Item choices*, and 0032
+ * rejected a mode that "silently auto-clears an Item deliberately routed `user`".
+ * Both objections are about overruling a decision somebody made. This touches
+ * **only Items with no route at all** — an inferred default, never a choice —
+ * which is the same absent-versus-explicit distinction `chosenRouteOf` draws for
+ * the ratchet. An Item explicitly routed `user` is left exactly as it is.
+ *
+ * Terminal Items are excluded for the same reason they are in `routeToAdopt`: a
+ * route decides who may clear an Item, and one already cleared must not have that
+ * question reopened.
+ */
+export function backfillRoutes(
+	items: PlanItem[],
+	meta: PlanMeta | null,
+): PlanItem[] {
+	const route = defaultRoute(meta);
+	if (route === "user") return []; // Mode off: `user` is already the default.
+	const changed: PlanItem[] = [];
+	for (const item of items) {
+		if (item.route !== undefined) continue;
+		if (TERMINAL.includes(item.status)) continue;
+		item.route = route;
+		changed.push(item);
+	}
+	return changed;
+}
+
 /** One line of a plan file: one Plan Item. */
 interface PlanItem {
 	/** Stable id within the file, `p1`, `p2`, ... (assigned at add/seed). */
@@ -995,7 +1038,7 @@ const PlanParams = Type.Object({
 			'delete = remove an item from the plan entirely (requires id). For an item created by mistake or made irrelevant. Only non-terminal items: a terminal item is the record of what happened, so use "dropped" to abandon work visibly rather than erasing it.',
 			"attach = record the Task ID of the subagent delegation executing an item (requires id and taskId).",
 			'route = set who may clear an item: "user" (you cannot clear it), "oracle" (a pass Verdict clears it), or "skip" (it never enters review). Requires id and route. An item with no route yet may be set to any route; once a route is explicit it only ever escalates skip → oracle → user, so you may always ask for more scrutiny, never less.',
-			'autonomous = turn Autonomous Mode on or off for the whole plan (requires "on"). While on, an item that has no route of its own picks up the "oracle" route on its next state change, so it is reviewed without the user. Items already routed keep their route.',
+			'autonomous = turn Autonomous Mode on or off for the whole plan (requires "on"). Turning it on adopts the "oracle" route for every item that has no route of its own, including ones already sitting in "review" (whose reviews are dispatched immediately), and any item groomed later picks it up too. An item you explicitly routed keeps its route, and a terminal item is never re-routed.',
 			'seed = create a fresh plan for another plan key — the way you write a subagent\'s Starter Plan after delegating (requires for and items). Never clobbers an existing plan.',
 			"archive = move the plan file to the archive (all items must be terminal; a no-op report if already archived).",
 			"show = read the current plan back.",
@@ -2076,19 +2119,46 @@ export default function (pi: ExtensionAPI) {
 					// Written through mutatePlan so the meta line is created under the
 					// same lock as any item write, and so an existing plan with no meta
 					// line gains one atomically (docs/adr/0035).
-					view.items = await mutatePlan(
+					//
+					// Switching the mode ON also adopts the default onto Items that never
+					// stated a route. Without that, an Item already sitting in `review`
+					// waits for a reviewer that is never dispatched, because the default is
+					// otherwise only applied on a transition and a parked Item never makes
+					// one — which stranded five real Items. Only *unrouted* Items are
+					// touched, so this is not the override ADR 0023 rejected; see
+					// `backfillRoutes`.
+					let adopted: PlanItem[] = [];
+					const updatedItems = await mutatePlan(
 						file,
-						(cur) => cur,
+						(cur) => {
+							if (on) adopted = backfillRoutes(cur, { kind: "plan-meta", autonomous: true });
+							return cur;
+						},
 						() => ({ kind: "plan-meta", autonomous: on }),
 					);
+					view.items = updatedItems;
 					view.file = file;
-					// Existing items are deliberately untouched: the mode supplies a
-					// default for items groomed from now on, and retro-routing work
-					// the user already chose to review would be exactly the override
-					// ADR 0023 rejected.
+
+					// An Item that adopted `oracle` while already in `review` needs its
+					// review dispatched here: dispatch normally rides on the transition
+					// *into* `review`, which has already happened for these.
+					const parked = adopted.filter((i) => i.status === "review");
+					if (!dispatchSuppressed())
+						for (const item of parked)
+							void dispatchReview(file, item.id, process.cwd());
+
+					const adoptedNote =
+						adopted.length === 0
+							? ` No item needed re-routing.`
+							: ` Adopted "oracle" for ${adopted.length} item${adopted.length === 1 ? "" : "s"} that had no route of their own (${adopted.map((i) => i.id).join(", ")}); items you had explicitly routed keep their route.${
+									parked.length > 0
+										? ` ${parked.length} of them ${parked.length === 1 ? "was" : "were"} already in "review", so ${parked.length === 1 ? "its" : "their"} review ${parked.length === 1 ? "was" : "were"} dispatched now (${parked.map((i) => i.id).join(", ")}).`
+										: ""
+								}`;
+
 					return result(
 						on
-							? `Autonomous Mode is ON for ${key}. Items you groom to "ready" from now on default to the "oracle" route instead of "user". Existing items keep their current route — nothing was re-routed. When such an item reaches "review" an oracle review is dispatched automatically: a pass clears it, a fail or unsure returns it to "active" with the findings in its note, and after two failed verdicts its route ratchets to "user".`
+							? `Autonomous Mode is ON for ${key}. An item with no route of its own defaults to "oracle" instead of "user".${adoptedNote} When such an item reaches "review" an oracle review is dispatched automatically: a pass clears it, a fail or unsure returns it to "active" with the findings in its note, and after two failed verdicts its route ratchets to "user".`
 							: `Autonomous Mode is OFF for ${key}. Items you groom from now on default to the "user" route. Items already routed to "oracle" keep that route — a route only ever escalates, so turning the mode off cannot lower them.`,
 					);
 				}

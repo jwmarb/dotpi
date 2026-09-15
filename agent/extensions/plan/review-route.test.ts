@@ -34,7 +34,7 @@
  * these tests pin down that it survives.
  */
 import { describe, expect, test } from "bun:test";
-import { canDelete, routeToAdopt, setRoute } from "./index.ts";
+import { backfillRoutes, canDelete, routeToAdopt, setRoute } from "./index.ts";
 
 const AUTONOMOUS = { kind: "plan-meta" as const, autonomous: true };
 const MANUAL = { kind: "plan-meta" as const, autonomous: false };
@@ -223,5 +223,94 @@ describe("canDelete", () => {
 		const res = canDelete(undefined, "p99", "k", false);
 		expect(res.ok).toBe(false);
 		if (!res.ok) expect(res.error).toContain("Unknown item id");
+	});
+});
+
+/**
+ * `backfillRoutes` adopts Autonomous Mode's default onto Items that never stated
+ * a route, including ones already parked in `review`.
+ *
+ * `routeToAdopt` only fires on a transition, so an Item sitting in `review` when
+ * the mode is switched on adopts nothing and waits for a reviewer that is never
+ * dispatched. That stranded five real Items in this repo's own plan.
+ *
+ * The load-bearing assertion is that an **explicitly** routed Item is untouched.
+ * ADR 0023 rejected a plan-level route that overrides per-Item choices, and 0032
+ * rejected a mode that silently auto-clears an Item deliberately routed `user`.
+ * Backfilling only *unrouted* Items is the absent-versus-explicit distinction
+ * again — if that ever slips, this turns into the override both ADRs refused.
+ */
+describe("backfillRoutes", () => {
+	const AUTO = { kind: "plan-meta" as const, autonomous: true };
+	const OFF = { kind: "plan-meta" as const, autonomous: false };
+
+	const plan = () => [
+		{ id: "p1", text: "unrouted, in review", status: "review" as const },
+		{ id: "p2", text: "unrouted, active", status: "active" as const },
+		{
+			id: "p3",
+			text: "pinned to user",
+			status: "review" as const,
+			route: "user" as const,
+		},
+		{ id: "p4", text: "unrouted but done", status: "done" as const },
+		{
+			id: "p5",
+			text: "already oracle",
+			status: "active" as const,
+			route: "oracle" as const,
+		},
+	];
+
+	test("adopts oracle for unrouted non-terminal items", () => {
+		const items = plan();
+		const changed = backfillRoutes(items, AUTO);
+		expect(changed.map((i) => i.id)).toEqual(["p1", "p2"]);
+		expect(items.find((i) => i.id === "p1")?.route).toBe("oracle");
+		expect(items.find((i) => i.id === "p2")?.route).toBe("oracle");
+	});
+
+	// The property that keeps this from being ADR 0023's rejected override.
+	test("never touches an item the user explicitly routed", () => {
+		const items = plan();
+		backfillRoutes(items, AUTO);
+		expect(items.find((i) => i.id === "p3")?.route).toBe("user");
+	});
+
+	test("leaves an already-oracle item alone", () => {
+		const items = plan();
+		const changed = backfillRoutes(items, AUTO);
+		expect(changed.map((i) => i.id)).not.toContain("p5");
+		expect(items.find((i) => i.id === "p5")?.route).toBe("oracle");
+	});
+
+	// A terminal item's route decides who may clear it; it is already cleared, so
+	// that question must not be reopened.
+	test("never routes a terminal item", () => {
+		const items = plan();
+		backfillRoutes(items, AUTO);
+		expect(items.find((i) => i.id === "p4")?.route).toBeUndefined();
+	});
+
+	test("reports the parked items so their reviews can be dispatched", () => {
+		// Dispatch normally rides on the transition into `review`, which has already
+		// happened for these — so the caller needs to know which they are.
+		const changed = backfillRoutes(plan(), AUTO);
+		expect(changed.filter((i) => i.status === "review").map((i) => i.id)).toEqual(["p1"]);
+	});
+
+	test("changes nothing when the mode is off or absent", () => {
+		for (const meta of [OFF, null, { kind: "plan-meta" as const }]) {
+			const items = plan();
+			expect(backfillRoutes(items, meta)).toEqual([]);
+			expect(items.find((i) => i.id === "p1")?.route).toBeUndefined();
+		}
+	});
+
+	test("is idempotent", () => {
+		const items = plan();
+		backfillRoutes(items, AUTO);
+		// Second call finds nothing left unrouted, so it cannot re-dispatch reviews.
+		expect(backfillRoutes(items, AUTO)).toEqual([]);
 	});
 });
