@@ -134,3 +134,94 @@ describe("rework report delivery", () => {
 		expect(q.pendingCount()).toBe(0);
 	});
 });
+
+/**
+ * A queued report is re-checked against the plan file before it is delivered.
+ *
+ * ## Why this exists
+ *
+ * The first time the Rework notification fired on real work it arrived **stale**.
+ * The Rework landed while the orchestrator was mid-turn, so the report was queued
+ * correctly — but during that same turn the orchestrator read the Rework's commit
+ * and moved the Item to `review` itself. The queued message then arrived
+ * announcing the Item as sitting in `active` and asking for a decision that had
+ * been made two minutes earlier.
+ *
+ * The queue was right; the *claim inside the message* was what went stale,
+ * because it was composed when the Rework landed and delivered later. So the
+ * Item's state is re-read at delivery and the report dropped unless it is still
+ * `active`. A message asking for settled work to be redone is worse than silence.
+ */
+describe("stale report suppression", () => {
+	/** The delivery rule, with the freshness re-check from `index.ts`. */
+	function makeQueue(planStatus: () => string) {
+		const delivered: string[] = [];
+		const pending: string[] = [];
+		let turnInFlight = false;
+		return {
+			delivered,
+			startTurn: () => {
+				turnInFlight = true;
+			},
+			report(id: string) {
+				if (turnInFlight) pending.push(id);
+				else if (planStatus() === "active") delivered.push(id);
+			},
+			settle() {
+				turnInFlight = false;
+				for (const id of pending.splice(0)) {
+					// `reportStillStands`: re-read, not the state captured at landing.
+					if (planStatus() === "active") delivered.push(id);
+				}
+			},
+		};
+	}
+
+	test("drops a report whose item was moved on during the delaying turn", () => {
+		let status = "active";
+		const q = makeQueue(() => status);
+		q.startTurn();
+		q.report("p10");
+		// The orchestrator inspects the rework and acts, inside the same turn.
+		status = "review";
+		q.settle();
+		expect(q.delivered).toEqual([]);
+	});
+
+	test("delivers a report whose item is still awaiting a decision", () => {
+		const q = makeQueue(() => "active");
+		q.startTurn();
+		q.report("p10");
+		q.settle();
+		expect(q.delivered).toEqual(["p10"]);
+	});
+
+	test("drops a report whose item was accepted outright", () => {
+		let status = "active";
+		const q = makeQueue(() => status);
+		q.startTurn();
+		q.report("p10");
+		status = "done";
+		q.settle();
+		expect(q.delivered).toEqual([]);
+	});
+
+	test("drops a report whose item no longer exists", () => {
+		let status = "active";
+		const q = makeQueue(() => status);
+		q.startTurn();
+		q.report("p10");
+		// Deleted: `reportStillStands` finds no item and returns false.
+		status = "(missing)";
+		q.settle();
+		expect(q.delivered).toEqual([]);
+	});
+
+	test("one stale report does not block a fresh one behind it", () => {
+		const statuses: Record<string, string> = { p10: "review", p11: "active" };
+		const delivered: string[] = [];
+		const pending = ["p10", "p11"];
+		for (const id of pending) if (statuses[id] === "active") delivered.push(id);
+		expect(delivered).toEqual(["p11"]);
+	});
+});

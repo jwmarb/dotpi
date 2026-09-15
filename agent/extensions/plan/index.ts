@@ -1212,6 +1212,16 @@ interface ReworkDoneDetails {
 	runId: string;
 	/** Whether the worker reached a normal end, as opposed to dying or wedging. */
 	completed: boolean;
+	/**
+	 * The plan file, so the Item's state can be re-read at *delivery*.
+	 *
+	 * A report queued mid-turn is delivered when the turn ends, and in that gap the
+	 * orchestrator may already have inspected the Rework and moved the Item on —
+	 * which happened the first time this fired for real. A message composed at
+	 * landing time would then assert a state that is no longer true and ask for a
+	 * decision already taken.
+	 */
+	file: string;
 }
 
 /**
@@ -1259,6 +1269,33 @@ function reportReworkDone(details: ReworkDoneDetails, text: string): void {
 		deliver(details, text);
 	} catch {
 		// A stale runtime (mid-reload) must not take the host down over a message.
+	}
+}
+
+/**
+ * Whether a queued report still describes reality, at the moment of delivery.
+ *
+ * A report is composed when the Rework lands but delivered when the turn ends,
+ * and in that gap the orchestrator may have read the Rework's commit and moved
+ * the Item on itself — which is exactly what happened the first time this fired
+ * for real: the message announced an Item as sitting in `active` and asked for a
+ * decision that had already been made two minutes earlier.
+ *
+ * So the Item is re-read here and the report dropped unless it is still `active`
+ * and still awaiting a decision. Delivering a stale one is worse than delivering
+ * nothing, because it invites the reader to redo settled work.
+ *
+ * Never throws: a failed read means "cannot confirm", and the plan file remains
+ * the durable record either way.
+ */
+async function reportStillStands(details: ReworkDoneDetails): Promise<boolean> {
+	try {
+		const items = await loadPlan(details.file);
+		const item = items.find((i) => i.id === details.itemId);
+		// Gone, or already moved on by the user or the orchestrator: nothing to decide.
+		return item?.status === "active";
+	} catch {
+		return false;
 	}
 }
 
@@ -1653,7 +1690,7 @@ async function dispatchRework(
 		// reading is how a bad fix gets blessed twice.
 		if (reported) {
 			reportReworkDone(
-				{ itemId: id, runId, completed: !outcome.deadReason },
+				{ itemId: id, runId, completed: !outcome.deadReason, file },
 				outcome.deadReason
 					? [
 							`Rework of plan item ${id} did NOT complete: ${outcome.deadReason}.`,
@@ -2339,13 +2376,22 @@ export default function (pi: ExtensionAPI) {
 		// Drained rather than iterated: a report must be delivered exactly once, and
 		// `sendMessage` here starts a new turn, which re-enters `agent_start`.
 		const queued = pendingReworkReports.splice(0);
-		for (const report of queued) {
-			try {
-				notifyReworkDone?.(report.details, report.text);
-			} catch {
-				// One undeliverable report must not strand the others.
+		// Fire-and-forget: `agent_settled` must return now, and each report re-reads
+		// the plan file before it is delivered.
+		void (async () => {
+			for (const report of queued) {
+				try {
+					// The Item may have moved while this sat in the queue — the
+					// orchestrator can read a Rework's commit and act on it inside the very
+					// turn that delayed the report. A message asking for a decision
+					// already taken is worse than silence.
+					if (!(await reportStillStands(report.details))) continue;
+					notifyReworkDone?.(report.details, report.text);
+				} catch {
+					// One undeliverable report must not strand the others.
+				}
 			}
-		}
+		})();
 	});
 
 	/**
