@@ -46,26 +46,41 @@ const CHILD_RUN_MARKERS = [
 	"PI_RUN_WRAPPER",
 ] as const;
 
-/** Whether this process is a child Run rather than a user's own session. */
-function isChildRun(): boolean {
+/**
+ * Whether a process is a child Run rather than a user's own session.
+ *
+ * Takes the environment rather than reading `process.env` so the five-way
+ * behaviour can be asserted directly. An extension is loaded once at pi startup
+ * and stays resident, so a predicate that can only be exercised by restarting pi
+ * is a predicate nothing checks.
+ *
+ * @param env - The environment to judge; defaults to this process's.
+ */
+export function isChildRun(env: NodeJS.ProcessEnv = process.env): boolean {
 	return CHILD_RUN_MARKERS.some((key) => {
-		const value = process.env[key];
+		const value = env[key];
 		return value !== undefined && value !== "";
 	});
 }
 
+/**
+ * Whether a `session_start` reason is a moment to (re)name this pane.
+ *
+ * `startup` is a fresh session that has never been named. `reload` is how this
+ * extension first arrives in a pane that predates it — excluding it is what made
+ * `/reload` load the code and then leave the pane unnamed.
+ *
+ * `new`, `resume` and `fork` swap the session inside a pane that is already
+ * named, so relabelling there would fight a name the user set by hand.
+ */
+export function namesOnReason(reason: string): boolean {
+	return reason === "startup" || reason === "reload";
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, _ctx) => {
-		// `startup` and `reload` only. Both mean "this pane may not carry its name":
-		// a fresh session has never been named, and a reload is how this extension
-		// arrives in a pane that predates it — which is the common case for an
-		// existing session, and the one a `startup`-only guard silently missed.
-		//
-		// `new`, `resume` and `fork` are deliberately excluded. Those swap the
-		// session inside a pane that is already named, so relabelling would fight a
-		// name the user may have set by hand, and none of them can be the moment
-		// this extension first sees the pane.
-		if (event.reason !== "startup" && event.reason !== "reload") return;
+		// Which reasons name a pane, and why, is documented on `namesOnReason`.
+		if (!namesOnReason(event.reason)) return;
 		try {
 			// A Run's tab and pane are named by whoever spawned it, and that naming
 			// is better than anything this file could produce — it knows the Task,
