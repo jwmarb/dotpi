@@ -194,4 +194,50 @@ describe("deletePlanItem", () => {
 		expect(res.ok).toBe(true);
 		expect(readPlan()).toEqual([]);
 	});
+	/**
+	 * A refusal must leave the file **byte-for-byte** as it was.
+	 *
+	 * `mutatePlan` used to rewrite the file after every callback, so a refused
+	 * delete still serialised the plan from its parsed items. That is lossy, and
+	 * silently so: `loadPlan` skips malformed lines and drops unrecognised fields,
+	 * so refusing to delete a terminal Item could destroy a corrupt line and an
+	 * unknown field on an operation that reported changing nothing.
+	 *
+	 * The earlier "unknown id changes nothing" test could not catch it, because a
+	 * canonical one-line plan survives a round-trip unchanged. This one uses
+	 * content that does not.
+	 */
+	test("a refusal leaves a non-canonical file byte-for-byte intact", async () => {
+		mkdirSync(path.dirname(PLAN_FILE), { recursive: true });
+		const original = [
+			'{"kind":"plan-meta","autonomous":true}',
+			// An unrecognised field, which loadPlan drops on a round-trip.
+			'{"id":"p1","text":"terminal","status":"done","customField":"KEEP ME"}',
+			// A malformed line, which loadPlan skips entirely.
+			"THIS LINE IS NOT JSON",
+			'{"id":"p2","text":"live","status":"active"}',
+		].join("\n") + "\n";
+		writeFileSync(PLAN_FILE, original);
+
+		// Refused: p1 is terminal.
+		const terminal = await deletePlanItem(PLAN_FILE, KEY, "p1");
+		expect(terminal.ok).toBe(false);
+		expect(readFileSync(PLAN_FILE, "utf-8")).toBe(original);
+
+		// Refused: no such item.
+		const unknown = await deletePlanItem(PLAN_FILE, KEY, "p99");
+		expect(unknown.ok).toBe(false);
+		expect(readFileSync(PLAN_FILE, "utf-8")).toBe(original);
+
+		// A real delete may rewrite the file — that is the point of it — but it must
+		// still not invent or lose items it was not asked about.
+		const ok = await deletePlanItem(PLAN_FILE, KEY, "p2");
+		expect(ok.ok).toBe(true);
+		expect(readFileSync(PLAN_FILE, "utf-8")).not.toBe(original);
+		// `readPlan` here parses every line, so the plan-meta line appears as an
+		// entry with no id — filter it out rather than assert on its shape.
+		expect(readPlan().filter((i) => i.id).map((i) => i.id)).toEqual(["p1"]);
+		// The meta line survived the real write, which is the bug ADR 0032 records.
+		expect(readFileSync(PLAN_FILE, "utf-8")).toContain('"kind":"plan-meta"');
+	});
 });

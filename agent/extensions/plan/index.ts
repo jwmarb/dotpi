@@ -598,7 +598,10 @@ export async function deletePlanItem(
 		const allowed = canDelete(item, id, key, reworkAlive);
 		if (!allowed.ok) {
 			outcome = { ok: false, error: allowed.error };
-			return cur; // Refused: persist nothing changed.
+			// NO_WRITE, not `cur`: returning the items would rewrite the file from
+			// the parsed list and silently drop malformed lines and unknown fields
+			// on an operation that reports changing nothing.
+			return NO_WRITE;
 		}
 		const doomed = item!;
 		outcome = { ok: true, text: doomed.text, wasStatus: doomed.status };
@@ -981,26 +984,54 @@ async function lockDirAge(lockDir: string): Promise<number> {
 }
 
 /**
+ * Returned by a {@link mutatePlan} callback to mean "write nothing at all".
+ *
+ * Several operations validate inside the lock and then refuse — a terminal Item
+ * that may not be deleted, an unknown id, a Rework still holding an Item. Those
+ * used to `return cur` and were documented as persisting nothing, which was false:
+ * `mutatePlan` rewrote the file unconditionally, and because `loadPlan` skips
+ * malformed lines and drops unrecognised fields, that rewrite could *destroy data*
+ * on an operation that reported changing nothing. Measured on a non-canonical
+ * plan file, a refused delete silently removed both a corrupt line and an unknown
+ * field.
+ *
+ * A sentinel rather than a boolean flag or a nullable return, because the callback
+ * already returns the item list: this keeps "no change" impossible to express by
+ * accident, and impossible to confuse with "an empty plan".
+ */
+const NO_WRITE = Symbol("plan:no-write");
+
+/**
  * Atomically read, transform, and rewrite a plan file as one unit of the
  * per-file mutation queue — concurrent tool calls on the same key cannot lose
  * each other's items.
+ *
+ * A callback that returns {@link NO_WRITE} leaves the file completely untouched —
+ * not rewritten from the parsed items — which is what a validate-then-refuse
+ * operation needs in order to honestly persist nothing.
  *
  * The items handed to `mutate` are always re-read from disk under the lock, so
  * a change the Board made since this process last looked is never clobbered
  * (docs/adr/0015).
  *
  * @param file - Absolute path of the plan file.
- * @param mutate - Transform from current items to the next items.
+ * @param mutate - Transform from current items to the next items, or
+ *        {@link NO_WRITE} to abandon the write and leave the file byte-for-byte
+ *        as it was.
  * @param mutateMeta - Optional transform of the plan-meta line. Omit it to carry
  *        existing meta through unchanged; meta is always preserved either way.
- * @returns The item list that was persisted.
+ *        Not consulted when the items callback returns {@link NO_WRITE}.
+ * @returns The item list that was persisted, or the items as read when the
+ *          callback declined to write.
  * @throws {PlanLockTimeoutError} When another writer holds the lock for longer
  *         than the wait budget. Nothing is written; the caller reports it and
  *         the user or agent retries (docs/adr/0035).
  */
 async function mutatePlan(
 	file: string,
-	mutate: (items: PlanItem[]) => PlanItem[] | Promise<PlanItem[]>,
+	mutate: (
+		items: PlanItem[],
+	) => PlanItem[] | typeof NO_WRITE | Promise<PlanItem[] | typeof NO_WRITE>,
 	mutateMeta?: (meta: PlanMeta | null) => PlanMeta | null,
 ): Promise<PlanItem[]> {
 	let next: PlanItem[] = [];
@@ -1008,7 +1039,16 @@ async function mutatePlan(
 		const release = await acquirePlanLock(file);
 		try {
 			const items = await loadPlan(file);
-			next = await mutate(items);
+			const result = await mutate(items);
+			if (result === NO_WRITE) {
+				// Return before the file is touched at all. Rewriting it from `items`
+				// would be lossy even though nothing "changed": `loadPlan` drops
+				// malformed lines and unrecognised fields, so a refusal would silently
+				// delete data it never reported deleting.
+				next = items;
+				return;
+			}
+			next = result;
 			// Meta is read and rewritten inside the same lock as the items. Without
 			// this the first mutation after setting Autonomous Mode would silently
 			// delete it, since the file is rewritten wholly from the item list.
@@ -2149,7 +2189,9 @@ export default function (pi: ExtensionAPI) {
 					let outcome: ReturnType<typeof attachTaskId> | undefined;
 					const updated = await mutatePlan(file, (cur) => {
 						outcome = attachTaskId(cur, key, id, taskId);
-						if (!outcome.ok) return cur; // Refused: persist nothing changed.
+						// NO_WRITE so a refusal really is a no-op on disk; `cur` would
+						// rewrite the file lossily (see mutatePlan).
+						if (!outcome.ok) return NO_WRITE;
 						for (const it of cur) if (it.id === id) it.taskId = taskId;
 						return cur;
 					});
