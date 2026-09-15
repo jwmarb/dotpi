@@ -73,9 +73,14 @@ definitions, most ADRs) has 0 post-introduction commits.
 `subagent/watcher.ts`, `subagent/native.ts`, `subagent/child-done.ts`. All
 three were introduced by `e90f305` ("Run autonomous reviews and reworks as
 native Runs"), the single largest non-root commit in the repo (2,163 insertions) and the
-dominant post-introduction contributor to every core hotspot: 444 of 707 lines
-in `subagent/index.ts`, all 266 in `spawnlimit.ts`, 199 of 443 in
-`plan/review.ts`. A review of the hotspots that omits this commit's
+dominant post-introduction contributor to **two of the three** core hotspots:
+444 of 707 lines in `subagent/index.ts` and 199 of 443 in `plan/review.ts`. It
+is *not* dominant in the top-ranked hotspot: only 13 of `plan/index.ts`'s 963
+lines are its, because that file's churn is the plan tool's own evolution
+(**Review Route**, **Autonomous Mode**, **Rework**) rather than the native-Run
+work. (An earlier draft claimed "every core hotspot" and cited `spawnlimit.ts`,
+which is second tier, not core.) A review of `subagent/index.ts` and
+`plan/review.ts` that omits this commit's
 introductions would review the modifications while skipping the code they
 modify. `watcher.ts` (402 lines) is additionally the largest chunk of code
 with zero post-introduction history — the least battle-tested code in the
@@ -86,11 +91,17 @@ explanation rather than by rank.
 
 - `herdr/socket.ts` (492 lines at introduction, `e8c2058`) and
   `dynamic-prompt.ts` (large at root): big files with ≤9 post-introduction
-  changed lines — size is not churn. Both appear in the introduction table.
+  changed lines — size is not churn. `socket.ts` appears in the introduction
+  table below; `dynamic-prompt.ts` cannot, because it exists at the root commit
+  and that table covers only files introduced after it.
 - Docs (`CONTEXT.md`, `PATCHES.md`, `docs/adr/*`): ranked in the table, out of
   code-review scope.
 
 ## Files introduced after the root commit (introduction churn, separate table)
+
+All 31 of them, at snapshot `27e3bb1`, largest first. (An earlier draft
+listed only the top 12 while claiming to list every file — the claim, not the
+cut-off, was the error.)
 
 | Lines at introduction | Commit | File |
 |---|---|---|
@@ -106,3 +117,22 @@ explanation rather than by rank.
 | 180 | `3b6a1af` | `agent/extensions/litellm.ts` |
 | 147 | `232b43e` | `agent/extensions/subagent/prompts.ts` |
 | 145 | `c2ff96a` | `scripts/check-thinking-label-patch.mjs` |
+| 136 | `0d0fd3d` | `agent/extensions/plan/rework-report.test.ts` |
+| 119 | `3b6a1af` | `docs/adr/0042-credentials-come-from-a-dotenv-file.md` |
+| 114 | `da3e4b8` | `agent/extensions/subagent/spawnlimit.ts` |
+| 104 | `7d5383e` | `scripts/check.sh` |
+| 100 | `6f5c571` | `agent/extensions/herdr/names.test.ts` |
+| 83 | `43ef5f5` | `agent/extensions/herdr-names.ts` |
+| 80 | `e90f305` | `agent/extensions/subagent/native.test.ts` |
+| 76 | `e90f305` | `docs/adr/0044-native-runs-herdr-owns-the-process.md` |
+| 75 | `f0a866f` | `agent/extensions/git-hooks.ts` |
+| 75 | `e90f305` | `herdr-plugin/README.md` |
+| 43 | `7d5383e` | `.githooks/pre-commit` |
+| 26 | `e90f305` | `herdr-plugin/dispatch.sh` |
+| 21 | `e90f305` | `herdr-plugin/herdr-plugin.toml` |
+| 19 | `8935a8d` | `docs/adr/0041-rework-is-done-by-a-fresh-run.md` |
+| 17 | `da3e4b8` | `docs/adr/0040-one-spawn-cap-for-every-child.md` |
+| 12 | `bfcd5f3` | `docs/adr/0045-injected-prompt-joins-the-run-directory.md` |
+| 12 | `3b6a1af` | `agent/.env.example` |
+| 10 | `3b6a1af` | `agent/mcp.json` |
+| 9 | `1693f59` | `docs/adr/0043-card-title-is-the-whole-item-text.md` |
