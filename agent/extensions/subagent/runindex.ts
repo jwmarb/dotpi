@@ -319,6 +319,29 @@ export async function scanRunDirs(agentDir: string): Promise<RunIndexEntry[]> {
 }
 
 /**
+ * Group a scanned index by Task ID, each Task's Runs ordered by ordinal so
+ * `#1` reads before `#2` — the same ordering `formatRunIndex` applies, for
+ * consumers that address Runs individually (the `prompt` action) rather than
+ * render them. A string sort would put `-10` before `-2`.
+ */
+export function groupRunsByTask(
+	entries: RunIndexEntry[],
+): Map<string, RunIndexEntry[]> {
+	const byId = new Map<string, RunIndexEntry[]>();
+	for (const e of entries) {
+		let runs = byId.get(e.taskId);
+		if (!runs) {
+			runs = [];
+			byId.set(e.taskId, runs);
+		}
+		runs.push(e);
+	}
+	for (const runs of byId.values())
+		runs.sort((a, b) => ordinalOf(a) - ordinalOf(b));
+	return byId;
+}
+
+/**
  * Relative time in the "5m ago" style; anything under a minute is "just now".
  */
 function relativeTime(fromMs: number, nowMs: number = Date.now()): string {

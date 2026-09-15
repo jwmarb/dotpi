@@ -65,6 +65,7 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { extractResult } from "./results.js";
 import { reapSessions, thawRun } from "./reaper.js";
 import { formatRunIndex, scanRunDirs } from "./runindex.js";
+import { collectTaskPrompts } from "./prompts.js";
 import { DONE_TOOL_NAME } from "./child-done.js";
 import {
 	buildLaunchPlan,
@@ -2454,6 +2455,59 @@ export default function (pi: ExtensionAPI) {
 					details: detailsFor([]),
 				};
 			}
+			if (params.action === "prompt") {
+				// Read-only: the prompt is recorded at spawn (docs/adr/0045) and lives
+				// on disk, so this claims no notification and closes no tab.
+				//
+				// Resolution spans both sources, for the same reason `list` and
+				// `open` do: the registry is memory-only (docs/adr/0001), so a Task
+				// from an earlier session has no registry entry at all — only its
+				// Run directories. The prompt is disk evidence precisely because the
+				// registry dies with the session, so a live-only lookup would report
+				// every earlier-session Task as unknown.
+				const promptIds = params.taskIds ?? [];
+				if (promptIds.length === 0)
+					return {
+						content: [
+							{
+								type: "text",
+								text: `action "prompt" requires taskIds. Use action "list" to see the tasks in this session, or /runs to see earlier sessions.`,
+							},
+						],
+						details: detailsFor([]),
+						isError: true,
+					};
+
+				const { lines, live, missing } = await collectTaskPrompts(
+					getAgentDir(),
+					(id) => registry.get(id),
+					promptIds,
+				);
+				if (lines.length === 0)
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Unknown task id(s): ${missing.join(", ")}. Use action "list" to see the tasks in this session, or /runs to see earlier sessions.`,
+							},
+						],
+						details: detailsFor([]),
+						isError: true,
+					};
+
+				const missingNote =
+					missing.length > 0
+						? `\n\n(unknown task id(s): ${missing.join(", ")})`
+						: "";
+				return {
+					content: [{ type: "text", text: lines.join("\n\n") + missingNote }],
+					details: detailsFor(
+						live
+							.map((id) => registry.get(id))
+							.filter((t): t is Task => t !== undefined),
+					),
+				};
+			}
 
 			const ids = params.taskIds ?? [];
 			if (ids.length === 0)
@@ -2490,36 +2544,6 @@ export default function (pi: ExtensionAPI) {
 
 			const missingNote =
 				missing.length > 0 ? `\n\n(unknown task id(s): ${missing.join(", ")})` : "";
-
-			if (params.action === "prompt") {
-				// Read-only: the prompt is recorded at spawn (docs/adr/0045) and lives
-				// on disk, so this claims no notification and closes no tab.
-				const lines: string[] = [];
-				for (const task of found) {
-					lines.push(`${task.id}:`);
-					for (const run of task.runs) {
-						lines.push(
-							`─── ${run.step ? `step ${run.step}: ` : ""}${run.agent}`,
-						);
-						const promptPath = path.join(
-							runsRoot(getAgentDir()),
-							run.runId,
-							"prompt.md",
-						);
-						let text: string;
-						try {
-							text = await fs.promises.readFile(promptPath, "utf-8");
-						} catch {
-							text = "(no prompt recorded — the Run predates prompt recording, or was refused before spawn)";
-						}
-						lines.push(text.trimEnd());
-					}
-				}
-				return {
-					content: [{ type: "text", text: lines.join("\n\n") + missingNote }],
-					details: detailsFor(found),
-				};
-			}
 
 			if (params.action === "status") {
 				const text = found.map(formatTaskStatus).join("\n\n");
