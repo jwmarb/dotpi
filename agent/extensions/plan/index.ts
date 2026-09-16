@@ -186,10 +186,19 @@ function chosenRouteOf(item: PlanItem): ReviewRoute | null {
  * The **Review Budget**: failed Verdicts allowed on one Item before its route
  * ratchets to `user`.
  *
- * Two, so a problem oracle keeps rejecting reaches a human rather than consuming
- * Runs forever (docs/adr/0032).
+ * Twenty — effectively unlimited, with a floor. The ratchet is still a real
+ * backstop against an oracle that rejects forever, but it is deliberately set
+ * far beyond the number of rounds any honest item needs, so it behaves as a
+ * runaway stop rather than as a routine handoff to the user.
+ *
+ * It was two, on the reasoning that a problem oracle should reach a human
+ * quickly (docs/adr/0032). In practice two rounds is not much: an item can be
+ * genuinely improved by each **Rework** and still be rejected twice on
+ * different grounds, and the ratchet then parks correct-and-improving work in
+ * front of a human who has nothing to add. Raising the ceiling keeps the
+ * guarantee that the loop terminates while letting the loop actually run.
  */
-const REVIEW_BUDGET = 2;
+const REVIEW_BUDGET = 20;
 
 /**
  * Per-plan settings, stored as a single `kind: "plan-meta"` line in the plan
