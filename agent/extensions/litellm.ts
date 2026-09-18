@@ -116,6 +116,25 @@ async function fetchJson<T>(url: string): Promise<T | null> {
 }
 
 /**
+ * pi thinking levels mapped to the effort values the qwen model groups accept
+ * upstream, verified 2026-09-18 against the live proxy.
+ *
+ * qwen only accepts `low` / `medium` / `xhigh` — anything else (including pi's
+ * `high`, `minimal` and `max`) 400s with "Unexpected reasoning effort". Higher
+ * pi levels clamp to `xhigh`, the top effort; `off` maps to `none`, the one
+ * value the proxy accepts that actually disables thinking (sending no effort
+ * at all would leave the model on its default, which is `xhigh`).
+ */
+const QWEN_THINKING_LEVEL_MAP = {
+  off: 'none',
+  minimal: 'low',
+  low: 'low',
+  medium: 'medium',
+  high: 'xhigh',
+  xhigh: 'xhigh',
+  max: 'xhigh',
+} as const;
+/**
  * LiteLLM proxy extension. Fetches model metadata from a LiteLLM proxy and
  * registers it as a provider, including per-token costs and cache read/write rates.
  *
@@ -165,6 +184,11 @@ export default async function (pi: ExtensionAPI) {
         id: m.model_group,
         name: m.model_group,
         reasoning: m.supports_reasoning,
+        thinkingLevelMap: m.supports_reasoning
+          ? m.model_group.startsWith('qwen/')
+            ? QWEN_THINKING_LEVEL_MAP
+            : { xhigh: 'xhigh' }
+          : undefined,
         input: m.supports_vision ? (['text', 'image'] as const) : (['text'] as const),
         cost: {
           input: perMillionTokens(m.input_cost_per_token),
