@@ -2080,9 +2080,10 @@ export default function (pi: ExtensionAPI) {
 	 * for *main* sessions (a resumed session's conversation no longer
 	 * contains the plan).
 	 *
-	 * Subagent children (PI_PLAN_KEY set) are deliberately not injected:
-	 * their Starter Plan arrives in the delegation prompt, and duplicating
-	 * it into context would just burn tokens (docs/adr/0012).
+		 * Subagent children (PI_PLAN_KEY set) are deliberately not injected:
+	 * their Starter Plan is seeded into their own plan file at spawn
+	 * (docs/adr/0048), and duplicating it into context would just burn
+	 * tokens (docs/adr/0012).
 	 */
 	pi.on("session_start", (_event, ctx) => {
 		if (!process.env.PI_PLAN_KEY) {
