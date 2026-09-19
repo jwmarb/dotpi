@@ -1,5 +1,5 @@
 /**
- * Reading back the Injected prompt (docs/adr/0045).
+ * Reading back the prompt recorded at spawn (docs/adr/0045, docs/adr/0047).
  *
  * The prompt is recorded at spawn as `prompt.md` in the Run directory, so
  * reading it back is a disk operation even for the current session — the
@@ -50,6 +50,9 @@ export interface PromptTask {
  *
  * Never throws: a missing prompt is a reportable state, not an error
  * (docs/adr/0045).
+ *
+ * For a plan-spawned Run the file additionally carries the **Delegation brief**,
+ * marked as the first user message (docs/adr/0047).
  */
 export async function readRunPrompt(
 	agentDir: string,

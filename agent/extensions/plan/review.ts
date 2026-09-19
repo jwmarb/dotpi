@@ -625,7 +625,7 @@ export async function runReview(opts: {
 	let tmpDir: string | null = null;
 	try {
 		tmpDir = await mkdtemp(path.join(os.tmpdir(), `pi-plan-${purpose}-`));
-		const promptPath = path.join(tmpDir, "prompt.md");
+		const promptPath = path.join(tmpDir, "system-prompt.md");
 		await writeFile(promptPath, agent.body, "utf-8");
 
 		// The Run directory records the whole delegation payload — the agent
@@ -635,6 +635,11 @@ export async function runReview(opts: {
 		// content byte-for-byte; a plan-spawned Run's brief no longer crosses
 		// that flag, so its record marks the channel instead.
 		if (opts.runDir && opts.runId) {
+			// createRunDir's mkdir is best-effort — a labelling failure must not
+			// cost the Run — so ensure the directory here: a missing dir would ENOENT
+			// the write and kill the review as "not prepared", and a dead review
+			// spends no Review Budget, so the Item would retry into the same hole.
+			await fs.promises.mkdir(opts.runDir, { recursive: true });
 			await writePromptToRunDir(
 				opts.runDir,
 				[agent.body, "## First user message", brief].join("\n\n---\n\n"),

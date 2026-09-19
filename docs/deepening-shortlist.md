@@ -39,7 +39,7 @@ watchdog, TERM→KILL reaping, Mirror Pane).
 **Evidence of drift already present — narrowed.** Three things are duplicated
 verbatim across the two branches: skill resolution and `runResult` population
 (1084 native, 1315 fallback), the `sessionDir` mkdir (1106, 1336), and the
-`prompt.md` sidecar write (1107, 1339; ADR 0045).
+`prompt.md` sidecar write (1107, 1339; ADR 0045 — a shared `writePromptToRunDir` call since ADR 0047).
 
 **What is *not* evidence** (corrected after review):
 

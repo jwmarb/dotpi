@@ -317,6 +317,7 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	await Promise.all(workers);
 	return results;
 }
+
 /**
  * Determine how to re-invoke the current `pi` process.
  */
@@ -1706,7 +1707,7 @@ const TasksParams = Type.Object({
 		["list", "status", "result", "prompt", "wait", "cancel", "open"] as const,
 		{
 			description:
-			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; prompt = the prompt each run was started with, recorded at spawn (the injected system prompt for delegated runs; for plan-spawned runs the agent definition plus the delegation brief, marked as the first user message); wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view)."
+			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; prompt = the prompt each run was started with, recorded at spawn (the injected system prompt for delegated runs; for plan-spawned runs the agent definition plus the delegation brief, marked as the first user message); wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view).",
 		},
 	),
 	taskIds: Type.Optional(
