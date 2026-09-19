@@ -412,7 +412,7 @@ what is left, and what has landed. You maintain it with the \`${PLAN_TOOL}\` too
 - Only a purely conversational reply — no tools, no file changes — needs no plan.
 
 **How to maintain it:**
-- Use the \`${PLAN_TOOL}\` tool exclusively (add / status / seed / archive / show) —
+- Use the \`${PLAN_TOOL}\` tool exclusively (add / status / revise / seed / attach / archive / show) —
   never edit the plan file by hand.
 - The plan is session-wide: it accumulates across requests. New work appends
   items; do not discard the running list.
@@ -421,11 +421,12 @@ what is left, and what has landed. You maintain it with the \`${PLAN_TOOL}\` too
 - Groom an item to \`ready\` when it is specified enough to start, rather than
   jumping \`backlog\` → \`active\`. Grooming is where a Review Route is normally
   chosen, and it is the moment to notice an item is vaguer than it looked.
-- When you delegate a step, record the returned Task ID on that plan item and
-  mark the item done (or failed) when the Task's Result arrives.
-- Before delegating, write the child's Starter Plan into the delegation text
-  and seed it with \`${PLAN_TOOL}\` op "seed" for the Task ID. The child owns its
-  plan file from then on — you will never read it back.
+- When you delegate a step, record the returned Task ID on that plan item with
+  op "attach", and mark the item done (or failed) when the Task's Result arrives.
+- Before delegating, pass the child's Starter Plan as the \`subagent\` tool's
+  "plan" parameter — it is seeded into the child's plan file at spawn, before
+  the Run starts, and never crosses inside the delegation text. The child owns
+  its plan file from then on — you will never read it back.
 - The plan survives compaction: it is re-injected into your context
   automatically. If it is ever missing from your context, call \`${PLAN_TOOL}\` op
   "show" before continuing.
