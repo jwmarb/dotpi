@@ -726,7 +726,7 @@ const PlanParams = Type.Object({
 			"attach = record the Task ID of the subagent delegation executing an item (requires id and taskId).",
 			'route = set who may clear an item: "user" (you cannot clear it), "oracle" (a pass Verdict clears it), or "skip" (it never enters review). Requires id and route. An item with no route yet may be set to any route; once a route is explicit it only ever escalates skip → oracle → user, so you may always ask for more scrutiny, never less.',
 			'autonomous = turn Autonomous Mode on or off for the whole plan (requires "on"). Turning it on adopts the "oracle" route for every item that has no route of its own, including ones already sitting in "review" (whose reviews are dispatched immediately), and any item groomed later picks it up too. An item you explicitly routed keeps its route, and a terminal item is never re-routed.',
-			'seed = create a fresh plan for another plan key — the way you write a subagent\'s Starter Plan after delegating (requires for and items). Never clobbers an existing plan.',
+			'seed = create a fresh plan for another plan key — the ad-hoc path for writing a plan for a key after the fact (a child\'s Starter Plan is normally seeded at spawn via the subagent tool\'s "plan" parameter) (requires for and items). Never clobbers an existing plan.',
 			"archive = move the plan file to the archive (all items must be terminal; a no-op report if already archived).",
 			"show = read the current plan back.",
 		].join(" "),
@@ -788,7 +788,7 @@ const PlanParams = Type.Object({
 	for: Type.Optional(
 		Type.String({
 			description:
-				"Plan key to address, overriding the default (this session's plan). Use the Task ID of a subagent you just delegated to, e.g. sub-a3f1 — that is how you seed its Starter Plan.",
+				"Plan key to address, overriding the default (this session's plan). To address a subagent's plan file, use the Task ID of the delegation that spawned it, e.g. sub-a3f1 — its Starter Plan is seeded there at spawn via the subagent tool's \"plan\" parameter; op seed for that key is the ad-hoc after-the-fact path.",
 		}),
 	),
 });
