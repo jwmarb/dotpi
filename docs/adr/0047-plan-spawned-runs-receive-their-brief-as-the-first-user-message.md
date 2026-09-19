@@ -1,0 +1,15 @@
+# Plan-spawned Runs receive their brief as the first user message
+
+**Status:** accepted
+
+Autonomous reviews and Rework runs (plan-spawned `pln-` Runs) previously received their brief — the item text, the oracle's findings, the Verdict contract — in a temporary system-prompt file, while the child's first user message was a boilerplate pointer ("Carry out the rework described in your system prompt."). A user watching the Run Pane therefore saw only the pointer, and because the temp file was deleted when the attempt ended, no observer — the user, the /runs row, `subagent_tasks` `prompt` — could answer what the Run had been asked (the `prompt.md` exception of ADR 0045). Delegated `sub-` Runs never had this shape: their task crosses as the first user message and `--append-system-prompt` carries the agent definition, so the transcript records what the Run was asked.
+
+**Decision:** a plan-spawned Run's brief crosses as the child's first user message — verbatim, no prefix — on both spawn paths (Native and piped). The channel mirrors the `sub-` mechanism, and the verbatim form matches that mechanism's native path; the Fallback path prefixes a delegated task with `Task: `, and plan-spawned Runs take no prefix on either path. The `--append-system-prompt` channel shrinks to the agent definition alone. The Run directory records `prompt.md` at spawn containing the agent definition plus the brief, marked as the first user message, so the directory answers "what was this Run asked" on its own. This closes ADR 0045's `pln-` exception: every Run directory now carries a `prompt.md`.
+
+**Considered options.**
+
+- *A summary user message with the full contract left in the system prompt.* The pane shows only a gist, and the system prompt and the transcript then disagree about what the Run is.
+- *Duplicate the contract in both channels.* Costs tokens twice and creates two copies that can drift apart.
+- *Leave the brief in the system prompt and add a TUI viewer for it.* pi exposes the system prompt only through the extension UI context (no built-in view), so a viewer would be a second, partial record beside the transcript, which every consumer already reads.
+
+**Consequences.** `parseVerdict` is channel-agnostic: the Verdict contract now arrives as a user message, and the strict trailing-token contract of ADR 0037 is unchanged. Piped runs pass the brief as a positional argv argument, so very long findings text is bounded by ARG_MAX — the same property the piped `sub-` path already has for its task. The `subagent_tasks` `prompt` action and the /runs listing pick up the new `pln-` `prompt.md` files with no reader changes. Runs from before this ADR have no `pln-` `prompt.md`; readers report "no prompt recorded" rather than an error, as before. The temp file is retained for the append channel (the agent definition, passed by path because it is far past any safe argv length) and for unobserved runs that have no Run directory.

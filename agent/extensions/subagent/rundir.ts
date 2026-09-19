@@ -28,7 +28,7 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
-
+import { withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 /**
  * A Run's lifecycle as recorded in `run.json` by whoever spawned it.
  *
@@ -155,4 +155,31 @@ export function mirrorPaneLabel(run: {
 	return run.multiRun
 		? `${run.agent} #${run.step ?? ordinal ?? "?"}`
 		: `${run.agent} (#${shortRunId(run.runId)})`;
+}
+
+/**
+ * Write a Run's **Injected prompt** into its Run directory as `prompt.md`
+ * (docs/adr/0045, docs/adr/0047). For a delegated Run the file is what
+ * crosses `--append-system-prompt`, so the file on disk is byte-for-byte
+ * what the child was started with. For a plan-spawned Run it is the whole
+ * delegation payload: the agent definition plus the **Delegation brief**,
+ * marked as the first user message, because that brief crosses as the
+ * child's first user message rather than through `--append-system-prompt`
+ * (docs/adr/0047).
+ *
+ * Left unarchived, like `run.json`: archiving compresses only the session
+ * JSONL, and the prompt is small evidence, not history.
+ */
+export async function writePromptToRunDir(
+	runDir: string,
+	prompt: string,
+): Promise<string> {
+	const filePath = path.join(runDir, "prompt.md");
+	await withFileMutationQueue(filePath, async () => {
+		await writeFile(filePath, prompt, {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+	});
+	return filePath;
 }

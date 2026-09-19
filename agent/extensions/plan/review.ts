@@ -32,7 +32,7 @@ import {
 	RUN_ENTRYPOINT,
 	RUN_PLUGIN_ID,
 } from "../subagent/native.js";
-import { shortRunId } from "../subagent/rundir.js";
+import { shortRunId, writePromptToRunDir } from "../subagent/rundir.js";
 import { claimSlot } from "../subagent/spawnlimit.js";
 import { watchNativeRun } from "../subagent/watcher.js";
 
@@ -368,6 +368,7 @@ async function runReviewNatively(opts: {
 	runDir: string;
 	runId: string;
 	promptPath: string;
+	task: string;
 	model?: string;
 	tools?: string[];
 	timeoutMs: number;
@@ -412,10 +413,11 @@ async function runReviewNatively(opts: {
 		],
 		model: opts.model,
 		systemPromptPath: opts.promptPath,
-		task:
-			opts.purpose === "rework"
-				? "Carry out the rework described in your system prompt."
-				: "Review the Plan Item described in your system prompt.",
+		// The brief crosses as the child's first user message, mirroring the
+		// delegated sub- mechanism: the pane and the Transcript record what the
+		// Run was asked, instead of a pointer into a system prompt no one can
+		// see (docs/adr/0047).
+		task: opts.task,
 		// NOT the reviewed plan's key. A review must not load that plan — including
 		// its autonomous mode — as its own, and the sentinel must stay non-empty or
 		// the plan extension treats the child as a main session and spawns a Board
@@ -610,25 +612,34 @@ export async function runReview(opts: {
 	}
 	const agent = parseAgentFile(raw);
 
-	// The prompt goes through a file: it is far past any safe argv length, and a
-	// review prompt embeds arbitrary findings text.
+	// The brief — what the child is asked to do — crosses as the child's
+	// first user message, not through the system prompt (docs/adr/0047):
+	// the pane and the Transcript then record what the Run was asked.
+	const brief =
+		purpose === "rework"
+			? reworkContract(opts.itemText, opts.note)
+			: reviewContract(opts.itemText, opts.note);
+
+	// The system-prompt channel carries the agent definition alone. It goes
+	// through a file because it is far past any safe argv length.
 	let tmpDir: string | null = null;
 	try {
 		tmpDir = await mkdtemp(path.join(os.tmpdir(), `pi-plan-${purpose}-`));
 		const promptPath = path.join(tmpDir, "prompt.md");
-		await writeFile(
-			promptPath,
-			[
-				agent.body,
-				purpose === "rework"
-					? reworkContract(opts.itemText, opts.note)
-					: reviewContract(opts.itemText, opts.note),
-			].join(
-				"\n\n---\n\n",
-			),
-			"utf-8",
-		);
+		await writeFile(promptPath, agent.body, "utf-8");
 
+		// The Run directory records the whole delegation payload — the agent
+		// definition plus the brief marked as the first user message — so the
+		// directory answers "what was this Run asked" on its own (ADR 0045,
+		// ADR 0047). A delegated Run's `prompt.md` is its `--append-system-prompt`
+		// content byte-for-byte; a plan-spawned Run's brief no longer crosses
+		// that flag, so its record marks the channel instead.
+		if (opts.runDir && opts.runId) {
+			await writePromptToRunDir(
+				opts.runDir,
+				[agent.body, "## First user message", brief].join("\n\n---\n\n"),
+			);
+		}
 		const args = ["--mode", "text", "-p", "--append-system-prompt", promptPath];
 		// Write the transcript where every existing viewer already looks. Without
 		// --session-dir the child writes its session nowhere discoverable, which is
@@ -641,11 +652,9 @@ export async function runReview(opts: {
 		}
 		if (agent.model) args.push("--model", agent.model);
 		if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
-		args.push(
-			purpose === "rework"
-				? "Carry out the rework described in your system prompt."
-				: "Review the Plan Item described in your system prompt.",
-		);
+		// The brief is the child's first user message — bare, no prefix: the
+		// contract opens with its own heading (docs/adr/0047).
+		args.push(brief);
 
 		// A **Native Run** for the review, when herdr can host one: the same real
 		// interactive `pi` TUI a delegated Run gets, in its own pane, watchable and
@@ -673,6 +682,7 @@ export async function runReview(opts: {
 					runDir: opts.runDir,
 					runId: opts.runId,
 					promptPath,
+					task: brief,
 					model: agent.model,
 					tools: agent.tools,
 					timeoutMs,

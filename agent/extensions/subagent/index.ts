@@ -57,7 +57,6 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	type ThemeColor,
-	withFileMutationQueue,
 } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
@@ -78,6 +77,7 @@ import {
 	mirrorPaneLabel,
 	runsRoot,
 	shortRunId,
+	writePromptToRunDir,
 	writeRunSidecar,
 } from "./rundir.js";
 // The shared admission cap: one machine, one budget (docs/adr/0040), counted
@@ -317,29 +317,6 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	await Promise.all(workers);
 	return results;
 }
-
-/**
- * Write a Run's **Injected prompt** into its Run directory as `prompt.md`
- * (docs/adr/0045). The returned path is what crosses `--append-system-prompt`,
- * so the file on disk is byte-for-byte what the child was started with.
- *
- * Left unarchived, like `run.json`: archiving compresses only the session
- * JSONL, and the prompt is small evidence, not history.
- */
-async function writePromptToRunDir(
-	runDir: string,
-	prompt: string,
-): Promise<string> {
-	const filePath = path.join(runDir, "prompt.md");
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, {
-			encoding: "utf-8",
-			mode: 0o600,
-		});
-	});
-	return filePath;
-}
-
 /**
  * Determine how to re-invoke the current `pi` process.
  */
@@ -1729,7 +1706,7 @@ const TasksParams = Type.Object({
 		["list", "status", "result", "prompt", "wait", "cancel", "open"] as const,
 		{
 			description:
-			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; prompt = the injected system prompt each run was started with (recorded at spawn); wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view).",
+			"list = all tasks and their state, plus earlier sessions from disk; status = per-run state/turns/cost for one or more tasks; result = the finished results; prompt = the prompt each run was started with, recorded at spawn (the injected system prompt for delegated runs; for plan-spawned runs the agent definition plus the delegation brief, marked as the first user message); wait = block until the given tasks finish; cancel = kill running tasks; open = resume a finished task in a live pi pane (this CONTINUES it, appending to its transcript — there is no read-only view)."
 		},
 	),
 	taskIds: Type.Optional(
@@ -2380,7 +2357,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Tasks",
 		description: [
 			"Inspect and control background subagent tasks started with the subagent tool.",
-			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), prompt (the injected system prompt each run was started with), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (resume a finished task in a live pi pane — this CONTINUES the session and appends to its transcript; there is no read-only view).',
+			'Actions: list (all tasks and their state, including earlier sessions from disk), status (per-run state, turns and cost for given task ids), result (the finished write-ups), prompt (the prompt each run was started with, recorded at spawn: the injected system prompt for delegated runs; for plan-spawned runs the agent definition plus the delegation brief, marked as the first user message), wait (block until the given tasks finish, with optional timeoutSeconds), cancel (kill running tasks), open (resume a finished task in a live pi pane — this CONTINUES the session and appends to its transcript; there is no read-only view).',
 			"Task ids look like sub-a3f1 and are returned when you start a task.",
 		].join(" "),
 		parameters: TasksParams,
