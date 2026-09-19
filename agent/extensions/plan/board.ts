@@ -292,6 +292,14 @@ function escapeRegex(s: string): string {
 }
 
 /**
+ * The live-file pattern of a Task's `.rN` variant siblings: every Run of a
+ * multi-run Task keys its own plan under its own variant ID (docs/adr/0012).
+ */
+function variantPattern(taskId: string): RegExp {
+	return new RegExp(`^${escapeRegex(taskId)}\\.r\\d+\\.jsonl$`);
+}
+
+/**
  * Read the plan items of the Runs a card carries, best-effort.
  *
  * A card with a Task ID lists the Runs' own plan files: the Task's plan, its
@@ -331,7 +339,7 @@ export async function readRunPlans(
 	const want = new Set<string>(
 		[taskId, ...extraRunIds].map((r) => `${r}.jsonl`),
 	);
-	const variant = new RegExp(`^${escapeRegex(taskId)}\\.r\\d+\\.jsonl$`);
+	const variant = variantPattern(taskId);
 	const live = new Set(names);
 	const files: { name: string; dir: string }[] = [];
 	for (const name of names.filter((n) => want.has(n) || variant.test(n)).sort()) {
@@ -762,6 +770,19 @@ async function findArchived(file: string): Promise<string | null> {
 let tasksInFlight = false;
 
 /**
+ * The basenames of the Run plan files the last draw found on the cards
+ * (docs/adr/0048): the Tasks' plans, the rework/review Runs the Items record,
+ * and the Tasks' `.rN` variants.
+ *
+ * The watcher and the poll schedule a draw when any of these files changes.
+ * A review or rework Run writes its own plan file and never touches the main
+ * plan, so the main file's changes alone would leave a card stale once its
+ * Task session has settled — exactly the case the live-visibility promise
+ * exists for (docs/adr/0048).
+ */
+let watchedPlanNames = new Set<string>();
+
+/**
  * First rendered line shown at the top of the pane.
  *
  * A long plan renders taller than any pane — a 23-item plan is ~140 lines — so
@@ -829,6 +850,26 @@ async function draw(): Promise<void> {
 			if (rework) extra.push(rework);
 			if (review) extra.push(review);
 			byTask.set(item.taskId, extra);
+		}
+		// The Run plan files this draw tracks (docs/adr/0048): the Tasks' plans
+		// and the Runs the Items record, plus the `.rN` variants read off the
+		// directory. The watcher and the poll redraw on a change to any of
+		// these, independent of the main file and of Task session liveness.
+		watchedPlanNames = new Set(
+			[...byTask.entries()].flatMap(([taskId, extra]) => [
+				`${taskId}.jsonl`,
+				...extra.map((r) => `${r}.jsonl`),
+			]),
+		);
+		let liveNames: string[];
+		try {
+			liveNames = await readdir(path.join(agentDir, "plans"));
+		} catch {
+			liveNames = [];
+		}
+		for (const [taskId] of byTask) {
+			const variant = variantPattern(taskId);
+			for (const n of liveNames) if (variant.test(n)) watchedPlanNames.add(n);
 		}
 		await Promise.all(
 			[...byTask.entries()].map(async ([taskId, extra]) => {
@@ -1052,8 +1093,19 @@ if (isEntrypoint) {
 	const base = path.basename(file);
 	try {
 		watch(dir, (_event, changed) => {
-			if (!changed || changed === base || changed.startsWith(base))
+			if (!changed) return;
+			if (changed === base || changed.startsWith(base)) {
 				scheduleDraw();
+				return;
+			}
+			// The Runs' own plans live in this same directory (docs/adr/0048):
+			// a review/rework Run writes its plan here and never touches the main
+			// file, so its events are what redraw the card.
+			for (const name of watchedPlanNames)
+				if (changed === name || changed.startsWith(name)) {
+					scheduleDraw();
+					return;
+				}
 		});
 	} catch {
 		// No inotify: fall back to polling below.
@@ -1066,27 +1118,36 @@ if (isEntrypoint) {
 	// and never touches the plan, so watching the plan alone would leave turn
 	// counts frozen while a subagent works (docs/adr/0026): whenever any Task is
 	// unfinished, redraw on the tick regardless of the plan's own mtime.
-	let lastStamp = "";
+	// and the poll stamps the carried Run plans on their own (docs/adr/0048):
+	// a review or rework Run writes its plan file in the plans directory and
+	// never touches the main one, so a change to it draws the card even when
+	// no Task session is alive.
+	const stamps = new Map<string, string>();
 	setInterval(() => {
 		void (async () => {
 			if (tasksInFlight) {
 				scheduleDraw();
 				return;
 			}
-			try {
-				const info = await stat(file);
-				const stamp = `${info.mtimeMs}:${info.size}`;
-				if (stamp !== lastStamp) {
-					lastStamp = stamp;
-					scheduleDraw();
+			let changed = false;
+			for (const name of [base, ...watchedPlanNames]) {
+				let stamp: string;
+				try {
+					const info = await stat(path.join(dir, name));
+					stamp = `${info.mtimeMs}:${info.size}`;
+				} catch {
+					// Gone (archived, or not created yet): the absence is the
+					// stamp, so the file's appearance draws on its own.
+					stamp = "gone";
 				}
-			} catch {
-				// File gone (archived): redraw once to show the empty state.
-				if (lastStamp !== "gone") {
-					lastStamp = "gone";
-					scheduleDraw();
+				if (stamps.get(name) !== stamp) {
+					stamps.set(name, stamp);
+					changed = true;
 				}
 			}
+			for (const name of [...stamps.keys()])
+				if (name !== base && !watchedPlanNames.has(name)) stamps.delete(name);
+			if (changed) scheduleDraw();
 		})();
 	}, 2000);
 

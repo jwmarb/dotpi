@@ -23,7 +23,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, utimesSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readRunPlans, render } from "./board.js";
@@ -46,6 +46,11 @@ const ARCHIVED_R1_OLD = "Archived r1 old item";
 const ARCHIVED_R1_NEW = "Archived r1 new item";
 const ARCHIVED_R1_DECOY = "Archived r1 decoy item";
 const DIM_ARCHIVED_R1 = "\x1b[2m✓ Archived parallel item\x1b[0m";
+const LIVE_MAIN_KEY = "pln-live-main";
+const LIVE_TASK = "sub-live-1";
+const LIVE_REVIEW = "pln-live-v-1";
+const LIVE_FIRST_ITEM = "Initial review step";
+const LIVE_NEXT_ITEM = "Second review step";
 const LIFECYCLE_TASK = "sub-lifecycle-1";
 const LIFECYCLE_ITEM_TEXT = "Ship the fix";
 const LIFECYCLE_FINDING = "The fix is wrong";
@@ -496,5 +501,85 @@ describe("post-hoc Run plans survive dispatch completion (ADR 0048)", () => {
 		const frame = render([item!], mainFile, 80, false, new Map(), new Map([[LIFECYCLE_TASK, plans]]));
 		expect(frame).toContain(REVIEW_SEED_TEXT);
 		expect(frame).toContain(LIFECYCLE_FINDING);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Live redraw (ADR 0048): a review/rework Run writes its own plan file and
+// never touches the main plan, so the Board must redraw the card when that
+// file changes — even with the card's Task session settled and the main file
+// still. The fixture leaves the Run-plan paths (watcher filter, poll stamps)
+// as the only two that can schedule that draw; a card that goes stale here is
+// the staleness ADR 0048's live-visibility promise forbids.
+// ---------------------------------------------------------------------------
+
+describe("Board redraws when a carried Run plan changes (ADR 0048)", () => {
+	test("a review Run plan change draws with no Task session alive", async () => {
+		const workDir = await mkdtemp(path.join(os.tmpdir(), "board-live-"));
+		const agentDir = path.join(workDir, "agent");
+		const plansDir = path.join(agentDir, "plans");
+		await mkdir(plansDir, { recursive: true });
+		// The main plan: one active card carrying a Task and a review Run.
+		// Written once and never touched again — its stamp alone cannot be what
+		// redraws.
+		const mainFile = path.join(plansDir, `${LIVE_MAIN_KEY}.jsonl`);
+		await writeFile(
+			mainFile,
+			JSON.stringify({
+				id: "p1",
+				text: "Live card",
+				status: "active",
+				taskId: LIVE_TASK,
+				reviewRunId: LIVE_REVIEW,
+			}) +
+				"\n",
+			"utf-8",
+		);
+		// The review Run's own plan.
+		const reviewFile = path.join(plansDir, `${LIVE_REVIEW}.jsonl`);
+		await writeFile(
+			reviewFile,
+			JSON.stringify({ id: "p1", text: LIVE_FIRST_ITEM, status: "active" }) + "\n",
+			"utf-8",
+		);
+		// No subagent-sessions directory: the Task's progress reads null and
+		// tasksInFlight stays false, so the live-progress redraw path is out too.
+		const child = Bun.spawn(
+			["bun", path.join(import.meta.dir, "board.ts"), mainFile],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const decoder = new TextDecoder();
+		let out = "";
+		const finished = (async () => {
+			for await (const chunk of child.stdout) out += decoder.decode(chunk);
+		})();
+		const seen = async (needle: string, ms: number) => {
+			const deadline = Date.now() + ms;
+			while (Date.now() < deadline && !out.includes(needle))
+				await new Promise((r) => setTimeout(r, 50));
+			expect(out).toContain(needle);
+		};
+		// The first frame already lists the Run plan: the card was drawn when
+		// the main file recorded the Run.
+		await seen(LIVE_FIRST_ITEM, 5000);
+		// Let the first poll tick elapse: with an empty stamp map it redraws
+		// unconditionally, so letting it pass is what makes the next wait prove
+		// the steady-state path — a change to the Run plan alone, with the main
+		// file still and no Task session alive.
+		await new Promise((r) => setTimeout(r, 2300));
+		// The Run advances: a second item lands in its plan file. Main file
+		// untouched, no Task session alive.
+		await appendFile(
+			reviewFile,
+			JSON.stringify({ id: "p2", text: LIVE_NEXT_ITEM, status: "active" }) + "\n",
+			"utf-8",
+		);
+		// 2.5s: past one poll interval, so a fix that only the watcher delivers
+		// is not the one being rewarded — and long enough for a poll-only fix.
+		await seen(LIVE_NEXT_ITEM, 2500);
+		child.kill("SIGINT");
+		await child.exited;
+		await finished;
+		await rm(workDir, { recursive: true, force: true });
 	});
 });
