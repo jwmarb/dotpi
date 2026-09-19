@@ -51,6 +51,9 @@ const LIVE_TASK = "sub-live-1";
 const LIVE_REVIEW = "pln-live-v-1";
 const LIVE_FIRST_ITEM = "Initial review step";
 const LIVE_NEXT_ITEM = "Second review step";
+const VARIANT_MAIN_KEY = "pln-live-variant";
+const VARIANT_TASK = "sub-live-variant";
+const VARIANT_NEW_ITEM = "New parallel item";
 const LIFECYCLE_TASK = "sub-lifecycle-1";
 const LIFECYCLE_ITEM_TEXT = "Ship the fix";
 const LIFECYCLE_FINDING = "The fix is wrong";
@@ -577,6 +580,66 @@ describe("Board redraws when a carried Run plan changes (ADR 0048)", () => {
 		// 2.5s: past one poll interval, so a fix that only the watcher delivers
 		// is not the one being rewarded — and long enough for a poll-only fix.
 		await seen(LIVE_NEXT_ITEM, 2500);
+		child.kill("SIGINT");
+		await child.exited;
+		await finished;
+		await rm(workDir, { recursive: true, force: true });
+	});
+
+	test("a .rN variant file created after the steady-state draw is discovered and drawn", async () => {
+		const workDir = await mkdtemp(path.join(os.tmpdir(), "board-variant-"));
+		const agentDir = path.join(workDir, "agent");
+		const plansDir = path.join(agentDir, "plans");
+		await mkdir(plansDir, { recursive: true });
+		// The main plan: one active card carrying a Task only — no review/rework
+		// Run recorded, and no .rN sibling on disk when the Board starts. The
+		// file is written once and never touched again.
+		const mainFile = path.join(plansDir, `${VARIANT_MAIN_KEY}.jsonl`);
+		await writeFile(
+			mainFile,
+			JSON.stringify({
+				id: "p1",
+				text: "Variant card",
+				status: "active",
+				taskId: VARIANT_TASK,
+			}) +
+				"\n",
+			"utf-8",
+		);
+		// No subagent-sessions directory: the Task's progress reads null and
+		// tasksInFlight stays false, so the live-progress redraw path is out
+		// too. The ONLY mechanisms left are the watcher and the poll.
+		const child = Bun.spawn(
+			["bun", path.join(import.meta.dir, "board.ts"), mainFile],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const decoder = new TextDecoder();
+		let out = "";
+		const finished = (async () => {
+			for await (const chunk of child.stdout) out += decoder.decode(chunk);
+		})();
+		const seen = async (needle: string, ms: number) => {
+			const deadline = Date.now() + ms;
+			while (Date.now() < deadline && !out.includes(needle))
+				await new Promise((r) => setTimeout(r, 50));
+			expect(out).toContain(needle);
+		};
+		// The card draws with no Run plans: nothing has ever seen the .rN name.
+		await seen("Variant card", 5000);
+		// Let the first poll tick elapse: with an empty stamp map it redraws
+		// unconditionally, so letting it pass is what makes the next wait prove
+		// the steady-state path.
+		await new Promise((r) => setTimeout(r, 2300));
+		// An unseeded parallel Run creates its own plan on first use: a .rN
+		// sibling no draw has ever seen. Main file untouched.
+		await writeFile(
+			path.join(plansDir, `${VARIANT_TASK}.r1.jsonl`),
+			JSON.stringify({ id: "p1", text: VARIANT_NEW_ITEM, status: "active" }) + "\n",
+			"utf-8",
+		);
+		// 2.5s: past one poll interval, so a fix only the watcher delivers is
+		// not the one being rewarded — and long enough for a poll-only fix.
+		await seen(VARIANT_NEW_ITEM, 2500);
 		child.kill("SIGINT");
 		await child.exited;
 		await finished;

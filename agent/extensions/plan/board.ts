@@ -783,6 +783,17 @@ let tasksInFlight = false;
 let watchedPlanNames = new Set<string>();
 
 /**
+ * The Task IDs carried by the last draw (docs/adr/0048).
+ *
+ * A Task's `.rN` siblings can first appear AFTER a draw — an unseeded
+ * parallel Run creates its plan on first use (docs/adr/0012) — so the watcher
+ * and the poll match the directory's current membership against these Tasks'
+ * variant pattern, not only the names the last draw saw: `watchedPlanNames`
+ * alone would never name a file that did not exist at draw time.
+ */
+let watchedTaskIds = new Set<string>();
+
+/**
  * First rendered line shown at the top of the pane.
  *
  * A long plan renders taller than any pane — a 23-item plan is ~140 lines — so
@@ -861,6 +872,7 @@ async function draw(): Promise<void> {
 				...extra.map((r) => `${r}.jsonl`),
 			]),
 		);
+		watchedTaskIds = new Set(byTask.keys());
 		let liveNames: string[];
 		try {
 			liveNames = await readdir(path.join(agentDir, "plans"));
@@ -1106,6 +1118,15 @@ if (isEntrypoint) {
 					scheduleDraw();
 					return;
 				}
+			// A `.rN` sibling the last draw never saw: an unseeded parallel Run
+			// creates its plan on first use (docs/adr/0012/0048), so its creation
+			// event names a file no draw has watched. Only the name against a
+			// carried Task's variant pattern says it belongs to this Board.
+			for (const taskId of watchedTaskIds)
+				if (variantPattern(taskId).test(changed)) {
+					scheduleDraw();
+					return;
+				}
 		});
 	} catch {
 		// No inotify: fall back to polling below.
@@ -1121,7 +1142,11 @@ if (isEntrypoint) {
 	// and the poll stamps the carried Run plans on their own (docs/adr/0048):
 	// a review or rework Run writes its plan file in the plans directory and
 	// never touches the main one, so a change to it draws the card even when
-	// no Task session is alive.
+	// no Task session is alive. Both mechanisms also discover a `.rN` sibling
+	// whose first appearance postdates the last draw: an unseeded parallel Run
+	// creates its plan on first use (docs/adr/0012), and the directory's
+	// current membership — matched against the carried Tasks' variant pattern
+	// — is what a steady-state draw can never see.
 	const stamps = new Map<string, string>();
 	setInterval(() => {
 		void (async () => {
@@ -1129,8 +1154,23 @@ if (isEntrypoint) {
 				scheduleDraw();
 				return;
 			}
+			// A `.rN` sibling can first appear after the last draw, so stamp the
+			// directory's CURRENT membership for the carried Tasks' variant
+			// pattern, not only the names the last draw knew: a name no draw has
+			// seen is discovered here, not just re-stamped.
+			let liveNames: string[];
+			try {
+				liveNames = await readdir(dir);
+			} catch {
+				liveNames = [];
+			}
+			const variantNames = new Set(
+				[...watchedTaskIds].flatMap((t) =>
+					liveNames.filter((n) => variantPattern(t).test(n)),
+				),
+			);
 			let changed = false;
-			for (const name of [base, ...watchedPlanNames]) {
+			for (const name of [base, ...watchedPlanNames, ...variantNames]) {
 				let stamp: string;
 				try {
 					const info = await stat(path.join(dir, name));
@@ -1146,7 +1186,12 @@ if (isEntrypoint) {
 				}
 			}
 			for (const name of [...stamps.keys()])
-				if (name !== base && !watchedPlanNames.has(name)) stamps.delete(name);
+				if (
+					name !== base &&
+					!watchedPlanNames.has(name) &&
+					!variantNames.has(name)
+				)
+					stamps.delete(name);
 			if (changed) scheduleDraw();
 		})();
 	}, 2000);
