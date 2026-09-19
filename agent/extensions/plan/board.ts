@@ -44,6 +44,14 @@ interface PlanItem {
 	reworkRunId?: string;
 	/** The review Run judging this item, if one is in flight (docs/adr/0048). */
 	reviewRunId?: string;
+	/**
+	 * The last Rework Run dispatched for this item. Never cleared, so the
+	 * post-hoc draw can read the (archived) Run's plan after the in-flight
+	 * marker above is gone (docs/adr/0048).
+	 */
+	lastReworkRunId?: string;
+	/** The last review Run dispatched for this item, for the same reason. */
+	lastReviewRunId?: string;
 }
 
 /**
@@ -264,6 +272,7 @@ async function readRunProgress(
 			// the sidecar already recorded one (docs/adr/0036).
 			if (!finished) unfinished++;
 		}
+	}
 	return { agent, turns, finished: unfinished === 0 };
 }
 
@@ -271,7 +280,7 @@ async function readRunProgress(
  * One item of a Run's own plan file, reduced to what the card's plan lines
  * need (docs/adr/0048).
  */
-interface RunPlanItem {
+export interface RunPlanItem {
 	id: string;
 	text: string;
 	status: PlanState;
@@ -289,6 +298,9 @@ function escapeRegex(s: string): string {
  * `.rN` variants — read off the directory, never guessed by string
  * interpolation — and the rework and review Runs the Item records. The plan
  * file is the single source of truth, read live on every draw (docs/adr/0048).
+ * A wanted key with no live file falls back to the archive (plans/archive/):
+ * a child's plan self-archives when its last item goes terminal, so the dimmed
+ * done items must survive there. Live files always win over archive entries.
  *
  * Everything is best-effort: the Board renders a card whether or not any Run
  * left a plan file readable, so a missing or corrupt file renders nothing
@@ -299,7 +311,7 @@ function escapeRegex(s: string): string {
  * @param extraRunIds - The Item's rework/review Run IDs, if it carries them.
  * @returns The items, in file order, or an empty list when nothing is readable.
  */
-async function readRunPlans(
+export async function readRunPlans(
 	agentDir: string,
 	taskId: string,
 	extraRunIds: string[],
@@ -318,14 +330,26 @@ async function readRunPlans(
 		[taskId, ...extraRunIds].map((r) => `${r}.jsonl`),
 	);
 	const variant = new RegExp(`^${escapeRegex(taskId)}\\.r\\d+\\.jsonl$`);
-	const files = names
-		.filter((n) => want.has(n) || variant.test(n))
-		.sort();
+	const live = new Set(names);
+	const files: { name: string; dir: string }[] = [];
+	for (const name of names.filter((n) => want.has(n) || variant.test(n)).sort()) {
+		files.push({ name, dir: plansDir });
+	}
+	// A wanted key with no live file falls back to the archive: a child's plan
+	// self-archives the moment its last item goes terminal (docs/adr/0048),
+	// so the dimmed done items the card should show vanish without this.
+	// Live files always win over archive entries.
+	const archiveDir = path.join(plansDir, "archive");
+	for (const key of [...want].sort()) {
+		if (live.has(key)) continue;
+		const archived = await newestArchivedFile(archiveDir, key.replace(/\.jsonl$/, ""));
+		if (archived) files.push({ name: path.basename(archived), dir: archiveDir });
+	}
 	const items: RunPlanItem[] = [];
-	for (const name of files) {
+	for (const { name, dir } of files) {
 		let raw: string;
 		try {
-			raw = await readFile(path.join(plansDir, name), "utf-8");
+			raw = await readFile(path.join(dir, name), "utf-8");
 		} catch {
 			continue; // Unreadable file: the card renders the rest.
 		}
@@ -410,6 +434,16 @@ async function load(file: string): Promise<PlanItem[]> {
 						typeof obj.reviewRunId === "string" && obj.reviewRunId !== ""
 							? obj.reviewRunId
 							: undefined,
+					lastReworkRunId:
+						typeof obj.lastReworkRunId === "string" &&
+						obj.lastReworkRunId !== ""
+							? obj.lastReworkRunId
+							: undefined,
+					lastReviewRunId:
+						typeof obj.lastReviewRunId === "string" &&
+						obj.lastReviewRunId !== ""
+							? obj.lastReviewRunId
+							: undefined,
 					// Unknown routes are dropped, matching the tool: a route this build
 					// does not know must not be rendered as though it were understood.
 					route:
@@ -445,7 +479,7 @@ function wrap(text: string, width: number): string[] {
 }
 
 /** Render the whole board as a string. */
-function render(
+export function render(
 	items: PlanItem[],
 	file: string,
 	cols: number,
@@ -602,6 +636,50 @@ if (isEntrypoint && !file) {
 }
 
 /**
+ * The newest archived file matching a plan key.
+ *
+ * Archive files are named `<date>-<key>.jsonl`, optionally with a `.2`, `.3`
+ * collision suffix, so the newest match is picked by mtime, not by name —
+ * the suffix does not sort lexicographically in recency order.
+ *
+ * The match is on the archive's own naming grammar, not a substring: a key
+ * that is a prefix of a longer key (or a fragment of one) must not pull the
+ * longer key's file into this plan's results.
+ *
+ * @param archiveDir - The `plans/archive` directory.
+ * @param key - The plan key to match.
+ * @returns The path of the newest matching file, or null.
+ */
+async function newestArchivedFile(archiveDir: string, key: string): Promise<string | null> {
+	let names: string[];
+	try {
+		names = await readdir(archiveDir);
+	} catch {
+		return null;
+	}
+	// Exact grammar, not `includes`: `<date>-` prefix, the key verbatim, an
+	// optional numeric collision suffix, and the `.jsonl` ending. Anchored at
+	// both ends, so `pln-a1-1` never matches a request for `pln-a1`.
+	const mine = names.filter((n) =>
+		new RegExp(String.raw`^\d{4}-\d{2}-\d{2}-${escapeRegex(key)}(?:\.\d+)?\.jsonl$`).test(n),
+	);
+	if (!mine.length) return null;
+	// Pick by mtime rather than by name: the collision suffix (.2, .3) does not
+	// sort lexicographically in recency order.
+	let newest: { name: string; at: number } | null = null;
+	for (const n of mine) {
+		try {
+			const info = await stat(path.join(archiveDir, n));
+			if (!newest || info.mtimeMs > newest.at)
+				newest = { name: n, at: info.mtimeMs };
+		} catch {
+			// Skip unreadable entries.
+		}
+	}
+	return newest ? path.join(archiveDir, newest.name) : null;
+}
+
+/**
  * Find the archived form of a plan whose live file is gone.
  *
  * A completed plan self-archives, so the live path stops existing at the exact
@@ -614,31 +692,10 @@ if (isEntrypoint && !file) {
  * @returns Newest archived file for the same plan key, or null.
  */
 async function findArchived(file: string): Promise<string | null> {
-	const dir = path.dirname(file);
-	const key = path.basename(file, ".jsonl");
-	const archiveDir = path.join(dir, "archive");
-	try {
-		const names = await readdir(archiveDir);
-		const mine = names.filter(
-			(n) => n.includes(key) && n.endsWith(".jsonl"),
-		);
-		if (!mine.length) return null;
-		// Pick by mtime rather than by name: the collision suffix (.2, .3) does not
-		// sort lexicographically in recency order.
-		let newest: { name: string; at: number } | null = null;
-		for (const n of mine) {
-			try {
-				const info = await stat(path.join(archiveDir, n));
-				if (!newest || info.mtimeMs > newest.at)
-					newest = { name: n, at: info.mtimeMs };
-			} catch {
-				// Skip unreadable entries.
-			}
-		}
-		return newest ? path.join(archiveDir, newest.name) : null;
-	} catch {
-		return null;
-	}
+	return newestArchivedFile(
+		path.join(path.dirname(file), "archive"),
+		path.basename(file, ".jsonl"),
+	);
 }
 
 /**
@@ -699,17 +756,24 @@ async function draw(): Promise<void> {
 	tasksInFlight = [...progress.values()].some((p) => !p.finished);
 
 	// The Runs' own plans, per Task (docs/adr/0048): the Task's plan, its `.rN`
-	// variants and the rework/review Runs the Items record. Read live on every
-	// draw, like the progress — the plan file is the single source of truth. Best-
-	// effort per Task: an empty list renders the card exactly as before.
+	// variants and the rework/review Runs the Items record. The in-flight markers
+	// (reworkRunId/reviewRunId) name the Run while it works; once it ends they are
+	// cleared and the Run's plan self-archives — the durable lastReworkRunId /
+	// lastReviewRunId then keep the (archived) plan findable, post-hoc. Read live
+	// on every draw, like the progress — the plan file is the single source of
+	// truth. Best-effort per Task: an empty list renders the card exactly as before.
 	const runPlans = new Map<string, RunPlanItem[]>();
 	{
 		const byTask = new Map<string, string[]>();
 		for (const item of items) {
 			if (!item.taskId) continue;
 			const extra = byTask.get(item.taskId) ?? [];
-			if (item.reworkRunId) extra.push(item.reworkRunId);
-			if (item.reviewRunId) extra.push(item.reviewRunId);
+			// In-flight marker first, durable record after: the marker dies with the
+			// Run, and the record is what a post-hoc draw reads (docs/adr/0048).
+			const rework = item.reworkRunId ?? item.lastReworkRunId;
+			const review = item.reviewRunId ?? item.lastReviewRunId;
+			if (rework) extra.push(rework);
+			if (review) extra.push(review);
 			byTask.set(item.taskId, extra);
 		}
 		await Promise.all(
@@ -884,11 +948,9 @@ if (isEntrypoint && process.stdin.isTTY) {
 				scroll = Math.min(maxScroll, scroll + 1);
 				break;
 			case "\x1b[5~": // page up
-			case "k":
 				scroll = Math.max(0, scroll - page);
 				break;
 			case "\x1b[6~": // page down
-			case "j":
 				scroll = Math.min(maxScroll, scroll + page);
 				break;
 			case "g":
@@ -976,7 +1038,6 @@ if (isEntrypoint) {
 
 		process.stdout.on("resize", scheduleDraw);
 	}
-}
 
 
 // ---------------------------------------------------------------------------

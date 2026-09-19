@@ -17,6 +17,7 @@ import { mkdirSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YOUR_PLAN_NUDGE } from "../plan/planfile.js";
+import { setSpawnCapRoot } from "../subagent/spawnlimit.js";
 
 const AGENT_NAME = "worker";
 const TASK = "Do the thing.";
@@ -131,9 +132,15 @@ describe("Starter Plan seeding at subagent spawn (ADR 0048)", () => {
 			sendMessage: () => {},
 			appendEntry: () => {},
 		});
+		// Isolate the spawn cap on this temp dir (the review-brief.test.ts
+		// pattern), after install() so it wins over the fixture agent dir.
+		setSpawnCapRoot(workDir);
 	});
 
 	afterEach(async () => {
+		// Clear the spawn override so a later test file in the same process
+		// cannot inherit this one's fake.
+		(await import("./index.js")).setSpawnFn(null);
 		if (savedAgentDir) process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 		else delete process.env.PI_CODING_AGENT_DIR;
 		if (savedHerdrSocket) process.env.HERDR_SOCKET_PATH = savedHerdrSocket;
@@ -212,5 +219,45 @@ describe("Starter Plan seeding at subagent spawn (ADR 0048)", () => {
 		);
 		expect(run1.map((i) => i.id)).toEqual(P_ONE);
 		expect(run2.map((i) => i.id)).toEqual(["p1", "p2"]);
+		// Seeded items carry the child's schema, in both siblings.
+		for (const item of [...run1, ...run2]) {
+			expect(item.status).toBe("backlog");
+			expect(item.route).toBe("skip");
+		}
+	});
+
+	test("chain: the nudge lands on the {previous}-interpolated task text", async () => {
+		const result = await launch({
+			chain: [
+				{ agent: AGENT_NAME, task: "First step." },
+				{
+					agent: AGENT_NAME,
+					task: "Second step, given: {previous}",
+					plan: ["Chained item"],
+				},
+			],
+		});
+		const taskId = result.details.taskId;
+
+		// The first step produced CHILD_RESULT, so the second step's {previous}
+		// interpolates to its extracted <result> text — and the seed's nudge is
+		// appended AFTER that interpolation (subagent/index.ts: the
+		// interpolation rewrites run.task, THEN seeding appends the nudge). A
+		// reordering that appended the nudge first would drop it from every
+		// chain step, because the interpolation rewrites run.task from the
+		// un-nudged item text.
+		const brief = seenArgs!.at(-1)!;
+		expect(brief).toBe(
+			"Task: Second step, given: All three items are complete.\n\n" +
+				YOUR_PLAN_NUDGE(1),
+		);
+
+		// The chained Run's own plan file is seeded under its run-suffixed key.
+		const chained = await parsePlanFile(
+			path.join(agentDir, "plans", `${taskId}.r2.jsonl`),
+		);
+		expect(chained.map((i) => i.id)).toEqual(["p1"]);
+		expect(chained[0]!.status).toBe("backlog");
+		expect(chained[0]!.route).toBe("skip");
 	});
 });

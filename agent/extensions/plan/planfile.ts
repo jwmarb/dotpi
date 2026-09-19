@@ -143,8 +143,29 @@ export interface PlanItem {
 	 * Board, which lists a card's Runs by reading each Run's own plan file — the
 	 * rework Run is findable through `reworkRunId`, and without this field the
 	 * review Run's plan would be findable only by parsing the Item's note.
+	 * The {@link lastReviewRunId} twin survives the Run's end, for the post-hoc
+	 * read.
 	 */
 	reviewRunId?: string;
+	/**
+	 * The Run ID of the last **Rework** dispatched for this Item.
+	 *
+	 * A durable record, not a liveness marker: set when the Rework is
+	 * dispatched and never cleared, so that after the Run ends — and its own
+	 * plan has self-archived — the Board can still find the worker's plan
+	 * through this Item (docs/adr/0048). The in-flight twin is
+	 * {@link reworkRunId}, which is cleared when the Run ends and is the one a
+	 * liveness check reads.
+	 */
+	lastReworkRunId?: string;
+	/**
+	 * The Run ID of the last review dispatched for this Item.
+	 *
+	 * The durable twin of {@link lastReworkRunId} for the review side: set at
+	 * dispatch, never cleared (docs/adr/0048). The in-flight twin is
+	 * {@link reviewRunId}.
+	 */
+	lastReviewRunId?: string;
 }
 
 /**
@@ -241,11 +262,21 @@ export async function loadPlan(file: string): Promise<PlanItem[]> {
 						typeof obj.reworkRunId === "string" && obj.reworkRunId !== ""
 							? obj.reworkRunId
 							: undefined,
-					reviewRunId:
+						reviewRunId:
 						typeof obj.reviewRunId === "string" && obj.reviewRunId !== ""
 							? obj.reviewRunId
 							: undefined,
-				});
+						lastReworkRunId:
+							typeof obj.lastReworkRunId === "string" &&
+							obj.lastReworkRunId !== ""
+								? obj.lastReworkRunId
+								: undefined,
+						lastReviewRunId:
+							typeof obj.lastReviewRunId === "string" &&
+							obj.lastReviewRunId !== ""
+								? obj.lastReviewRunId
+								: undefined,
+					});
 			}
 		} catch {
 			// Corrupt line: skip it, keep the rest.
@@ -587,10 +618,8 @@ export function YOUR_PLAN_NUDGE(n: number): string {
  * read and this one cannot be clobbered by us (docs/adr/0035).
  *
  * Checking *existence* rather than the parsed item list is what protects an
- * empty, metadata-only, or corrupt file: those parse to zero items, so a
- * length check would seed them and `mutatePlan`'s rewrite-from-parsed would
- * destroy the lines `loadPlan` cannot represent — metadata, corrupt entries
- * (docs/adr/0048).
+ * empty, metadata-only, or corrupt file — see {@link planFileExists}, the
+ * one predicate both seed paths use (docs/adr/0048).
  *
  * Seeded items carry route `skip`: the child is the worker and cannot `/accept`
  * its own items, and a `user`-routed item would block the child's `done`
@@ -618,22 +647,37 @@ export async function seedRunPlan(
 	// mutatePlan callback, and the compiler does not track writes made through
 	// a closure, so a plain `let` narrows at the read below.
 	const result: { seeded: boolean } = { seeded: false };
-	await mutatePlan(file, async (_items) => {
+	await mutatePlan(file, async () => {
 		// Never clobber: a file that pre-exists, whatever it contains, is
 		// somebody else's — the seed is skipped, not merged (docs/adr/0048).
-		let exists = false;
-		try {
-			await stat(file);
-			exists = true;
-		} catch {
-			// Absent: this is the only branch the seed may take.
-		}
-		if (exists) return NO_WRITE;
+		if (await planFileExists(file)) return NO_WRITE;
 		result.seeded = true;
 		return seeded;
 	});
 	return result;
 }
+
+/**
+ * Whether a plan file already exists on disk (docs/adr/0048).
+ *
+ * The shared "is the seed skipped" predicate: the ADR's contract is that a
+ * pre-existing file means the seed is skipped — whatever it contains. An
+ * empty, metadata-only, or corrupt file exists, so it is skipped, not seeded:
+ * those parse to zero items, so a length check would seed them and the
+ * rewrite-from-parsed would destroy the lines `loadPlan` cannot represent —
+ * metadata, corrupt entries (docs/adr/0048).
+ *
+ * @param file - Absolute path of the plan file.
+ */
+export async function planFileExists(file: string): Promise<boolean> {
+	try {
+		await stat(file);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * The plan file for a plan key, under an agent directory.
  *

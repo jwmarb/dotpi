@@ -56,6 +56,7 @@ import {
 	loadMeta,
 	loadPlan,
 	mutatePlan,
+	planFileExists,
 	planFilePathFor,
 	seedRunPlan,
 } from "./planfile.js";
@@ -620,8 +621,8 @@ const REVIEW_SEED_ITEM = "Carry out the review and emit the Verdict";
  *
  * @param findings - What the reviewer objected to.
  * @returns The items to seed: the blocks (or the findings), then
- *          "Verify by running the repo's checks", then
- *          "Commit exactly one commit".
+ *          "Verify by running the repo's checks.", then
+ *          "Commit exactly one commit."
  */
 export function reworkSeedItems(findings: string): string[] {
 	const blocks: string[] = [];
@@ -649,8 +650,8 @@ export function reworkSeedItems(findings: string): string[] {
 			: blocks;
 	return [
 		...items,
-		"Verify by running the repo's checks",
-		"Commit exactly one commit",
+		"Verify by running the repo's checks.",
+		"Commit exactly one commit.",
 	];
 }
 
@@ -1125,12 +1126,19 @@ export async function dispatchReview(
 			// Swallowed: the review is the point, the plan is the display.
 		});
 		// Record the review Run's ID on the Item, mirroring the Rework twin's
-		// reworkRunId: the Board reads the review Run's plan through it. Set via
-		// the plan file BEFORE spawning, for the same reason the Rework marker is:
-		// the plan file is the only channel another process reads.
+		// reworkRunId: the Board reads the review Run's plan through it. The durable
+		// lastReviewRunId is stamped in the same write and is never cleared: the
+		// in-flight marker dies with the Run (and the Run's plan self-archives), so
+		// without the record the post-hoc Board would lose the plan it is meant to
+		// show (docs/adr/0048). Set via the plan file BEFORE spawning, for the same
+		// reason the Rework marker is: the plan file is the only channel another
+		// process reads.
 		await mutatePlan(file, (cur) => {
 			const target = cur.find((i) => i.id === id);
-			if (target) target.reviewRunId = runId;
+			if (target) {
+				target.reviewRunId = runId;
+				target.lastReviewRunId = runId;
+			}
 			return cur;
 		});
 		let outcome: Awaited<ReturnType<typeof runReview>>;
@@ -1271,12 +1279,18 @@ export async function dispatchRework(
 				// Swallowed: the Rework is the point, the plan is the display.
 			},
 		);
-		// Publish the in-flight marker BEFORE spawning, so a re-review cannot slip
+// Publish the in-flight marker BEFORE spawning, so a re-review cannot slip
 		// between the spawn and the mark and judge code the worker is mid-way through
-		// changing. The plan file is the only channel another process reads.
+		// changing. The plan file is the only channel another process reads. The
+		// durable lastReworkRunId is stamped in the same write and is never
+		// cleared, so the post-hoc Board can find this Run's (archived) plan after
+		// the in-flight marker is gone (docs/adr/0048).
 		await mutatePlan(file, (cur) => {
 			const target = cur.find((i) => i.id === id);
-			if (target) target.reworkRunId = runId;
+			if (target) {
+				target.reworkRunId = runId;
+				target.lastReworkRunId = runId;
+			}
 			return cur;
 		});
 		let outcome: Awaited<ReturnType<typeof runReview>>;
@@ -1538,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
 			'Item states are the Board\'s columns: "backlog" (captured, not yet groomed), "ready" (specified enough to start now), "active" (in progress, limit one), "blocked" (cannot proceed — use it instead of leaving an item falsely active), "review" (you believe it landed).',
 			'"done" means the item\'s Review Route was satisfied, not "I finished". An item routed "user" — the default when no route is set — reaches done only by the user\'s hand via /accept, so finish your work by moving it to "review" and saying so. An item routed "oracle" is cleared by a pass Verdict; one routed "skip" goes straight to done. Set a route with op "route", and remember it only ever escalates (skip → oracle → user): you may always ask for more scrutiny, never less.',
 			'When advice or new facts change the shape of the work (e.g. an oracle or planner Result), rewrite the affected items with op "revise" and mark abandoned ones "dropped" — "failed" means attempted and did not land, not "we changed our mind".',
-			'When delegating to a subagent: write the child\'s Starter Plan into the delegation text, seed it via plan op "seed" for the returned Task ID, and record that Task ID on the plan item that delegates the step with plan op "attach" (the item\'s id + the Task ID — the item always exists before its delegation runs). The child owns its plan file from then on.',
+			'When delegating to a subagent: pass the child\'s Starter Plan as the subagent tool\'s "plan" parameter — it is seeded into the child\'s plan file at spawn, before the Run starts — and record the returned Task ID on the plan item that delegates the step with plan op "attach" (the item\'s id + the Task ID — the item always exists before its delegation runs). The child owns its plan file from then on. Plan op "seed" is the ad-hoc path for writing a plan for a key after the fact: it never clobbers an existing plan.',
 		],
 		parameters: PlanParams,
 
@@ -1910,10 +1924,12 @@ export default function (pi: ExtensionAPI) {
 							'op "seed" requires "for" (the plan key, e.g. a Task ID) and "items".',
 							undefined,
 						);
-					const existing = await loadPlan(file);
-					if (existing.length > 0)
+					// The ADR's contract (docs/adr/0048): a pre-existing file — empty,
+					// metadata-only, or corrupt included — means the seed is skipped, the
+					// same predicate the spawn path uses (docs/adr/0048).
+					if (await planFileExists(file))
 						return result(
-							`Plan for ${key} already has ${existing.length} item(s) — not clobbered. Use op "add" to extend it.`,
+							`Plan for ${key} already exists — not clobbered. Use op "add" to extend it.`,
 							undefined,
 						);
 					const seeded: PlanItem[] = params.items.map((it, n) => ({

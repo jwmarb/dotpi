@@ -180,7 +180,7 @@ describe("loadPlan item schema round-trip", () => {
 		await rm(dir, { recursive: true, force: true });
 	});
 
-	test("carries reworkRunId and reviewRunId", async () => {
+	test("carries reworkRunId and reviewRunId, and their durable last-Run twins", async () => {
 		const file = path.join(dir, "plan.jsonl");
 		await writeFile(
 			file,
@@ -190,12 +190,19 @@ describe("loadPlan item schema round-trip", () => {
 				status: "review",
 				reworkRunId: "pln-abc1-1",
 				reviewRunId: "pln-def2-1",
+				lastReworkRunId: "pln-old1-1",
+				lastReviewRunId: "pln-old2-1",
 			}) + "\n",
 			"utf-8",
 		);
 		const items = await loadPlan(file);
 		expect(items[0].reworkRunId).toBe("pln-abc1-1");
 		expect(items[0].reviewRunId).toBe("pln-def2-1");
+		// The durable records survive independently of the in-flight markers:
+		// they are what the post-hoc Board reads once the markers are cleared
+		// (docs/adr/0048).
+		expect(items[0].lastReworkRunId).toBe("pln-old1-1");
+		expect(items[0].lastReviewRunId).toBe("pln-old2-1");
 	});
 
 	test("drops an empty-string run id: it is absence, not a value", async () => {
@@ -207,11 +214,15 @@ describe("loadPlan item schema round-trip", () => {
 				text: "The item",
 				status: "active",
 				reviewRunId: "",
+				lastReworkRunId: "",
+				lastReviewRunId: "",
 			}) + "\n",
 			"utf-8",
 		);
 		const items = await loadPlan(file);
 		expect(items[0].reviewRunId).toBeUndefined();
+		expect(items[0].lastReworkRunId).toBeUndefined();
+		expect(items[0].lastReviewRunId).toBeUndefined();
 	});
 
 	test("keeps an unknown status as an item, filed backlog", async () => {
