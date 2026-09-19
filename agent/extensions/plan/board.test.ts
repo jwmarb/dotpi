@@ -40,6 +40,12 @@ const META_LINE = '{"kind":"plan-meta","autonomous":true}';
 const NOT_JSON = "not-json-at-all";
 const SUFFIX_ARCHIVED_ITEM = "Suffix archived item";
 const REVIEW_SEED_TEXT = "Carry out the review and emit the Verdict";
+const ARCHIVED_R1_ITEM = "Archived parallel item";
+const ARCHIVED_R2_ITEM = "Archived chain item";
+const ARCHIVED_R1_OLD = "Archived r1 old item";
+const ARCHIVED_R1_NEW = "Archived r1 new item";
+const ARCHIVED_R1_DECOY = "Archived r1 decoy item";
+const DIM_ARCHIVED_R1 = "\x1b[2m✓ Archived parallel item\x1b[0m";
 const LIFECYCLE_TASK = "sub-lifecycle-1";
 const LIFECYCLE_ITEM_TEXT = "Ship the fix";
 const LIFECYCLE_FINDING = "The fix is wrong";
@@ -214,6 +220,93 @@ describe("readRunPlans (ADR 0048)", () => {
 		const items = await readRunPlans(agentDir, TASK_ID, [REWORK_RUN]);
 		expect(items.some((i) => i.text === SUFFIX_ARCHIVED_ITEM)).toBe(true);
 	});
+
+	test("falls back to the archive for .rN variants whose live files are absent", async () => {
+		// The parallel and chain children complete: their live .rN plans
+		// self-archive the moment their last item goes terminal.
+		await rm(path.join(agentDir, "plans", `${TASK_ID}.r1.jsonl`));
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture-1.r1.jsonl"),
+			JSON.stringify({ id: "p1", text: ARCHIVED_R1_ITEM, status: "done" }) + "\n",
+			"utf-8",
+		);
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture-1.r2.jsonl"),
+			JSON.stringify({ id: "p1", text: ARCHIVED_R2_ITEM, status: "active" }) + "\n",
+			"utf-8",
+		);
+
+		// Both Runs' archived plans are found: every distinct .rN is listed.
+		const items = await readRunPlans(agentDir, TASK_ID, []);
+		expect(items.some((i) => i.text === ARCHIVED_R1_ITEM)).toBe(true);
+		expect(items.some((i) => i.text === ARCHIVED_R2_ITEM)).toBe(true);
+	});
+
+	test("archived .rN picks the newest by mtime, collision suffix and all", async () => {
+		await rm(path.join(agentDir, "plans", `${TASK_ID}.r1.jsonl`));
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		const olderFile = path.join(archiveDir, "2026-09-18-sub-fixture-1.r1.jsonl");
+		const newerFile = path.join(archiveDir, "2026-09-19-sub-fixture-1.r1.2.jsonl");
+		await writeFile(olderFile, JSON.stringify({ id: "p1", text: ARCHIVED_R1_OLD, status: "done" }) + "\n", "utf-8");
+		await writeFile(newerFile, JSON.stringify({ id: "p1", text: ARCHIVED_R1_NEW, status: "done" }) + "\n", "utf-8");
+		// Pin mtime explicitly: the .2 suffix sorts AFTER the plain name
+		// lexicographically, so this test proves mtime (not name) decides.
+		utimesSync(olderFile, new Date("2026-09-19T10:00:00Z"), new Date("2026-09-19T10:00:00Z"));
+		utimesSync(newerFile, new Date("2026-09-18T10:00:00Z"), new Date("2026-09-18T10:00:00Z"));
+
+		const items = await readRunPlans(agentDir, TASK_ID, []);
+		const r1Items = items.filter((i) => i.text === ARCHIVED_R1_OLD || i.text === ARCHIVED_R1_NEW);
+		expect(r1Items).toHaveLength(1);
+		expect(r1Items[0]!.text).toBe(ARCHIVED_R1_OLD);
+	});
+
+	test("live .rN file wins over its archived versions", async () => {
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture-1.r1.jsonl"),
+			JSON.stringify({ id: "p1", text: ARCHIVED_R1_DECOY, status: "done" }) + "\n",
+			"utf-8",
+		);
+		// The live .r1 (created in beforeEach) has the sibling items.
+		const items = await readRunPlans(agentDir, TASK_ID, []);
+		expect(items.some((i) => i.text === "Sibling run item")).toBe(true);
+		expect(items.some((i) => i.text === ARCHIVED_R1_DECOY)).toBe(false);
+	});
+
+	test("archived .rN match is key-exact: a shorter Task never pulls a longer Task's variant", async () => {
+		await rm(path.join(agentDir, "plans", `${TASK_ID}.r1.jsonl`));
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		// The archive file is for the LONGER Task (TASK_ID = sub-fixture-1),
+		// which contains the requested key as a strict prefix — substring
+		// matching would select it.
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture-1.r1.jsonl"),
+			JSON.stringify({ id: "p1", text: NOT_ON_CARD, status: "active" }) + "\n",
+			"utf-8",
+		);
+		const items = await readRunPlans(agentDir, "sub-fixture", []);
+		expect(items.some((i) => i.text === NOT_ON_CARD)).toBe(false);
+	});
+
+	test("archived .rN match is key-exact: a longer Task never pulls a shorter Task's variant", async () => {
+		await rm(path.join(agentDir, "plans", `${TASK_ID}.r1.jsonl`));
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		// The archive file is for the SHORTER Task (sub-fixture); the request
+		// is TASK_ID (sub-fixture-1).
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture.r1.jsonl"),
+			JSON.stringify({ id: "p1", text: NOT_ON_CARD, status: "active" }) + "\n",
+			"utf-8",
+		);
+		const items = await readRunPlans(agentDir, TASK_ID, []);
+		expect(items.some((i) => i.text === NOT_ON_CARD)).toBe(false);
+	});
 });
 
 describe("Board card render (ADR 0048)", () => {
@@ -244,6 +337,27 @@ describe("Board card render (ADR 0048)", () => {
 		expect(frame).not.toContain(DIM_JUDGE);
 		expect(frame).not.toContain(COLORED_WIRE);
 		expect(frame).not.toContain(NOT_ON_CARD);
+	});
+
+	test("lists archived .rN plans under the card after the live files are gone", async () => {
+		// The sibling Run completed: its live .r1 plan self-archived.
+		await rm(path.join(agentDir, "plans", `${TASK_ID}.r1.jsonl`));
+		const archiveDir = path.join(agentDir, "plans", "archive");
+		await mkdir(archiveDir, { recursive: true });
+		await writeFile(
+			path.join(archiveDir, "2026-09-19-sub-fixture-1.r1.jsonl"),
+			JSON.stringify({ id: "p1", text: ARCHIVED_R1_ITEM, status: "done" }) + "\n",
+			"utf-8",
+		);
+
+		const runPlans = new Map(
+			[[TASK_ID, await readRunPlans(agentDir, TASK_ID, [REWORK_RUN, REVIEW_RUN])]],
+		);
+		const frame = render([CARD], mainFile, 80, false, new Map(), runPlans);
+		// The archived Run's done item is drawn dimmed, from the archive alone.
+		expect(frame).toContain(DIM_ARCHIVED_R1);
+		// And the live sibling items it replaced are gone from the card.
+		expect(frame).not.toContain("Sibling run item");
 	});
 });
 

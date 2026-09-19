@@ -300,7 +300,9 @@ function escapeRegex(s: string): string {
  * file is the single source of truth, read live on every draw (docs/adr/0048).
  * A wanted key with no live file falls back to the archive (plans/archive/):
  * a child's plan self-archives when its last item goes terminal, so the dimmed
- * done items must survive there. Live files always win over archive entries.
+ * done items must survive there — the `.rN` siblings included, a parallel or
+ * chain child's variant archived the moment that Run completes. Live files
+ * always win over archive entries.
  *
  * Everything is best-effort: the Board renders a card whether or not any Run
  * left a plan file readable, so a missing or corrupt file renders nothing
@@ -343,6 +345,16 @@ export async function readRunPlans(
 	for (const key of [...want].sort()) {
 		if (live.has(key)) continue;
 		const archived = await newestArchivedFile(archiveDir, key.replace(/\.jsonl$/, ""));
+		if (archived) files.push({ name: path.basename(archived), dir: archiveDir });
+	}
+	// The `.rN` siblings fall back the same way: a parallel or chain child
+	// self-archives its own `<taskId>.rN` plan when its last item goes terminal
+	// (docs/adr/0048), and the card keeps listing it post-hoc. Every distinct
+	// `.rN` the archive holds belongs to this Task's; a live variant file wins
+	// over that variant's archived versions.
+	for (const key of (await archivedVariantKeys(archiveDir, taskId)).sort()) {
+		if (live.has(`${key}.jsonl`)) continue;
+		const archived = await newestArchivedFile(archiveDir, key);
 		if (archived) files.push({ name: path.basename(archived), dir: archiveDir });
 	}
 	const items: RunPlanItem[] = [];
@@ -677,6 +689,48 @@ async function newestArchivedFile(archiveDir: string, key: string): Promise<stri
 		}
 	}
 	return newest ? path.join(archiveDir, newest.name) : null;
+}
+
+/**
+ * The distinct `.rN` variant keys the archive holds for a Task's plan key.
+ *
+ * A parallel or chain child self-archives its own `<taskId>.rN` plan when its
+ * last item goes terminal (docs/adr/0048), and the card must keep listing that
+ * Run's items post-hoc — the live scan alone would see nothing once every
+ * variant is archived. Archive files are named `<date>-<key>.jsonl`,
+ * optionally with a numeric collision suffix, so the variant keys are
+ * recovered by stripping the date prefix, the `.jsonl` ending, and a trailing
+ * collision suffix from the names that match the variant grammar.
+ *
+ * @param archiveDir - The `plans/archive` directory.
+ * @param taskId - The Task ID whose `.rN` variants are wanted.
+ * @returns The distinct variant keys (e.g. `pln-1.r2`), in no particular order.
+ */
+async function archivedVariantKeys(archiveDir: string, taskId: string): Promise<string[]> {
+	let names: string[];
+	try {
+		names = await readdir(archiveDir);
+	} catch {
+		return [];
+	}
+	// The live scan's variant grammar under the archive's own naming: the
+	// `<date>-` prefix, `<taskId>.rN` verbatim, an optional numeric collision
+	// suffix, and the `.jsonl` ending. Anchored at both ends, so a sibling
+	// Task's variants never leak into this card's results.
+	const variant = new RegExp(
+		String.raw`^\d{4}-\d{2}-\d{2}-${escapeRegex(taskId)}\.r\d+(?:\.\d+)?\.jsonl$`,
+	);
+	const keys = new Set<string>();
+	for (const n of names) {
+		if (!variant.test(n)) continue;
+		keys.add(
+			n
+				.replace(/^\d{4}-\d{2}-\d{2}-/, "")
+				.replace(/\.jsonl$/, "")
+				.replace(/\.\d+$/, ""),
+		);
+	}
+	return [...keys];
 }
 
 /**
