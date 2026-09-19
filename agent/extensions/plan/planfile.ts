@@ -505,6 +505,13 @@ export async function mutatePlan(
 ): Promise<PlanItem[]> {
 	let next: PlanItem[] = [];
 	await withFileMutationQueue(file, async () => {
+		// The lock directory lives inside the plan file's own directory, so that
+		// directory must exist before the lock can be created. If it does not,
+		// every `mkdir(lockDir)` fails with ENOENT, the lock's age reads as
+		// Infinity ("infinitely stale"), and acquirePlanLock breaks-and-retries
+		// forever without ever reaching its deadline — hanging the caller, in
+		// particular the spawn path's best-effort seed on a fresh agent dir.
+		await mkdir(path.dirname(file), { recursive: true });
 		const release = await acquirePlanLock(file);
 		try {
 			const items = await loadPlan(file);

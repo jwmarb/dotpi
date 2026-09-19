@@ -26,6 +26,8 @@ const PRE_EXISTING = '{"id":"p1","text":"pre-existing","status":"active"}\n';
 const NOT_JSON = "not-json-at-all";
 const SEED_IDS = ["p1", "p2", "p3"];
 const SEED_TEXTS = ["First item", "Second item", "Third item"];
+const FRESH_TEXT = "Seeded into a fresh dir";
+const HANG_MESSAGE = "seedRunPlan hung on a fresh agent dir";
 
 
 describe("YOUR_PLAN_NUDGE", () => {
@@ -51,8 +53,10 @@ describe("seedRunPlan", () => {
 
 	beforeEach(async () => {
 		agentDir = await mkdtemp(path.join(os.tmpdir(), "planfile-seed-"));
-		// planFilePathFor nests under plans/; the store never creates that parent
-		// itself, so the fixture provides what the production agent dir has.
+		// planFilePathFor nests under plans/. The pre-existing-file tests write
+		// files directly (writeFile creates no parent), so the fixture provides
+		// the directory; the fresh-agent-dir block below covers the store
+		// creating it itself.
 		await mkdir(path.join(agentDir, "plans"), { recursive: true });
 	});
 
@@ -128,6 +132,39 @@ describe("seedRunPlan", () => {
 		// Corrupt lines parse to zero items too; the seed must not overwrite
 		// them (docs/adr/0048).
 		expect(await readFile(file, "utf-8")).toBe(corrupt);
+	});
+
+	// Regression: a fresh agent dir has no plans/ directory at all. The lock
+	// directory lives inside plans/, so the store must create the parent
+	// before acquiring the lock — otherwise the missing-dir ENOENT reads as
+	// an "infinitely stale" lock and the acquire loop never reaches its
+	// deadline, hanging the spawn path's best-effort seed (docs/adr/0048).
+	describe("in a fresh agent dir without a plans directory", () => {
+		let agentDir: string;
+
+		beforeEach(async () => {
+			agentDir = await mkdtemp(path.join(os.tmpdir(), "planfile-seed-fresh-"));
+			// Deliberately no mkdir of plans/ here: that is the case under test.
+		});
+
+		afterEach(async () => {
+			await rm(agentDir, { recursive: true, force: true });
+		});
+
+		test("seeds into a plans directory that does not exist yet", async () => {
+			const result = await Promise.race([
+				seedRunPlan(agentDir, "sub-fresh-1", [FRESH_TEXT]),
+				// The bug was an infinite loop, not a slow write: a timeout here
+				// is a hang. The fixed path completes in a few fs operations.
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error(HANG_MESSAGE)), 2000),
+				),
+			]);
+			expect(result.seeded).toBe(true);
+			const items = await loadPlan(planFilePathFor(agentDir, "sub-fresh-1"));
+			expect(items.map((i) => i.text)).toEqual([FRESH_TEXT]);
+			expect(items.map((i) => i.route)).toEqual(["skip"]);
+		});
 	});
 });
 
@@ -210,6 +247,19 @@ describe("mutatePlan", () => {
 		const items = await mutatePlan(file, () => NO_WRITE);
 		expect(items).toHaveLength(1); // what was read
 		expect(await readFile(file, "utf-8")).toBe(before);
+	});
+
+	test("creates the plan file's directory before acquiring the lock", async () => {
+		// The lock directory lives inside the plan file's own directory. When
+		// that directory does not exist, acquiring the lock first loops on
+		// ENOENT forever (the missing dir reads as infinitely stale) — so the
+		// directory must be created before the lock, not only before the write.
+		const file = path.join(dir, "nested", "plan.jsonl");
+		const items = await mutatePlan(file, () => [
+			{ id: "p1", text: "Nested", status: "backlog" },
+		]);
+		expect(items).toHaveLength(1);
+		expect(await readFile(file, "utf-8")).toContain("Nested");
 	});
 });
 
