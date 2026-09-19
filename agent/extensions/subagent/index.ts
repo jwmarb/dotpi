@@ -1963,8 +1963,9 @@ export default function (pi: ExtensionAPI) {
 		 * The nudge crosses only when the seed succeeds, because a skipped seed
 		 * (a pre-existing plan file) means the items the nudge describes are not
 		 * the ones the child will see. Appending here — before executeRun — is
-		 * what gets the nudge into both the argv the child receives and the
-		 * prompt.md recorded beside its session (docs/adr/0045).
+		 * what gets the nudge into the `Task:` argv line the child receives;
+		 * prompt.md records the system prompt (docs/adr/0045) and does not
+		 * carry it.
 		 */
 		const seedStarterPlan = async (
 			run: RunResult,

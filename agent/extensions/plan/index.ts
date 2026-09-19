@@ -1924,9 +1924,9 @@ export default function (pi: ExtensionAPI) {
 							'op "seed" requires "for" (the plan key, e.g. a Task ID) and "items".',
 							undefined,
 						);
-					// The ADR's contract (docs/adr/0048): a pre-existing file — empty,
-					// metadata-only, or corrupt included — means the seed is skipped, the
-					// same predicate the spawn path uses (docs/adr/0048).
+					// A pre-existing file — empty, metadata-only, or corrupt included —
+					// means the seed is skipped, per the ADR's contract: the same
+					// predicate the spawn path uses (docs/adr/0048).
 					if (await planFileExists(file))
 						return result(
 							`Plan for ${key} already exists — not clobbered. Use op "add" to extend it.`,

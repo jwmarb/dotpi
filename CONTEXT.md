@@ -56,7 +56,7 @@ One step in a **Plan**: what to do, plus its state as the work progresses. A **P
 _Avoid_: subtask, step (a **step** is what you do; a **Plan Item** is the tracked entry for it)
 
 **Starter Plan**:
-A **Plan** the orchestrator authors for a subagent before delegating work. Its items cross into the subagent's plan file at spawn — never inside the **Delegation brief** — so the child's plan tool and the parent's **Board** address the same file (ADR 0048), and the subagent tool’s “plan” parameter is how the items cross: the spawner seeds the child’s plan file at spawn, and when the seed lands a fixed nudge line is appended to the **Delegation brief** telling the child to maintain its plan. The subagent owns and maintains it from that moment on; the orchestrator never reads it back.
+A **Plan** the orchestrator authors for a subagent before delegating work. Its items cross into the subagent's plan file at spawn — never inside the **Delegation brief** — so the child's plan tool and the parent's **Board** address the same file (ADR 0048). A fixed nudge line also crosses inside the **Delegation brief**, telling the child the plan exists and is part of the job; the subagent owns and maintains it from that moment on, and the orchestrator never reads it back.
 _Avoid_: delegation brief (that is the prompt text; the **Starter Plan** is the tracked structure behind it)
 
 **Revision**:
