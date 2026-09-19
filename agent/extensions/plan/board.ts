@@ -40,6 +40,10 @@ interface PlanItem {
 	taskId?: string;
 	/** Who may clear this item; absent means `user` (docs/adr/0023, 0024). */
 	route?: "user" | "oracle" | "skip";
+	/** The Rework Run working this item, if one is in flight (docs/adr/0041). */
+	reworkRunId?: string;
+	/** The review Run judging this item, if one is in flight (docs/adr/0048). */
+	reviewRunId?: string;
 }
 
 /**
@@ -260,8 +264,95 @@ async function readRunProgress(
 			// the sidecar already recorded one (docs/adr/0036).
 			if (!finished) unfinished++;
 		}
-	}
 	return { agent, turns, finished: unfinished === 0 };
+}
+
+/**
+ * One item of a Run's own plan file, reduced to what the card's plan lines
+ * need (docs/adr/0048).
+ */
+interface RunPlanItem {
+	id: string;
+	text: string;
+	status: PlanState;
+}
+
+/** Escape a string for use inside a RegExp. */
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Read the plan items of the Runs a card carries, best-effort.
+ *
+ * A card with a Task ID lists the Runs' own plan files: the Task's plan, its
+ * `.rN` variants — read off the directory, never guessed by string
+ * interpolation — and the rework and review Runs the Item records. The plan
+ * file is the single source of truth, read live on every draw (docs/adr/0048).
+ *
+ * Everything is best-effort: the Board renders a card whether or not any Run
+ * left a plan file readable, so a missing or corrupt file renders nothing
+ * extra rather than failing the draw.
+ *
+ * @param agentDir - The pi agent directory holding `plans`.
+ * @param taskId - The Task ID recorded on the Plan Item.
+ * @param extraRunIds - The Item's rework/review Run IDs, if it carries them.
+ * @returns The items, in file order, or an empty list when nothing is readable.
+ */
+async function readRunPlans(
+	agentDir: string,
+	taskId: string,
+	extraRunIds: string[],
+): Promise<RunPlanItem[]> {
+	const plansDir = path.join(agentDir, "plans");
+	let names: string[];
+	try {
+		names = await readdir(plansDir);
+	} catch {
+		return [];
+	}
+	// The Run's own files: the Task's plan plus its `.rN` siblings (a multi-run
+	// Task keys each Run separately, docs/adr/0012), plus the rework and
+	// review Runs the Item records.
+	const want = new Set<string>(
+		[taskId, ...extraRunIds].map((r) => `${r}.jsonl`),
+	);
+	const variant = new RegExp(`^${escapeRegex(taskId)}\\.r\\d+\\.jsonl$`);
+	const files = names
+		.filter((n) => want.has(n) || variant.test(n))
+		.sort();
+	const items: RunPlanItem[] = [];
+	for (const name of files) {
+		let raw: string;
+		try {
+			raw = await readFile(path.join(plansDir, name), "utf-8");
+		} catch {
+			continue; // Unreadable file: the card renders the rest.
+		}
+		for (const line of raw.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const obj = JSON.parse(line) as Partial<RunPlanItem> & {
+					kind?: unknown;
+				};
+				// The plan-meta line carries settings, not items.
+				if (obj.kind === "plan-meta") continue;
+				if (
+					typeof obj.id === "string" &&
+					typeof obj.text === "string" &&
+					typeof obj.status === "string"
+				)
+					items.push({
+						id: obj.id,
+						text: obj.text,
+						status: canonical(obj.status),
+					});
+			} catch {
+				// Mid-write or corrupt: skip the line, keep the rest.
+			}
+		}
+	}
+	return items;
 }
 
 /**
@@ -311,6 +402,14 @@ async function load(file: string): Promise<PlanItem[]> {
 					status: canonical(obj.status),
 					note: typeof obj.note === "string" ? obj.note : undefined,
 					taskId: typeof obj.taskId === "string" ? obj.taskId : undefined,
+					reworkRunId:
+						typeof obj.reworkRunId === "string" && obj.reworkRunId !== ""
+							? obj.reworkRunId
+							: undefined,
+					reviewRunId:
+						typeof obj.reviewRunId === "string" && obj.reviewRunId !== ""
+							? obj.reviewRunId
+							: undefined,
 					// Unknown routes are dropped, matching the tool: a route this build
 					// does not know must not be rendered as though it were understood.
 					route:
@@ -352,6 +451,7 @@ function render(
 	cols: number,
 	archived = false,
 	progress: Map<string, RunProgress> = new Map(),
+	runPlans: Map<string, RunPlanItem[]> = new Map(),
 ): string {
 	const out: string[] = [];
 	const width = Math.max(28, Math.min(cols, 100));
@@ -431,6 +531,22 @@ function render(
 					out.push(
 						`         ${fg("221", `[${item.taskId}]`)} ${dim(detail)}`,
 					);
+					// The Runs' own plans, one line per item: what the Run is working
+					// through, live from the plan file (docs/adr/0048). Indented and
+					// wrapped like the note line; done items dimmed with the note's
+					// dimming. Nothing readable → nothing extra, so a card with no plan
+					// data renders exactly as before.
+					const plans = runPlans.get(item.taskId);
+					if (plans?.length)
+						for (const planItem of plans)
+							for (const nl of wrap(planItem.text, width - 14))
+								out.push(
+									`         ${
+										planItem.status === "done"
+											? dim(`${GLYPH[planItem.status]} ${nl}`)
+											: `${fg(COLOR[planItem.status], GLYPH[planItem.status])} ${nl}`
+									}`,
+								);
 				}
 				if (item.note)
 					for (const nl of wrap(item.note, width - 14))
@@ -460,7 +576,27 @@ function render(
 // ---------------------------------------------------------------------------
 
 const file = process.argv[2];
-if (!file) {
+
+/**
+ * Whether this module is the Board entrypoint (spawned by the plan
+ * extension) rather than imported (by the render tests). The entry code below
+ * owns the terminal — raw mode, the alternate screen, the redraw loop — and it
+ * must run exactly once, in the process the user is looking at. The check is
+ * `process.argv[1]` against this file's own path: it matches only when the
+ * user ran this file.
+ */
+const isEntrypoint = (() => {
+	const entry = process.argv[1];
+	if (!entry) return false;
+	try {
+		return path.resolve(entry) ===
+			path.resolve(new URL(import.meta.url).pathname);
+	} catch {
+		return false;
+	}
+})();
+
+if (isEntrypoint && !file) {
 	console.error("usage: board.ts <plan-file>");
 	process.exit(2);
 }
@@ -562,6 +698,27 @@ async function draw(): Promise<void> {
 	);
 	tasksInFlight = [...progress.values()].some((p) => !p.finished);
 
+	// The Runs' own plans, per Task (docs/adr/0048): the Task's plan, its `.rN`
+	// variants and the rework/review Runs the Items record. Read live on every
+	// draw, like the progress — the plan file is the single source of truth. Best-
+	// effort per Task: an empty list renders the card exactly as before.
+	const runPlans = new Map<string, RunPlanItem[]>();
+	{
+		const byTask = new Map<string, string[]>();
+		for (const item of items) {
+			if (!item.taskId) continue;
+			const extra = byTask.get(item.taskId) ?? [];
+			if (item.reworkRunId) extra.push(item.reworkRunId);
+			if (item.reviewRunId) extra.push(item.reviewRunId);
+			byTask.set(item.taskId, extra);
+		}
+		await Promise.all(
+			[...byTask.entries()].map(async ([taskId, extra]) => {
+				const p = await readRunPlans(agentDir, taskId, extra);
+				if (p.length) runPlans.set(taskId, p);
+			}),
+		);
+	}
 	const cols = process.stdout.columns ?? 80;
 	const rows = process.stdout.rows ?? 40;
 
@@ -573,7 +730,7 @@ async function draw(): Promise<void> {
 	// not enough on the normal screen: a frame taller than the pane scrolls the
 	// buffer, `2J` only clears the viewport, and the scrolled-off remains stacked
 	// up behind each new frame.
-	const full = render(items, shownFile, cols, archived, progress).split("\n");
+	const full = render(items, shownFile, cols, archived, progress, runPlans).split("\n");
 	const footer = archived
 		? "  archived · a new plan will appear here"
 		: "  watching · ↑↓/PgUp/PgDn to scroll · ctrl+c to close";
@@ -676,25 +833,27 @@ function restoreScreen(): void {
 	}
 }
 
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
-	process.on(sig, () => {
+if (isEntrypoint) {
+	for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
+		process.on(sig, () => {
+			restoreScreen();
+			process.exit(0);
+		});
+	process.on("exit", restoreScreen);
+	// A crash must not strand the pane on the alternate screen either.
+	process.on("uncaughtException", (err) => {
 		restoreScreen();
-		process.exit(0);
+		console.error(err);
+		process.exit(1);
 	});
-process.on("exit", restoreScreen);
-// A crash must not strand the pane on the alternate screen either.
-process.on("uncaughtException", (err) => {
-	restoreScreen();
-	console.error(err);
-	process.exit(1);
-});
-// `void draw()` means a rejected draw never reaches `uncaughtException`, so the
-// terminal would be stranded by the one failure mode most likely to happen.
-process.on("unhandledRejection", (err) => {
-	restoreScreen();
-	console.error(err);
-	process.exit(1);
-});
+	// `void draw()` means a rejected draw never reaches `uncaughtException`, so the
+	// terminal would be stranded by the one failure mode most likely to happen.
+	process.on("unhandledRejection", (err) => {
+		restoreScreen();
+		console.error(err);
+		process.exit(1);
+	});
+}
 
 /**
  * Scroll keys.
@@ -705,7 +864,7 @@ process.on("unhandledRejection", (err) => {
  * individual keypresses; without it stdin stays line-buffered and nothing
  * arrives until Enter.
  */
-if (process.stdin.isTTY) {
+if (isEntrypoint && process.stdin.isTTY) {
 	process.stdin.setRawMode(true);
 	process.stdin.resume();
 	process.stdin.setEncoding("utf8");
@@ -725,9 +884,11 @@ if (process.stdin.isTTY) {
 				scroll = Math.min(maxScroll, scroll + 1);
 				break;
 			case "\x1b[5~": // page up
+			case "k":
 				scroll = Math.max(0, scroll - page);
 				break;
 			case "\x1b[6~": // page down
+			case "j":
 				scroll = Math.min(maxScroll, scroll + page);
 				break;
 			case "g":
@@ -744,7 +905,6 @@ if (process.stdin.isTTY) {
 		if (scroll !== before) scheduleDraw();
 	});
 }
-
 /**
  * Enter the alternate screen and hide the cursor.
  *
@@ -764,56 +924,59 @@ function enterAltScreen(): void {
 // buffer, so no frame can scroll real history and no clear can destroy it.
 // Cleanup handlers are installed by enterAltScreen() *before* the escape is
 // written, so any failure from here on still restores the terminal.
-enterAltScreen();
+if (isEntrypoint) {
+	enterAltScreen();
 
-await drawOnce();
+	await drawOnce();
 
-// Watch the *directory*, not the file: the plan is replaced by atomic rename,
-// which breaks a watch bound to the original inode. The directory sees the
-// rename regardless.
-const dir = path.dirname(file);
-const base = path.basename(file);
-try {
-	watch(dir, (_event, changed) => {
-		if (!changed || changed === base || changed.startsWith(base))
-			scheduleDraw();
-	});
-} catch {
-	// No inotify: fall back to polling below.
+	// Watch the *directory*, not the file: the plan is replaced by atomic rename,
+	// which breaks a watch bound to the original inode. The directory sees the
+	// rename regardless.
+	const dir = path.dirname(file);
+	const base = path.basename(file);
+	try {
+		watch(dir, (_event, changed) => {
+			if (!changed || changed === base || changed.startsWith(base))
+				scheduleDraw();
+		});
+	} catch {
+		// No inotify: fall back to polling below.
+	}
+
+	// Belt and braces: a slow poll catches anything the watcher misses (network
+	// filesystems, editors that write via a temp dir, an archived plan vanishing).
+	//
+	// The poll also carries live Task progress. A Run writes its own session file
+	// and never touches the plan, so watching the plan alone would leave turn
+	// counts frozen while a subagent works (docs/adr/0026): whenever any Task is
+	// unfinished, redraw on the tick regardless of the plan's own mtime.
+	let lastStamp = "";
+	setInterval(() => {
+		void (async () => {
+			if (tasksInFlight) {
+				scheduleDraw();
+				return;
+			}
+			try {
+				const info = await stat(file);
+				const stamp = `${info.mtimeMs}:${info.size}`;
+				if (stamp !== lastStamp) {
+					lastStamp = stamp;
+					scheduleDraw();
+				}
+			} catch {
+				// File gone (archived): redraw once to show the empty state.
+				if (lastStamp !== "gone") {
+					lastStamp = "gone";
+					scheduleDraw();
+				}
+			}
+		})();
+	}, 2000);
+
+		process.stdout.on("resize", scheduleDraw);
+	}
 }
-
-// Belt and braces: a slow poll catches anything the watcher misses (network
-// filesystems, editors that write via a temp dir, an archived plan vanishing).
-//
-// The poll also carries live Task progress. A Run writes its own session file
-// and never touches the plan, so watching the plan alone would leave turn
-// counts frozen while a subagent works (docs/adr/0026): whenever any Task is
-// unfinished, redraw on the tick regardless of the plan's own mtime.
-let lastStamp = "";
-setInterval(() => {
-	void (async () => {
-		if (tasksInFlight) {
-			scheduleDraw();
-			return;
-		}
-		try {
-			const info = await stat(file);
-			const stamp = `${info.mtimeMs}:${info.size}`;
-			if (stamp !== lastStamp) {
-				lastStamp = stamp;
-				scheduleDraw();
-			}
-		} catch {
-			// File gone (archived): redraw once to show the empty state.
-			if (lastStamp !== "gone") {
-				lastStamp = "gone";
-				scheduleDraw();
-			}
-		}
-	})();
-}, 2000);
-
-process.stdout.on("resize", scheduleDraw);
 
 
 // ---------------------------------------------------------------------------

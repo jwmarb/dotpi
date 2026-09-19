@@ -94,15 +94,19 @@ function killGraceFor(purpose: ChildPurpose): number {
 // one machine, not one per spawner.
 
 /**
- * Sentinel written into a review child's `PI_PLAN_KEY`.
+ * The plan key a spawned Run's child receives is the Run's own runId
+ * (docs/adr/0048) — the shared `__review__` sentinel retired with it, and the
+ * Run's plan file is seeded at dispatch from the same code path that mints it.
  *
- * It must be a non-empty string. An empty string is falsy, and the plan
- * extension branches on `!process.env.PI_PLAN_KEY` to decide whether it is a
- * main session — so `""` made every review child believe it *was* the main
- * session, restoring and re-injecting the plan and spawning a Board.
+ * The contract the sentinel carried survives, and the runId satisfies both
+ * halves: the key must be a non-empty string (an empty string is falsy, and the
+ * plan extension branches on `!process.env.PI_PLAN_KEY` to decide whether it is
+ * a main session — so `""` made every review child believe it *was* the main
+ * session, restoring and re-injecting the plan and spawning a Board), and it
+ * must not be the reviewed plan's key (a review must not load that plan —
+ * including its autonomous mode — as its own). A `pln-` runId is non-empty and
+ * can never be the reviewed plan's key.
  */
-export const REVIEW_PLAN_KEY = "__review__";
-
 
 /**
  * Whether this process must not dispatch reviews.
@@ -115,6 +119,24 @@ export function dispatchSuppressed(
 ): boolean {
 	return env[REVIEW_ENV_FLAG] === "1";
 }
+
+/**
+ * Module-level spawn override, for the dispatch path's tests.
+ *
+ * {@link runReview} takes a per-call `spawnFn`, but `dispatchReview` and
+ * `dispatchRework` call it without one — and a test that wants to pin the
+ * spawn a *dispatch* performs (the plan key the child receives, the Run
+ * directory, the seeding) cannot reach through the per-call option. This
+ * seam is consulted only when no per-call spawn was given, so a caller that
+ * passes `spawnFn` is unaffected.
+ */
+let spawnOverride: typeof spawn | null = null;
+
+/** Install (or clear, with `null`) the module-level spawn override. */
+export function setSpawnFn(fn: typeof spawn | null): void {
+	spawnOverride = fn;
+}
+
 
 /** Outcome of a dispatched review, before any plan mutation. */
 export interface ReviewOutcome {
@@ -418,11 +440,10 @@ async function runReviewNatively(opts: {
 		// Run was asked, instead of a pointer into a system prompt no one can
 		// see (docs/adr/0047).
 		task: opts.task,
-		// NOT the reviewed plan's key. A review must not load that plan — including
-		// its autonomous mode — as its own, and the sentinel must stay non-empty or
-		// the plan extension treats the child as a main session and spawns a Board
-		// inside it (docs/adr/0037).
-		planKey: REVIEW_PLAN_KEY,
+		// The Run's own plan key (docs/adr/0048) — see the contract at
+		// `REVIEW_PLAN_KEY`'s retirement above: non-empty, and never the reviewed
+		// plan's key.
+		planKey: opts.runId,
 	});
 
 	// The recursion interlock has to reach the child through the pane's env, since
@@ -572,8 +593,7 @@ export async function runReview(opts: {
 	const timeoutMs =
 		opts.timeoutMs ??
 		(purpose === "rework" ? REWORK_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
-	const spawnImpl = opts.spawnFn ?? spawn;
-
+	const spawnImpl = opts.spawnFn ?? spawnOverride ?? spawn;
 	// The interlock is enforced HERE, at the only place that actually spawns, not
 	// merely in dispatchReview. A guard the spawner does not itself apply is a
 	// guard any new caller can bypass — which is exactly how the fork bomb got
@@ -722,12 +742,13 @@ export async function runReview(opts: {
 					...process.env,
 					// The interlock: this child must not dispatch reviews of its own.
 					[REVIEW_ENV_FLAG]: "1",
-					// Not the reviewed plan's key: a review must not load that plan —
-					// including its autonomous mode — as its own. It must still be a
-					// NON-EMPTY sentinel, because the plan extension treats a falsy
-					// PI_PLAN_KEY as "I am the main session" and would then restore the
-					// plan, re-inject it and spawn a Board inside every review child.
-					PI_PLAN_KEY: REVIEW_PLAN_KEY,
+					// The Run's own plan key (docs/adr/0048), not the reviewed plan's
+					// key: a review must not load that plan — including its autonomous
+					// mode — as its own. The runId carries the sentinel's contract:
+					// non-empty (a falsy key would make the child believe it is the
+					// main session and spawn a Board inside it) and never the reviewed
+					// plan's key.
+					PI_PLAN_KEY: opts.runId,
 				},
 			});
 

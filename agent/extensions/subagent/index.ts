@@ -72,6 +72,10 @@ import {
 	RUN_ENTRYPOINT,
 	RUN_PLUGIN_ID,
 } from "./native.js";
+// The plan file store: a delegated Run's Starter Plan is seeded in the same
+// code path that computes its plan key, and the nudge that tells the child the
+// plan exists crosses as part of the delegation brief (docs/adr/0048).
+import { seedRunPlan, YOUR_PLAN_NUDGE } from "../plan/planfile.js";
 import type { RunOutcome } from "./rundir.js";
 import {
 	mirrorPaneLabel,
@@ -80,6 +84,20 @@ import {
 	writePromptToRunDir,
 	writeRunSidecar,
 } from "./rundir.js";
+
+/**
+ * Injectable spawn, for the piped path's tests.
+ *
+ * The piped Run spawns the real `pi` binary; a harness that cannot afford a
+ * real child process swaps in a fake one through this seam. Only the piped
+ * path consults it — the native path goes through herdr, not spawn.
+ */
+let spawnImpl: typeof spawn = spawn;
+
+/** Install (or clear, with `null`) the module-level spawn override. */
+export function setSpawnFn(fn: typeof spawn | null): void {
+	spawnImpl = fn ?? spawn;
+}
 // The shared admission cap: one machine, one budget (docs/adr/0040), counted
 // across every pi in this tree since native Runs can spawn (docs/adr/0044).
 import {
@@ -1325,7 +1343,7 @@ async function executeAttemptWithSlot(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
+			const proc = spawnImpl(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
@@ -1641,11 +1659,16 @@ const SkillsSchema = Type.Array(Type.String(), {
 	description:
 		'Names of skills to preload into the subagent\'s system prompt (e.g. ["tdd", "python-style"]). The full SKILL.md content is injected, so the subagent starts with that knowledge already in context. Use this whenever the task should follow a skill\'s methodology — subagents cannot discover skills on their own.',
 });
+const StarterPlanSchema = Type.Array(Type.String(), {
+	description:
+		"Initial plan items seeded into the child's own plan file at spawn (the Starter Plan; never part of the delegation brief). The child maintains it as it works (docs/adr/0048).",
+});
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	skills: Type.Optional(SkillsSchema),
+	plan: Type.Optional(StarterPlanSchema),
 	cwd: Type.Optional(
 		Type.String({ description: "Working directory for the agent process" }),
 	),
@@ -1657,6 +1680,7 @@ const ChainItem = Type.Object({
 		description: "Task with optional {previous} placeholder for prior output",
 	}),
 	skills: Type.Optional(SkillsSchema),
+	plan: Type.Optional(StarterPlanSchema),
 	cwd: Type.Optional(
 		Type.String({ description: "Working directory for the agent process" }),
 	),
@@ -1678,6 +1702,7 @@ const SubagentParams = Type.Object({
 		Type.String({ description: "Task to delegate (for single mode)" }),
 	),
 	skills: Type.Optional(SkillsSchema),
+	plan: Type.Optional(StarterPlanSchema),
 	tasks: Type.Optional(
 		Type.Array(TaskItem, {
 			description: "Array of {agent, task} for parallel execution",
@@ -1919,7 +1944,7 @@ export default function (pi: ExtensionAPI) {
 		task: Task,
 		defaultCwd: string,
 		agents: AgentConfig[],
-		items: { agent: string; task: string; skills?: string[]; cwd?: string }[],
+		items: { agent: string; task: string; skills?: string[]; cwd?: string; plan?: string[] }[],
 	): Promise<void> => {
 		const onProgress = () => refreshStatus();
 
@@ -1929,6 +1954,35 @@ export default function (pi: ExtensionAPI) {
 		const planKeyFor = (index: number) =>
 			task.runs.length === 1 ? task.id : `${task.id}.r${index + 1}`;
 
+		/**
+		 * Seed a Run's own plan file from its Starter Plan, and when the seed
+		 * lands, append the nudge to the task text (docs/adr/0048).
+		 *
+		 * The seed is best-effort: a plan that cannot be written is not a reason
+		 * to fail a spawn — the Run proceeds exactly as it would without one.
+		 * The nudge crosses only when the seed succeeds, because a skipped seed
+		 * (a pre-existing plan file) means the items the nudge describes are not
+		 * the ones the child will see. Appending here — before executeRun — is
+		 * what gets the nudge into both the argv the child receives and the
+		 * prompt.md recorded beside its session (docs/adr/0045).
+		 */
+		const seedStarterPlan = async (
+			run: RunResult,
+			plan: string[] | undefined,
+			index: number,
+		): Promise<void> => {
+			if (!plan?.length) return;
+			try {
+				const { seeded } = await seedRunPlan(
+					getAgentDir(),
+					planKeyFor(index),
+					plan,
+				);
+				if (seeded) run.task = `${run.task}\n\n${YOUR_PLAN_NUDGE(plan.length)}`;
+			} catch {
+				// Best-effort, like every sidecar write here: the Run is the point.
+			}
+		};
 		// One Tab per Task, one Mirror Pane per Run (docs/adr/0016). Only top-level
 		// Runs get panes: subagent children inherit no pane identity, so the gate
 		// closes for nested delegations automatically. Failure to build any of this
@@ -1990,6 +2044,9 @@ export default function (pi: ExtensionAPI) {
 						/\{previous\}/g,
 						() => previousOutput,
 					);
+					// The Starter Plan crosses before the Run starts: the seed and the
+					// nudge both need to land before executeRun records the prompt.
+					await seedStarterPlan(run, items[i].plan, i);
 
 					await executeRun(
 						defaultCwd,
@@ -2023,8 +2080,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await mapWithConcurrencyLimit(items, MAX_CONCURRENCY, async (item, index) =>
-				executeRun(
+			await mapWithConcurrencyLimit(items, MAX_CONCURRENCY, async (item, index) => {
+				// The Starter Plan crosses before the Run starts: the seed and the
+				// nudge both need to land before executeRun records the prompt.
+				await seedStarterPlan(task.runs[index], item.plan, index);
+				return executeRun(
 					defaultCwd,
 					agents,
 					task.runs[index],
@@ -2033,7 +2093,8 @@ export default function (pi: ExtensionAPI) {
 					task.abort.signal,
 					onProgress,
 					planKeyFor(index),
-				),
+				);
+			},
 			);
 
 			const failures = task.runs.filter(runFailed);
@@ -2134,6 +2195,7 @@ export default function (pi: ExtensionAPI) {
 								agent: params.agent!,
 								task: params.task!,
 								skills: params.skills,
+								plan: params.plan,
 								cwd: params.cwd,
 							},
 						];

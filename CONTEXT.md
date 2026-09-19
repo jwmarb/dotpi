@@ -56,7 +56,7 @@ One step in a **Plan**: what to do, plus its state as the work progresses. A **P
 _Avoid_: subtask, step (a **step** is what you do; a **Plan Item** is the tracked entry for it)
 
 **Starter Plan**:
-A **Plan** the orchestrator authors for a subagent before delegating work. Its items cross into the subagent's plan file at spawn — never inside the **Delegation brief** — so the child's plan tool and the parent's **Board** address the same file (ADR 0048) _[design only: until it lands, the items cross inside the delegation text and the orchestrator seeds the plan file after the fact]_. The subagent owns and maintains it from that moment on; the orchestrator never reads it back.
+A **Plan** the orchestrator authors for a subagent before delegating work. Its items cross into the subagent's plan file at spawn — never inside the **Delegation brief** — so the child's plan tool and the parent's **Board** address the same file (ADR 0048), and the subagent tool’s “plan” parameter is how the items cross: the spawner seeds the child’s plan file at spawn, and when the seed lands a fixed nudge line is appended to the **Delegation brief** telling the child to maintain its plan. The subagent owns and maintains it from that moment on; the orchestrator never reads it back.
 _Avoid_: delegation brief (that is the prompt text; the **Starter Plan** is the tracked structure behind it)
 
 **Revision**:
@@ -162,7 +162,7 @@ _Avoid_: reopen (retired — it promised a read that no longer exists), replay, 
 The **Pane** that renders the **Board**. Exactly one per session, spawned at session start. It occupies the alternate screen, so it keeps its own display buffer rather than sharing the pane's scrollback, and is scrolled with keys (ADR 0031).
 
 **Board**:
-The live kanban projection of a **Plan**, drawn as columns in the **Board Pane**. Unlike other readers, the **Board** may also write: see **Column**. It reads more than the plan: a card carrying a **Task ID** shows that **Task**'s live progress, read from its **Runs**' sessions and **Run Meta** (ADR 0026), and will list the **Runs**' own **Plan** items, read from each **Run**'s plan file — the single source of truth for that **Plan**, no snapshot in the **Run** directory — with done items dimmed _[design only: ADR 0048; the Board does not yet read the Runs' plan files]_. A card's title is the item's whole text — wrapped or multi-line, every line keeps title styling — so the item's note is the card's only dimmed element that belongs to the item itself (ADR 0043).
+The live kanban projection of a **Plan**, drawn as columns in the **Board Pane**. Unlike other readers, the **Board** may also write: see **Column**. It reads more than the plan: a card carrying a **Task ID** shows that **Task**'s live progress, read from its **Runs**' sessions and **Run Meta** (ADR 0026), and will list the **Runs**' own **Plan** items, read from each **Run**'s plan file — the single source of truth for that **Plan**, no snapshot in the **Run** directory — with done items dimmed (ADR 0048). A card's title is the item's whole text — wrapped or multi-line, every line keeps title styling — so the item's note is the card's only dimmed element that belongs to the item itself (ADR 0043).
 _Avoid_: kanban, plan view (the **Board** is writable, so it is not merely a view)
 
 **Column**:

@@ -31,19 +31,34 @@ import {
 	readdir,
 	readFile,
 	rename,
-	rm,
 	stat,
-	writeFile,
 } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { randomBytes } from "node:crypto";
 import {
 	dispatchSuppressed,
 	REWORK_TIMEOUT_MS,
 	runReview,
 } from "./review.js";
+// The plan file store: line schema, the corruption-tolerant reader, the
+// cross-process lock and the atomic mutate. Moved out of this module (and
+// importable by the spawners) so a Run's plan can be seeded at spawn without
+// pulling the whole plan tool in (docs/adr/0048).
+import {
+	NO_WRITE,
+	type PlanItem,
+	type PlanMeta,
+	type PlanState,
+	type ReviewRoute,
+	ROUTE_ORDER,
+	loadMeta,
+	loadPlan,
+	mutatePlan,
+	planFilePathFor,
+	seedRunPlan,
+} from "./planfile.js";
 // The shared Run-directory contract, so a plan-spawned Run is discoverable by
 // exactly the readers that already scan the subagent layout (docs/adr/0039).
 import {
@@ -69,49 +84,6 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Lifecycle of a single Plan Item. Terminal states: done, failed, dropped.
- *
- * The non-terminal states are the Board's columns (docs/adr/0018): moving a
- * card *is* a state change, and there is no column concept separate from state.
- *
- * `backlog` is captured but not yet groomed; `ready` is specified enough to
- * start right now; `blocked` cannot proceed; `review` means the agent believes
- * it landed and is waiting on the user to accept it. Only the user moves
- * `review` -> `done`, so `done` means *accepted* (docs/adr/0017).
- *
- * `failed` means attempted and did not land; `dropped` means abandoned by
- * choice (docs/adr/0014). Both are terminal, but only `failed` claims
- * something went wrong.
- *
- * `pending` is the legacy state that `backlog` and `ready` split. It is still
- * accepted when reading files written by older builds, and is treated as
- * `backlog` everywhere it is displayed or counted.
- */
-type PlanState =
-	| "pending"
-	| "backlog"
-	| "ready"
-	| "active"
-	| "blocked"
-	| "review"
-	| "done"
-	| "failed"
-	| "dropped";
-
-/** Every state this build understands, for validating lines off disk. */
-const KNOWN_STATES: readonly PlanState[] = [
-	"pending",
-	"backlog",
-	"ready",
-	"active",
-	"blocked",
-	"review",
-	"done",
-	"failed",
-	"dropped",
-];
-
-/**
  * States an agent may set on its own behalf, regardless of Review Route.
  *
  * `done` is absent because it is *conditional*, not forbidden: whether an agent
@@ -129,28 +101,6 @@ const AGENT_SETTABLE: readonly PlanState[] = [
 	"failed",
 	"dropped",
 ];
-
-/**
- * Who may clear a Plan Item (docs/adr/0023).
- *
- * - `user` — only the user's hand, via `/accept`. The default when absent.
- * - `oracle` — cleared by a `pass` Verdict from an oracle review.
- * - `skip` — goes `active` → `done` directly and never enters `review`, because
- *   `review` is the column for items awaiting a reviewer and a skipped item has
- *   none.
- */
-type ReviewRoute = "user" | "oracle" | "skip";
-
-/**
- * Routes in ratchet order, least scrutiny first.
- *
- * The order *is* the rule: a route may only ever move to a later entry. That
- * one-way ratchet is what makes choosing a route at grooming time safe — an
- * agent that discovers its work is hairier than groomed can always ask for more
- * scrutiny, and can never award itself less once it knows how painful review
- * would be.
- */
-const ROUTE_ORDER: readonly ReviewRoute[] = ["skip", "oracle", "user"];
 
 /**
  * The route an item is on, treating an absent route as `user`.
@@ -199,29 +149,6 @@ function chosenRouteOf(item: PlanItem): ReviewRoute | null {
  * guarantee that the loop terminates while letting the loop actually run.
  */
 const REVIEW_BUDGET = 20;
-
-/**
- * Per-plan settings, stored as a single `kind: "plan-meta"` line in the plan
- * file.
- *
- * It lives in the plan file rather than settings.json because the mode is a
- * property of a body of work — one plan may be autonomous while another is not —
- * and it must survive restarts (docs/adr/0032).
- */
-interface PlanMeta {
-	kind: "plan-meta";
-	/** When true, an unrouted Item adopts the `oracle` route on any non-terminal state change, never on a terminal one (docs/adr/0032). */
-	autonomous?: boolean;
-}
-
-/** Whether a line parsed from the plan file is the plan-meta line. */
-function isPlanMeta(obj: unknown): obj is PlanMeta {
-	return (
-		typeof obj === "object" &&
-		obj !== null &&
-		(obj as { kind?: unknown }).kind === "plan-meta"
-	);
-}
 
 /**
  * The default Review Route for an Item under the given meta.
@@ -309,50 +236,6 @@ export function backfillRoutes(
 		changed.push(item);
 	}
 	return changed;
-}
-
-/** One line of a plan file: one Plan Item. */
-interface PlanItem {
-	/** Stable id within the file, `p1`, `p2`, ... (assigned at add/seed). */
-	id: string;
-	/** What the step is. */
-	text: string;
-	status: PlanState;
-	/** Free-form annotation (why it failed, what landed, ...). */
-	note?: string;
-	/** Task ID of the subagent delegation executing this item, if any. */
-	taskId?: string;
-	/**
-	 * Who may clear this item (docs/adr/0023).
-	 *
-	 * Absent means `user`, so every plan file written before routes existed keeps
-	 * exactly today's behaviour — an upgrade never silently starts auto-clearing
-	 * anything. Only ever escalated, never lowered: `skip` → `oracle` → `user`.
-	 */
-	route?: ReviewRoute;
-	/**
-	 * How many oracle Verdicts have already failed this item.
-	 *
-	 * Bounds the `active` → `review` → `active` loop under Autonomous Mode: once
-	 * the Review Budget is spent the route ratchets to `user` (docs/adr/0032).
-	 */
-	reviews?: number;
-	/**
-	 * The Run ID of a **Rework** currently working this Item, if any.
-	 *
-	 * Set before the worker is spawned and cleared when it ends, so it is the one
-	 * fact a *different* process can use to know the Item is being edited right
-	 * now. Without it, a re-review dispatched while a worker is running judges the
-	 * pre-fix code, and its stale `fail` spends the last **Review Budget** unit and
-	 * ratchets the route to `user` — irreversibly demoting an Item the worker had
-	 * actually fixed. That was reproduced, not theorised (docs/adr/0041).
-	 *
-	 * On the Item rather than in the Run sidecar because `run.json` records the Run
-	 * but not which Item it serves, so it cannot answer "is anyone reworking p1?".
-	 * A stale value (host killed mid-Rework) is handled by treating the Run's own
-	 * recorded outcome as the source of truth, not this field's presence.
-	 */
-	reworkRunId?: string;
 }
 
 /** Status colors per state, mapped to the theme vocabulary the other
@@ -714,374 +597,61 @@ export function applyVerdict(
 }
 
 /**
- * Read and parse a plan file.
+ * The single item that seeds a review Run's own plan (docs/adr/0048).
  *
- * A line that fails to parse is skipped rather than fatal: the file is the
- * durable copy, and one corrupt line must not destroy the rest of the plan.
- *
- * A **plan-meta** line (one carrying `kind: "plan-meta"` instead of an item's
- * id/text/status) holds per-plan settings such as **Autonomous Mode**. It is
- * returned separately from the items, because every writer rewrites the whole
- * file from the item list — so meta that is not threaded explicitly through
- * save is destroyed by the next mutation (docs/adr/0032).
- *
- * @param file - Absolute path of the plan file.
- * @returns Parsed items, or an empty array when the file does not exist.
+ * A fixed checklist was considered and rejected: it prescribes the oracle's
+ * working method, and its judgement is meant to be its own reading of the work
+ * (docs/adr/0048). One item names the work without prescribing it.
  */
-async function loadPlan(file: string): Promise<PlanItem[]> {
-	let raw: string;
-	try {
-		raw = await readFile(file, "utf-8");
-	} catch {
-		return [];
-	}
-	const items: PlanItem[] = [];
-	for (const line of raw.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const obj = JSON.parse(line) as Partial<PlanItem>;
-			// The plan-meta line is not an item; skipping it explicitly (rather than
-			// relying on it lacking id/text/status) means adding a field to meta can
-			// never make it look like an item.
-			if (isPlanMeta(obj)) continue;
-			if (
-				typeof obj.id === "string" &&
-				typeof obj.text === "string" &&
-				typeof obj.status === "string"
-			) {
-				// An unrecognised status comes from a build that knows a state
-				// this one does not. Keep the item and surface it as pending
-				// rather than skipping the line: misreporting a state is a
-				// smaller loss than silently dropping a step (docs/adr/0014).
-				const status = (KNOWN_STATES as readonly string[]).includes(obj.status)
-					? (obj.status as PlanState)
-					: "backlog";
-				items.push({
-					id: obj.id,
-					text: obj.text,
-					status,
-					note: typeof obj.note === "string" ? obj.note : undefined,
-					taskId: typeof obj.taskId === "string" ? obj.taskId : undefined,
-					// An unrecognised route is dropped rather than trusted: it would
-					// come from a build that knows a route this one does not, and
-					// guessing wrong here means clearing work nobody reviewed. Absent
-					// means `user`, the safe end of the ratchet (docs/adr/0023).
-					route: (ROUTE_ORDER as readonly string[]).includes(
-						obj.route as string,
-					)
-						? (obj.route as ReviewRoute)
-						: undefined,
-					reviews:
-						typeof obj.reviews === "number" && Number.isFinite(obj.reviews)
-							? obj.reviews
-							: undefined,
-					reworkRunId:
-						typeof obj.reworkRunId === "string" && obj.reworkRunId !== ""
-							? obj.reworkRunId
-							: undefined,
-				});
-			}
-		} catch {
-			// Corrupt line: skip it, keep the rest.
-		}
-	}
-	return items;
-}
+const REVIEW_SEED_ITEM = "Carry out the review and emit the Verdict";
 
 /**
- * Read the plan-meta line, if the plan has one.
+ * Split a reviewer's findings into the items that seed a Rework Run's plan.
  *
- * Separate from {@link loadPlan} so its eleven callers stay untouched: only the
- * few places that care about per-plan settings pay for reading them.
+ * Pure and exported for the same reason as {@link applyVerdict}: the live tool
+ * cannot be trusted to exercise on-disk code, so the rule is tested directly.
  *
- * @param file - Absolute path of the plan file.
- * @returns The meta line, or null when absent or unreadable.
+ * Blocks are split on bullet lines (`-`, `*`, `•`) and blank lines, trimmed,
+ * empties dropped (docs/adr/0048). A bullet's marker is not part of the item —
+ * the item is the finding. When the split yields at most one block, the findings
+ * seed ONE item (plus the contract's verify and commit) rather than nothing:
+ * a single prose paragraph of findings is still the worker's context, and a
+ * Rework with an empty plan would have nothing to work through.
+ *
+ * @param findings - What the reviewer objected to.
+ * @returns The items to seed: the blocks (or the findings), then
+ *          "Verify by running the repo's checks", then
+ *          "Commit exactly one commit".
  */
-async function loadMeta(file: string): Promise<PlanMeta | null> {
-	let raw: string;
-	try {
-		raw = await readFile(file, "utf-8");
-	} catch {
-		return null;
-	}
-	for (const line of raw.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const obj: unknown = JSON.parse(line);
-			if (isPlanMeta(obj))
-				return {
-					kind: "plan-meta",
-					autonomous: obj.autonomous === true,
-				};
-		} catch {
-			// Corrupt line: keep looking.
-		}
-	}
-	return null;
-}
-
-/**
- * Cross-process advisory lock around a plan file.
- *
- * `withFileMutationQueue` serialises writers *inside* one process. Since the
- * Board writes the same file from its own process (docs/adr/0015), that is no
- * longer enough: two processes could interleave read-modify-write and lose an
- * item. Both writers take this lock.
- *
- * `mkdir` is the atomic primitive: it fails if the directory exists, so exactly
- * one holder wins. The lock records its owner pid and acquisition time so a
- * crashed holder can be broken rather than wedging the plan forever — an
- * unbreakable lock on your own plan file is worse than the race it prevents.
- */
-
-/**
- * A plan mutation refused because another writer holds the lock.
- *
- * Deliberately an error rather than a silent unlocked write: a refused mutation
- * is visible and retryable, a lost one is neither (docs/adr/0035).
- */
-class PlanLockTimeoutError extends Error {
-	constructor(file: string) {
-		super(
-			`Plan file is locked by another writer and did not free up within ${LOCK_WAIT_MS}ms: ${file}. Nothing was written — retry the operation.`,
-		);
-		this.name = "PlanLockTimeoutError";
-	}
-}
-
-/** How long a lock may be held before another writer treats it as abandoned. */
-const LOCK_STALE_MS = 10_000;
-
-/** How long to keep trying before refusing the mutation. */
-const LOCK_WAIT_MS = 3000;
-
-/** Poll interval while waiting for a held lock. */
-const LOCK_POLL_MS = 50;
-
-/**
- * Acquire the cross-process lock for a plan file.
- *
- * @param file - Absolute path of the plan file being guarded.
- * @returns A release function that removes the lock only if this caller still
- *          owns it — a holder whose lock was broken as stale must not delete the
- *          replacement holder's lock.
- * @throws {PlanLockTimeoutError} When the lock is held by a live writer for
- *         longer than the wait budget. Refusing is deliberate: proceeding
- *         unlocked loses one of the two writes silently (docs/adr/0035).
- */
-async function acquirePlanLock(file: string): Promise<() => Promise<void>> {
-	const lockDir = `${file}.lock`;
-	const deadline = Date.now() + LOCK_WAIT_MS;
-
-	// A per-acquisition token, so `release` can tell "my lock" from "the lock that
-	// replaced mine after it was broken as stale". Without it, a slow holder
-	// returning from a long write deletes the new holder's lock and two writers
-	// run unlocked (docs/adr/0035).
-	const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-	const writeOwner = async () => {
-		try {
-			await writeFile(
-				path.join(lockDir, "owner.json"),
-				JSON.stringify({ pid: process.pid, at: Date.now(), token }),
-				{ encoding: "utf-8" },
-			);
-		} catch {
-			// The lock is held either way; owner metadata is a debugging aid.
-		}
+export function reworkSeedItems(findings: string): string[] {
+	const blocks: string[] = [];
+	let current = "";
+	const push = () => {
+		const t = current.trim();
+		if (t) blocks.push(t);
+		current = "";
 	};
-
-	/** Remove the lock, but only while this acquisition still owns it. */
-	const release = async () => {
-		try {
-			const owner = JSON.parse(
-				await readFile(path.join(lockDir, "owner.json"), "utf-8"),
-			) as { token?: unknown };
-			// Someone else's lock: leave it alone. An unreadable or token-less owner
-			// file predates this scheme, so fall through and remove it as before.
-			if (typeof owner.token === "string" && owner.token !== token) return;
-		} catch {
-			// No owner file: treat the lock as ours to clear, as the old code did.
-		}
-		try {
-			await rm(lockDir, { recursive: true, force: true });
-		} catch {
-			// Already gone: nothing to undo.
-		}
-	};
-
-	/** Break a lock judged stale, ignoring whose it is. */
-	const breakStale = async () => {
-		try {
-			await rm(lockDir, { recursive: true, force: true });
-		} catch {
-			// Someone else broke it first.
-		}
-	};
-
-	while (true) {
-		try {
-			await mkdir(lockDir, { recursive: false });
-			await writeOwner();
-			return release;
-		} catch {
-			// Held by someone. Decide whether they are alive or abandoned.
-			//
-			// The owner file is written just *after* the directory is created, so a
-			// fresh lock legitimately has no owner.json for a moment. Treating that
-			// as stale would break a live lock and lose the holder's write, so the
-			// directory's own mtime is the fallback age.
-			let age: number;
-			try {
-				const raw = await readFile(path.join(lockDir, "owner.json"), "utf-8");
-				const owner = JSON.parse(raw) as { at?: number };
-				age =
-					typeof owner.at === "number"
-						? Date.now() - owner.at
-						: await lockDirAge(lockDir);
-			} catch {
-				age = await lockDirAge(lockDir);
-			}
-
-			if (age > LOCK_STALE_MS) {
-				// Breaking someone else's abandoned lock, so this must ignore
-				// ownership — `release` deliberately refuses to touch another
-				// acquisition's lock.
-				await breakStale();
-				try {
-					await mkdir(lockDir, { recursive: false });
-					await writeOwner();
-					return release;
-				} catch {
-					// Lost the race to break it; keep waiting rather than proceed.
-				}
-			} else if (Date.now() > deadline) {
-				// The holder looks alive but is slower than our budget. Fail rather
-				// than proceed unlocked: returning a no-op release let two processes
-				// each read, mutate and atomically rename, so the second rename
-				// silently discarded the first writer's item. Atomic rename prevents a
-				// *torn* file, never a lost update — and the in-process mutation queue
-				// cannot help, since the contending writer is another process (every
-				// subagent child runs this same extension with its own PI_PLAN_KEY).
-				//
-				// A refused mutation is recoverable: the caller reports it and retries.
-				// A lost one is invisible (docs/adr/0035).
-				throw new PlanLockTimeoutError(file);
-			}
-
-			await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
+	for (const line of findings.split("\n")) {
+		const bullet = /^\s*[-*•]\s+/.exec(line);
+		if (bullet) {
+			push();
+			current = line.slice(bullet[0].length).trimStart();
+		} else if (!line.trim()) {
+			push();
+		} else {
+			current = current ? `${current} ${line.trim()}` : line.trim();
 		}
 	}
-}
-
-/**
- * Age of a lock directory from its own mtime.
- *
- * Used when `owner.json` is absent or unreadable: a lock that exists but has no
- * owner metadata is presumed fresh while the directory itself is young.
- *
- * @returns Milliseconds since the directory was created, or Infinity if it has
- *          vanished (in which case it is free, and "infinitely stale" is right).
- */
-async function lockDirAge(lockDir: string): Promise<number> {
-	try {
-		const info = await stat(lockDir);
-		return Date.now() - info.mtimeMs;
-	} catch {
-		return Number.POSITIVE_INFINITY;
-	}
-}
-
-/**
- * Returned by a {@link mutatePlan} callback to mean "write nothing at all".
- *
- * Several operations validate inside the lock and then refuse — a terminal Item
- * that may not be deleted, an unknown id, a Rework still holding an Item. Those
- * used to `return cur` and were documented as persisting nothing, which was false:
- * `mutatePlan` rewrote the file unconditionally, and because `loadPlan` skips
- * malformed lines and drops unrecognised fields, that rewrite could *destroy data*
- * on an operation that reported changing nothing. Measured on a non-canonical
- * plan file, a refused delete silently removed both a corrupt line and an unknown
- * field.
- *
- * A sentinel rather than a boolean flag or a nullable return, because the callback
- * already returns the item list: this keeps "no change" impossible to express by
- * accident, and impossible to confuse with "an empty plan".
- */
-const NO_WRITE = Symbol("plan:no-write");
-
-/**
- * Atomically read, transform, and rewrite a plan file as one unit of the
- * per-file mutation queue — concurrent tool calls on the same key cannot lose
- * each other's items.
- *
- * A callback that returns {@link NO_WRITE} leaves the file completely untouched —
- * not rewritten from the parsed items — which is what a validate-then-refuse
- * operation needs in order to honestly persist nothing.
- *
- * The items handed to `mutate` are always re-read from disk under the lock, so
- * a change the Board made since this process last looked is never clobbered
- * (docs/adr/0015).
- *
- * @param file - Absolute path of the plan file.
- * @param mutate - Transform from current items to the next items, or
- *        {@link NO_WRITE} to abandon the write and leave the file byte-for-byte
- *        as it was.
- * @param mutateMeta - Optional transform of the plan-meta line. Omit it to carry
- *        existing meta through unchanged; meta is always preserved either way.
- *        Not consulted when the items callback returns {@link NO_WRITE}.
- * @returns The item list that was persisted, or the items as read when the
- *          callback declined to write.
- * @throws {PlanLockTimeoutError} When another writer holds the lock for longer
- *         than the wait budget. Nothing is written; the caller reports it and
- *         the user or agent retries (docs/adr/0035).
- */
-async function mutatePlan(
-	file: string,
-	mutate: (
-		items: PlanItem[],
-	) => PlanItem[] | typeof NO_WRITE | Promise<PlanItem[] | typeof NO_WRITE>,
-	mutateMeta?: (meta: PlanMeta | null) => PlanMeta | null,
-): Promise<PlanItem[]> {
-	let next: PlanItem[] = [];
-	await withFileMutationQueue(file, async () => {
-		const release = await acquirePlanLock(file);
-		try {
-			const items = await loadPlan(file);
-			const result = await mutate(items);
-			if (result === NO_WRITE) {
-				// Return before the file is touched at all. Rewriting it from `items`
-				// would be lossy even though nothing "changed": `loadPlan` drops
-				// malformed lines and unrecognised fields, so a refusal would silently
-				// delete data it never reported deleting.
-				next = items;
-				return;
-			}
-			next = result;
-			// Meta is read and rewritten inside the same lock as the items. Without
-			// this the first mutation after setting Autonomous Mode would silently
-			// delete it, since the file is rewritten wholly from the item list.
-			const curMeta = await loadMeta(file);
-			const nextMeta = mutateMeta ? mutateMeta(curMeta) : curMeta;
-			await mkdir(path.dirname(file), { recursive: true });
-			const tmp = `${file}.tmp-${process.pid}`;
-			// Meta leads the file so a human reading the JSONL sees the plan's mode
-			// before its items.
-			const lines = [
-				...(nextMeta ? [JSON.stringify(nextMeta)] : []),
-				...next.map((i) => JSON.stringify(i)),
-			];
-			await writeFile(
-				tmp,
-				lines.join("\n") + (lines.length ? "\n" : ""),
-				{ encoding: "utf-8" },
-			);
-			await rename(tmp, file);
-		} finally {
-			await release();
-		}
-	});
-	return next;
+	push();
+	const items =
+		blocks.length <= 1
+			? [findings.trim()]
+			: blocks;
+	return [
+		...items,
+		"Verify by running the repo's checks",
+		"Commit exactly one commit",
+	];
 }
 
 /**
@@ -1491,7 +1061,7 @@ export async function reworkStillRunning(runId: string): Promise<boolean> {
  * @param id - The Item to review.
  * @param cwd - Working directory for the review.
  */
-async function dispatchReview(
+export async function dispatchReview(
 	file: string,
 	id: string,
 	cwd: string,
@@ -1547,6 +1117,22 @@ async function dispatchReview(
 		// independently without colliding.
 		const runId = `pln-${randomBytes(4).toString("hex")}-1`;
 		const runDir = await createRunDir(getAgentDir(), runId, "oracle");
+		// The review's own plan (docs/adr/0048): the Run carries the one item its
+		// work is, so the Board can show what the review is working through. The
+		// seed is best-effort, like the Run directory itself — a plan that cannot
+		// be written must never cost a review its chance to run.
+		await seedRunPlan(getAgentDir(), runId, [REVIEW_SEED_ITEM]).catch(() => {
+			// Swallowed: the review is the point, the plan is the display.
+		});
+		// Record the review Run's ID on the Item, mirroring the Rework twin's
+		// reworkRunId: the Board reads the review Run's plan through it. Set via
+		// the plan file BEFORE spawning, for the same reason the Rework marker is:
+		// the plan file is the only channel another process reads.
+		await mutatePlan(file, (cur) => {
+			const target = cur.find((i) => i.id === id);
+			if (target) target.reviewRunId = runId;
+			return cur;
+		});
 		let outcome: Awaited<ReturnType<typeof runReview>>;
 		try {
 			outcome = await runReview({
@@ -1606,6 +1192,14 @@ async function dispatchReview(
 			}
 			return cur;
 		});
+		// Clear the review Run's marker exactly as the Rework twin clears its own:
+		// unconditionally once the review has ended, so a marker left set cannot
+		// point the Board at a finished review forever.
+		await mutatePlan(file, (cur) => {
+			const target = cur.find((i) => i.id === id);
+			if (target?.reviewRunId === runId) target.reviewRunId = undefined;
+			return cur;
+		});
 
 		// A failed Verdict returns the Item to `active` carrying findings, and
 		// something has to pick it up or the loop stalls there. A FRESH Run does it,
@@ -1654,7 +1248,7 @@ async function dispatchReview(
  * @param itemText - What the step is; unchanged by the failed review.
  * @param findings - What the reviewer objected to. The worker's only context.
  */
-async function dispatchRework(
+export async function dispatchRework(
 	file: string,
 	id: string,
 	cwd: string,
@@ -1668,6 +1262,15 @@ async function dispatchRework(
 	try {
 		const runId = `pln-${randomBytes(4).toString("hex")}-1`;
 		const runDir = await createRunDir(getAgentDir(), runId, "worker");
+		// The Rework's own plan (docs/adr/0048): oracle's findings, split into
+		// blocks, seed the worker's plan as the items it works through, plus the
+		// contract's verify and commit. Best-effort, like the Run directory: a
+		// plan that cannot be seeded must never cost a Rework its chance to run.
+		await seedRunPlan(getAgentDir(), runId, reworkSeedItems(findings)).catch(
+			() => {
+				// Swallowed: the Rework is the point, the plan is the display.
+			},
+		);
 		// Publish the in-flight marker BEFORE spawning, so a re-review cannot slip
 		// between the spawn and the mark and judge code the worker is mid-way through
 		// changing. The plan file is the only channel another process reads.
@@ -1799,11 +1402,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const planFileFor = (ctx: ExtensionUIContext, keyOverride?: string): string =>
-		path.join(
-			getAgentDir(),
-			"plans",
-			`${keyOverride ?? currentKey(ctx)}.jsonl`,
-		);
+		planFilePathFor(getAgentDir(), keyOverride ?? currentKey(ctx));
 
 	/** Live plan state feeding the widget renderer. The renderer reads this on
 	 * every TUI render, so mutations only need to update it and request a
@@ -2321,6 +1920,11 @@ export default function (pi: ExtensionAPI) {
 						id: `p${n + 1}`,
 						text: it.text,
 						status: "backlog",
+						// Seeded items carry route `skip`: the seeder is the Starter Plan
+						// writer, and the child owns the plan from here — a child cannot
+						// `/accept` its own items, and a `user`-routed item would block
+						// the child's `done` (docs/adr/0048).
+						route: "skip",
 						note: it.note,
 						taskId: it.taskId,
 					}));
