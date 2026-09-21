@@ -10,15 +10,18 @@
  *
  * Measured behaviours this module relies on (verified against herdr 0.9.0):
  *
- * 1. `pane split --current` returns the new pane's `pane_id` and `tab_id` —
- *    always take IDs from responses, never predict them.
+ * 1. `tab create --workspace <ws> --cwd <path> --label <t> --no-focus`
+ *    returns `result.root_pane.pane_id` (the tab's fresh shell pane) and
+ *    `result.tab.tab_id`. Preferred: each child gets its own tab in the
+ *    orchestrator's workspace, leaving the orchestrator tab's layout intact.
+ *    Always take IDs from responses, never predict them.
  * 2. `agent start <name> --kind pi --pane <id> [-- argv...]` launches `pi`
  *    in a pane that is at its interactive shell prompt and resolves only once
  *    herdr's pi detection reports the agent interactive-ready. Extra
  *    `pi` arguments ride after `--`.
  * 3. `agent prompt <pane> <text>` submits one prompt to the agent; it is
  *    rejected with `agent_blocked` when the agent is already blocked.
- * 4. `agent wait <pane> --until done` resolves as soon as herdr reports the
+ * 5. `agent wait <pane> --until done` resolves as soon as herdr reports the
  *    agent `done` — for pi that is "the turn finished", which also covers a
  *    child that exits (after exit the pane persists with status `done` and
  *    its scrollback stays readable). `agent read` therefore remains usable
@@ -108,6 +111,16 @@ function pick(obj: unknown, path: string[]): string | undefined {
 }
 
 /**
+ * Identifies the workspace containing the calling pane (the orchestrator's),
+ * or null when herdr is absent/refuses.
+ */
+async function currentWorkspaceId(): Promise<string | null> {
+  const r = await herdr(["pane", "current"]);
+  if (!r.ok || !r.data) return null;
+  return pick(r.data, ["result", "pane", "workspace_id"]) ?? null;
+}
+
+/**
  * Splits the current pane (the orchestrator's) and returns the new pane's
  * identity, or null when herdr is absent/refuses.
  *
@@ -123,6 +136,40 @@ export async function splitPane(cwd: string, env?: Record<string, string>): Prom
   const paneId = pick(r.data, ["result", "pane", "pane_id"]);
   const tabId = pick(r.data, ["result", "pane", "tab_id"]);
   return paneId && tabId ? { paneId, tabId } : null;
+}
+
+/**
+ * Spawns a child pane as a **separate tab in the orchestrator's workspace**
+ * (one fresh shell pane per tab) and returns the pane/tab identity, or null
+ * when herdr is absent/refuses. Falls back to splitting the current pane
+ * when the workspace is unknown or `tab create` is unavailable (older herdr).
+ * Closing the tab's only pane closes the tab, so the existing `closePane`
+ * cleanup path is unchanged.
+ *
+ * @param label - Tab/pane label for herdr's sidebar (e.g. `librarian sub-1234`).
+ * @param env - Extra env for the launched process (herdr injects it into the
+ *        shell; the pi child inherits it). How the child learns its run id
+ *        and the orchestrator's pane id.
+ */
+export async function createChildPane(
+  cwd: string,
+  label: string,
+  env?: Record<string, string>,
+): Promise<{ paneId: string; tabId: string } | null> {
+  const workspaceId = await currentWorkspaceId();
+  if (workspaceId) {
+    const args = ["tab", "create", "--workspace", workspaceId, "--cwd", cwd, "--label", label, "--no-focus"];
+    for (const [key, value] of Object.entries(env ?? {})) args.push("--env", `${key}=${value}`);
+    const r = await herdr(args);
+    if (r.ok && r.data) {
+      const paneId = pick(r.data, ["result", "root_pane", "pane_id"]);
+      const tabId = pick(r.data, ["result", "tab", "tab_id"]);
+      if (paneId && tabId) return { paneId, tabId };
+    }
+    // `tab create` missing (pre-0.9 herdr) or a changed reply shape: fall
+    // back to the legacy split of the current pane.
+  }
+  return splitPane(cwd, env);
 }
 
 /** Cosmetic: labels the pane in herdr's sidebar. Never a failure path. */

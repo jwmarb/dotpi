@@ -5,8 +5,9 @@
  * advertises:
  *
  * - `subagent` — delegate a task to one of the agents in
- *   `agent/agents/*.md`. Each spawn opens a **new herdr agent**: a fresh pane
- *   (`herdr pane split`), a native `pi` TUI in it (`herdr agent start
+ *   `agent/agents/*.md`. Each spawn opens a **new herdr tab in this
+ *   workspace** (`herdr tab create`, one fresh shell pane per tab, labelled
+ *   `<agent> <runId>`), a native `pi` TUI in it (`herdr agent start
  *   --kind pi` with the agent's system prompt, tools, and model), and the
  *   task delivered as the child's first prompt (`herdr agent prompt`). The
  *   tool returns a task id (`sub-a3f1`), not a result.
@@ -26,7 +27,6 @@
  *   closes its own pane the moment it finishes; the parent closes it again as
  *   a backstop.
  * - sidecar absent  → **failed**; the pane is kept open with its scrollback
- *   as evidence (herdr destroys scrollback when a pane is closed).
  *   as evidence (herdr destroys scrollback when a pane is closed).
  *
  * Panes persist after the process exits in herdr 0.9.0 (measured), so the
@@ -65,13 +65,13 @@ import {
 } from "./lib.js";
 import {
   closePane,
+  createChildPane,
   getAgent,
   promptAgent,
   readAgent,
   renamePane,
   sendKeys,
   sendPrompt,
-  splitPane,
   startAgent,
   waitAgent,
   waitAgentWorking,
@@ -183,9 +183,10 @@ interface SpawnOutcome {
 }
 
 /**
- * Spawns one herdr agent for a subagent definition: new pane, native `pi`
- * child, task prompt. Every failure path cleans up the pane it already
- * created, so a failed spawn leaves no orphan running.
+ * Spawns one herdr agent for a subagent definition: a new tab in this
+ * workspace (one fresh shell pane, native `pi` child), task prompt. Every
+ * failure path cleans up the pane it already created, so a failed spawn
+ * leaves no orphan running (closing the tab's only pane closes the tab).
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
   const agents = await discoverAgents(join(getAgentDir(), "agents"));
@@ -207,6 +208,10 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     startedAt: Date.now(),
   };
   mkdirSync(rec.runDir, { recursive: true });
+  // Register in-memory now, not only on disk: subagent_tasks resolves ids
+  // from this map, and a fresh spawn must be statusable/waitable within the
+  // same process (the disk registry is what a *restarted* parent rebuilds).
+  runs.set(rec.runId, rec);
 
   const promptPath = join(rec.runDir, "system-prompt.md");
   try {
@@ -219,12 +224,12 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // orchestrator messaging — this orchestrator's own pane id, which herdr
   // injects into our process as HERDR_PANE_ID.
   const env = buildChildEnv(rec, process.env.HERDR_PANE_ID);
-  const pane = await splitPane(rec.cwd, env);
+  const pane = await createChildPane(rec.cwd, `${agent.name} ${rec.runId}`, env);
   if (!pane) {
     return {
       ok: false,
       error:
-        "Could not open a herdr pane: is the herdr server running? Check `herdr status`. Subagents need herdr to spawn their agent panes.",
+        "Could not open a herdr tab: is the herdr server running? Check `herdr status`. Subagents need herdr to spawn their agent tabs.",
     };
   }
   rec.paneId = pane.paneId;
@@ -282,7 +287,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
 
 /**
  * Classifies a run herdr says is `done`: sidecar → done (pane closed as
- * cleanup); no sidecar → failed (pane kept open as evidence).
+ * cleanup — closing the tab's only pane closes the tab); no sidecar → failed
+ * (pane kept open as evidence).
  *
  * The sidecar is checked a couple of times with a short settle: herdr
  * detects the finished turn from the terminal, and the child's sidecar write
@@ -365,13 +371,13 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description:
-      "Delegate a task to a specialized agent (see Available Agents). Spawns a new herdr agent pane running that agent as a pi child with its own system prompt, tools, and model. Returns a task id, not a result — the task keeps running in the background.",
+      "Delegate a task to a specialized agent (see Available Agents). Spawns a new herdr tab in this workspace running that agent as a pi child with its own system prompt, tools, and model. Returns a task id, not a result — the task keeps running in the background.",
     promptSnippet:
-      "Delegate a self-contained task to a specialized agent; it runs in its own herdr pane and returns a task id (use subagent_tasks to collect the result).",
+      "Delegate a self-contained task to a specialized agent; it runs in its own herdr tab and returns a task id (use subagent_tasks to collect the result).",
     promptGuidelines: [
       "Pick the agent whose role matches the task; the task text must be self-contained — the child sees no conversation history.",
       "Delegation is asynchronous: you get a task id back, not the answer. Call subagent_tasks with action \"wait\" when you need the result, and keep working meanwhile.",
-      "You can spawn several subagents in one turn; they run concurrently in their own panes.",
+      "You can spawn several subagents in one turn; they run concurrently in their own tabs.",
     ],
     parameters: Type.Object({
       agent: Type.String({ description: "Name of the agent to delegate to (see Available Agents)" }),
@@ -397,11 +403,11 @@ export default function (pi: ExtensionAPI) {
           {
             type: "text",
             text:
-              `Delegated to ${rec.agent}: task ${rec.runId} is running in herdr pane ${rec.paneId}. ` +
+              `Delegated to ${rec.agent}: task ${rec.runId} is running in tab ${rec.tabId} (pane ${rec.paneId}) of this workspace. ` +
               `Collect it with subagent_tasks (action "wait", ids ["${rec.runId}"]) when you need the result.`,
           },
         ],
-        details: { ok: true, task: rec.runId, agent: rec.agent, paneId: rec.paneId },
+        details: { ok: true, task: rec.runId, agent: rec.agent, tabId: rec.tabId, paneId: rec.paneId },
       };
     },
   });
@@ -604,10 +610,10 @@ async function listRuns(): Promise<{ content: { type: "text"; text: string }[]; 
   const running = all.filter((r) => r.status === "running").length;
   const lines = all.map((rec) => {
     const age = Math.round(((rec.finishedAt ?? Date.now()) - rec.startedAt) / 1000);
-    return `${rec.runId} (${rec.agent}): ${rec.status} [${age}s]${rec.paneId ? ` pane ${rec.paneId}` : ""}`;
+    return `${rec.runId} (${rec.agent}): ${rec.status} [${age}s]${rec.tabId ? ` tab ${rec.tabId}` : ""}${rec.paneId ? ` pane ${rec.paneId}` : ""}`;
   });
   return {
     content: [{ type: "text", text: `${all.length} task(s), ${running} running.\n${lines.join("\n")}` }],
-    details: { tasks: all.map((r) => ({ task: r.runId, agent: r.agent, status: r.status, paneId: r.paneId })) },
+    details: { tasks: all.map((r) => ({ task: r.runId, agent: r.agent, status: r.status, tabId: r.tabId, paneId: r.paneId })) },
   };
 }
