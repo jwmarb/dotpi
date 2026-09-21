@@ -38,6 +38,9 @@ bun.lockb
 # on this machine.
 agent/sessions/
 agent/subagent-sessions/
+# subagent-herdr extension: one dir per delegated run (child session file,
+# .exit sidecar, system prompt, meta.json). Machine state, never config.
+agent/subagent-runs/
 agent/pi-blackhole/
 # Plans are per-session working state keyed by session id, and the archive grows
 # without bound. The decisions worth keeping end up in docs/adr and CONTEXT.md.
