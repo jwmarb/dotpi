@@ -21,9 +21,12 @@
  * child down. The parent waits on herdr's agent state (`agent wait --until
  * done`) and classifies from the sidecar:
  *
- * - sidecar present → **done**; the answer is the last assistant message of
- *   the child's session transcript, and the pane is closed (cleanup).
+ * - sidecar present → **done**; the answer is the last assistant message at
+ *   or before the `subagent_done` call in the child's transcript. The child
+ *   closes its own pane the moment it finishes; the parent closes it again as
+ *   a backstop.
  * - sidecar absent  → **failed**; the pane is kept open with its scrollback
+ *   as evidence (herdr destroys scrollback when a pane is closed).
  *   as evidence (herdr destroys scrollback when a pane is closed).
  *
  * Panes persist after the process exits in herdr 0.9.0 (measured), so the

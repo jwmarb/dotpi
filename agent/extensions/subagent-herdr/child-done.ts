@@ -30,13 +30,20 @@
  * message from there. Restating the answer as a tool argument would duplicate
  * it and put a size limit on an answer that the transcript already carries.
  *
- * @module subagent-herdr/child-done
+ * ## Pane self-dismissal
+ *
+ * After the sidecar is on disk, the child also closes its own herdr pane
+ * (`closeOwnPane`, using the `HERDR_PANE_ID` herdr injects into launched
+ * agents), so a finished run disappears immediately instead of lingering
+ * until herdr's post-exit cleanup. The parent still closes the pane as a
+ * backstop when it classifies the run — a close that didn't land there must
+ * not leave a ghost pane behind.
  */
+import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-
 /**
  * Did this turn end cleanly enough to count as completion?
  *
@@ -53,6 +60,22 @@ export function endedCleanly(messages: readonly { role: string; stopReason?: str
     return m.stopReason === "stop";
   }
   return false;
+}
+
+/**
+ * Closes this child's own herdr pane, fire-and-forget.
+ *
+ * herdr injects `HERDR_PANE_ID` into every agent it launches, so a child can
+ * dismiss its own pane the instant it finishes instead of lingering until
+ * herdr's post-exit cleanup. Closing the pane kills the process group, which
+ * also makes `ctx.shutdown()` below a redundant safety net. Never throws:
+ * a cosmetic cleanup must not be able to fail the completion handshake, and
+ * the parent closes the pane again as a backstop when it classifies the run.
+ */
+function closeOwnPane(): void {
+  const paneId = process.env.HERDR_PANE_ID;
+  if (process.env.HERDR_ENV !== "1" || !paneId) return;
+  execFile("herdr", ["pane", "close", paneId], { timeout: 5000 }, () => {});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -119,7 +142,9 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Shut down *after* the sidecar is on disk, never before.
+      // Sidecar on disk, pane dismissed, *then* shut down (the pane close
+      // already kills the process group; this covers a close that didn't land).
+      closeOwnPane();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Reported completion; closing this session." }],
@@ -136,6 +161,9 @@ export default function (pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return;
     signalled = writeSidecar(sessionFile);
-    if (signalled) ctx.shutdown();
+    if (signalled) {
+      closeOwnPane();
+      ctx.shutdown();
+    }
   });
 }
