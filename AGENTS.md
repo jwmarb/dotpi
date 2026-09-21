@@ -55,7 +55,7 @@ git config core.hooksPath .githooks            # normally done for you at pi sta
 
 ## NOTES
 
-- **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime). The only typecheck scope is `agent/extensions/mcp/tsconfig.json` (`noEmit`; that dir has its own `package.json` + `node_modules`).
+- **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime). Two typecheck scopes exist (`noEmit`): `agent/extensions/mcp/tsconfig.json` (its dir has its own `package.json` + `node_modules`) and `agent/extensions/subagent-herdr/tsconfig.json` (resolve deps via the home `node_modules`; run with `../mcp/node_modules/.bin/tsc -p tsconfig.json`).
 - **The pre-commit hook is currently dormant.** `.githooks/pre-commit` invokes `scripts/check.sh`, which was removed in `e7039b0`; the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time.
 - **`PATCHES.md` is partly stale.** Its references to `scripts/patch-pi.sh`, `scripts/check-thinking-label-patch.mjs`, `docs/adr/*` and `herdr-plugin/` were deleted in `e7039b0` (removal of the herdr/plan/subagent extensions and their docs). Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical — the ADRs no longer exist in the repo.
 - **`agent/git/` and `agent/npm/` are vendored checkouts of installed packages** (`settings.json` `packages`: pi-lsp-extension, pi-fff, pi-blackhole, pi-better-edit; `agent/npm/package.json` also pins pi-lens). They carry their own `.git` and their own test suites — always run this repo's tests by explicit path; a bare `bun test` sweeps in the vendored tests and fails for reasons unrelated to this repo.
