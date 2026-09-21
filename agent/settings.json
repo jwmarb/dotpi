@@ -2,6 +2,7 @@
   "lastChangelogVersion": "0.85.1",
   "defaultProvider": "litellm",
   "defaultModel": "qwen/qwen3.8-27b",
+  "defaultThinkingLevel": "xhigh",
   "hideThinkingBlock": true,
   "extensions": [],
   "images": {
