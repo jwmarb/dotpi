@@ -4,11 +4,11 @@
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
 
 # ---- Secrets ----------------------------------------------------------------
-# The real .env: the ONLY file here holding live credentials, plus the
-# gateway URL. Both keys and the URL are read from it (docs/adr/0042) —
-# LITELLM_API_KEY for the litellm provider, LITELLM_MCP_KEY for the
-# mcp.json gateway header, LITELLM_MCP_URL for the mcp.json gateway address.
-# agent/.env.example IS
+# The real .env: the ONLY file here holding live credentials, plus both
+# gateway URLs. Everything agent/mcp.json and agent/extensions/litellm.ts
+# need is read from it (docs/adr/0042) — LITELLM_API_KEY and LITELLM_BASE_URL
+# for the litellm provider, LITELLM_MCP_KEY and LITELLM_MCP_URL for the
+# mcp.json gateway.
 # Losing this file means re-minting two keys from the gateway; losing a key to
 # git history would mean rotating them under pressure.
 agent/.env

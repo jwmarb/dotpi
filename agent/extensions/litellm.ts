@@ -1,19 +1,18 @@
 import type { ExtensionAPI, ProviderConfig } from '@mariozechner/pi-coding-agent';
 import { requireEnv } from './lib/dotenv.js';
 
-const BASE_URL = 'https://your-litellm-gateway/v1';
-const BASE_ORIGIN = BASE_URL.replace(/\/v1$/, '');
 /**
  * The LiteLLM provider key, read from `LITELLM_API_KEY` (see docs/adr/0042).
  *
- * Read lazily rather than at module load so a missing key fails when the
+ * Read lazily rather than at module load so a missing value fails when the
  * provider is actually being configured, where the error can be reported,
  * instead of throwing during extension import and taking the session with it.
  *
  * There is deliberately NO fallback to a literal: a fallback would mean the
- * secret stays in this file, which is the whole point of moving it out.
+ * value stays in this file, which is the whole point of moving it out.
  */
 const apiKey = () => requireEnv('LITELLM_API_KEY', 'the LiteLLM provider');
+const baseUrl = () => requireEnv('LITELLM_BASE_URL', 'the LiteLLM provider');
 
 const TOKENS_PER_MILLION = 1_000_000;
 
@@ -139,15 +138,17 @@ const QWEN_THINKING_LEVEL_MAP = {
  * registers it as a provider, including per-token costs and cache read/write rates.
  *
  * Preconditions:
- * - The LiteLLM proxy at BASE_URL must be reachable.
- * - LITELLM_API_KEY must be set (in the environment or agent/.env); throws naming it if not.
+ * - LITELLM_BASE_URL and LITELLM_API_KEY must be set (in the environment or
+ *   agent/.env); throws naming the missing variable if not.
+ * - The LiteLLM proxy at LITELLM_BASE_URL must be reachable.
  *
  * @param pi - The Pi extension API handle.
  */
 export default async function (pi: ExtensionAPI) {
+  const baseOrigin = baseUrl().replace(/\/v1$/, '');
   const [groupInfo, modelInfo] = await Promise.all([
-    fetchJson<LiteLLMModelGroupInfoResponse>(`${BASE_ORIGIN}/model_group/info`),
-    fetchJson<LiteLLMModelInfoResponse>(`${BASE_ORIGIN}/model/info`),
+    fetchJson<LiteLLMModelGroupInfoResponse>(`${baseOrigin}/model_group/info`),
+    fetchJson<LiteLLMModelInfoResponse>(`${baseOrigin}/model/info`),
   ]);
 
   if (!groupInfo) return;
@@ -175,7 +176,7 @@ export default async function (pi: ExtensionAPI) {
   const chatModels = groupInfo.data.filter((m) => m.mode == null || m.mode === 'chat' || m.mode === 'completion');
 
   pi.registerProvider('litellm', {
-    baseUrl: BASE_URL,
+    baseUrl: baseUrl(),
     apiKey: apiKey(),
     api: 'openai-completions',
     models: chatModels.map((m) => {
