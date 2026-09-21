@@ -12,8 +12,8 @@ Read from `~/.pi/agent/mcp.json` (override with `PI_MCP_CONFIG`). Standard
 {
   "mcpServers": {
     "litellm-gateway": {
-      "url": "https://your-litellm-gateway/mcp",
-      "headers": { "Authorization": "Bearer ***" },
+      "url": "${LITELLM_MCP_URL}",
+      "headers": { "x-litellm-api-key": "Bearer ${LITELLM_MCP_KEY}" },
       "timeout": 15000
     },
     "local-fs": {
@@ -31,6 +31,10 @@ Per server:
 - `command` (+ `args`, `env`) — stdio transport (spawns a child process)
 - `timeout` — connect timeout in ms (default 15000)
 - `disabled: true` — skip the server
+
+Any string field (`url`, `headers`, `args`, `env`) supports `${VAR}` placeholders,
+expanded from the process environment or `agent/.env`. An unset variable fails
+loudly at config load with the exact field named; escape a literal `${` as `$${`.
 
 ## Tools
 

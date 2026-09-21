@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "litellm-gateway": {
-      "url": "https://your-litellm-gateway/mcp",
+      "url": "${LITELLM_MCP_URL}",
       "headers": {
         "x-litellm-api-key": "Bearer ${LITELLM_MCP_KEY}"
       }
