@@ -9,7 +9,16 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildChildArgv, DONE_TOOL_NAME, extractRunResult, makeRunId, parseAgentFile } from "./lib.js";
+import {
+  buildChildArgv,
+  buildChildEnv,
+  DONE_TOOL_NAME,
+  extractRunResult,
+  makeRunId,
+  parseAgentFile,
+  readReports,
+  REPORT_TOOL_NAME,
+} from "./lib.js";
 import { endedCleanly } from "./child-done.js";
 
 // ---------------------------------------------------------------------------
@@ -94,16 +103,16 @@ describe("buildChildArgv", () => {
     expect(argv.slice(0, 6)).toEqual(["-e", base.childDonePath, "--session-dir", base.runDir, "--session-id", base.runId]);
   });
 
-  test("appends subagent_done to a declared tool allowlist", () => {
+  test("appends the done and report tools to a declared tool allowlist", () => {
     const argv = buildChildArgv({ ...base, tools: ["read", "grep"] });
     expect(argv).toContain("--tools");
     const tools = argv[argv.indexOf("--tools") + 1];
-    expect(tools).toBe(`read,grep,${DONE_TOOL_NAME}`);
+    expect(tools).toBe(`read,grep,${DONE_TOOL_NAME},${REPORT_TOOL_NAME}`);
   });
 
-  test("does not duplicate subagent_done if an agent file already declares it", () => {
-    const argv = buildChildArgv({ ...base, tools: [DONE_TOOL_NAME] });
-    expect(argv[argv.indexOf("--tools") + 1]).toBe(DONE_TOOL_NAME);
+  test("does not duplicate the handshake tools if an agent file already declares them", () => {
+    const argv = buildChildArgv({ ...base, tools: [DONE_TOOL_NAME, REPORT_TOOL_NAME] });
+    expect(argv[argv.indexOf("--tools") + 1]).toBe(`${DONE_TOOL_NAME},${REPORT_TOOL_NAME}`);
   });
 
   test("omits --tools for an all-tools agent", () => {
@@ -193,6 +202,12 @@ describe("extractRunResult", () => {
     expect(r.answered).toBe(true);
     expect(r.text).toBe("ok");
   });
+  test("returns not-found for a missing dir and a foreign session id", async () => {
+    expect((await extractRunResult(join(tmpdir(), "does-not-exist"), "sub-0005")).found).toBe(false);
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    writeFileSync(join(dir, "2026-09-20T12-00-00-000Z_sub-9999.jsonl"), "[]");
+    expect((await extractRunResult(dir, "sub-0006")).found).toBe(false);
+  });
 
   test("prefers the answer over the closing remark after subagent_done", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
@@ -224,12 +239,42 @@ describe("extractRunResult", () => {
     expect(r.answered).toBe(true);
     expect(r.text).toBe("Here is my answer");
   });
+});
 
-  test("returns not-found for a missing dir and a foreign session id", async () => {
-    expect((await extractRunResult(join(tmpdir(), "does-not-exist"), "sub-0005")).found).toBe(false);
+describe("buildChildEnv", () => {
+  test("carries the run identity and the parent pane when known", () => {
+    const env = buildChildEnv({ runId: "sub-0008", agent: "worker", runDir: "/runs/sub-0008" }, "w5:p1");
+    expect(env).toEqual({
+      PI_SUBAGENT_RUN_ID: "sub-0008",
+      PI_SUBAGENT_AGENT: "worker",
+      PI_SUBAGENT_RUN_DIR: "/runs/sub-0008",
+      PI_SUBAGENT_PARENT_PANE: "w5:p1",
+    });
+  });
+
+  test("omits the parent pane when the orchestrator has none", () => {
+    const env = buildChildEnv({ runId: "sub-0009", agent: "worker", runDir: "/runs/sub-0009" }, undefined);
+    expect(env.PI_SUBAGENT_PARENT_PANE).toBeUndefined();
+    expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0009");
+  });
+});
+
+describe("readReports", () => {
+  test("parses the report log and tolerates a partial final line", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
-    writeFileSync(join(dir, "2026-09-20T12-00-00-000Z_sub-9999.jsonl"), "[]");
-    expect((await extractRunResult(dir, "sub-0006")).found).toBe(false);
+    writeFileSync(
+      join(dir, "reports.jsonl"),
+      `${JSON.stringify({ at: 1, message: "first" })}\n${JSON.stringify({ at: 2, message: "second" })}\n{"at":3,"mes`,
+    );
+    expect(await readReports(dir)).toEqual([
+      { at: 1, message: "first" },
+      { at: 2, message: "second" },
+    ]);
+  });
+
+  test("returns [] when the child never reported", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    expect(await readReports(dir)).toEqual([]);
   });
 });
 

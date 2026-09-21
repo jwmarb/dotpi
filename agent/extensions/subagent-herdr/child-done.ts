@@ -40,7 +40,8 @@
  * not leave a ghost pane behind.
  */
 import { execFile } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -148,6 +149,73 @@ export default function (pi: ExtensionAPI) {
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Reported completion; closing this session." }],
+        details: {},
+      };
+    },
+  });
+  // -------------------------------------------------------------------------
+  // subagent_report — the child → orchestrator leg of mid-run communication
+  // -------------------------------------------------------------------------
+
+  pi.registerTool({
+    name: "subagent_report",
+    label: "Subagent Report",
+    description:
+      "Send a message to the orchestrator while your run is in progress: a status update, a blocker, or a finding it should act on now. The orchestrator receives it shortly and it is also recorded in your run's report log. Do NOT use it for your final answer — your last message is the answer.",
+    promptSnippet:
+      "Send a mid-run message (status, blocker, finding) to the orchestrator while you keep working.",
+    promptGuidelines: [
+      "Use subagent_report for mid-run communication only: a status checkpoint, a blocker you cannot resolve, a decision the orchestrator should make, or a finding it should know about before your run ends.",
+      "A report does not block your run — keep working after sending one; the orchestrator may reply, and the reply arrives here as a normal message in this session.",
+      "Your final answer is your final message, not a report. Never restate your answer in a report.",
+    ],
+    parameters: Type.Object({
+      message: Type.String({ description: "The message to send to the orchestrator" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const runDir = process.env.PI_SUBAGENT_RUN_DIR;
+      if (!runDir) {
+        return {
+          content: [{ type: "text", text: "Error: PI_SUBAGENT_RUN_DIR is not set; the report cannot be recorded." }],
+          details: {},
+        };
+      }
+
+      // Record first: the log is durable even when delivery is not (the
+      // orchestrator's pane may be in a dialog, or gone).
+      try {
+        appendFileSync(
+          join(runDir, "reports.jsonl"),
+          `${JSON.stringify({ at: Date.now(), message: params.message })}\n`,
+        );
+      } catch {
+        // fall through: delivery still happens
+      }
+
+      const parentPane = process.env.PI_SUBAGENT_PARENT_PANE;
+      if (!parentPane) {
+        return {
+          content: [
+            { type: "text", text: "Report recorded; no parent pane is known, so the orchestrator will pick it up on its next task check." },
+          ],
+          details: {},
+        };
+      }
+
+      const runId = process.env.PI_SUBAGENT_RUN_ID ?? "unknown";
+      const agent = process.env.PI_SUBAGENT_AGENT ?? "subagent";
+      // Fire-and-forget: a report must never wedge the child's turn on a
+      // slow delivery. The prefix is what lets the orchestrator tell a child's
+      // message apart from a human's.
+      execFile(
+        "herdr",
+        ["agent", "prompt", parentPane, `[subagent ${runId} (${agent})] ${params.message}`],
+        { timeout: 10_000 },
+        () => {},
+      );
+      return {
+        content: [{ type: "text", text: "Report sent to the orchestrator." }],
         details: {},
       };
     },

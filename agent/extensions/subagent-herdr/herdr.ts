@@ -110,9 +110,15 @@ function pick(obj: unknown, path: string[]): string | undefined {
 /**
  * Splits the current pane (the orchestrator's) and returns the new pane's
  * identity, or null when herdr is absent/refuses.
+ *
+ * @param env - Extra env for the launched pane process (herdr injects it into
+ *        the shell; the pi child inherits it). How the child learns its run id
+ *        and the orchestrator's pane id.
  */
-export async function splitPane(cwd: string): Promise<{ paneId: string; tabId: string } | null> {
-  const r = await herdr(["pane", "split", "--current", "--direction", "right", "--cwd", cwd]);
+export async function splitPane(cwd: string, env?: Record<string, string>): Promise<{ paneId: string; tabId: string } | null> {
+  const args = ["pane", "split", "--current", "--direction", "right", "--cwd", cwd];
+  for (const [key, value] of Object.entries(env ?? {})) args.push("--env", `${key}=${value}`);
+  const r = await herdr(args);
   if (!r.ok || !r.data) return null;
   const paneId = pick(r.data, ["result", "pane", "pane_id"]);
   const tabId = pick(r.data, ["result", "pane", "tab_id"]);
@@ -165,6 +171,16 @@ export async function promptAgent(
     ["agent", "prompt", paneId, text, "--wait", "--until", "working", "--timeout", String(PROMPT_START_TIMEOUT_MS)],
     PROMPT_START_TIMEOUT_MS + EXEC_SLACK_MS,
   );
+  return { ok: r.ok, error: r.error };
+}
+
+/**
+ * Fires a prompt at a pane without waiting for any state change — the shape
+ * for *mid-run* messages to a subagent (a child that is already working
+ * queues the input; `--wait --until working` would be a no-op or a stall).
+ */
+export async function sendPrompt(paneId: string, text: string): Promise<{ ok: boolean; error: string | null }> {
+  const r = await herdr(["agent", "prompt", paneId, text]);
   return { ok: r.ok, error: r.error };
 }
 

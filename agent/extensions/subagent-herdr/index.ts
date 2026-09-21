@@ -54,7 +54,15 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { buildChildArgv, discoverAgents, extractRunResult, makeRunId, type RunResult } from "./lib.js";
+import {
+  buildChildArgv,
+  buildChildEnv,
+  discoverAgents,
+  extractRunResult,
+  makeRunId,
+  readReports,
+  type RunResult,
+} from "./lib.js";
 import {
   closePane,
   getAgent,
@@ -62,6 +70,7 @@ import {
   readAgent,
   renamePane,
   sendKeys,
+  sendPrompt,
   splitPane,
   startAgent,
   waitAgent,
@@ -206,7 +215,11 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error: `Could not write the child's system prompt to ${promptPath}.` };
   }
 
-  const pane = await splitPane(rec.cwd);
+  // The child's pane env: its run identity, and — the key to child →
+  // orchestrator messaging — this orchestrator's own pane id, which herdr
+  // injects into our process as HERDR_PANE_ID.
+  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID);
+  const pane = await splitPane(rec.cwd, env);
   if (!pane) {
     return {
       ok: false,
@@ -324,6 +337,21 @@ function truncate(text: string): string {
   return `${text.slice(0, RESULT_MAX_CHARS)}\n…[truncated; full transcript: see run dir]`;
 }
 
+/**
+ * Appends the child's mid-run reports (the child → orchestrator leg) to a
+ * result output block, when there are any. A report that was also delivered
+ * live to this session shows up here too — the log is the durable copy.
+ */
+async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
+  const reports = await readReports(rec.runDir);
+  if (reports.length === 0) return;
+  out.push(
+    `--- reports sent to you by ${rec.agent} during the run (${reports.length}) ---\n${reports
+      .map((r) => `- ${r.message}`)
+      .join("\n")}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -400,9 +428,13 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("result"),
         Type.Literal("list"),
         Type.Literal("cancel"),
+        Type.Literal("message"),
       ]),
       ids: Type.Optional(
-        Type.Array(Type.String(), { description: "Task ids (sub-xxxx); required for status/wait/result/cancel, ignored for list" }),
+        Type.Array(Type.String(), { description: "Task ids (sub-xxxx); required for status/wait/result/cancel/message, ignored for list" }),
+      ),
+      text: Type.Optional(
+        Type.String({ description: "The message to deliver, for action \"message\" (arrives at each running subagent as a new instruction in its session)" }),
       ),
       timeout_ms: Type.Optional(
         Type.Number({ description: "Max time to block for action \"wait\", in ms (default 300000, max 900000)" }),
@@ -410,7 +442,7 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      return dispatchTasks(params.action, params.ids ?? [], params.timeout_ms ?? WAIT_DEFAULT_MS);
+      return dispatchTasks(params.action, params.ids ?? [], params.text, params.timeout_ms ?? WAIT_DEFAULT_MS);
     },
   });
 }
@@ -420,8 +452,9 @@ export default function (pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 
 async function dispatchTasks(
-  action: "status" | "wait" | "result" | "list" | "cancel",
+  action: "status" | "wait" | "result" | "list" | "cancel" | "message",
   ids: string[],
+  text: string | undefined,
   timeoutMs: number,
 ): Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> {
   if (action === "list") return listRuns();
@@ -445,6 +478,32 @@ async function dispatchTasks(
         const live = await liveStatus(rec);
         lines.push(`${rec.runId} (${rec.agent}): ${rec.status}${live ? ` [herdr: ${live}]` : ""}`);
         details[rec.runId] = { status: rec.status, herdr: live };
+      }
+      return { content: [{ type: "text", text: unknownNote + lines.join("\n") }], details };
+    }
+
+    case "message": {
+      if (!text || !text.trim()) {
+        return {
+          content: [{ type: "text", text: 'Error: action "message" needs a non-empty "text".' }],
+          details: { ok: false },
+        };
+      }
+      const lines: string[] = [];
+      const details: Record<string, unknown> = {};
+      for (const rec of recs) {
+        if (rec.status !== "running" || !rec.paneId) {
+          lines.push(`${rec.runId} (${rec.agent}): not running (${rec.status}) — message not delivered`);
+          details[rec.runId] = { delivered: false, status: rec.status };
+          continue;
+        }
+        const sent = await sendPrompt(rec.paneId, text);
+        lines.push(
+          sent.ok
+            ? `${rec.runId} (${rec.agent}): message delivered to pane ${rec.paneId}`
+            : `${rec.runId} (${rec.agent}): delivery failed (${sent.error ?? "unknown"})`,
+        );
+        details[rec.runId] = { delivered: sent.ok, status: rec.status };
       }
       return { content: [{ type: "text", text: unknownNote + lines.join("\n") }], details };
     }
@@ -489,6 +548,7 @@ async function dispatchTasks(
             const diag = await paneDiagnostic(rec);
             if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
           }
+          await pushReports(rec, out);
           details[rec.runId] = { status: rec.status };
         }
       }
@@ -512,6 +572,7 @@ async function dispatchTasks(
           const diag = await paneDiagnostic(rec);
           if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
         }
+        await pushReports(rec, out);
         details[rec.runId] = { status: rec.status };
       }
       return { content: [{ type: "text", text: unknownNote + out.join("\n\n") }], details };

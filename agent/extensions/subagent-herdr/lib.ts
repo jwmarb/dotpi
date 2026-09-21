@@ -14,6 +14,9 @@ import { join } from "node:path";
 /** The tool a child calls (via `child-done.ts`) to declare itself finished. */
 export const DONE_TOOL_NAME = "subagent_done";
 
+/** The tool a child calls (via `child-done.ts`) to message the orchestrator mid-run. */
+export const REPORT_TOOL_NAME = "subagent_report";
+
 /**
  * Metadata for a subagent definition parsed from `agent/agents/<name>.md`.
  * Same frontmatter contract as dynamic-prompt.ts's agent discovery.
@@ -126,6 +129,63 @@ export interface ChildLaunchOptions {
 }
 
 /**
+ * Env for the child's pane, set with `pane split --env` so herdr injects it
+ * into the launched shell and (by inheritance) the pi child.
+ *
+ * `PI_SUBAGENT_PARENT_PANE` is what makes child → orchestrator messaging
+ * possible: it names the orchestrator's own pane (read from the parent
+ * process's `HERDR_PANE_ID`), and the child's report tool prompts it. The
+ * other vars let the child's extensions identify the run without guessing.
+ */
+export function buildChildEnv(
+  rec: { runId: string; agent: string; runDir: string },
+  parentPaneId: string | undefined,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    PI_SUBAGENT_RUN_ID: rec.runId,
+    PI_SUBAGENT_AGENT: rec.agent,
+    PI_SUBAGENT_RUN_DIR: rec.runDir,
+  };
+  if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
+  return env;
+}
+
+/** One message a child sent to the orchestrator via `subagent_report`. */
+export interface ChildReport {
+  /** When it was written (ms), for ordering. */
+  at: number;
+  message: string;
+}
+
+/**
+ * Reads the child's report log (`<runDir>/reports.jsonl`, appended by the
+ * child's report tool). Empty array when the child never reported — the
+ * common case, which must stay cheap.
+ */
+export async function readReports(runDir: string): Promise<ChildReport[]> {
+  let content: string;
+  try {
+    content = await readFile(join(runDir, "reports.jsonl"), "utf-8");
+  } catch {
+    return [];
+  }
+  const out: ChildReport[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const r: unknown = JSON.parse(line);
+      if (typeof r === "object" && r !== null && typeof (r as { message?: unknown }).message === "string") {
+        const ro = r as { at?: unknown; message: string };
+        out.push({ at: typeof ro.at === "number" ? ro.at : 0, message: ro.message });
+      }
+    } catch {
+      // partial line: a report being written as we read — drop it
+    }
+  }
+  return out;
+}
+
+/**
  * Builds the `pi` argv a herdr `agent start` hands to the child (everything
  * after its `--`).
  *
@@ -134,9 +194,10 @@ export interface ChildLaunchOptions {
  * of the task's quoting hazards and means a child that never receives a prompt
  * is an empty TUI a human can read, not a half-quoted launch.
  *
- * `subagent_done` is always appended to the tool allowlist: a child that
- * cannot report completion cannot finish, so the one tool that ends a run is
- * never something an agent definition can accidentally omit.
+ * `subagent_done` and `subagent_report` are always appended to the tool
+ * allowlist: a child that cannot report completion cannot finish, and a
+ * child that cannot message the orchestrator is a subagent that can only
+ * shout from a pane nobody is watching.
  */
 export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   const argv: string[] = [
@@ -149,7 +210,7 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   ];
   if (opts.model) argv.push("--model", opts.model);
   if (opts.tools && opts.tools.length > 0) {
-    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME])];
+    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME])];
     argv.push("--tools", tools.join(","));
   }
   if (opts.systemPromptPath) argv.push("--append-system-prompt", opts.systemPromptPath);
