@@ -1,6 +1,5 @@
 /**
- * Tests for the pure parts of subagent-herdr: run ids, agent file parsing,
- * the child argv contract, and transcript result extraction.
+ * Tests for the pure parts of subagent-herdr: run ids, the child argv
  *
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
@@ -15,7 +14,6 @@ import {
   DONE_TOOL_NAME,
   extractRunResult,
   makeRunId,
-  parseAgentFile,
   readReports,
   REPORT_TOOL_NAME,
 } from "./lib.js";
@@ -33,57 +31,6 @@ describe("makeRunId", () => {
   test("produces distinct ids", () => {
     const ids = new Set(Array.from({ length: 500 }, () => makeRunId()));
     expect(ids.size).toBeGreaterThan(400);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// parseAgentFile
-// ---------------------------------------------------------------------------
-
-describe("parseAgentFile", () => {
-  test("parses name, description, inline tools and model, and captures the prompt body", () => {
-    const content = [
-      "---",
-      "name: worker",
-      "description: Implements a single well-specified change",
-      "tools: read, write, edit, bash",
-      "model: qwen/qwen3.8-27b",
-      "---",
-      "",
-      "# Worker",
-      "You implement tasks end to end.",
-      "",
-    ].join("\n");
-    const a = parseAgentFile(content, "worker.md");
-    expect(a).not.toBeNull();
-    expect(a!.name).toBe("worker");
-    expect(a!.description).toBe("Implements a single well-specified change");
-    expect(a!.tools).toEqual(["read", "write", "edit", "bash"]);
-    expect(a!.model).toBe("qwen/qwen3.8-27b");
-    expect(a!.promptBody).toContain("You implement tasks end to end.");
-    expect(a!.promptBody).not.toContain("name: worker");
-  });
-
-  test("parses block-style tool lists", () => {
-    const content = [
-      "---",
-      "name: explorer",
-      "description: Read-only recon",
-      "tools:",
-      "  - read",
-      "  - grep",
-      "  - find",
-      "---",
-      "Body text.",
-    ].join("\n");
-    const a = parseAgentFile(content, "explorer.md");
-    expect(a!.tools).toEqual(["read", "grep", "find"]);
-    expect(a!.model).toBeUndefined();
-  });
-
-  test("returns null without frontmatter or without a name", () => {
-    expect(parseAgentFile("just prose", "x.md")).toBeNull();
-    expect(parseAgentFile("---\ndescription: no name here\n---\nbody", "x.md")).toBeNull();
   });
 });
 

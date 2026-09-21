@@ -57,12 +57,12 @@ import { Type } from "typebox";
 import {
   buildChildArgv,
   buildChildEnv,
-  discoverAgents,
   extractRunResult,
   makeRunId,
   readReports,
   type RunResult,
 } from "./lib.js";
+import { discoverAgents } from "../lib/agents.js";
 import {
   closePane,
   createChildPane,

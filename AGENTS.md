@@ -31,6 +31,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget line-fitting) |
+| Agent definition grammar (`agents/*.md`) | `agent/extensions/lib/agents.ts` (single parser — prompt + spawn import it; one parser per format, like dotenv) |
 | Commit message style | `agent/prompts/git-commit.md` |
 | Delegation/planning vocabulary | `CONTEXT.md` |
 | Why pi is patched in `node_modules` | `PATCHES.md` |

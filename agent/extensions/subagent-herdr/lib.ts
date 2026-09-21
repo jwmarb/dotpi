@@ -2,9 +2,10 @@
  * Pure helpers for the subagent-herdr extension.
  *
  * Everything here is side-effect free (except the documented fs reads in
- * `discoverAgents` / `extractRunResult`), so the whole launch contract can be
- * unit-tested by calling the functions and reading what comes back. The herdr
- * CLI calls live in `herdr.ts`; the tool wiring in `index.ts`.
+ * `readReports` / `extractRunResult`), so the whole launch contract can be
+ * unit-tested by calling the functions and reading what comes back. Agent
+ * definition parsing lives in `../lib/agents.ts` (the single parser); the
+ * herdr CLI calls live in `herdr.ts`; the tool wiring in `index.ts`.
  *
  * @module subagent-herdr/lib
  */
@@ -18,98 +19,12 @@ export const DONE_TOOL_NAME = "subagent_done";
 export const REPORT_TOOL_NAME = "subagent_report";
 
 /**
- * Metadata for a subagent definition parsed from `agent/agents/<name>.md`.
- * Same frontmatter contract as dynamic-prompt.ts's agent discovery.
- */
-export interface AgentInfo {
-  name: string;
-  description: string;
-  /** Allowed tools, or undefined if the agent can use all tools. */
-  tools?: string[];
-  /** Preferred LLM model, or undefined to use the default. */
-  model?: string;
-  /** The agent's system-prompt body: the markdown after the frontmatter. */
-  promptBody: string;
-  filePath: string;
-}
-
-/**
  * A run id in the `sub-a3f1` shape that the orchestrator prompt advertises.
  * Four hex chars: plenty for a handful of concurrent runs, short enough to
  * read aloud.
  */
 export function makeRunId(): string {
   return `sub-${Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0")}`;
-}
-
-/**
- * Scans `agentsDir` for `.md` files with parseable frontmatter.
- * @param agentsDir - Absolute path to the agents directory.
- * @returns A sorted (by name) list of agents, or `[]` on any failure.
- */
-export async function discoverAgents(agentsDir: string): Promise<AgentInfo[]> {
-  let entries: string[];
-  try {
-    entries = await readdir(agentsDir);
-  } catch {
-    return [];
-  }
-  const agents: AgentInfo[] = [];
-  for (const file of entries.filter((e) => e.endsWith(".md"))) {
-    const content = await readFile(join(agentsDir, file), "utf-8");
-    const parsed = parseAgentFile(content, file);
-    if (parsed) agents.push(parsed);
-  }
-  return agents.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/**
- * Parses one agent definition: YAML-ish frontmatter (name, description,
- * tools, model) plus the markdown body that becomes the child's system
- * prompt. Mirrors dynamic-prompt.ts's frontmatter grammar so the two
- * discoveries never drift.
- *
- * @returns The parsed agent, or `null` when the frontmatter is missing or
- *          has no `name` (such a file is skipped by discovery).
- */
-export function parseAgentFile(content: string, fileName: string): AgentInfo | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---\r?\n?([\s\S]*)$/);
-  if (!match) return null;
-
-  const raw = match[1];
-  const name = extractString(raw, "name");
-  if (!name) return null;
-
-  return {
-    name,
-    description: extractString(raw, "description"),
-    tools: extractStringList(raw, "tools"),
-    model: extractString(raw, "model") || undefined,
-    promptBody: match[2].trim(),
-    filePath: fileName,
-  };
-}
-
-/** Single scalar frontmatter value (`key: value`, first match). */
-function extractString(yaml: string, key: string): string {
-  const match = yaml.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : "";
-}
-
-/**
- * List frontmatter value supporting both the inline (`tools: a, b`) and
- * block (`tools:\n  - a`) spellings used in the agent files.
- */
-function extractStringList(yaml: string, key: string): string[] {
-  const inline = yaml.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  if (inline && !inline[1].startsWith("-")) {
-    return inline[1].split(",").map((s) => s.trim()).filter(Boolean);
-  }
-  const block = yaml.match(new RegExp(`^${key}:\\n((?:\\s+- .+\\n?)+)`, "m"));
-  if (block) {
-    return block[1].split("\n").map((l) => l.replace(/^\s+-\s*/, "").trim()).filter(Boolean);
-  }
-  return [];
 }
 
 /** Inputs for planning one child launch (see `buildChildArgv`). */
