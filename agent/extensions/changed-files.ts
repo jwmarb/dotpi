@@ -30,9 +30,8 @@ import {
 	type TUI,
 	Key,
 	matchesKey,
-	truncateToWidth,
-	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { cachedByWidth, frame, row } from "./lib/widget.js";
 
 /** Maximum number of files shown in the inline widget. */
 const MAX_WIDGET_FILES = 5;
@@ -293,37 +292,6 @@ function styleDiffLine(line: string, theme: Theme): string {
 	return theme.fg("text", line);
 }
 
-/**
- * Wrap a body in a rounded frame with an accent title, fitting `width`
- * visible columns exactly (every line is truncated/padded to fit).
- *
- * @param body - The framed content lines (may carry ANSI styling).
- * @param width - Total frame width in visible columns.
- * @param theme - The theme accessor.
- * @param title - Plain-text title shown in the top border.
- * @returns The framed lines.
- */
-function frameLines(body: string[], width: number, theme: Theme, title: string): string[] {
-	const w = Math.max(10, Math.floor(width));
-	const innerW = w - 4; // "│ " + content + " │"
-
-	// Top border: `╭─ Title ───╮`
-	let t = title;
-	const maxTitle = Math.max(4, w - 8);
-	if (visibleWidth(t) > maxTitle) t = truncateToWidth(t, maxTitle);
-	const dashes = Math.max(0, w - visibleWidth("╭─ ") - visibleWidth(t) - 2);
-	const out: string[] = [`╭─ ${theme.fg("accent", theme.bold(t))} ${"─".repeat(dashes)}╮`];
-
-	for (const line of body) {
-		const fitted = truncateToWidth(line, innerW);
-		const pad = Math.max(0, innerW - visibleWidth(fitted));
-		out.push(`│ ${fitted}${" ".repeat(pad)} │`);
-	}
-
-	out.push(`╰${"─".repeat(w - 2)}╯`);
-	return out;
-}
-
 // ---------------------------------------------------------------------------
 // Diff modal
 // ---------------------------------------------------------------------------
@@ -377,10 +345,18 @@ function createDiffViewer(args: DiffViewerArgs): Component {
 	let listScroll = 0;
 	let diffScroll = 0;
 	const diffCache = new Map<string, string[]>();
-	let cachedLines: string[] | undefined;
+	/**
+	 * The overlay's render cache.
+	 *
+	 * Declared before `build` and assigned immediately after it, so no code path
+	 * can reach `refresh()` — and therefore `viewer` — before the assignment:
+	 * `refresh` is called only from `handleInput`, which escapes only via the
+	 * object returned at the end of this function.
+	 */
+	let viewer: { render: (width: number) => string[]; invalidate: () => void };
 
 	function refresh(): void {
-		cachedLines = undefined;
+		viewer.invalidate();
 		tui.requestRender();
 	}
 
@@ -406,25 +382,33 @@ function createDiffViewer(args: DiffViewerArgs): Component {
 		return lines;
 	}
 
-	function render(width: number): string[] {
-		if (cachedLines) return cachedLines;
-		const w = Math.max(10, Math.floor(width));
-		const innerW = Math.max(4, w - 4);
+	/**
+	 * Builds the overlay's lines for a given width. Measurement, padding and the
+	 * border all belong to `lib/widget.js`; this decides only *what* is shown.
+	 */
+	function build(width: number): string[] {
+		// The frame spends 4 columns on its walls, so rows are laid out against
+		// the inner width. `frame` drops the border entirely when even that will
+		// not fit, and re-fits whatever comes back.
+		const innerW = Math.max(1, Math.floor(width) - 4);
 		const body: string[] = [];
 		let title: string;
 
 		if (view === "files") {
 			title = `Changed Files (${files.length})`;
-			const rows = files.map((file, i) => {
-				const marker = i === selectedIndex ? theme.fg("accent", ">") : " ";
-				const dot = theme.fg(statusToColor(file.status), STATUS_PREFIX[file.status] ?? "●");
-				const counts = formatCounts(file, theme);
-				const maxPath = Math.max(
-					4,
-					innerW - visibleWidth(`${marker}  ${dot} `) - visibleWidth(counts) - 1,
-				);
-				return `${marker}  ${dot} ${truncateToWidth(theme.fg("text", file.path), maxPath)} ${counts}`;
-			});
+			const rows = files.map((file, i) =>
+				row(
+					[
+						{ text: i === selectedIndex ? theme.fg("accent", ">") : " " },
+						{
+							text: `  ${theme.fg(statusToColor(file.status), STATUS_PREFIX[file.status] ?? "●")} `,
+						},
+						{ text: theme.fg("text", file.path), flex: true },
+						{ text: ` ${formatCounts(file, theme)}` },
+					],
+					innerW,
+				),
+			);
 
 			const visible = visibleRows();
 			// Keep the selection in view.
@@ -440,7 +424,7 @@ function createDiffViewer(args: DiffViewerArgs): Component {
 			const file = files[selectedIndex];
 			if (!file) {
 				view = "files";
-				return render(width);
+				return build(width);
 			}
 			title = file.path;
 			const all = diffLinesFor(file);
@@ -454,13 +438,16 @@ function createDiffViewer(args: DiffViewerArgs): Component {
 			const slice = all.slice(diffScroll, diffScroll + visible);
 			while (slice.length < visible) slice.push("");
 			for (const line of slice) {
-				body.push(truncateToWidth(styleDiffLine(line, theme), innerW));
+				body.push(styleDiffLine(line, theme));
 			}
 			body.push(theme.fg("dim", " ↑↓ scroll · PgUp/PgDn jump · ←/Esc back · Ctrl+C close"));
 		}
 
-		cachedLines = frameLines(body, w, theme, title);
-		return cachedLines;
+		return frame(body, {
+			title,
+			width,
+			styleTitle: (t) => theme.fg("accent", theme.bold(t)),
+		});
 	}
 
 	function handleInput(data: string): void {
@@ -506,12 +493,27 @@ function createDiffViewer(args: DiffViewerArgs): Component {
 		}
 	}
 
+	// The cache is keyed on the render width, so a horizontal resize rebuilds
+	// rather than serving lines measured against the old terminal.
+	viewer = cachedByWidth(build);
+
+	// `build` also sizes its row slice from the terminal *height* (visibleRows),
+	// which the width-keyed cache cannot see. pi re-renders on a height change
+	// but does not invalidate, so a taller terminal would keep the old row count
+	// until the next keypress. Track it here and drop the cached draw ourselves.
+	let lastRows = tui.terminal?.rows;
+
 	return {
-		render,
-		handleInput,
-		invalidate: () => {
-			cachedLines = undefined;
+		render: (width: number) => {
+			const rows = tui.terminal?.rows;
+			if (rows !== lastRows) {
+				lastRows = rows;
+				viewer.invalidate();
+			}
+			return viewer.render(width);
 		},
+		handleInput,
+		invalidate: () => viewer.invalidate(),
 	};
 }
 
@@ -699,31 +701,40 @@ function toRelativePath(path: string, cwd: string): string {
 	return path;
 }
 
-/** Widget factory shim so `setWidget` keeps its (tui, theme) signature. */
+/**
+ * Widget factory shim so `setWidget` keeps its (tui, theme) signature.
+ *
+ * Every line goes out through `lib/widget.js`, header included: the header used
+ * to be pushed unmeasured, and at 18-20 visible columns (it grows with the file
+ * count) it was well past the width that kills the host in a narrow Run Pane.
+ * The rows were worse — their hand-rolled path budget was off by one, so a
+ * truncated path emitted `width + 1` columns even at an 80-column terminal.
+ */
 function buildWidgetComponentFor(files: ChangedFile[], theme: Theme): Component {
 	const shown = files.slice(0, MAX_WIDGET_FILES);
 	const hidden = files.length - shown.length;
-	return {
-		render: (width: number) => {
-			const usable = Number.isFinite(width) && width > 0 ? width : 40;
-			const lines: string[] = [];
+	return cachedByWidth((width) => {
+		const lines: string[] = [
+			theme.fg("accent", theme.bold(" Changed Files")) +
+				theme.fg("dim", ` (${files.length})`),
+		];
+		for (const file of shown) {
 			lines.push(
-				theme.fg("accent", theme.bold(" Changed Files")) +
-					theme.fg("dim", ` (${files.length})`),
+				row(
+					[
+						{
+							text: `  ${theme.fg(statusToColor(file.status), STATUS_PREFIX[file.status] ?? "●")} `,
+						},
+						{ text: theme.fg("text", file.path), flex: true },
+						{ text: `  ${formatCounts(file, theme)}` },
+					],
+					width,
+				),
 			);
-			for (const file of shown) {
-				const prefix = `  ${theme.fg(statusToColor(file.status), STATUS_PREFIX[file.status] ?? "●")}`;
-				const counts = formatCounts(file, theme);
-				const maxPath = Math.max(4, usable - visibleWidth(prefix) - visibleWidth(counts) - 2);
-				lines.push(
-					`${prefix} ${truncateToWidth(theme.fg("text", file.path), maxPath)}  ${counts}`,
-				);
-			}
-			if (hidden > 0) {
-				lines.push(theme.fg("dim", `  … ${hidden} more — /diff`));
-			}
-			return lines;
-		},
-		invalidate: () => {},
-	};
+		}
+		if (hidden > 0) {
+			lines.push(theme.fg("dim", `  … ${hidden} more — /diff`));
+		}
+		return lines;
+	});
 }
