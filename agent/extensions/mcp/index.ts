@@ -157,7 +157,11 @@ function loadConfig(configPath: string): Map<string, McpServerConfig> {
 	}
 	// Fill in credentials from agent/.env before expanding, so a placeholder can
 	// resolve from the file as well as from the real environment (docs/adr/0042).
-	loadDotenv();
+	// Force a fresh read: config load is the one moment a mid-session edit to .env
+	// must become visible to a re-imported extension; the shared cache would
+	// otherwise keep serving the pre-edit snapshot for this process's life, and a
+	// newly referenced ${VAR} would fail to expand on hot reload.
+	loadDotenv({ force: true });
 	raw = expandPlaceholders(raw, configPath);
 
 	const file = raw as { mcpServers?: McpConfigFile } | McpConfigFile;

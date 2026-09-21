@@ -130,7 +130,8 @@ let cached: LoadResult | null = null;
  * Idempotent: the first call does the work and later calls return the same
  * result, so several extensions can each call it at load without re-reading.
  *
- * @param opts.force Re-read even if already loaded (tests).
+ * @param opts.force Re-read even if already loaded (tests, and config loads that
+ * must see mid-session .env edits).
  */
 export function loadDotenv(opts: { force?: boolean } = {}): LoadResult {
 	if (cached && !opts.force) return cached;
