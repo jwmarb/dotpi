@@ -30,7 +30,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Add/repair an MCP server | `agent/mcp.json` (runtime: `/mcp status` · `list` · `refresh`) |
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
-| Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget line-fitting) |
+| Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget line construction/fitting, repo layout) |
+| Where a repo file lives (agent dir, agents/, skills/, .env, mcp.json) | `agent/extensions/lib/layout.ts` (single resolver — never throws, so top-level extension code can import it) |
 | Agent definition grammar (`agents/*.md`) | `agent/extensions/lib/agents.ts` (single parser — prompt + spawn import it; one parser per format, like dotenv) |
 | Commit message style | `agent/prompts/git-commit.md` |
 | Delegation/planning vocabulary | `CONTEXT.md` |

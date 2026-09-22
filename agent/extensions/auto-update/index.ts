@@ -10,8 +10,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours between checks
@@ -160,22 +160,35 @@ export default function (pi: ExtensionAPI) {
 }
 
 /**
- * Get the currently running version by reading package.json from the
- * resolved module path. Extensions are loaded via jiti which can resolve
- * the package, so we find it relative to the known dist/cli.js entry.
+ * The version of pi that is actually running.
+ *
+ * Resolved from the `pi` on PATH, not from a guessed `node_modules` location.
+ * This used to read `$HOME/node_modules/<pkg>/package.json`, which on this
+ * machine holds a *different, older* copy than the binary being run: it
+ * reported 0.75.4 while pi was 0.85.1, so every check compared the latest
+ * release against a version the user was not running and offered an update
+ * they already had.
+ *
+ * `process.execPath` is the bun runtime, not pi, so the package is located by
+ * resolving the `pi` symlink on PATH back to its own `package.json`.
  */
 function getCurrentVersion(): string | null {
 	try {
-		// The pi binary is a symlink to .../node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-		// We can find the package.json relative to that
-		const binPath = join(
-			process.env.HOME ?? "~",
-			"node_modules",
-			PACKAGE_NAME,
-			"package.json",
-		);
-		const pkg = JSON.parse(readFileSync(binPath, "utf-8"));
-		return pkg.version ?? null;
+		// process.argv[1] is the `pi` entry script being run. Resolving the
+		// symlink lands inside the package that is actually executing, whatever
+		// its install layout (bun global, npm, a checkout). `import.meta.resolve`
+		// does not work here: jiti aliases the package for extensions, so it
+		// throws "Cannot find module" inside a running pi.
+		let dir = dirname(realpathSync(process.argv[1] ?? ""));
+		for (let i = 0; i < 5; i++) {
+			const candidate = join(dir, "package.json");
+			if (existsSync(candidate)) {
+				const pkg = JSON.parse(readFileSync(candidate, "utf-8"));
+				if (pkg.name === PACKAGE_NAME) return pkg.version ?? null;
+			}
+			dir = dirname(dir);
+		}
+		return null;
 	} catch {
 		return null;
 	}

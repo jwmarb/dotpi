@@ -44,8 +44,10 @@ import { join } from "node:path";
 /**
  * Directory holding every run's session, sidecar and metadata (gitignored).
  *
- * Takes the agent directory rather than resolving it, so this module stays
- * importable by the child without depending on pi's export surface.
+ * Takes the agent directory rather than resolving it (`lib/layout.ts` is what
+ * resolves it): a path function that accepts its root is testable against a
+ * temp directory, and the child already receives its run directory as env, so
+ * neither side needs this module to go looking.
  *
  * @param agentDir - pi's agent directory.
  */

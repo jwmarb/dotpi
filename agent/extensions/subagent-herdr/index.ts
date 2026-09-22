@@ -54,7 +54,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -70,6 +69,7 @@ import {
   type RunResult,
 } from "./lib.js";
 import { type AgentInfo, discoverAgents } from "../lib/agents.js";
+import { agentDir, agentsDir } from "../lib/layout.js";
 import {
   exitPath,
   type FailedAttempt,
@@ -99,10 +99,10 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Where every run's session, sidecar and metadata live (gitignored). */
-const RUNS_DIR = runsDir(getAgentDir());
+const RUNS_DIR = runsDir(agentDir());
 
 /** This run's directory, derived from its id rather than stored on the record. */
-const dirFor = (runId: string): string => runDir(getAgentDir(), runId);
+const dirFor = (runId: string): string => runDir(agentDir(), runId);
 
 /** Directory of this extension, so `child-done.ts` can be passed to a child by absolute path. */
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
@@ -291,7 +291,7 @@ async function launchAttempt(
  * decision for the caller, not a reflex here.
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
-  const agents = await discoverAgents(join(getAgentDir(), "agents"));
+  const agents = await discoverAgents(agentsDir());
   const agent = agents.find((a) => a.name === params.agent);
   if (!agent) {
     const available = agents.map((a) => a.name).join(", ") || "none";

@@ -18,9 +18,8 @@
  * will not start.
  */
 
-import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { envFilePath } from "./lib/dotenv.js";
+import { repoRoot as resolveRepoRoot } from "./lib/layout.js";
 
 const HOOKS_PATH = ".githooks";
 
@@ -28,10 +27,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "startup") return;
 		try {
-			// The config dir is the parent of agent/, which is the repo root
-			// for a repo-shaped clone. envFilePath() resolves PI_CODING_AGENT_DIR
-			// (or ~/.pi/agent), so this is the clone pi is actually running.
-			const repoRoot = path.dirname(path.dirname(envFilePath()));
+			// The config dir is the parent of agent/, which is the repo root for a
+			// repo-shaped clone — the clone pi is actually running.
+			const repoRoot = resolveRepoRoot();
 
 			const top = await pi.exec("git", ["-C", repoRoot, "rev-parse", "--show-toplevel"]);
 			if (top.code !== 0) return; // not a git repo: nothing to arm

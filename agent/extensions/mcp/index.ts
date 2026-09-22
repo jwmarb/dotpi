@@ -28,12 +28,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import { Type } from "typebox";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadDotenv } from "../lib/dotenv.js";
+import { envFile, mcpConfigFile } from "../lib/layout.js";
 import { fittedWidget } from "../lib/widget.js";
 
 // --- Configuration -----------------------------------------------------------
@@ -71,16 +70,10 @@ type McpConfigFile = Record<string, McpServerConfig>;
 function resolveConfigPath(): string | null {
 	const envPath = process.env.PI_MCP_CONFIG;
 	if (envPath) return path.resolve(envPath);
-	try {
-		const agentDir = getAgentDir();
-		const p = path.join(agentDir, "mcp.json");
-		if (fs.existsSync(p)) return p;
-	} catch {
-		// getAgentDir() can fail if env is unset — fall through.
-	}
-	const fallback = path.join(os.homedir(), ".pi", "agent", "mcp.json");
-	if (fs.existsSync(fallback)) return fallback;
-	return null;
+	// One resolution, from lib/layout.ts: it cannot throw, so the second
+	// hand-rolled homedir fallback this used to carry is gone.
+	const p = mcpConfigFile();
+	return fs.existsSync(p) ? p : null;
 }
 
 /**
@@ -111,7 +104,7 @@ function expandPlaceholders(value: unknown, where: string, trail: string[] = [])
 				const field = trail.length ? trail.join(".") : "(root)";
 				throw new Error(
 					`${where}: ${field} references \${${name}}, which is not set.\n` +
-					`  Set ${name} in the environment or in ${path.join(getAgentDirSafe(), ".env")}.`,
+					`  Set ${name} in the environment or in ${envFile()}.`,
 				);
 			}
 			return v;
@@ -124,15 +117,6 @@ function expandPlaceholders(value: unknown, where: string, trail: string[] = [])
 		return out;
 	}
 	return value;
-}
-
-/** getAgentDir() that cannot throw, for use inside error messages. */
-function getAgentDirSafe(): string {
-	try {
-		return getAgentDir();
-	} catch {
-		return path.join(os.homedir(), ".pi", "agent");
-	}
 }
 
 /**

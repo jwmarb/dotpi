@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ProviderConfig } from '@mariozechner/pi-coding-agent';
+import type { ExtensionAPI, ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { requireEnv } from './lib/dotenv.js';
 
 /**

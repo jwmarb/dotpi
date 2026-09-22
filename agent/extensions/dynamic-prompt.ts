@@ -8,10 +8,9 @@
  *
  * @module dynamic-prompt
  */
-import { join } from 'node:path';
-import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
-import { getAgentDir } from '@mariozechner/pi-coding-agent';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { discoverAgents, type AgentInfo } from './lib/agents.js';
+import { agentsDir } from './lib/layout.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -46,8 +45,7 @@ export default function (pi: ExtensionAPI) {
     const opts = event.systemPromptOptions;
 
     // --- Discover agents from ~/.pi/agent/agents/ ---
-    const agentsDir = join(getAgentDir(), 'agents');
-    const agentInventory = await discoverAgents(agentsDir);
+    const agentInventory = await discoverAgents(agentsDir());
 
     // --- Build tool inventory ---
     // Only include tools that have a snippet available; fallback to empty description

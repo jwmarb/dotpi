@@ -8,7 +8,15 @@
  * This is deliberately the ONE loader shared by every consumer rather than a
  * copy per extension: two parsers of the same file drift, and drift is exactly
  * how the fork bomb of docs/adr/0037 bypassed an interlock that already
- * existed. Same reasoning as subagent/rundir.ts in docs/adr/0039.
+ * existed. Same reasoning as subagent-herdr/rundir.ts.
+ *
+ * Where the file *is* comes from `lib/layout.ts`. This module used to mirror
+ * pi's agent-directory resolution by hand, because it is imported by extension
+ * top-level code and pi's `getAgentDir()` throws on an unset environment. That
+ * constraint now lives in `layout.ts` — which never throws — so the mirror is
+ * gone rather than duplicated. (The hand-rolled copy had also drifted: it
+ * resolved a relative override against the cwd, which this module's own notes
+ * warn against, and expanded `~user` as if it were home-relative.)
  *
  * The parser is deliberately minimal — `KEY=VALUE`, `#` comments, optional
  * surrounding quotes. Multiline values, escape sequences and interpolation
@@ -17,8 +25,8 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+
+import { envExampleFile, envFile } from "./layout.js";
 
 /** Name of the env file, relative to the agent directory. */
 export const ENV_FILENAME = ".env";
@@ -68,35 +76,9 @@ export function parseEnv(text: string): Map<string, string> {
 	return out;
 }
 
-/**
- * Resolve the agent directory without importing pi.
- *
- * The MCP extension resolves its config through pi's `getAgentDir()`, but this
- * module is imported by extension top-level code and must not depend on pi's
- * export surface, so it mirrors the same resolution order by hand.
- *
- * The variable name is `PI_CODING_AGENT_DIR`, verified empirically rather than
- * assumed: pi builds it as `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`, and an
- * earlier guess of `PI_AGENT_DIR` was silently ignored — setting it changed
- * nothing, so the override would have looked supported while doing nothing.
- * pi also expands a leading `~`, which is mirrored here.
- *
- * Deliberately NOT the current working directory: this repo is a config
- * directory that pi is launched from OTHER projects, so cwd is not the repo
- * (docs/adr/0042).
- */
-function agentDir(): string {
-	const override = process.env.PI_CODING_AGENT_DIR;
-	if (override) {
-		const expanded = override.startsWith("~") ? path.join(os.homedir(), override.slice(1)) : override;
-		return path.resolve(expanded);
-	}
-	return path.join(os.homedir(), ".pi", "agent");
-}
-
 /** Absolute path of the env file this module loads. */
 export function envFilePath(): string {
-	return path.join(agentDir(), ENV_FILENAME);
+	return envFile();
 }
 
 /** Outcome of a load, for callers that want to report what happened. */
@@ -183,7 +165,7 @@ export function requireEnv(name: string, purpose: string): string {
 	const exists = fs.existsSync(file);
 	const hint = exists
 		? `Add a line to ${file}:\n    ${name}=<your key>`
-		: `Create ${file} with:\n    ${name}=<your key>\n  (copy ${path.join(path.dirname(file), ".env.example")} as a starting point)`;
+		: `Create ${file} with:\n    ${name}=<your key>\n  (copy ${envExampleFile()} as a starting point)`;
 
 	throw new Error(`${name} is not set, so ${purpose} cannot be configured.\n  ${hint}`);
 }
