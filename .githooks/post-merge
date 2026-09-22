@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#
+# Re-verify extension dependencies after a merge (pull, rebase, merge).
+#
+# node_modules/ is git-ignored, so the dependencies do not travel with the
+# clone. post-merge fires exactly when the tree (and with it
+# package-lock.json) may have changed; the initial clone is covered by
+# agent/extensions/git-hooks.ts at startup, which no git hook sees.
+#
+# Best-effort: a missing npm or a failed install prints a warning and moves
+# on — a hook failure must not block the merge.
+root=$(git rev-parse --show-toplevel) || exit 0
+[ -x "$root/scripts/setup-deps.sh" ] || exit 0
+bash "$root/scripts/setup-deps.sh" --force
+exit 0

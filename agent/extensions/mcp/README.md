@@ -3,6 +3,14 @@
 pi extension that connects to MCP (Model Context Protocol) servers and registers
 their tools as native pi tools the LLM can call.
 
+## Setup
+
+The extension's npm dependencies live in a gitignored `node_modules/`, so a
+fresh clone of the repo has the source without them — the load failure is
+`Cannot find module '@modelcontextprotocol/sdk/...'`. `scripts/setup-deps.sh`
+installs them, and it runs automatically: at pi startup (covers the initial
+clone, which no git hook sees) and on checkout/merge (tracked git hooks).
+A clone that still fails loads them with `bash scripts/setup-deps.sh`.
 ## Config
 
 Read from `~/.pi/agent/mcp.json` (override with `PI_MCP_CONFIG`). Standard
