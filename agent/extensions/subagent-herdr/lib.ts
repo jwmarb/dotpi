@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import {
   type ChildReport,
+  type FailedAttempt,
   isSessionFileFor,
   parseReportLine,
   reportsPath,
@@ -233,4 +234,70 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   }
   const file = dirEntries.find((e) => isSessionFileFor(e, runId));
   return file ? join(runDir, file) : undefined;
+}
+
+/**
+ * Every model to try for one run, in order: the requested (or declared) model
+ * first, then the agent file's `fallback_models`.
+ *
+ * An explicit `model` on the delegation call suppresses the fallbacks: the
+ * caller named a model, and silently running a different one would be a
+ * surprise rather than a recovery. Duplicates are dropped so a fallback that
+ * repeats the primary does not buy a second identical attempt.
+ *
+ * @param requested - The model named on the delegation call, if any.
+ * @param agent - The agent definition, for its model and fallbacks.
+ * @returns At least one entry; `[undefined]` means "pi's default model".
+ */
+export function candidateModels(
+  requested: string | undefined,
+  agent: { model?: string; fallbackModels?: string[] },
+): (string | undefined)[] {
+  if (requested) return [requested];
+  const out: (string | undefined)[] = [agent.model];
+  for (const m of agent.fallbackModels ?? []) {
+    if (!out.includes(m)) out.push(m);
+  }
+  return out;
+}
+
+/**
+ * The error text for a spawn where every candidate model failed to launch.
+ *
+ * Names each model tried, because "did not become interactive" on its own sends
+ * a reader to the pane when the cause may simply be that no declared model is
+ * reachable.
+ */
+export function describeLaunchFailure(failures: readonly FailedAttempt[]): string {
+  const first = failures[0];
+  if (failures.length <= 1) {
+    return first?.error ?? "The child could not be launched.";
+  }
+  const tried = failures
+    .map((f) => `  - ${f.model ?? "(default model)"}: ${f.error}`)
+    .join("\n");
+  return `All ${failures.length} candidate models failed to launch:\n${tried}`;
+}
+
+/**
+ * herdr's rule for an agent name, verified against herdr 0.9.0 by asking it.
+ *
+ * `agent start` rejects a name outside this shape with `invalid_agent_name`,
+ * which the spawn path used to surface as "did not become interactive" on every
+ * candidate model — a failure that looks like a broken model and is not.
+ */
+const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/**
+ * Why herdr would refuse this agent name, or `undefined` if it is usable.
+ *
+ * Checked before a pane is opened: a name herdr cannot use fails identically on
+ * every model, so retrying is pointless and the real cause should be said out
+ * loud instead.
+ *
+ * @param name - The agent name from its definition file.
+ */
+export function agentNameRejection(name: string): string | undefined {
+  if (HERDR_AGENT_NAME.test(name)) return undefined;
+  return `Agent name "${name}" is not usable by herdr: a name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 characters). Rename the agent definition file's \`name\` field.`;
 }

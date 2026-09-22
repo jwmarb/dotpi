@@ -61,14 +61,18 @@ import { Type } from "typebox";
 import {
   buildChildArgv,
   buildChildEnv,
+  agentNameRejection,
+  candidateModels,
+  describeLaunchFailure,
   extractRunResult,
   makeRunId,
   readReports,
   type RunResult,
 } from "./lib.js";
-import { discoverAgents } from "../lib/agents.js";
+import { type AgentInfo, discoverAgents } from "../lib/agents.js";
 import {
   exitPath,
+  type FailedAttempt,
   isRunRecord,
   metaPath,
   type RunRecord,
@@ -121,6 +125,9 @@ const RESULT_MAX_CHARS = 20_000;
  * rare, and the recovery path makes it harmless.
  */
 const PROMPT_SETTLE_MS = 1500;
+
+/** How long to wait for a turn to start after a recovery Enter. */
+const PROMPT_RECOVERY_MS = 15_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -179,11 +186,109 @@ interface SpawnOutcome {
   error?: string;
 }
 
+/** What one launch attempt needs from the world, so a test can supply its own. */
+interface Launcher {
+  createChildPane: typeof createChildPane;
+  renamePane: typeof renamePane;
+  startAgent: typeof startAgent;
+  closePane: typeof closePane;
+}
+
+const realLauncher: Launcher = { createChildPane, renamePane, startAgent, closePane };
+
+/** Outcome of trying to get one pi child interactive on one model. */
+interface AttemptOutcome {
+  ok: boolean;
+  paneId?: string;
+  tabId?: string;
+  /** Set when the attempt failed; the reason to record and to report. */
+  error?: string;
+  /** True when no pane could be opened at all (herdr itself is unavailable). */
+  fatal?: boolean;
+}
+
+/**
+ * Opens a pane and tries to get a pi child interactive on one model.
+ *
+ * A failure here is a *launch* failure: pi exits non-zero before its TUI comes
+ * up when a model is unknown or its provider refuses, which herdr reports as
+ * "did not become interactive". That is the signal a fallback acts on, and the
+ * reason the retry lives at this seam rather than around the whole run.
+ *
+ * The pane is closed on failure unless `keepPaneOnFailure`, which the last
+ * attempt sets: herdr destroys scrollback with the pane, and the final failure
+ * is the one a human needs to read.
+ */
+async function launchAttempt(
+  agent: AgentInfo,
+  rec: RunRecord,
+  dir: string,
+  promptPath: string,
+  model: string | undefined,
+  keepPaneOnFailure: boolean,
+  launcher: Launcher = realLauncher,
+): Promise<AttemptOutcome> {
+  // The child's pane env: its run identity, and — the key to child →
+  // orchestrator messaging — this orchestrator's own pane id, which herdr
+  // injects into our process as HERDR_PANE_ID.
+  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir);
+  const label = `${agent.name} ${rec.runId}`;
+  const pane = await launcher.createChildPane(rec.cwd, label, env);
+  if (!pane) {
+    return {
+      ok: false,
+      fatal: true,
+      error:
+        "Could not open a herdr tab: is the herdr server running? Check `herdr status`. Subagents need herdr to spawn their agent tabs.",
+    };
+  }
+  await launcher.renamePane(pane.paneId, label);
+
+  const argv = buildChildArgv({
+    childDonePath: join(SELF_DIR, "child-done.ts"),
+    runDir: dir,
+    runId: rec.runId,
+    model,
+    tools: agent.tools,
+    systemPromptPath: promptPath,
+  });
+  if (await launcher.startAgent(agent.name, pane.paneId, argv)) {
+    return { ok: true, paneId: pane.paneId, tabId: pane.tabId };
+  }
+
+  if (!keepPaneOnFailure) await launcher.closePane(pane.paneId);
+  return {
+    ok: false,
+    paneId: pane.paneId,
+    error: `pi in pane ${pane.paneId} did not become interactive${
+      model ? ` on model ${model}` : ""
+    } (see that pane's output).`,
+  };
+}
+
 /**
  * Spawns one herdr agent for a subagent definition: a new tab in this
  * workspace (one fresh shell pane, native `pi` child), task prompt. Every
  * failure path cleans up the pane it already created, so a failed spawn
  * leaves no orphan running (closing the tab's only pane closes the tab).
+ *
+ * Models come from `candidateModels` and are tried in order. The trigger is
+ * *prompt rejection*, not launch failure, because a dead model does not fail
+ * the launch: pi exits before its TUI appears, the pane's shell survives, and
+ * herdr reports `interactive_ready: true` anyway. The task then lands in a bash
+ * prompt, which herdr refuses — and that is the first reliable signal. So one
+ * attempt spans opening the pane *and* getting the task accepted.
+ *
+ * A pre-spawn model check was tried and removed: the only pi invocations that
+ * validate a model cost ~7s each (`--list-models` ignores `--model` entirely),
+ * and this signal catches the same failure a few seconds later for free.
+ *
+ * The model that actually ran and the ones that failed are both recorded, so a
+ * degraded fleet is visible rather than silently slower.
+ *
+ * Only *getting started* is retried. A child that accepted its task and then
+ * died has written part of a transcript and burned tokens; re-running it is a
+ * decision for the caller, not a reflex here.
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
   const agents = await discoverAgents(join(getAgentDir(), "agents"));
@@ -193,13 +298,20 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
   }
 
+  // herdr refuses some names outright, and that refusal used to surface as
+  // "did not become interactive" on every candidate model — a broken name
+  // looking exactly like a broken fleet.
+  const nameProblem = agentNameRejection(agent.name);
+  if (nameProblem) return { ok: false, error: nameProblem };
+
+  const models = candidateModels(params.model, agent);
   const runId = makeRunId();
   const rec: RunRecord = {
     runId,
     agent: agent.name,
     task: params.task,
     cwd: params.cwd ?? baseCwd,
-    model: params.model ?? agent.model,
+    model: models[0],
     status: "running",
     startedAt: Date.now(),
   };
@@ -217,70 +329,67 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error: `Could not write the child's system prompt to ${promptPath}.` };
   }
 
-  // The child's pane env: its run identity, and — the key to child →
-  // orchestrator messaging — this orchestrator's own pane id, which herdr
-  // injects into our process as HERDR_PANE_ID.
-  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir);
-  const pane = await createChildPane(rec.cwd, `${agent.name} ${rec.runId}`, env);
-  if (!pane) {
-    return {
-      ok: false,
-      error:
-        "Could not open a herdr tab: is the herdr server running? Check `herdr status`. Subagents need herdr to spawn their agent tabs.",
-    };
-  }
-  rec.paneId = pane.paneId;
-  rec.tabId = pane.tabId;
-  await renamePane(pane.paneId, `${agent.name} ${rec.runId}`);
-  saveMeta(rec);
+  const failures: FailedAttempt[] = [];
+  // One attempt = open a pane, get pi interactive, and get the task accepted.
+  // The prompt is part of the attempt because a dead model does not fail the
+  // launch: pi exits, the pane's shell survives, herdr still reports
+  // interactive-ready, and the task then lands in a bash prompt instead.
+  let launched: AttemptOutcome | undefined;
+  for (const [i, model] of models.entries()) {
+    const isLast = i === models.length - 1;
+    const attempt = await launchAttempt(agent, rec, dir, promptPath, model, isLast);
+    if (!attempt.ok) {
+      failures.push({ model, error: attempt.error ?? "unknown launch failure" });
+      // No pane at all means herdr is unavailable: another model cannot help.
+      if (attempt.fatal) break;
+      continue;
+    }
 
-  const argv = buildChildArgv({
-    childDonePath: join(SELF_DIR, "child-done.ts"),
-    runDir: dir,
-    runId: rec.runId,
-    model: rec.model,
-    tools: agent.tools,
-    systemPromptPath: promptPath,
-  });
-  if (!(await startAgent(agent.name, pane.paneId, argv))) {
-    await closePane(pane.paneId);
+    // Deliver the task and verify the turn actually started (see promptAgent in
+    // herdr.ts for why the plain form is not enough).
+    await sleep(PROMPT_SETTLE_MS);
+    const prompted = await promptAgent(attempt.paneId!, params.task);
+    let turnStarted = prompted.ok;
+    if (!turnStarted) {
+      // herdr typed the text but the turn never started — most likely the
+      // submitting Enter was lost to the TUI, with the task text sitting in the
+      // editor. One recovery Enter fixes exactly that.
+      await sendKeys(attempt.paneId!, "enter");
+      turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
+    }
+    if (turnStarted) {
+      launched = attempt;
+      rec.paneId = attempt.paneId;
+      rec.tabId = attempt.tabId;
+      // Record the fallback only when one was actually used, so the common case
+      // leaves no trace to read past.
+      if (i > 0 || failures.length > 0) {
+        rec.resolvedModel = model;
+        rec.failedAttempts = failures;
+      }
+      break;
+    }
+
+    failures.push({
+      model,
+      error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`,
+    });
+    // The pane is a dead end either way. Keep the last one to read; reclaim the
+    // rest so a three-model fallback does not leave three tabs behind.
+    if (!isLast) await closePane(attempt.paneId!);
+  }
+
+  if (!launched) {
     rec.status = "failed";
     rec.finishedAt = Date.now();
+    rec.failedAttempts = failures;
     saveMeta(rec);
-    return {
-      ok: false,
-      error: `herdr reported the pi child in pane ${pane.paneId} did not become interactive (see that pane's output).`,
-    };
-  }
-
-  // Deliver the task and verify the turn actually started (see promptAgent in
-  // herdr.ts for why the plain form is not enough).
-  await sleep(PROMPT_SETTLE_MS);
-  const prompted = await promptAgent(pane.paneId, params.task);
-  let turnStarted = prompted.ok;
-  if (!turnStarted) {
-    // herdr typed the text but the turn never started — most likely the
-    // submitting Enter was lost to the TUI, with the task text sitting in the
-    // editor. One recovery Enter fixes exactly that; if the turn is not
-    // running afterwards the submission was lost more deeply and the pane is
-    // left open for a human to read.
-    await sendKeys(pane.paneId, "enter");
-    turnStarted = await waitAgentWorking(pane.paneId, 15_000);
-  }
-  if (!turnStarted) {
-    rec.status = "failed";
-    rec.finishedAt = Date.now();
-    saveMeta(rec);
-    return {
-      ok: false,
-      error: `The task prompt was not accepted by the child in pane ${pane.paneId} (herdr said: ${prompted.error ?? "unknown"}); the pane is left open to read.`,
-    };
+    return { ok: false, error: describeLaunchFailure(failures) };
   }
 
   saveMeta(rec);
   return { ok: true, rec };
 }
-
 
 /**
  * Classifies a run herdr says is `done`: sidecar → done (pane closed as

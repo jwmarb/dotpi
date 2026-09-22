@@ -114,6 +114,20 @@ export function isSessionFileFor(fileName: string, runId: string): boolean {
 export type RunStatus = "running" | "done" | "failed" | "cancelled";
 
 /**
+ * One launch attempt that failed before the run started.
+ *
+ * Kept on the record so a degraded fleet is visible after the fact: a run that
+ * succeeded on its second model looks identical to one that succeeded on its
+ * first unless the failure is written down.
+ */
+export interface FailedAttempt {
+	/** The model that failed to launch, or `undefined` for pi's default. */
+	model?: string;
+	/** Why it failed, as reported by the launcher. */
+	error: string;
+}
+
+/**
  * One delegated run, persisted verbatim as `meta.json`.
  *
  * No `runDir`: see {@link runDir} — the path is derived from `runId`, so storing
@@ -130,6 +144,14 @@ export interface RunRecord {
 	status: RunStatus;
 	startedAt: number;
 	finishedAt?: number;
+	/**
+	 * The model the run actually launched on, set only when it is *not* the model
+	 * first requested (i.e. a fallback was used). Absent is the common case and
+	 * means `model` ran.
+	 */
+	resolvedModel?: string;
+	/** Launch attempts that failed before this run started, in order. */
+	failedAttempts?: FailedAttempt[];
 }
 
 /**

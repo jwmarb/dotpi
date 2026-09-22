@@ -37,8 +37,10 @@ export interface AgentInfo {
   /** Preferred LLM model, or undefined to use the default. */
   model?: string;
   /**
-   * Fallback models, from the file's `fallback_models` key. Parsed and
-   * tested, not yet consumed by any call site.
+   * Fallback models, from the file's `fallback_models` key. Tried in order by
+   * the spawn path when a child fails to *launch* (an unknown model, or a
+   * provider that is down or rate-limiting, makes pi exit before its TUI
+   * appears). An explicit model on the delegation call suppresses them.
    */
   fallbackModels?: string[];
   /** The agent's system-prompt body: the markdown after the frontmatter. */

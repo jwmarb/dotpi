@@ -11,6 +11,9 @@ import { join } from "node:path";
 import {
   buildChildArgv,
   buildChildEnv,
+  agentNameRejection,
+  candidateModels,
+  describeLaunchFailure,
   DONE_TOOL_NAME,
   extractRunResult,
   makeRunId,
@@ -328,3 +331,124 @@ describe("rundir record shapes", () => {
     expect(Object.keys(rec)).not.toContain("runDir");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Model fallback
+// ---------------------------------------------------------------------------
+
+describe("candidateModels", () => {
+  test("tries the agent's model first, then its fallbacks in order", () => {
+    expect(
+      candidateModels(undefined, {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
+      }),
+    ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5", "qwen/qwen3.8-27b"]);
+  });
+
+  test("an explicitly requested model suppresses the fallbacks", () => {
+    // The caller named a model; silently running a different one would be a
+    // surprise, not a recovery.
+    expect(
+      candidateModels("my/pinned-model", {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["qwen/qwen3.8-27b"],
+      }),
+    ).toEqual(["my/pinned-model"]);
+  });
+
+  test("an agent with no fallbacks yields exactly one attempt", () => {
+    expect(candidateModels(undefined, { model: "qwen/qwen3.8-27b" })).toEqual([
+      "qwen/qwen3.8-27b",
+    ]);
+  });
+
+  test("an agent with no model at all still yields one attempt: pi's default", () => {
+    // `[undefined]` means "launch without --model", not "launch nothing".
+    expect(candidateModels(undefined, {})).toEqual([undefined]);
+  });
+
+  test("drops a fallback that repeats the primary", () => {
+    // A duplicate would buy a second identical attempt against the same dead
+    // provider.
+    expect(
+      candidateModels(undefined, {
+        model: "qwen/qwen3.8-27b",
+        fallbackModels: ["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"],
+      }),
+    ).toEqual(["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"]);
+  });
+
+  test("keeps the declared order rather than sorting or deduping globally", () => {
+    expect(
+      candidateModels(undefined, { model: "a", fallbackModels: ["c", "b", "c"] }),
+    ).toEqual(["a", "c", "b"]);
+  });
+});
+
+describe("describeLaunchFailure", () => {
+  test("a single failure reports its own error verbatim", () => {
+    expect(
+      describeLaunchFailure([{ model: "qwen/q", error: "pane w5:p1 did not become interactive" }]),
+    ).toBe("pane w5:p1 did not become interactive");
+  });
+
+  test("several failures name every model tried", () => {
+    // Otherwise "did not become interactive" sends a reader to the pane when
+    // the real cause is that no declared model is reachable.
+    const text = describeLaunchFailure([
+      { model: "openai/gpt-5.6-sol", error: "exited 1" },
+      { model: "qwen/qwen3.8-27b", error: "exited 1" },
+    ]);
+    expect(text).toContain("All 2 candidate models failed");
+    expect(text).toContain("openai/gpt-5.6-sol");
+    expect(text).toContain("qwen/qwen3.8-27b");
+  });
+
+  test("names the default model when no model was declared", () => {
+    const text = describeLaunchFailure([
+      { model: undefined, error: "a" },
+      { model: "x", error: "b" },
+    ]);
+    expect(text).toContain("(default model)");
+  });
+
+  test("an empty list still produces a usable message", () => {
+    expect(describeLaunchFailure([])).toBe("The child could not be launched.");
+  });
+});
+
+describe("agentNameRejection", () => {
+  test("accepts the names this repo's agents actually use", () => {
+    for (const n of ["worker", "explorer", "librarian", "oracle", "planner", "reviewer", "spiker"]) {
+      expect(agentNameRejection(n)).toBeUndefined();
+    }
+  });
+
+  test("accepts digits, dashes and inner underscores", () => {
+    for (const n of ["a", "n1", "mid_dle", "with-dash", "a1_b-c"]) {
+      expect(agentNameRejection(n)).toBeUndefined();
+    }
+  });
+
+  test("rejects exactly what herdr rejects", () => {
+    // Verified against herdr 0.9.0, which answers `invalid_agent_name` for each
+    // of these. A leading underscore cost a real diagnosis: it failed on every
+    // candidate model and read as a broken fleet.
+    for (const n of ["_lead", "-dash", "dot.name", "UPPER", "1digit", ""]) {
+      expect(agentNameRejection(n)).toBeDefined();
+    }
+  });
+
+  test("rejects a name longer than 32 characters", () => {
+    expect(agentNameRejection("a".repeat(32))).toBeUndefined();
+    expect(agentNameRejection("a".repeat(33))).toBeDefined();
+  });
+
+  test("names the offending agent and the rule", () => {
+    const msg = agentNameRejection("_probe")!;
+    expect(msg).toContain("_probe");
+    expect(msg).toContain("lowercase letter");
+  });
+});
+
