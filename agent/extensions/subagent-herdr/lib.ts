@@ -12,6 +12,15 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import {
+  type ChildReport,
+  isSessionFileFor,
+  parseReportLine,
+  reportsPath,
+} from "./rundir.js";
+
+export type { ChildReport };
+
 /** The tool a child calls (via `child-done.ts`) to declare itself finished. */
 export const DONE_TOOL_NAME = "subagent_done";
 
@@ -51,51 +60,45 @@ export interface ChildLaunchOptions {
  * possible: it names the orchestrator's own pane (read from the parent
  * process's `HERDR_PANE_ID`), and the child's report tool prompts it. The
  * other vars let the child's extensions identify the run without guessing.
+ *
+ * `runDir` is passed alongside the record rather than read off it: the path is
+ * derived from the run id (see `rundir.ts`), so the record does not carry it,
+ * but the child is a separate process and cannot derive it without knowing
+ * pi's agent directory — so it crosses as env.
  */
 export function buildChildEnv(
-  rec: { runId: string; agent: string; runDir: string },
+  rec: { runId: string; agent: string },
   parentPaneId: string | undefined,
+  runDir: string,
 ): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_RUN_ID: rec.runId,
     PI_SUBAGENT_AGENT: rec.agent,
-    PI_SUBAGENT_RUN_DIR: rec.runDir,
+    PI_SUBAGENT_RUN_DIR: runDir,
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
   return env;
 }
 
-/** One message a child sent to the orchestrator via `subagent_report`. */
-export interface ChildReport {
-  /** When it was written (ms), for ordering. */
-  at: number;
-  message: string;
-}
-
 /**
- * Reads the child's report log (`<runDir>/reports.jsonl`, appended by the
- * child's report tool). Empty array when the child never reported — the
- * common case, which must stay cheap.
+ * Reads the child's report log ({@link reportsPath}, appended by the child's
+ * report tool). Empty array when the child never reported — the common case,
+ * which must stay cheap.
+ *
+ * The line format belongs to `rundir.ts`, which the child's writer shares: a
+ * reader that re-derived the shape here is how the two halves would drift.
  */
 export async function readReports(runDir: string): Promise<ChildReport[]> {
   let content: string;
   try {
-    content = await readFile(join(runDir, "reports.jsonl"), "utf-8");
+    content = await readFile(reportsPath(runDir), "utf-8");
   } catch {
     return [];
   }
   const out: ChildReport[] = [];
   for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const r: unknown = JSON.parse(line);
-      if (typeof r === "object" && r !== null && typeof (r as { message?: unknown }).message === "string") {
-        const ro = r as { at?: unknown; message: string };
-        out.push({ at: typeof ro.at === "number" ? ro.at : 0, message: ro.message });
-      }
-    } catch {
-      // partial line: a report being written as we read — drop it
-    }
+    const report = parseReportLine(line);
+    if (report) out.push(report);
   }
   return out;
 }
@@ -228,6 +231,6 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   } catch {
     return undefined;
   }
-  const file = dirEntries.find((e) => e.endsWith(`_${runId}.jsonl`));
+  const file = dirEntries.find((e) => isSessionFileFor(e, runId));
   return file ? join(runDir, file) : undefined;
 }

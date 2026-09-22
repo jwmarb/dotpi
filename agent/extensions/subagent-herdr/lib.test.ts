@@ -18,6 +18,19 @@ import {
   REPORT_TOOL_NAME,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
+import {
+  exitPath,
+  formatExitSidecar,
+  formatReportLine,
+  isRunRecord,
+  isSessionFileFor,
+  metaPath,
+  parseReportLine,
+  reportsPath,
+  runDir,
+  runsDir,
+  systemPromptPath,
+} from "./rundir.js";
 
 // ---------------------------------------------------------------------------
 // makeRunId
@@ -190,7 +203,7 @@ describe("extractRunResult", () => {
 
 describe("buildChildEnv", () => {
   test("carries the run identity and the parent pane when known", () => {
-    const env = buildChildEnv({ runId: "sub-0008", agent: "worker", runDir: "/runs/sub-0008" }, "w5:p1");
+    const env = buildChildEnv({ runId: "sub-0008", agent: "worker" }, "w5:p1", "/runs/sub-0008");
     expect(env).toEqual({
       PI_SUBAGENT_RUN_ID: "sub-0008",
       PI_SUBAGENT_AGENT: "worker",
@@ -200,7 +213,7 @@ describe("buildChildEnv", () => {
   });
 
   test("omits the parent pane when the orchestrator has none", () => {
-    const env = buildChildEnv({ runId: "sub-0009", agent: "worker", runDir: "/runs/sub-0009" }, undefined);
+    const env = buildChildEnv({ runId: "sub-0009", agent: "worker" }, undefined, "/runs/sub-0009");
     expect(env.PI_SUBAGENT_PARENT_PANE).toBeUndefined();
     expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0009");
   });
@@ -236,5 +249,82 @@ describe("endedCleanly", () => {
     expect(endedCleanly([{ role: "assistant", stopReason: "aborted" }])).toBe(false);
     expect(endedCleanly([{ role: "assistant", stopReason: "stop" }, { role: "user" }])).toBe(false);
     expect(endedCleanly([])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rundir: the contract shared across the parent/child process seam
+// ---------------------------------------------------------------------------
+
+describe("rundir paths", () => {
+  test("derives a run directory from the agent dir and run id", () => {
+    expect(runsDir("/home/u/.pi/agent")).toBe("/home/u/.pi/agent/subagent-runs");
+    expect(runDir("/home/u/.pi/agent", "sub-a3f1")).toBe(
+      "/home/u/.pi/agent/subagent-runs/sub-a3f1",
+    );
+  });
+
+  test("names the files inside a run directory", () => {
+    const d = runDir("/agent", "sub-0001");
+    expect(metaPath(d)).toBe("/agent/subagent-runs/sub-0001/meta.json");
+    expect(reportsPath(d)).toBe("/agent/subagent-runs/sub-0001/reports.jsonl");
+    expect(systemPromptPath(d)).toBe("/agent/subagent-runs/sub-0001/system-prompt.md");
+  });
+
+  test("hangs the sidecar off the session file, not the run directory", () => {
+    // pi mints the timestamp prefix, so the sidecar can only be derived from
+    // whatever the session file turned out to be called.
+    expect(exitPath("/runs/sub-1/2026-01-01T00-00-00_sub-1.jsonl")).toBe(
+      "/runs/sub-1/2026-01-01T00-00-00_sub-1.jsonl.exit",
+    );
+  });
+
+  test("matches a session file by run id, not by prefix", () => {
+    expect(isSessionFileFor("2026-01-01T00-00-00_sub-a3f1.jsonl", "sub-a3f1")).toBe(true);
+    // A different run whose id merely contains ours must not match.
+    expect(isSessionFileFor("2026-01-01T00-00-00_sub-a3f1x.jsonl", "sub-a3f1")).toBe(false);
+    expect(isSessionFileFor("meta.json", "sub-a3f1")).toBe(false);
+    expect(isSessionFileFor("2026_sub-a3f1.jsonl.exit", "sub-a3f1")).toBe(false);
+  });
+});
+
+describe("rundir record shapes", () => {
+  test("the child's report line is exactly what the parent's reader accepts", () => {
+    // The drift this module exists to prevent: writer and reader are now the
+    // same pair of functions, so this round-trip is the contract.
+    const line = formatReportLine("found the bug", 1700);
+    expect(line.endsWith("\n")).toBe(true);
+    expect(parseReportLine(line)).toEqual({ at: 1700, message: "found the bug" });
+  });
+
+  test("a report line tolerates a truncated tail and junk", () => {
+    expect(parseReportLine('{"at":1,"message":"half')).toBeUndefined();
+    expect(parseReportLine("")).toBeUndefined();
+    expect(parseReportLine("   ")).toBeUndefined();
+    expect(parseReportLine('{"at":1}')).toBeUndefined(); // no message
+    expect(parseReportLine('{"message":"x"}')).toEqual({ at: 0, message: "x" });
+  });
+
+  test("the sidecar records when a run finished, never what it concluded", () => {
+    const parsed = JSON.parse(formatExitSidecar(4242));
+    expect(parsed).toEqual({ type: "done", at: 4242 });
+  });
+
+  test("a meta record needs only a runId to be usable", () => {
+    // loadRegistry reads every meta.json on disk, including ones truncated by a
+    // parent that crashed mid-spawn.
+    expect(isRunRecord({ runId: "sub-1" })).toBe(true);
+    expect(isRunRecord({ agent: "worker" })).toBe(false);
+    expect(isRunRecord(null)).toBe(false);
+    expect(isRunRecord("sub-1")).toBe(false);
+    expect(isRunRecord({ runId: 42 })).toBe(false);
+  });
+
+  test("a record carries no runDir, because the path is derived", () => {
+    // Guards the decision: a stored path is a second source of truth that can
+    // disagree with where the file was actually found.
+    const rec = { runId: "sub-1", agent: "worker", task: "t", cwd: "/", status: "running" as const, startedAt: 1 };
+    expect(isRunRecord(rec)).toBe(true);
+    expect(Object.keys(rec)).not.toContain("runDir");
   });
 });

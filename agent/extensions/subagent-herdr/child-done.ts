@@ -9,7 +9,10 @@
  * ## The two signals, and why there are two
  *
  * Both write the same `<session>.exit` sidecar next to the child's session
- * file, so the parent has one thing to check:
+ * file, so the parent has one thing to check. Its path and contents come from
+ * `rundir.ts`, the module this child shares with the parent that reads them:
+ * this file is loaded with pi's `-e`, whose loader resolves sibling imports,
+ * so the two halves of the handshake can be spelled once instead of twice.
  *
  * 1. **The `subagent_done` tool.** A deliberate declaration: the child decides
  *    it is finished and says so. Always available, because the launcher
@@ -41,7 +44,13 @@
  */
 import { execFile } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+
+import {
+  exitPath,
+  formatExitSidecar,
+  formatReportLine,
+  reportsPath,
+} from "./rundir.js";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -91,7 +100,7 @@ export default function (pi: ExtensionAPI) {
    */
   const writeSidecar = (sessionFile: string): boolean => {
     try {
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", at: Date.now() }));
+      writeFileSync(exitPath(sessionFile), formatExitSidecar());
       return true;
     } catch {
       return false;
@@ -185,10 +194,7 @@ export default function (pi: ExtensionAPI) {
       // Record first: the log is durable even when delivery is not (the
       // orchestrator's pane may be in a dialog, or gone).
       try {
-        appendFileSync(
-          join(runDir, "reports.jsonl"),
-          `${JSON.stringify({ at: Date.now(), message: params.message })}\n`,
-        );
+        appendFileSync(reportsPath(runDir), formatReportLine(params.message));
       } catch {
         // fall through: delivery still happens
       }

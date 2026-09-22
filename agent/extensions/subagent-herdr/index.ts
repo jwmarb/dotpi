@@ -39,6 +39,10 @@
  * (the registry). The in-memory registry is rebuilt from `meta.json` at
  * load, so a restarted orchestrator can still `list` / `result` old runs.
  *
+ * That layout — every path, and the shape of every file — belongs to
+ * `rundir.ts`, which the child imports too. A run directory's path is derived
+ * from its run id, so `meta.json` does not store one.
+ *
  * Do not rename this directory's entry point: pi discovers
  * `extensions/<dir>/index.ts` as an extension that must default-export a
  * factory; `child-done.ts` is a plain factory loaded explicitly with `-e`
@@ -64,6 +68,15 @@ import {
 } from "./lib.js";
 import { discoverAgents } from "../lib/agents.js";
 import {
+  exitPath,
+  isRunRecord,
+  metaPath,
+  type RunRecord,
+  runDir,
+  runsDir,
+  systemPromptPath,
+} from "./rundir.js";
+import {
   closePane,
   createChildPane,
   getAgent,
@@ -82,7 +95,10 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Where every run's session, sidecar and metadata live (gitignored). */
-const RUNS_DIR = join(getAgentDir(), "subagent-runs");
+const RUNS_DIR = runsDir(getAgentDir());
+
+/** This run's directory, derived from its id rather than stored on the record. */
+const dirFor = (runId: string): string => runDir(getAgentDir(), runId);
 
 /** Directory of this extension, so `child-done.ts` can be passed to a child by absolute path. */
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
@@ -108,32 +124,11 @@ const PROMPT_SETTLE_MS = 1500;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-export type RunStatus = "running" | "done" | "failed" | "cancelled";
-
-/** One delegated run. Also persisted verbatim as `meta.json`. */
-export interface RunRecord {
-  runId: string;
-  agent: string;
-  task: string;
-  cwd: string;
-  model?: string;
-  paneId?: string;
-  tabId?: string;
-  runDir: string;
-  status: RunStatus;
-  startedAt: number;
-  finishedAt?: number;
-}
-
 const runs = new Map<string, RunRecord>();
-
-function metaPath(rec: RunRecord): string {
-  return join(rec.runDir, "meta.json");
-}
 
 function saveMeta(rec: RunRecord): void {
   try {
-    writeFileSync(metaPath(rec), JSON.stringify(rec, null, 2));
+    writeFileSync(metaPath(dirFor(rec.runId)), JSON.stringify(rec, null, 2));
   } catch {
     // Losing the meta file degrades a run to "unknown after restart"; the
     // session transcript on disk is unaffected, so this never blocks work.
@@ -155,8 +150,10 @@ function loadRegistry(): void {
   }
   for (const d of dirs) {
     try {
-      const rec = JSON.parse(readFileSync(join(RUNS_DIR, d, "meta.json"), "utf-8")) as RunRecord;
-      if (rec && typeof rec.runId === "string") runs.set(rec.runId, rec);
+      const parsed: unknown = JSON.parse(
+        readFileSync(metaPath(join(RUNS_DIR, d)), "utf-8"),
+      );
+      if (isRunRecord(parsed)) runs.set(parsed.runId, parsed);
     } catch {
       // Partial dir (crashed mid-spawn): ignored.
     }
@@ -203,17 +200,17 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     task: params.task,
     cwd: params.cwd ?? baseCwd,
     model: params.model ?? agent.model,
-    runDir: join(RUNS_DIR, runId),
     status: "running",
     startedAt: Date.now(),
   };
-  mkdirSync(rec.runDir, { recursive: true });
+  const dir = dirFor(runId);
+  mkdirSync(dir, { recursive: true });
   // Register in-memory now, not only on disk: subagent_tasks resolves ids
   // from this map, and a fresh spawn must be statusable/waitable within the
   // same process (the disk registry is what a *restarted* parent rebuilds).
   runs.set(rec.runId, rec);
 
-  const promptPath = join(rec.runDir, "system-prompt.md");
+  const promptPath = systemPromptPath(dir);
   try {
     writeFileSync(promptPath, agent.promptBody);
   } catch {
@@ -223,7 +220,7 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // The child's pane env: its run identity, and — the key to child →
   // orchestrator messaging — this orchestrator's own pane id, which herdr
   // injects into our process as HERDR_PANE_ID.
-  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID);
+  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir);
   const pane = await createChildPane(rec.cwd, `${agent.name} ${rec.runId}`, env);
   if (!pane) {
     return {
@@ -239,7 +236,7 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
 
   const argv = buildChildArgv({
     childDonePath: join(SELF_DIR, "child-done.ts"),
-    runDir: rec.runDir,
+    runDir: dir,
     runId: rec.runId,
     model: rec.model,
     tools: agent.tools,
@@ -295,9 +292,9 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
  * races that detection by a few milliseconds.
  */
 async function finishRun(rec: RunRecord): Promise<RunResult> {
-  const result = await extractRunResult(rec.runDir, rec.runId);
+  const result = await extractRunResult(dirFor(rec.runId), rec.runId);
   const sidecarPresent = (): boolean =>
-    !!result.sessionFile && existsSync(`${result.sessionFile}.exit`);
+    !!result.sessionFile && existsSync(exitPath(result.sessionFile));
 
   let clean = sidecarPresent();
   if (!clean && result.found) {
@@ -349,7 +346,7 @@ function truncate(text: string): string {
  * live to this session shows up here too — the log is the durable copy.
  */
 async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
-  const reports = await readReports(rec.runDir);
+  const reports = await readReports(dirFor(rec.runId));
   if (reports.length === 0) return;
   out.push(
     `--- reports sent to you by ${rec.agent} during the run (${reports.length}) ---\n${reports
@@ -547,7 +544,7 @@ async function dispatchTasks(
           out.push(`${formatResultHeader(rec)}\nstill running${live ? ` [herdr: ${live}]` : " [pane gone]"}`);
           details[rec.runId] = { status: "running" };
         } else {
-          const result = await extractRunResult(rec.runDir, rec.runId);
+          const result = await extractRunResult(dirFor(rec.runId), rec.runId);
           out.push(formatResultHeader(rec));
           out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
           if (rec.status === "failed" && !result.answered) {
@@ -571,7 +568,7 @@ async function dispatchTasks(
           details[rec.runId] = { status: "running" };
           continue;
         }
-        const result = await extractRunResult(rec.runDir, rec.runId);
+        const result = await extractRunResult(dirFor(rec.runId), rec.runId);
         out.push(formatResultHeader(rec));
         out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
         if (rec.status === "failed" && !result.answered) {
