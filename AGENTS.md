@@ -12,9 +12,9 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/prompts/` — prompt templates (`git-commit.md`: Conventional Commits)
 - `agent/themes/` — TUI theme (`tokyo-night.json`)
 - `agent/settings.json` — pi config: default provider/model/thinking level, installed packages (`git:`/`npm:` refs)
-- `agent/mcp.json` — MCP servers (litellm-gateway); key sent as `${LITELLM_MCP_KEY}` placeholder
+- `agent/mcp.json` — MCP servers (litellm-gateway); URL and key sent as `${LITELLM_MCP_URL}` / `${LITELLM_MCP_KEY}` placeholders
 - `agent/.env` — the ONLY file with live credentials (gitignored; `agent/.env.example` is the committed template)
-- `agent/fff/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/` — machine state, all gitignored
+- `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/` — machine state, all gitignored
 - `.githooks/` — tracked `pre-commit`, `post-checkout`, `post-merge` (self-armed by `git-hooks.ts`)
 - `scripts/setup-deps.sh` — installs each extension's npm dependencies; run at startup and by the checkout/merge hooks
 
@@ -30,6 +30,9 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Add/repair an MCP server | `agent/mcp.json` (runtime: `/mcp status` · `list` · `refresh`) |
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
+| List/resume previous sessions | `agent/extensions/sessions.ts` (`/sessions` modal) |
+| Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
+| Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget line construction/fitting, repo layout) |
 | Where a repo file lives (agent dir, agents/, skills/, .env, mcp.json) | `agent/extensions/lib/layout.ts` (single resolver — never throws, so top-level extension code can import it) |
 | Agent definition grammar (`agents/*.md`) | `agent/extensions/lib/agents.ts` (single parser — prompt + spawn import it; one parser per format, like dotenv) |
@@ -38,7 +41,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ## CONVENTIONS
 
-- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/widget.test.ts` and `agent/extensions/subagent-herdr/lib.test.ts`.
+- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions}.test.ts` and `agent/extensions/subagent-herdr/lib.test.ts`.
 - **One dotenv loader.** `agent/extensions/lib/dotenv.ts` is the single parser for `agent/.env`; do not add a second (two parsers drift, and drift is how credentials get out of sync).
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both.
@@ -47,7 +50,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/lib/widget.test.ts            # widget tests (32)
+bun test agent/extensions/lib/                          # widget/agents/layout/sessions tests (59)
 bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (41)
 pi /update                                     # check for + install a pi update (auto-update extension; checks at most every 4h)
 pi /mcp status | list [server] | refresh [server]  # MCP server health and tool registration
@@ -55,7 +58,7 @@ pi /reload                                     # hot-reload extensions after edi
 git config core.hooksPath .githooks            # normally done for you at pi startup by agent/extensions/git-hooks.ts
 ```
 
-Both test files import packages pi normally injects itself (`@earendil-works/pi-tui`, `typebox`), so `bun test` — which has no access to pi's alias map — only resolves them via a gitignored root `node_modules/` of symlinks into bun's global tree:
+Some of the test files import packages pi normally injects itself (`@earendil-works/pi-tui` in the widget tests; `typebox` and pi-coding-agent types via `child-done.ts` in the herdr tests), so `bun test` — which has no access to pi's alias map — only resolves them via a gitignored root `node_modules/` of symlinks into bun's global tree:
 
 ```sh
 G=$HOME/.cache/.bun/install/global/node_modules
@@ -71,7 +74,7 @@ ln -sfn "$PWD/agent/extensions/mcp/node_modules/@types" node_modules/@types   # 
 - **The pre-commit hook is currently dormant.** `.githooks/pre-commit` invokes `scripts/check.sh`, which was removed in `e7039b0`; the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time.
 - **`PATCHES.md` and `CONTEXT.md` no longer exist** (deleted in `5eea62b`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical — the ADRs were deleted in `e7039b0`.
 - **`pi` must come from bun's global bin.** Extensions import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, which are never installed locally: pi injects them by loading each extension through jiti with an **alias map** to its own bundled copies (`getAliases()` in the bundle). So the packages are only resolvable when the running binary is the one that owns them — `$HOME/.cache/.bun/bin/pi`. An older `@mariozechner/pi-coding-agent` on `PATH` (the pre-rename scope, e.g. under `~/.local/share/pi-node/`) has no `@earendil-works/*` aliases, so every extension fails at startup with a misleading `Cannot find module '@earendil-works/pi-tui'`. `~/.bashrc` pins `BUN_INSTALL` and prepends `$BUN_INSTALL/bin` for this reason; bun otherwise derives that path from `XDG_CACHE_HOME` and falls back to a different, empty `~/.bun`.
-- **`agent/git/` holds vendored checkouts of installed packages** (`settings.json` `packages`: pi-lsp-extension, pi-fff, pi-blackhole, pi-better-edit). They carry their own `.git` and their own test suites — always run this repo's tests by explicit path; a bare `bun test` sweeps in the vendored tests (~1975 tests, hundreds failing) for reasons unrelated to this repo.
+- `agent/git/` holds vendored checkouts of the `git:` packages (pi-lsp-extension, pi-blackhole); the `npm:` packages (pi-fff, pi-better-edit) install under `agent/npm/node_modules`. The git checkouts carry their own `.git` and their own test suites — always run this repo's tests by explicit path; a bare `bun test` sweeps in the vendored tests (~1975 tests, hundreds failing) for reasons unrelated to this repo.
 - `agent/subagent-runs/` holds one dir per delegated run (gitignored): the child's session file, its `.exit` sidecar, the child system prompt, `reports.jsonl` (child → orchestrator messages from `subagent_report`), and `meta.json` — the on-disk registry of the subagent-herdr extension (`agent/extensions/subagent-herdr/`). Each subagent spawn opens a new herdr tab in the orchestrator's workspace (`herdr tab create`, labelled `<agent> <runId>`); the child closes its own pane on completion (closing the tab's only pane closes the tab; parent backstops), failed panes stay open as evidence. Messaging is bidirectional: `subagent_tasks` action "message" sends a prompt to a running child, and the child's `subagent_report` tool messages the orchestrator (live via herdr, durably in the report log).
 - `agent/pi-blackhole/` holds the pi-blackhole package's pending-Run state (gitignored); `herdr.jsonl` at the root is herdr's activity log (gitignored), not repo content.
-- Nested AGENTS.md: `agent/git/github.com/k0valik/pi-blackhole/AGENTS.md` — the vendored package's own knowledge base (pnpm test/typecheck/lint/build), applies inside that checkout only.
+- Nested AGENTS.md: `agent/extensions/subagent-herdr/AGENTS.md` (module internals — herdr CLI protocol, completion handshake, run-directory contract); `agent/git/github.com/k0valik/pi-blackhole/AGENTS.md` — the vendored package's own knowledge base (pnpm test/typecheck/lint/build), applies inside that checkout only.
