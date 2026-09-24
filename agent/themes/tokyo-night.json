@@ -45,7 +45,7 @@
     "text": "fg",
     "muted": "dark5",
     "dim": "comment",
-    "thinkingText": "comment",
+    "thinkingText": "blue1",
 
     "scrollbarTrack": "fgGutter",
     "scrollbarThumb": "dark5",

@@ -33,12 +33,12 @@
  *     reserved as well (app.tools.expand), so the live expand is alt+t, which
  *     is bound to nothing in pi's defaults.
  *
- * Per-message labels REQUIRE the local pi patch. Upstream, setHiddenThinkingLabel
- * is global: it relabels every collapsed block in the transcript, so each finished
- * turn would show the newest duration instead of its own. `scripts/patch-pi.sh`
- * narrows a label to the message being streamed (patch 3; see PATCHES.md and
- * docs/adr/0034). Without the patch this extension still works, but the durations
- * are wrong on every turn but the last.
+ * setHiddenThinkingLabel is global in pi: one label for every collapsed block.
+ * Each finished turn therefore relabels all blocks with its own duration, so on a
+ * long session older blocks show the newest duration, not their own. The duration
+ * is persisted on the assistant message (thinkingDurationMs) and re-applied on
+ * session_start, so a resumed, forked, or reloaded transcript doesn't fall back
+ * to pi's default "Thinking..." label.
  *
  * Note: the theme captured at session start is used for styling; switch
  * themes with /theme and it applies after the next /reload or restart.
@@ -79,6 +79,8 @@ class ThinkingIndicator implements Component {
 	private expanded = false;
 	private thinking = "";
 	private startedAt = 0;
+	/** Duration of the most recent finished reasoning, in ms (carries over to message_end). */
+	private lastFinishedMs: number | undefined;
 	private frame = 0;
 	private timer: ReturnType<typeof setInterval> | undefined;
 
@@ -109,21 +111,30 @@ class ThinkingIndicator implements Component {
 			this.tui.requestRender();
 		}
 	}
+	/**
+	 * Milliseconds of the most recent finished reasoning. Exposed so message_end
+	 * can persist the duration even when onIdle() already consumed it on
+	 * text_start/toolcall_start.
+	 */
+	get finishedMs(): number | undefined {
+		return this.lastFinishedMs;
+	}
 
 	/**
 	 * Call on text_start / text_delta / toolcall_start / message_end / agent_end.
 	 *
-	 * Returns the whole-second duration of the reasoning that just ended, or
+	 * Returns the duration in milliseconds of the reasoning that just ended, or
 	 * undefined when there was nothing active. The caller uses it to write the
 	 * "Thought for Xs" record into the transcript — the widget itself keeps no
 	 * finished state, since it clears here and the transcript is what survives.
 	 */
 	onIdle(): number | undefined {
 		if (!this.active) return undefined;
-		const seconds = this.elapsedSeconds();
+		const ms = Date.now() - this.startedAt;
+		this.lastFinishedMs = ms;
 		this.reset();
 		this.tui.requestRender();
-		return seconds;
+		return ms;
 	}
 
 	private elapsedSeconds(): number {
@@ -204,15 +215,51 @@ class ThinkingIndicator implements Component {
 let indicator: ThinkingIndicator | undefined;
 
 /**
- * Writes the finished-reasoning record into pi's collapsed thinking placeholder.
+ * Builds the label pi shows for a finished thinking block.
  *
- * Skipped for a 0s duration: sub-second reasoning is noise, and leaving the
- * default "Thinking..." label there is more honest than claiming "0s".
+ * Sub-second reasoning is labelled "<1s" rather than skipped: the default
+ * "Thinking..." label reads as in-progress, so a finished block left with it
+ * looks stuck — and the default 27B model routinely thinks for under a second.
  */
-function recordDuration(ctx: ExtensionContext, seconds: number | undefined): void {
-	if (seconds === undefined || seconds <= 0) return;
-	ctx.ui.setHiddenThinkingLabel(`Thought for ${seconds}s (${TRANSCRIPT_EXPAND_KEY} to expand)`);
+function durationLabel(ms: number): string {
+	const seconds = Math.floor(ms / 1000);
+	return `Thought for ${seconds <= 0 ? "<1s" : `${seconds}s`} (${TRANSCRIPT_EXPAND_KEY} to expand)`;
 }
+
+/** Writes the finished-reasoning record into pi's collapsed thinking placeholder. */
+function recordDuration(ctx: ExtensionContext, ms: number | undefined): void {
+	if (ms === undefined) return;
+	ctx.ui.setHiddenThinkingLabel(durationLabel(ms));
+}
+
+/**
+ * Re-apply the newest persisted duration after pi re-renders a stored transcript.
+ *
+ * Only the newest is applied because setHiddenThinkingLabel is global — see the
+ * header. A session with nothing persisted leaves pi's default label alone.
+ */
+function restoreLatestDuration(ctx: ExtensionContext): void {
+	let latest: number | undefined;
+	for (const entry of ctx.sessionManager.buildContextEntries()) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role !== "assistant") continue;
+		const ms = (message as { thinkingDurationMs?: number }).thinkingDurationMs;
+		if (typeof ms === "number") latest = ms;
+	}
+	if (latest !== undefined) ctx.ui.setHiddenThinkingLabel(durationLabel(latest));
+}
+
+/**
+ * How long to wait before re-applying the restored label.
+ *
+ * On /reload and session switches the transcript already exists when
+ * session_start fires, so the immediate call relabels it. On a cold start
+ * (`pi --session`, `pi -c`) pi renders the transcript *after* session_start and
+ * the immediate call is lost, so it is re-applied once the first frame is up.
+ * Measured: a set at session_start (and at +0ms) does not survive; +200ms does.
+ */
+const RESTORE_RETRY_MS = 250;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
@@ -222,6 +269,16 @@ export default function (pi: ExtensionAPI) {
 			indicator = new ThinkingIndicator(tui, theme);
 			return indicator;
 		});
+		// Any start that renders a stored transcript (pi --session/--continue, the
+		// /sessions switch, a fork, /reload) rebuilds its thinking blocks with pi's
+		// default label, and resetExtensionUI has dropped the global one. Restoring
+		// unconditionally is correct: reason does not distinguish those starts
+		// (a --session resume reports "startup"), and a session with nothing
+		// persisted leaves the label untouched.
+		restoreLatestDuration(ctx);
+		setTimeout(() => {
+			if (ctx.hasUI) restoreLatestDuration(ctx);
+		}, RESTORE_RETRY_MS);
 	});
 
 	pi.on("message_update", (event, ctx) => {
@@ -244,7 +301,16 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_end", (event, ctx) => {
 		if (!indicator || !ctx.hasUI) return;
-		if (event.message.role === "assistant") recordDuration(ctx, indicator.onIdle());
+		if (event.message.role !== "assistant") return;
+		// For text/toolcall turns onIdle() already consumed the duration when the
+		// block first went idle; lastFinishedMs carries it across to message_end.
+		const ms = indicator.onIdle() ?? indicator.finishedMs;
+		recordDuration(ctx, ms);
+		const hasThinking = event.message.content.some((c) => c.type === "thinking" && c.thinking.trim());
+		if (ms === undefined || !hasThinking) return;
+		// Persist the duration on the message itself so a re-rendered transcript
+		// (resume, switch, reload) can restore the label.
+		return { message: { ...event.message, thinkingDurationMs: ms } as typeof event.message };
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
