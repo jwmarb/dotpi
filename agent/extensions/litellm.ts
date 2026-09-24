@@ -198,7 +198,22 @@ export default async function (pi: ExtensionAPI) {
           cacheWrite: cache?.cacheWrite ?? 0,
         },
         contextWindow: m.max_input_tokens ?? 262_144,
-        maxTokens: m.max_output_tokens ?? 256_000,
+        // This gateway reports max_output_tokens: null for most model groups, and
+        // the old `?? 256_000` fallback made maxTokens ~= contextWindow. pi's
+        // clampMaxTokensToContext (pi-ai/api/simple-options.js) then computes
+        //   available = contextWindow - estimate(context) - 4096
+        // and sends min(maxTokens, available) as max_tokens -- so the completion
+        // reservation absorbed the entire remaining window. Because `estimate`
+        // is a char/4 heuristic (utils/estimate.js) it undercounts dense scraped
+        // markdown by ~16%, which is more than the fixed 4096 safety margin, so
+        // input + max_tokens overshot the 262144 limit and litellm returned a
+        // hard 400 (observed: run sub-72cc, over by 1581 then 106 tokens, at
+        // only ~10-14% real context use). Compaction cannot fix this: freeing
+        // input just hands the same space back to the reservation.
+        //
+        // A bounded default keeps max_tokens well clear of the window while
+        // staying larger than any reply we actually want.
+        maxTokens: m.max_output_tokens ?? 32_768,
       };
     }),
   } satisfies ProviderConfig);
