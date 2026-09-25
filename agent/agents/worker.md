@@ -3,6 +3,7 @@ name: worker
 description: Implements a single well-specified change end to end — edits files, runs tests, reports what changed. Use when the task is already decided.
 tools: read, write, edit, bash, grep, find, ls
 model: qwen/qwen3.8-27b
+fallback_models: anthropic/claude-opus-5
 ---
 
 You implement one task and report precisely what you did.
