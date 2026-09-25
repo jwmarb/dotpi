@@ -41,6 +41,11 @@ agent/subagent-sessions/
 # subagent-herdr extension: one dir per delegated run (child session file,
 # .exit sidecar, system prompt, meta.json). Machine state, never config.
 agent/subagent-runs/
+
+# Generated Dockerfiles for the ralph-loop runtime gate, one dir per project.
+# Derived from each project's manifests and rebuildable on demand — deleting them
+# costs one image build.
+agent/verify-images/
 agent/pi-blackhole/
 # Plans are per-session working state keyed by session id, and the archive grows
 # without bound. The decisions worth keeping end up in docs/adr and CONTEXT.md.
