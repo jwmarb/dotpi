@@ -37,7 +37,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
 | List/resume previous sessions | `agent/extensions/sessions.ts` (`/sessions` modal) |
 | Loop the agent on a goal until it declares completion | `agent/extensions/ralph-loop/` (`/ralph-loop`, `/ulw-loop`, `/loop-stop`; `--verify[=static\|runtime\|both]`) |
-| Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools) |
+| Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools; event-driven — no blocking wait, the child wakes the parent) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
 | Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget measuring/fitting, repo layout, agent parsing) |
@@ -49,7 +49,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## CONVENTIONS
 
 - **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions}.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
-- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter, `subagent-herdr/rundir.ts` owns the run-directory shapes. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync.
+- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both.
 - **Commits follow Conventional Commits** per `agent/prompts/git-commit.md`.
@@ -58,7 +58,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ```sh
 bun test agent/extensions/lib/                          # widget/agents/layout/sessions tests (59)
-bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (41)
+bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (49)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
@@ -90,4 +90,4 @@ cd agent/extensions/subagent-herdr && ../mcp/node_modules/.bin/tsc -p tsconfig.j
 - `agent/subagent-runs/` is the on-disk registry of the subagent-herdr extension (gitignored): one dir per delegated run holding the child's session file, its `.exit` sidecar, the child system prompt, `reports.jsonl`, and `meta.json`.
 - Runtime verification needs a working Docker daemon — without one the `--verify` gate returns `inconclusive` and the loop stops rather than assuming success. `agent/verify-images/` holds the generated per-project Dockerfiles (gitignored; rebuildable).
 - `agent/pi-blackhole/` holds the pi-blackhole package's pending-Run state (gitignored); `herdr.jsonl` at the root is herdr's activity log (gitignored), not repo content.
-- Nested knowledge bases: `agent/AGENTS.md` (data-file grammars: agent + skill frontmatter, theme, docker base) · `agent/extensions/AGENTS.md` (per-extension inventory, `lib/` rules, typecheck scopes) · `agent/extensions/subagent-herdr/AGENTS.md` (herdr CLI protocol, completion handshake, run-directory contract) · `agent/extensions/ralph-loop/AGENTS.md` (the `agent_settled` loop contract and the `--verify` gates) · `agent/git/github.com/k0valik/pi-blackhole/AGENTS.md` (the vendored package's own KB — pnpm test/typecheck/lint/build; applies inside that checkout only).
+- Nested knowledge bases: `agent/AGENTS.md` (data-file grammars: agent + skill frontmatter, theme, docker base) · `agent/extensions/AGENTS.md` (per-extension inventory, `lib/` rules, typecheck scopes) · `agent/extensions/subagent-herdr/AGENTS.md` (herdr CLI protocol, the event-driven wake path, completion handshake, run-directory contract) · `agent/extensions/ralph-loop/AGENTS.md` (the `agent_settled` loop contract and the `--verify` gates) · `agent/git/github.com/k0valik/pi-blackhole/AGENTS.md` (the vendored package's own KB — pnpm test/typecheck/lint/build; applies inside that checkout only).

@@ -234,3 +234,70 @@ export interface ExitSidecar {
 export function formatExitSidecar(at: number = Date.now()): string {
 	return JSON.stringify({ type: "done", at } satisfies ExitSidecar);
 }
+
+// ---------------------------------------------------------------------------
+// The wake notice: child → orchestrator, carried as a prompt
+// ---------------------------------------------------------------------------
+
+/**
+ * What a child is telling its orchestrator.
+ *
+ * - `report` — a mid-run message; the child keeps working.
+ * - `done` — the child finished and is shutting down.
+ */
+export type NoticeKind = "report" | "done";
+
+/** A parsed wake notice. */
+export interface Notice {
+	runId: string;
+	agent: string;
+	kind: NoticeKind;
+	/** The message body; empty for a bare `done`. */
+	text: string;
+}
+
+/**
+ * Serialise a notice for `herdr agent prompt`.
+ *
+ * This is the *only* way a child reaches a sleeping orchestrator, so the
+ * grammar is spelled here rather than at either end: the child formats a
+ * notice, and the parent's input hook re-parses it out of its own TUI input.
+ * A writer and a reader that cannot disagree is the whole point of this module.
+ *
+ * The prefix is what lets the orchestrator tell a child's message apart from a
+ * human's — the parent swallows anything matching this shape, so a shape that
+ * drifted would surface as the orchestrator eating the user's typing.
+ */
+export function formatNotice(
+	runId: string,
+	agent: string,
+	kind: NoticeKind,
+	message = "",
+): string {
+	const head = `[subagent ${runId} (${agent}) ${kind}]`;
+	return message ? `${head} ${message}` : head;
+}
+
+/**
+ * The shape {@link formatNotice} produces.
+ *
+ * Deliberately strict on both ids (`sub-` + four hex, and herdr's agent-name
+ * rule): the parent *swallows* every input that matches, so a loose pattern
+ * would silently eat a human's message that happened to start with a bracket.
+ */
+const NOTICE_RE =
+	/^\[subagent (sub-[0-9a-f]{4}) \(([a-z][a-z0-9_-]{0,31})\) (report|done)\][ \t]?([\s\S]*)$/;
+
+/**
+ * Parse one wake notice, or `undefined` when the text is not one.
+ *
+ * `undefined` is the safe answer: the caller passes the input through to the
+ * agent untouched, so a human typing something bracket-shaped is never lost.
+ *
+ * @param text - Raw input text as it arrived in the orchestrator's session.
+ */
+export function parseNotice(text: string): Notice | undefined {
+	const m = NOTICE_RE.exec(text.trim());
+	if (!m) return undefined;
+	return { runId: m[1], agent: m[2], kind: m[3] as NoticeKind, text: m[4].trim() };
+}

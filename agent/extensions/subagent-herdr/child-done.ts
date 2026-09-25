@@ -42,13 +42,15 @@
  * backstop when it classifies the run — a close that didn't land there must
  * not leave a ghost pane behind.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 
 import {
   exitPath,
   formatExitSidecar,
+  formatNotice,
   formatReportLine,
+  type NoticeKind,
   reportsPath,
 } from "./rundir.js";
 
@@ -86,6 +88,50 @@ function closeOwnPane(): void {
   const paneId = process.env.HERDR_PANE_ID;
   if (process.env.HERDR_ENV !== "1" || !paneId) return;
   execFile("herdr", ["pane", "close", paneId], { timeout: 5000 }, () => {});
+}
+
+/**
+ * Wakes the orchestrator by typing a notice into its pane.
+ *
+ * This is the whole child → orchestrator channel. The orchestrator no longer
+ * sits in a blocking wait, so it is *idle* when this lands — and an idle pi
+ * treats an incoming prompt as a new turn. That is the point: a sleeping
+ * orchestrator is woken by the notice rather than discovering it whenever a
+ * blocking call happened to return.
+ *
+ * Fire-and-forget on purpose. A report must never wedge the child's turn on a
+ * slow delivery, and a `done` notice must never delay the shutdown that
+ * follows it: the `.exit` sidecar is the durable record of completion, so a
+ * notice that fails to land costs the orchestrator promptness, never the
+ * result.
+ *
+ * @param kind - `report` for a mid-run message, `done` for completion.
+ * @param message - Body text; omitted for a bare `done`.
+ * @returns Whether a parent pane was known to deliver to.
+ */
+function notifyParent(kind: NoticeKind, message = ""): boolean {
+  const parentPane = process.env.PI_SUBAGENT_PARENT_PANE;
+  if (!parentPane) return false;
+  const runId = process.env.PI_SUBAGENT_RUN_ID ?? "unknown";
+  const agent = process.env.PI_SUBAGENT_AGENT ?? "subagent";
+  // `spawn` rather than `execFile`, detached and unref'd, because the `done`
+  // notice races its own sender's death: `closeOwnPane()` kills this child's
+  // *process group*, and a delivery still in flight would go with it — the
+  // orchestrator would then sleep until a human poked it, which is the bug this
+  // channel exists to fix. `detached` puts the delivery in its own process group
+  // so it survives that kill; `unref` plus ignored stdio means it holds neither
+  // the event loop nor a pipe to a process that is about to exit. (`detached` is
+  // a spawn option; `execFile` does not accept it.)
+  const child = spawn(
+    "herdr",
+    ["agent", "prompt", parentPane, formatNotice(runId, agent, kind, message)],
+    { detached: true, stdio: "ignore" },
+  );
+  // A missing `herdr` binary emits 'error' asynchronously; unhandled, that is an
+  // uncaught exception that would take the child down on its way out.
+  child.on("error", () => {});
+  child.unref();
+  return true;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -152,8 +198,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Sidecar on disk, pane dismissed, *then* shut down (the pane close
-      // already kills the process group; this covers a close that didn't land).
+      // Wake the orchestrator, *then* tear down. The notice is what turns a
+      // finished child into a live orchestrator turn; the sidecar it already
+      // wrote is the durable fallback if the notice never lands.
+      notifyParent("done");
+      // Sidecar on disk, parent notified, pane dismissed, *then* shut down (the
+      // pane close already kills the process group; this covers a close that
+      // didn't land).
       closeOwnPane();
       ctx.shutdown();
       return {
@@ -199,8 +250,7 @@ export default function (pi: ExtensionAPI) {
         // fall through: delivery still happens
       }
 
-      const parentPane = process.env.PI_SUBAGENT_PARENT_PANE;
-      if (!parentPane) {
+      if (!notifyParent("report", params.message)) {
         return {
           content: [
             { type: "text", text: "Report recorded; no parent pane is known, so the orchestrator will pick it up on its next task check." },
@@ -208,18 +258,6 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
-
-      const runId = process.env.PI_SUBAGENT_RUN_ID ?? "unknown";
-      const agent = process.env.PI_SUBAGENT_AGENT ?? "subagent";
-      // Fire-and-forget: a report must never wedge the child's turn on a
-      // slow delivery. The prefix is what lets the orchestrator tell a child's
-      // message apart from a human's.
-      execFile(
-        "herdr",
-        ["agent", "prompt", parentPane, `[subagent ${runId} (${agent})] ${params.message}`],
-        { timeout: 10_000 },
-        () => {},
-      );
       return {
         content: [{ type: "text", text: "Report sent to the orchestrator." }],
         details: {},
@@ -236,6 +274,7 @@ export default function (pi: ExtensionAPI) {
     if (!sessionFile) return;
     signalled = writeSidecar(sessionFile);
     if (signalled) {
+      notifyParent("done");
       closeOwnPane();
       ctx.shutdown();
     }

@@ -24,10 +24,12 @@ import { endedCleanly } from "./child-done.js";
 import {
   exitPath,
   formatExitSidecar,
+  formatNotice,
   formatReportLine,
   isRunRecord,
   isSessionFileFor,
   metaPath,
+  parseNotice,
   parseReportLine,
   reportsPath,
   runDir,
@@ -449,6 +451,88 @@ describe("agentNameRejection", () => {
     const msg = agentNameRejection("_probe")!;
     expect(msg).toContain("_probe");
     expect(msg).toContain("lowercase letter");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The wake notice
+// ---------------------------------------------------------------------------
+
+describe("formatNotice / parseNotice", () => {
+  test("round-trips a report with its message", () => {
+    const line = formatNotice("sub-a3f1", "explorer", "report", "found the seam in lib.ts");
+    expect(parseNotice(line)).toEqual({
+      runId: "sub-a3f1",
+      agent: "explorer",
+      kind: "report",
+      text: "found the seam in lib.ts",
+    });
+  });
+
+  test("round-trips a bare done notice", () => {
+    const line = formatNotice("sub-0b2c", "worker", "done");
+    expect(parseNotice(line)).toEqual({
+      runId: "sub-0b2c",
+      agent: "worker",
+      kind: "done",
+      text: "",
+    });
+  });
+
+  test("carries a multi-line report body", () => {
+    // herdr delivers the notice as one prompt; a report with newlines in it must
+    // survive rather than being truncated at the first line.
+    const body = "line one\nline two\nline three";
+    expect(parseNotice(formatNotice("sub-1234", "planner", "report", body))?.text).toBe(body);
+  });
+
+  test("accepts every agent name this repo actually uses", () => {
+    for (const agent of ["explorer", "librarian", "oracle", "planner", "reviewer", "spiker", "verifier", "worker"]) {
+      expect(parseNotice(formatNotice("sub-00ff", agent, "done"))?.agent).toBe(agent);
+    }
+  });
+
+  // The parser decides what the orchestrator *swallows*, so a false positive
+  // eats a human's message. These are the shapes that must never match.
+  test("does not match a human message, however bracket-shaped", () => {
+    for (const text of [
+      "",
+      "run the tests",
+      "[subagent] what is the status?",
+      "[subagent sub-a3f1] legacy prefix without a kind",
+      "[subagent sub-a3f1 (explorer)] no kind either",
+      "[subagent sub-a3f1 (explorer) chatter] unknown kind",
+      "[subagent sub-zzzz (explorer) done] run id is not hex",
+      "[subagent sub-a3f1 (Explorer) done] agent name is capitalised",
+      "[subagent sub-a3f1 (explorer) done", // unterminated
+      "please tell me about [subagent sub-a3f1 (explorer) done]", // not at the start
+    ]) {
+      expect(parseNotice(text)).toBeUndefined();
+    }
+  });
+
+  test("tolerates the surrounding whitespace a TUI submission can add", () => {
+    const notice = parseNotice(`\n  ${formatNotice("sub-abcd", "reviewer", "report", "two findings")}  \n`);
+    expect(notice?.runId).toBe("sub-abcd");
+    expect(notice?.text).toBe("two findings");
+  });
+
+  test("a notice body that is itself a notice does not confuse the parser", () => {
+    // A subagent quoting a notice back at its parent must parse as one report
+    // whose body is the quoted text, not as the inner notice.
+    const inner = formatNotice("sub-1111", "worker", "done");
+    const outer = formatNotice("sub-2222", "reviewer", "report", inner);
+    const parsed = parseNotice(outer);
+    expect(parsed?.runId).toBe("sub-2222");
+    expect(parsed?.kind).toBe("report");
+    expect(parsed?.text).toBe(inner);
+  });
+
+  test("ids in a notice match the ids makeRunId mints", () => {
+    // The grammar constrains the run id, so a drift in makeRunId's shape would
+    // silently stop every notice from being recognised.
+    const runId = makeRunId();
+    expect(parseNotice(formatNotice(runId, "worker", "done"))?.runId).toBe(runId);
   });
 });
 

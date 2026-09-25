@@ -165,7 +165,8 @@ ${opts.toolInventory.map((t) => `| ${t.name} | ${t.description} |`).join('\n')}
 ## Available Agents
 
 Specialized subagents you can delegate tasks to via the \`subagent\` tool.
-Delegation runs in the background and returns a task id, not a result.
+Delegation runs in the background and returns a task id, not a result: you end
+your turn and the subagent wakes you when it has something to say.
 
 | Agent | Description | Model | Tools |
 |-------|-------------|-------|-------|
@@ -177,19 +178,34 @@ ${opts.agentInventory.map((a) => `| ${a.name} | ${a.description} | ${a.model ?? 
 - Delegate with the \`subagent\` tool, naming the agent and its task
 - You can chain agents (e.g., worker → reviewer) for complex workflows
 
-**Delegation is asynchronous.** \`subagent\` starts a background *task* and returns
-a task id (e.g. \`sub-a3f1\`) — not the result. The task keeps running even if your
-turn ends or errors out, and you are notified automatically when it finishes.
+**Delegation is asynchronous, and you must end your turn to collect it.**
+\`subagent\` starts a background *task* and returns a task id (e.g. \`sub-a3f1\`) —
+not the result. There is deliberately **no blocking wait**: the way you wait for
+a subagent is to *finish your turn*.
 
-- Need the answer before your next step? Call \`subagent_tasks\` with
-  \`action: "wait"\` and the task ids. It blocks until they finish and returns the
-  results. Waiting on several ids in one call is one round trip.
-- Want to work on something else meanwhile? Launch the task, keep going, and act
-  on the completion notification when it arrives.
-- Use \`action: "status"\` to check progress, \`"result"\` to re-read a finished
-  task, \`"list"\` to see all tasks, and \`"cancel"\` to stop one.
+The loop works like this:
+
+1. Delegate (you can launch several at once — they run concurrently).
+2. Do any remaining work that does not depend on their answers.
+3. **End your turn.** Say what you delegated and stop. Do not poll, do not spin,
+   do not ask the user to wait.
+4. When a subagent reports something or finishes, a message arrives
+   automatically and you are woken with it. Its answer is in that message.
+5. Continue from there — collect the rest, or act on what you were told.
+
+- A subagent can message you **while it is still working** (a blocker, a
+  question, a finding). You can only see that because you ended your turn, so
+  ending it promptly is what makes mid-run collaboration possible at all.
+- Reply to a running subagent with \`subagent_tasks\` \`action: "message"\` — that
+  is how you unblock one that asked you something.
+- Use \`action: "result"\` to re-read a finished task, \`"status"\` for a quick
+  is-it-still-running check, \`"list"\` to see all tasks, and \`"cancel"\` to stop
+  one.
 - Never treat a task id as an answer, and never claim a delegated task is done
   until you have actually seen its result.
+- If every remaining step depends on a subagent, ending your turn *is* the
+  correct and complete action. An idle turn is not a failure — it is how you
+  hand control back until the subagent has something to say.
 `
       : '';
 

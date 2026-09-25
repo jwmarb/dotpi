@@ -21,11 +21,14 @@
  *    `pi` arguments ride after `--`.
  * 3. `agent prompt <pane> <text>` submits one prompt to the agent; it is
  *    rejected with `agent_blocked` when the agent is already blocked.
- * 5. `agent wait <pane> --until done` resolves as soon as herdr reports the
- *    agent `done` — for pi that is "the turn finished", which also covers a
- *    child that exits (after exit the pane persists with status `done` and
- *    its scrollback stays readable). `agent read` therefore remains usable
- *    after a run ends.
+ * 4. A pane persists after its process exits, with status `done` and its
+ *    scrollback intact, until something closes it. That is what keeps `agent read`
+ *    usable as failure evidence after a run has ended, and it is why a *missing*
+ *    pane is read as "the child is gone" rather than "herdr hiccuped".
+ *
+ * (`agent wait --until done` was used until the parent stopped blocking on
+ * children; `waitAgentWorking` keeps the `--until working` form, which is still
+ * needed to prove a task prompt was actually accepted.)
  *
  * `agent read` is the one oddity: it prints raw terminal text, not a JSON
  * document, so `readAgent` passes stdout through un-parsed.
@@ -245,19 +248,6 @@ export async function waitAgentWorking(paneId: string, timeoutMs: number): Promi
   );
   if (!r.ok || !r.data) return false;
   return pick(r.data, ["result", "agent", "agent_status"]) === "working";
-}
-
-/**
- * Blocks until herdr reports the agent `done` (pi: the turn finished, or the
- * process exited). False on timeout, missing pane, or CLI failure.
- */
-export async function waitAgent(paneId: string, timeoutMs: number): Promise<boolean> {
-  const r = await herdr(
-    ["agent", "wait", paneId, "--until", "done", "--timeout", String(timeoutMs)],
-    timeoutMs + EXEC_SLACK_MS,
-  );
-  if (!r.ok || !r.data) return false;
-  return pick(r.data, ["result", "agent", "agent_status"]) === "done";
 }
 
 /** The agent states herdr reports for a pane. */
