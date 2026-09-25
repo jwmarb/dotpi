@@ -27,6 +27,17 @@ agent/models-store.json
 *.bak
 *.orig-backup
 
+# ---- Personal identity ------------------------------------------------------
+# Skills written for one operator, carrying institutional identifiers rather
+# than placeholders. Nothing here is a credential, which is why it reads as
+# harmless and is not: an identifier plus the service it belongs to is enough
+# to act against its owner.
+# Kept on disk so the skill still loads locally, untracked so publishing this
+# repo cannot leak an identity. Placeholdering was rejected — such a file's
+# value is being specific, so a placeholdered copy just gets re-personalised.
+# Add a path here rather than sanitising in place.
+agent/skills/uarizona-hpc/
+
 # ---- Dependencies -----------------------------------------------------------
 node_modules/
 # bun's lockfile is binary; the text lockfile is committed instead if present.
