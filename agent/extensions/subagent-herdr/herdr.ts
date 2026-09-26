@@ -1,10 +1,15 @@
 /**
  * Thin CLI wrapper around the herdr 0.9.0 CLI (herdr 0.9.0, verified).
  *
- * Every herdr CLI command prints a single JSON document on stdout — a
- * `{"id", "result"}` reply on success, a `{"id", "error": {"code", ...}}`
- * reply on a clean failure. This module shells out, parses that one document,
- * and never throws: every entry point resolves a structured value, because a
+ * Every herdr CLI command prints a single JSON document: a `{"id", "result"}`
+ * reply on stdout with exit 0 on success, and — measured against 0.9.0 — a
+ * `{"id", "error": {"code", ...}}` reply on a non-zero exit, observed on
+ * **stderr**, on a clean failure. Both shapes carry the same structured code, so
+ * this module parses either stream on either path rather than treating a
+ * non-zero exit as opaque (the stdout branch is kept because the split is an
+ * observation, not a documented guarantee); losing that code is what made
+ * `agent_name_taken` unreadable as "herdr exited 1".
+ * It never throws: every entry point resolves a structured value, because a
  * display/management surface must not be able to take down the session that
  * hosts it.
  *
@@ -49,12 +54,74 @@ const EXEC_SLACK_MS = 15_000;
 export interface HerdrCall {
   /** False when the CLI failed, timed out, or answered with an error payload. */
   ok: boolean;
-  /** The parsed stdout document, when it was a JSON object. */
+  /**
+   * The parsed reply document, when one was a JSON object — from stdout on
+   * success, or from whichever stream carried the error payload on failure
+   * (herdr prints refusals on stderr). Only meaningful when `ok`.
+   */
   data: Record<string, unknown> | null;
   /** The `code` of a `{"error": {...}}` payload, or the spawn/exit failure. */
   error: string | null;
   /** Raw stderr, when any. */
   stderr: string;
+}
+
+/**
+ * Extracts a herdr `{"error": {"code"}}` document from one captured stream.
+ *
+ * Exported for tests: this is the seam where a genuine crash (OOM, SIGKILL,
+ * ENOENT — none of which produce JSON) must stay distinguishable from a
+ * structured refusal, and getting that wrong would hide real failures.
+ *
+ * Used on the failure path, where the document arrives on stderr with a
+ * non-zero exit; returns undefined for anything that is not such a document,
+ * so ordinary diagnostics are never mistaken for a structured refusal.
+ */
+export function errorPayload(
+  raw: string | undefined,
+): { code: string; data: Record<string, unknown> } | undefined {
+  if (!raw?.trim()) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const data = parsed as Record<string, unknown>;
+  const err = data.error;
+  // Arrays excluded deliberately: `{"error": []}` would otherwise yield the
+  // placeholder code and read as a structured refusal it is not.
+  if (typeof err !== "object" || err === null || Array.isArray(err)) return undefined;
+  const e = err as Record<string, unknown>;
+  return { code: String(e.code ?? e.message ?? "herdr_error"), data };
+}
+
+/**
+ * Turns a failed `execFile` into a {@link HerdrCall}, recovering herdr's own
+ * error code when one is there to recover.
+ *
+ * Measured (herdr 0.9.0): a clean refusal exits **non-zero** and prints its
+ * `{"error": {"code"}}` document on **stderr**, not stdout. This branch used to
+ * be treated as opaque, which threw the code away and reported only
+ * "herdr exited 1" — how an `agent_name_taken` ended up looking like a launch
+ * timeout for five runs. So both streams are checked before giving up.
+ *
+ * Pure and exported so the recovery is pinned by tests: the bug was not in
+ * parsing a payload but in *not looking* for one on the stream that carries it.
+ *
+ * @param e - The rejection from `execFile` (shape duck-typed; never trusted).
+ */
+export function classifyExecFailure(e: unknown): HerdrCall {
+  const ex = e as { code?: number | string; message?: string; stderr?: string; stdout?: string };
+  const payload = errorPayload(ex.stdout) ?? errorPayload(ex.stderr);
+  if (payload) return { ok: false, data: payload.data, error: payload.code, stderr: ex.stderr ?? "" };
+  return {
+    ok: false,
+    data: null,
+    error: ex.code ? `herdr exited ${ex.code}` : ex.message ?? String(e),
+    stderr: ex.stderr ?? "",
+  };
 }
 
 /**
@@ -76,13 +143,7 @@ export async function herdr(args: string[], timeoutMs = HERDR_TIMEOUT_MS): Promi
     stdout = out.stdout;
     stderr = out.stderr;
   } catch (e) {
-    const ex = e as { code?: number | string; message?: string; stderr?: string; stdout?: string };
-    return {
-      ok: false,
-      data: null,
-      error: ex.code ? `herdr exited ${ex.code}` : ex.message ?? String(e),
-      stderr: ex.stderr ?? "",
-    };
+    return classifyExecFailure(e);
   }
 
   let data: Record<string, unknown> | null = null;
@@ -183,14 +244,26 @@ export async function renamePane(paneId: string, label: string): Promise<boolean
 
 /**
  * Starts `pi` in an existing pane with the given argv (everything after
- * herdr's `--`). Resolves true only when herdr's pi detection reports the
- * agent interactive-ready.
+ * herdr's `--`). `ok` is true only when herdr's pi detection reports the agent
+ * interactive-ready.
+ *
+ * `error` carries herdr's own code, because the interesting failures here are
+ * *not* "pi never came up": `agent_name_taken` (the name is held by another
+ * live pane) and `invalid_agent_name` are both instant rejections that used to
+ * be flattened into "did not become interactive" and then retried against every
+ * candidate model — turning one clear, actionable code into the appearance of a
+ * fleet-wide model outage. Callers surface the code instead of guessing.
  */
-export async function startAgent(name: string, paneId: string, argv: string[], timeoutMs = 60_000): Promise<boolean> {
+export async function startAgent(
+  name: string,
+  paneId: string,
+  argv: string[],
+  timeoutMs = 60_000,
+): Promise<{ ok: boolean; error: string | null }> {
   const args = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", String(timeoutMs)];
   if (argv.length > 0) args.push("--", ...argv);
   const r = await herdr(args, timeoutMs + EXEC_SLACK_MS);
-  return r.ok;
+  return { ok: r.ok, error: r.error };
 }
 
 /**

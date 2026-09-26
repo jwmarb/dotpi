@@ -8,19 +8,24 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { discoverAgents } from "../lib/agents.js";
 import {
   buildChildArgv,
   buildChildEnv,
   agentNameRejection,
+  childNameRejection,
   candidateModels,
   describeLaunchFailure,
   DONE_TOOL_NAME,
   extractRunResult,
+  herdrAgentName,
   makeRunId,
   readReports,
   REPORT_TOOL_NAME,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
+import { classifyExecFailure, errorPayload } from "./herdr.js";
+import { launchAttempt, type Launcher } from "./index.js";
 import {
   exitPath,
   formatExitSidecar,
@@ -455,6 +460,75 @@ describe("agentNameRejection", () => {
 });
 
 // ---------------------------------------------------------------------------
+// herdrAgentName
+// ---------------------------------------------------------------------------
+
+describe("herdrAgentName", () => {
+  // Regression: herdr agent names are unique server-wide. Registering children
+  // under the bare definition name let one live `librarian` hold the name and
+  // made five concurrent librarian delegations fail with `agent_name_taken` in
+  // 4-11 ms each — burning every candidate model and reporting a dead fleet.
+  test("is unique per run for the same agent", () => {
+    const a = herdrAgentName("librarian", "sub-9622");
+    const b = herdrAgentName("librarian", "sub-66bb");
+    expect(a).not.toBe(b);
+  });
+
+  test("keeps the agent name readable as a prefix", () => {
+    expect(herdrAgentName("librarian", "sub-9622")).toBe("librarian-sub-9622");
+  });
+
+  test("is deterministic for one run", () => {
+    expect(herdrAgentName("worker", "sub-0d4e")).toBe(herdrAgentName("worker", "sub-0d4e"));
+  });
+
+  // The scoped name is what herdr actually receives, so it — not the bare
+  // definition name — is what has to satisfy herdr's rule.
+  test("stays a name herdr accepts for every agent in this repo", () => {
+    for (const n of ["worker", "explorer", "librarian", "oracle", "planner", "reviewer", "spiker", "verifier"]) {
+      const scoped = herdrAgentName(n, makeRunId());
+      expect(agentNameRejection(scoped)).toBeUndefined();
+      expect(scoped.length).toBeLessThanOrEqual(32);
+    }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// childNameRejection — the pre-spawn check, on the name herdr really gets
+// ---------------------------------------------------------------------------
+
+describe("childNameRejection", () => {
+  test("accepts every agent definition in this repo", async () => {
+    // The repo itself, not a hardcoded list: a ninth agent with a long name
+    // must fail this test rather than slip past it.
+    const agents = await discoverAgents(join(import.meta.dir, "..", "..", "agents"));
+    expect(agents.length).toBeGreaterThan(0);
+    for (const a of agents) {
+      expect(childNameRejection(a.name, makeRunId())).toBeUndefined();
+    }
+  });
+
+  // 32 is herdr's ceiling and the suffix costs 9, so a definition name has 23
+  // to spend. This is the gap the bare-name check left open: legal alone,
+  // illegal once scoped, and it used to fail only after a pane was opened.
+  test("rejects a name that is legal alone but too long once scoped", () => {
+    expect(agentNameRejection("a".repeat(24))).toBeUndefined();
+    expect(childNameRejection("a".repeat(24), "sub-9622")).toBeDefined();
+  });
+
+  test("accepts the longest name that still fits scoped", () => {
+    expect(childNameRejection("a".repeat(23), "sub-9622")).toBeUndefined();
+  });
+
+  test("still rejects a malformed definition name", () => {
+    for (const n of ["_lead", "UPPER", "dot.name", ""]) {
+      expect(childNameRejection(n, "sub-9622")).toBeDefined();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The wake notice
 // ---------------------------------------------------------------------------
 
@@ -536,3 +610,214 @@ describe("formatNotice / parseNotice", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// errorPayload — the failure-path parse
+// ---------------------------------------------------------------------------
+
+describe("errorPayload", () => {
+  // Regression: herdr prints refusals on stderr with a non-zero exit, so the
+  // catch branch used to discard the code and report only "herdr exited 1".
+  // That flattening is what disguised agent_name_taken as a launch timeout.
+  test("extracts the code from a herdr refusal document", () => {
+    const raw = JSON.stringify({ id: "cli:agent:start", error: { code: "agent_name_taken", message: "in use" } });
+    expect(errorPayload(raw)?.code).toBe("agent_name_taken");
+  });
+
+  test("keeps the whole document, not just the code", () => {
+    const raw = JSON.stringify({ id: "x", error: { code: "invalid_agent_name" } });
+    expect(errorPayload(raw)?.data.id).toBe("x");
+  });
+
+  // The contract that protects real failures: a crash must never be mistaken
+  // for a structured refusal, or the fallback loop would stop on a genuine
+  // problem it should have reported verbatim.
+  test("does not mistake a crash or non-herdr output for a refusal", () => {
+    for (const raw of [
+      undefined,
+      "",
+      "   ",
+      "Killed",
+      "error: out of memory",
+      "herdr: command not found",
+      "<html>502</html>",
+      "null",
+      "[]",
+      '"a string"',
+      "42",
+      JSON.stringify({ id: "x", result: { ok: true } }), // a success document
+      JSON.stringify({ id: "x" }), // no error key
+      JSON.stringify({ error: "not an object" }),
+      JSON.stringify({ error: null }),
+      JSON.stringify({ error: [] }), // an array is not a refusal
+    ]) {
+      expect(errorPayload(raw)).toBeUndefined();
+    }
+  });
+
+  test("falls back to message, then a placeholder, when code is absent", () => {
+    expect(errorPayload(JSON.stringify({ error: { message: "boom" } }))?.code).toBe("boom");
+    expect(errorPayload(JSON.stringify({ error: { detail: "?" } }))?.code).toBe("herdr_error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// launchAttempt — the fatal classification
+// ---------------------------------------------------------------------------
+
+/** A launcher whose `startAgent` fails with one herdr code, recording cleanup. */
+function stubLauncher(startError: string | null, closed: string[] = []): Launcher {
+  return {
+    createChildPane: async () => ({ paneId: "w9:p1", tabId: "w9:t1" }),
+    renamePane: async () => true,
+    startAgent: async () => ({ ok: startError === null, error: startError }),
+    closePane: async (paneId: string) => {
+      closed.push(paneId);
+      return true;
+    },
+  };
+}
+
+const stubAgent = {
+  name: "librarian",
+  description: "d",
+  promptBody: "b",
+  filePath: "librarian.md",
+} as Parameters<typeof launchAttempt>[0];
+
+const stubRec = { runId: "sub-9622", agent: "librarian", task: "t", cwd: "/tmp", status: "running", startedAt: 0 } as Parameters<typeof launchAttempt>[1];
+
+describe("launchAttempt fatal classification", () => {
+  // Regression: a name refusal is not model-specific, but it was retried
+  // against all three candidate models in well under 100 ms, which read as a
+  // dead fleet instead of one actionable error.
+  test("a name collision is fatal, so the model loop stops", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
+    expect(out.ok).toBe(false);
+    expect(out.fatal).toBe(true);
+  });
+
+  test("a malformed name is fatal too", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("invalid_agent_name"));
+    expect(out.fatal).toBe(true);
+  });
+
+  // The remedies must stay distinct: `herdr agent list` is a dead end for a
+  // malformed name, and collapsing the two codes into one message would repeat
+  // the flattening this change exists to undo.
+  test("each code gets its own remedy, and names the code", async () => {
+    const taken = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
+    const invalid = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("invalid_agent_name"));
+    expect(taken.error).toContain("agent_name_taken");
+    expect(taken.error).toContain("herdr agent list");
+    expect(invalid.error).toContain("invalid_agent_name");
+    expect(invalid.error).not.toContain("herdr agent list");
+  });
+
+  test("the scoped name is what herdr was asked for, and what the error names", async () => {
+    let asked: string | undefined;
+    const l = stubLauncher("agent_name_taken");
+    l.startAgent = async (name: string) => {
+      asked = name;
+      return { ok: false, error: "agent_name_taken" };
+    };
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, l);
+    expect(asked).toBe("librarian-sub-9622");
+    expect(out.error).toContain("librarian-sub-9622");
+  });
+
+  // A name refusal means herdr never ran pi, so the pane holds no scrollback
+  // and must not be retained as "evidence" — not even on the last attempt.
+  test("a name refusal always closes its pane, even when keepPaneOnFailure", async () => {
+    const closed: string[] = [];
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken", closed));
+    expect(closed).toEqual(["w9:p1"]);
+  });
+
+  // A refusal-closed pane must never be reported back, or a later cleanup path
+  // could try to close it a second time.
+  test("a fatal name refusal reports no pane id", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
+    expect(out.paneId).toBeUndefined();
+  });
+
+  // The contrast that matters: a real launch failure IS model-specific, so it
+  // must stay non-fatal and let the next candidate model be tried.
+  test("a genuine launch failure is not fatal and keeps its pane for evidence", async () => {
+    const closed: string[] = [];
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("timeout", closed));
+    expect(out.fatal).toBeUndefined();
+    expect(out.paneId).toBe("w9:p1");
+    expect(closed).toEqual([]);
+    expect(out.error).toContain("did not become interactive");
+    expect(out.error).toContain("timeout");
+  });
+
+  test("a non-last genuine failure reclaims its pane", async () => {
+    const closed: string[] = [];
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", false, stubLauncher("timeout", closed));
+    expect(closed).toEqual(["w9:p1"]);
+  });
+
+  test("no pane at all is fatal: another model cannot help", async () => {
+    const l = stubLauncher(null);
+    l.createChildPane = async () => null;
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, l);
+    expect(out.fatal).toBe(true);
+  });
+
+  test("a successful start reports the pane and tab it got", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher(null));
+    expect(out).toMatchObject({ ok: true, paneId: "w9:p1", tabId: "w9:t1" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyExecFailure — recovering a code from a non-zero exit
+// ---------------------------------------------------------------------------
+
+describe("classifyExecFailure", () => {
+  // THE regression, at the seam where it actually lived: the bug was not a bad
+  // parse, it was not *looking* on stderr. herdr prints refusals there with a
+  // non-zero exit, and reporting "herdr exited 1" instead of the code is what
+  // let agent_name_taken masquerade as a launch timeout across five runs.
+  test("recovers the code from a refusal printed on stderr", () => {
+    const r = classifyExecFailure({
+      code: 1,
+      stdout: "",
+      stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_name_taken" } }),
+    });
+    expect(r.error).toBe("agent_name_taken");
+    expect(r.ok).toBe(false);
+  });
+
+  test("still recovers a code from stdout, should herdr ever put it there", () => {
+    const r = classifyExecFailure({
+      code: 1,
+      stdout: JSON.stringify({ error: { code: "invalid_agent_name" } }),
+      stderr: "",
+    });
+    expect(r.error).toBe("invalid_agent_name");
+  });
+
+  test("exposes the parsed document so callers can read its detail", () => {
+    const r = classifyExecFailure({
+      code: 1,
+      stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_name_taken" } }),
+    });
+    expect(r.data).not.toBeNull();
+  });
+
+  // A crash must NOT be dressed up as a structured refusal: those are reported
+  // verbatim so a real problem stays visible.
+  test("reports a genuine crash by its exit status, not a fake code", () => {
+    expect(classifyExecFailure({ code: 137, stderr: "Killed" }).error).toBe("herdr exited 137");
+    expect(classifyExecFailure({ code: "ENOENT", message: "spawn failed" }).error).toBe("herdr exited ENOENT");
+    expect(classifyExecFailure({ message: "socket hang up" }).error).toBe("socket hang up");
+  });
+
+  test("always preserves raw stderr for diagnosis", () => {
+    expect(classifyExecFailure({ code: 1, stderr: "boom" }).stderr).toBe("boom");
+    expect(classifyExecFailure({ code: 1 }).stderr).toBe("");
+  });
+});

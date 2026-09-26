@@ -285,17 +285,68 @@ export function describeLaunchFailure(failures: readonly FailedAttempt[]): strin
  * `agent start` rejects a name outside this shape with `invalid_agent_name`,
  * which the spawn path used to surface as "did not become interactive" on every
  * candidate model — a failure that looks like a broken model and is not.
+ *
+ * The 32-character ceiling is why {@link herdrAgentName} appends `-sub-xxxx`
+ * (9 chars) to the *agent* name rather than embedding anything longer: the
+ * longest definition name here is `librarian` (18 with the suffix), so the
+ * budget is not tight, but a future long name must stay inside this rule.
  */
 const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
 /**
+ * The name to register one child under with `herdr agent start`.
+ *
+ * **herdr agent names are globally unique across the whole server**: `agent
+ * start` answers `agent_name_taken` when a name is already held by a live
+ * pane. Registering a child under its bare definition name therefore let the
+ * *first* live `librarian` own the name and made every concurrent or
+ * overlapping `librarian` unlaunchable — the failure is instant (measured 4-11 ms), so
+ * all candidate models were burned in under 100 ms and the run reported
+ * "did not become interactive" on every one of them, which reads as a dead
+ * fleet and is really a name collision.
+ *
+ * Scoping by run id makes the name unique by construction, which is the same
+ * reason pane and tab ids are never predicted: identity comes from the thing
+ * that is actually unique, not from a label that happens to be free.
+ *
+ * @param agentName - The agent definition's `name` (e.g. `librarian`).
+ * @param runId - The run id (e.g. `sub-9622`). {@link makeRunId} draws from
+ *        ~65k values without a registry check, so uniqueness is overwhelmingly
+ *        likely rather than guaranteed; a collision now surfaces as a clear
+ *        fatal `agent_name_taken` instead of the fake fleet outage above.
+ */
+export function herdrAgentName(agentName: string, runId: string): string {
+  return `${agentName}-${runId}`;
+}
+
+/**
+ * Why herdr would refuse the name this child will actually be registered
+ * under, or `undefined` if it is usable.
+ *
+ * This is the pre-spawn check, and it deliberately validates the **scoped**
+ * name: scoping costs 9 characters, so a definition name can be legal on its
+ * own (24 chars) and illegal once scoped (33). Checking the bare name let that
+ * through to fail after a pane had already been opened and closed.
+ *
+ * The late path still classifies `invalid_agent_name` as fatal, so this check
+ * is defence in depth — it converts a late, pane-wasting failure into an
+ * immediate and clearer one.
+ *
+ * @param agentName - The agent definition's `name`.
+ * @param runId - The run id this child will use.
+ */
+export function childNameRejection(agentName: string, runId: string): string | undefined {
+  return agentNameRejection(herdrAgentName(agentName, runId));
+}
+
+/**
  * Why herdr would refuse this agent name, or `undefined` if it is usable.
  *
- * Checked before a pane is opened: a name herdr cannot use fails identically on
- * every model, so retrying is pointless and the real cause should be said out
- * loud instead.
- *
- * @param name - The agent name from its definition file.
+ * @param name - The name to check. The spawn path must pass the **scoped** name
+ *        (what herdr actually receives), so call {@link childNameRejection}
+ *        rather than handing this a bare definition name — a name that is legal
+ *        alone but illegal once scoped would otherwise slip through and fail
+ *        late, after a pane had already been opened.
  */
 export function agentNameRejection(name: string): string | undefined {
   if (HERDR_AGENT_NAME.test(name)) return undefined;

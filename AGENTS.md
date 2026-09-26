@@ -58,7 +58,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ```sh
 bun test agent/extensions/lib/                          # widget/agents/layout/sessions tests (59)
-bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (49)
+bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (76)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name

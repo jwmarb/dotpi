@@ -86,10 +86,11 @@ import { Type } from "typebox";
 import {
   buildChildArgv,
   buildChildEnv,
-  agentNameRejection,
+  childNameRejection,
   candidateModels,
   describeLaunchFailure,
   extractRunResult,
+  herdrAgentName,
   makeRunId,
   readReports,
   type RunResult,
@@ -219,7 +220,7 @@ interface SpawnOutcome {
 }
 
 /** What one launch attempt needs from the world, so a test can supply its own. */
-interface Launcher {
+export interface Launcher {
   createChildPane: typeof createChildPane;
   renamePane: typeof renamePane;
   startAgent: typeof startAgent;
@@ -229,13 +230,17 @@ interface Launcher {
 const realLauncher: Launcher = { createChildPane, renamePane, startAgent, closePane };
 
 /** Outcome of trying to get one pi child interactive on one model. */
-interface AttemptOutcome {
+export interface AttemptOutcome {
   ok: boolean;
   paneId?: string;
   tabId?: string;
   /** Set when the attempt failed; the reason to record and to report. */
   error?: string;
-  /** True when no pane could be opened at all (herdr itself is unavailable). */
+  /**
+   * True when no other model could possibly help: herdr itself is unavailable
+   * (no pane at all), or it refused the agent name outright. Stops the
+   * candidate-model loop instead of re-proving the same refusal per model.
+   */
   fatal?: boolean;
 }
 
@@ -249,9 +254,15 @@ interface AttemptOutcome {
  *
  * The pane is closed on failure unless `keepPaneOnFailure`, which the last
  * attempt sets: herdr destroys scrollback with the pane, and the final failure
- * is the one a human needs to read.
+ * is the one a human needs to read. A *name* refusal is the exception — herdr
+ * never ran pi, so there is no scrollback to keep and the pane is always closed.
+ *
+ * Exported (with `Launcher`) so a test can supply its own world: the `fatal`
+ * classification below is the logic that stops a name refusal from being
+ * retried against every candidate model, and a stub launcher is the only way to
+ * pin it without a live herdr.
  */
-async function launchAttempt(
+export async function launchAttempt(
   agent: AgentInfo,
   rec: RunRecord,
   dir: string,
@@ -284,8 +295,44 @@ async function launchAttempt(
     tools: agent.tools,
     systemPromptPath: promptPath,
   });
-  if (await launcher.startAgent(agent.name, pane.paneId, argv)) {
+  // Registered under a *run-scoped* name: herdr agent names are globally
+  // unique, so the bare `agent.name` let one live child lock out every sibling
+  // (see herdrAgentName). The label above stays human-readable.
+  const started = await launcher.startAgent(herdrAgentName(agent.name, rec.runId), pane.paneId, argv);
+  if (started.ok) {
     return { ok: true, paneId: pane.paneId, tabId: pane.tabId };
+  }
+
+  // Name rejections are not launch failures: herdr refused before pi ever ran,
+  // so no other model can help, and the pane holds nothing but a shell prompt
+  // (no scrollback to preserve, hence the unconditional close). Reported as
+  // fatal so the fallback loop stops instead of re-proving it three times.
+  //
+  // The two codes get different remedies on purpose: they are distinct failures
+  // and `herdr agent list` is a dead end for a malformed name. Collapsing them
+  // into one message would repeat, one level up, the flattening this whole
+  // change exists to undo.
+  const scoped = herdrAgentName(agent.name, rec.runId);
+  if (started.error === "agent_name_taken") {
+    await launcher.closePane(pane.paneId);
+    return {
+      ok: false,
+      fatal: true,
+      error:
+        `herdr already has a live agent named "${scoped}" (agent_name_taken), so this child could not register. ` +
+        `Names are unique among live agents; run \`herdr agent list\` to see what holds it.`,
+    };
+  }
+  if (started.error === "invalid_agent_name") {
+    await launcher.closePane(pane.paneId);
+    return {
+      ok: false,
+      fatal: true,
+      error:
+        `herdr rejected the name "${scoped}" as malformed (invalid_agent_name). A name must match ` +
+        `[a-z][a-z0-9_-]{0,31} — at most 32 characters including the "-${rec.runId}" suffix (9). ` +
+        `Rename the agent definition's \`name\` field.`,
+    };
   }
 
   if (!keepPaneOnFailure) await launcher.closePane(pane.paneId);
@@ -294,7 +341,7 @@ async function launchAttempt(
     paneId: pane.paneId,
     error: `pi in pane ${pane.paneId} did not become interactive${
       model ? ` on model ${model}` : ""
-    } (see that pane's output).`,
+    }${started.error ? ` (herdr said: ${started.error})` : ""} (see that pane's output).`,
   };
 }
 
@@ -330,14 +377,16 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
   }
 
-  // herdr refuses some names outright, and that refusal used to surface as
-  // "did not become interactive" on every candidate model — a broken name
-  // looking exactly like a broken fleet.
-  const nameProblem = agentNameRejection(agent.name);
-  if (nameProblem) return { ok: false, error: nameProblem };
-
   const models = candidateModels(params.model, agent);
   const runId = makeRunId();
+
+  // Validate the name herdr will actually receive, not the definition name:
+  // scoping costs 9 characters, so a legal bare name can still exceed herdr's
+  // 32-char ceiling once scoped. Checking the bare string let that through to
+  // fail late, after a pane had been opened and closed.
+  const nameProblem = childNameRejection(agent.name, runId);
+  if (nameProblem) return { ok: false, error: nameProblem };
+
   const rec: RunRecord = {
     runId,
     agent: agent.name,
@@ -372,7 +421,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     const attempt = await launchAttempt(agent, rec, dir, promptPath, model, isLast);
     if (!attempt.ok) {
       failures.push({ model, error: attempt.error ?? "unknown launch failure" });
-      // No pane at all means herdr is unavailable: another model cannot help.
+      // Nothing model-specific went wrong (herdr unavailable, or it refused
+      // the name): trying another model would just repeat the same refusal.
       if (attempt.fatal) break;
       continue;
     }
