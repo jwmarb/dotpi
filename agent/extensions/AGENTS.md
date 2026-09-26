@@ -16,10 +16,12 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
 | `litellm.ts` | `registerProvider("litellm")` — model catalog, per-token + cache costs, `contextWindow`, thinking-level maps |
 | `sessions.ts` | `/sessions` — resumable session list from pi's own `SessionManager.list()`; no JSONL re-parsing |
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
+| `todo.ts` | `todo` tool + `/todos` — in-session checklist as a `belowEditor` widget. State replays from tool-result `details` on the current branch, so no file and no lock |
 | `auto-update/` | `/update` + `pi_update` tool — version check on `session_start`, at most every 4h |
 | `mcp/` | `/mcp status\|list\|refresh`; registers each MCP tool as `mcp__<server>__<tool>`. Docs: its `README.md` |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
 | `lib/layout.ts` | Where repo files live. **Never throws** — falls back to `~/.pi/agent` |
+| `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot |
 | `lib/agents.ts` | The single `agents/*.md` frontmatter parser (`discoverAgents`, `parseAgentFile`) |
 | `lib/widget.ts` | `fitLines`, `fittedWidget`, `row`, `frame`, `cachedByWidth` — the measuring seam |
 
@@ -40,6 +42,18 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
   are actually in `selectedTools`. The `plan` extension was removed in `7a54a3b`,
   so the planning branch is currently dead but harmless — do not emit a section
   whose tool may not exist.
+- **`todo.ts` is not the old `plan` extension, and must not grow into it.** The
+  dead planning branch above gates on a tool named `plan`; `todo` is a different
+  tool and deliberately does not re-arm it. That prompt section describes a
+  session-wide plan file, delegation Task IDs and survival across compaction —
+  none of which `todo` has. What `plan` was is worth knowing before extending
+  this: a plan file (`agent/plans/<key>.jsonl`) plus a live kanban Board in its
+  own pane, which needed a *second* writer (ADR 0015) and then a cross-process
+  lock that could still lose updates (ADR 0035), and whose last commits before
+  deletion were all stale-card fixes (ADR 0048). `todo` avoids all of it by
+  having no file: state is replayed from tool-result `details` on the current
+  branch, so there is exactly one writer and a rewind cannot leave a stale list
+  describing work the agent no longer remembers doing.
 - **Keep pure logic out of `index.ts`.** Both subdirectory extensions split
   `lib.ts` (pure, tested) from `index.ts` (session wiring). New complexity at this
   level should follow that split rather than growing a 1000-line top-level file.

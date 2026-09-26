@@ -39,6 +39,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Loop the agent on a goal until it declares completion | `agent/extensions/ralph-loop/` (`/ralph-loop`, `/ulw-loop`, `/loop-stop`; `--verify[=static\|runtime\|both]`) |
 | Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools; event-driven — no blocking wait, the child wakes the parent) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
+| Track multi-step work in a visible checklist | `agent/extensions/todo.ts` (`todo` tool, `/todos`; widget below the editor, state lives in tool-result `details` — no plan file) |
 | Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget measuring/fitting, repo layout, agent parsing) |
 | Where a repo file lives (agent dir, agents/, skills/, .env, mcp.json) | `agent/extensions/lib/layout.ts` (single resolver — never throws, so top-level extension code can import it) |
@@ -57,7 +58,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/lib/                          # widget/agents/layout/sessions tests (59)
+bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo tests (81)
 bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (76)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
 bun test agent/extensions/lib/widget.test.ts            # one file
