@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 
 const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 const start = src.indexOf("function deref");
-const end = src.indexOf("// --- Extension entry point");
+const end = src.indexOf("// --- OAuth");
 let fnText = src.slice(start, end).trim();
 fnText = fnText
   .replace(/: TSchema/g, "")

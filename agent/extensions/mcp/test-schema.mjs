@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 
 const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 const start = src.indexOf("function deref");
-const end = src.indexOf("// --- Extension entry point");
+const end = src.indexOf("// --- OAuth");
 if (start < 0 || end < 0) throw new Error("functions not found in index.ts");
 let fnText = src.slice(start, end).trim();
 // Strip TS-only syntax so it runs in plain node

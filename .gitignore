@@ -23,6 +23,8 @@ agent/.env.*
 # commit by accident and then hard to notice when they fill up.
 agent/auth.json
 agent/models-store.json
+# Per-server OAuth state (registered client + tokens) from mcp "auth": "oauth".
+agent/mcp-auth/
 # Never commit a backup of a config that may contain a key.
 *.bak
 *.orig-backup
@@ -58,6 +60,16 @@ agent/subagent-runs/
 # costs one image build.
 agent/verify-images/
 agent/pi-blackhole/
+# Trading profile (~/.pi/agent-trading): symlinks share the default profile's
+# tree, so only its own machine state is ignored here. Its .env and mcp-auth
+# are symlinks into agent/ and track as (relative) symlinks, not secrets.
+agent-trading/sessions/
+agent-trading/subagent-sessions/
+agent-trading/subagent-runs/
+agent-trading/verify-images/
+agent-trading/pi-blackhole/
+agent-trading/auth.json
+agent-trading/models-store.json
 # Plans are per-session working state keyed by session id, and the archive grows
 # without bound. The decisions worth keeping end up in docs/adr and CONTEXT.md.
 agent/plans/

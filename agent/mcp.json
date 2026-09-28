@@ -5,6 +5,10 @@
       "headers": {
         "x-litellm-api-key": "Bearer ${LITELLM_MCP_KEY}"
       }
+    },
+    "robinhood": {
+      "url": "https://agent.robinhood.com/mcp/trading",
+      "auth": "oauth"
     }
   }
 }

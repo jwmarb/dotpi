@@ -30,10 +30,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
+import * as http from "node:http";
+import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
+import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
+import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadDotenv } from "../lib/dotenv.js";
-import { envFile, mcpConfigFile } from "../lib/layout.js";
+import { agentDir, envFile, mcpConfigFile } from "../lib/layout.js";
 import { fittedWidget } from "../lib/widget.js";
 
 // --- Configuration -----------------------------------------------------------
@@ -54,6 +59,10 @@ interface McpServerConfig {
 	env?: Record<string, string>;
 	/** Per-server connect timeout in ms (optional). */
 	timeout?: number;
+	/** Use OAuth (authorization code + PKCE) for this HTTP server. */
+	auth?: "oauth";
+	/** Fixed local port for the OAuth callback (default: any free port). */
+	authPort?: number;
 	/** Enable/disable this server. */
 	disabled?: boolean;
 }
@@ -129,7 +138,7 @@ function expandPlaceholders(value: unknown, where: string, trail: string[] = [])
  */
 function loadConfig(configPath: string): Map<string, McpServerConfig> {
 	let raw: unknown;
-	try {
+try {
 		const text = fs.readFileSync(configPath, "utf8");
 		try {
 			raw = JSON.parse(text);
@@ -172,6 +181,10 @@ interface McpServerState {
 	config: McpServerConfig;
 	/** The connected MCP client (undefined while connecting/failed). */
 	client?: unknown; // Client from @modelcontextprotocol/sdk
+	/** Live OAuth redirect server, while an OAuth-protected server connects. */
+	authProvider?: McpOAuthProvider;
+	/** True while waiting for the user to finish browser authorization. */
+	authPending?: boolean;
 	transportKind: "http" | "stdio";
 	toolNames: string[];
 	toolDescriptions: Map<string, string>;
@@ -299,6 +312,257 @@ function toParametersSchema(raw: unknown, description: string): TSchema {
 	}
 	return Type.Object({}, { additionalProperties: true, description });
 }
+
+// --- OAuth (authorization code + PKCE) ----------------------------------------
+
+/** How long to wait for the user to finish browser authorization (ms). */
+const AUTH_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Per-server OAuth state file (registered client, tokens, PKCE verifier,
+ * discovery state). Lives outside mcp.json so rotating tokens never dirty the
+ * committed config.
+ */
+function authStateFile(server: string): string {
+	return path.join(agentDir(), "mcp-auth", `${server.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+
+function readAuthState(file: string): Record<string, unknown> {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+	} catch {
+		return {};
+	}
+}
+
+function writeAuthState(file: string, patch: Record<string, unknown>): void {
+	const next = { ...readAuthState(file), ...patch };
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+}
+
+/**
+ * Best-effort browser launch; the authorization URL is always printed to the
+ * console as well, so a headless machine (no xdg-open) can still finish the
+ * flow by hand.
+ */
+function openBrowser(url: string): void {
+	const [cmd, args] =
+		process.platform === "darwin"
+			? ["open", [url]]
+			: process.platform === "win32"
+				? ["cmd", ["/c", "start", "", url]]
+				: ["xdg-open", [url]];
+	try {
+		const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+		child.on("error", () => {});
+		child.unref();
+	} catch {
+		// no browser available — the console URL is the fallback
+	}
+}
+
+/**
+ * OAuthClientProvider for one MCP server: authorization code + PKCE with
+ * dynamic client registration (RFC 7591), a local 127.0.0.1 redirect server
+ * that captures the browser callback, and file-backed state so the user
+ * authenticates once and token refreshes survive restarts.
+ */
+class McpOAuthProvider implements OAuthClientProvider {
+	private readonly serverName: string;
+	private readonly file: string;
+	private readonly _redirectServer: http.Server;
+	private _redirectUrl = "";
+	private readonly _state: string;
+	private _codeResolve: ((code: string) => void) | null = null;
+	private _codeReject: ((err: Error) => void) | null = null;
+	private _codePromise: Promise<string> | null = null;
+	private readonly _ready: Promise<string>;
+	private _bufferedCode: string | undefined;
+
+	constructor(serverName: string, port = 0) {
+		this.serverName = serverName;
+		this.file = authStateFile(serverName);
+		this._state = randomBytes(16).toString("hex");
+		this._redirectServer = http.createServer((req, res) => this.handleRedirect(req, res));
+		// Bind at construction: clientMetadata.redirect_uris must be fixed
+		// before dynamic client registration, which happens before the
+		// redirect.
+		this._ready = new Promise<string>((resolve, reject) => {
+			this._redirectServer.once("error", reject);
+			this._redirectServer.listen(port, "127.0.0.1", () => {
+				const addr = this._redirectServer.address();
+				const p = typeof addr === "object" && addr !== null ? addr.port : port;
+				this._redirectUrl = `http://127.0.0.1:${p}/callback`;
+				resolve(this._redirectUrl);
+			});
+		});
+	}
+
+	/** Resolves with the redirect URL once the callback server is listening. */
+	ready(): Promise<string> {
+		return this._ready;
+	}
+
+	get redirectUrl(): string {
+		return this._redirectUrl;
+	}
+
+	get clientMetadata(): OAuthClientMetadata {
+		return {
+			client_name: `pi mcp ${this.serverName}`,
+			redirect_uris: [this._redirectUrl],
+			grant_types: ["authorization_code", "refresh_token"],
+			response_types: ["code"],
+			token_endpoint_auth_method: "none",
+		};
+	}
+
+	state(): string {
+		return this._state;
+	}
+
+	clientInformation(): OAuthClientInformationMixed | undefined {
+		return readAuthState(this.file).clientInformation as OAuthClientInformationMixed | undefined;
+	}
+
+	saveClientInformation(info: OAuthClientInformationMixed): void {
+		writeAuthState(this.file, { clientInformation: info });
+	}
+
+	tokens(): OAuthTokens | undefined {
+		return readAuthState(this.file).tokens as OAuthTokens | undefined;
+	}
+
+	saveTokens(tokens: OAuthTokens): void {
+		writeAuthState(this.file, { tokens });
+	}
+
+	async redirectToAuthorization(url: URL): Promise<void> {
+		console.log(`[mcp] ${this.serverName}: open this URL to authorize:\n  ${url}`);
+		openBrowser(String(url));
+	}
+
+	saveCodeVerifier(codeVerifier: string): void {
+		writeAuthState(this.file, { codeVerifier });
+	}
+
+	async codeVerifier(): Promise<string> {
+		return (readAuthState(this.file).codeVerifier as string | undefined) ?? "";
+	}
+
+	invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): void {
+		const drop =
+			scope === "all"
+				? ["clientInformation", "tokens", "codeVerifier", "discoveryState"]
+				: scope === "client"
+					? ["clientInformation"]
+					: scope === "tokens"
+						? ["tokens"]
+						: scope === "verifier"
+							? ["codeVerifier"]
+							: ["discoveryState"];
+		const data = readAuthState(this.file);
+		const next: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(data)) if (!drop.includes(k)) next[k] = v;
+		fs.mkdirSync(path.dirname(this.file), { recursive: true });
+		fs.writeFileSync(this.file, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+	}
+
+	saveDiscoveryState(state: OAuthDiscoveryState): void {
+		writeAuthState(this.file, { discoveryState: state });
+	}
+
+	discoveryState(): OAuthDiscoveryState | undefined {
+		return readAuthState(this.file).discoveryState as OAuthDiscoveryState | undefined;
+	}
+
+	/**
+	 * Wait for the browser callback to deliver an authorization code.
+	 * Rejects on timeout, state mismatch, a server-side authorization
+	 * error, or close().
+	 */
+	waitForCode(timeoutMs: number = AUTH_WAIT_TIMEOUT_MS): Promise<string> {
+		if (this._bufferedCode !== undefined) {
+			const c = this._bufferedCode;
+			this._bufferedCode = undefined;
+			return Promise.resolve(c);
+		}
+		if (!this._codePromise) {
+			this._codePromise = new Promise<string>((resolve, reject) => {
+				this._codeResolve = resolve;
+				this._codeReject = reject;
+			});
+		}
+		const timeout = new Promise<string>((_, reject) => {
+			const t = setTimeout(
+				() => reject(new Error(`timed out after ${Math.round(timeoutMs / 1000)}s waiting for browser authorization`)),
+				timeoutMs,
+			);
+			t.unref();
+		});
+		return Promise.race([this._codePromise, timeout]);
+	}
+
+	/** Stop the callback server; rejects any in-flight code wait. */
+	close(): void {
+		this._redirectServer.close();
+		if (this._codePromise) {
+			this._codeReject?.(new Error("OAuth flow cancelled"));
+			this._codePromise = null;
+			this._codeResolve = null;
+			this._codeReject = null;
+		}
+	}
+
+	private handleRedirect(req: http.IncomingMessage, res: http.ServerResponse): void {
+		const url = new URL(req.url ?? "/", "http://127.0.0.1");
+		if (req.method !== "GET" || url.pathname !== "/callback") {
+			res.writeHead(404, { "content-type": "text/plain" });
+			res.end("not found");
+			return;
+		}
+		const reply = (status: number, title: string, body: string) => {
+			res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+			res.end(`<html><body><h1>${title}</h1><p>${body}</p></body></html>`);
+		};
+		const code = url.searchParams.get("code");
+		const err = url.searchParams.get("error");
+		const state = url.searchParams.get("state");
+		if (state !== null && state !== this._state) {
+			reply(400, "State mismatch", "Please retry the authorization.");
+			this.settleCode(new Error("OAuth state mismatch (possible CSRF)"));
+			return;
+		}
+		if (err) {
+			reply(400, "Authorization failed", err);
+			this.settleCode(new Error(`authorization server returned an error: ${err}`));
+			return;
+		}
+		if (!code) {
+			reply(400, "Missing code", "The redirect contained no authorization code.");
+			this.settleCode(new Error("no authorization code in redirect"));
+			return;
+		}
+		reply(200, "Authenticated", "You can close this tab and return to pi.");
+		this.settleCode(null, code);
+	}
+
+	private settleCode(err: Error | null, code?: string): void {
+		if (err) {
+			this._codeReject?.(err);
+		} else if (this._codeResolve) {
+			this._codeResolve(code as string);
+		} else {
+			// The callback beat waitForCode() (fast redirect); buffer the code
+			// so a later waitForCode() picks it up instead of dropping it.
+			this._bufferedCode = code;
+		}
+		this._codePromise = null;
+		this._codeResolve = null;
+		this._codeReject = null;
+	}
+}
 // --- Extension entry point ---------------------------------------------------
 
 export default async function (pi: ExtensionAPI) {
@@ -340,7 +604,7 @@ export default async function (pi: ExtensionAPI) {
 				s.status === "connected"
 					? t.fg("dim", ` ${s.toolNames.length} tools`)
 					: s.status === "connecting"
-						? t.fg("warning", " connecting…")
+						? t.fg("warning", s.authPending ? " awaiting browser auth…" : " connecting…")
 						: t.fg("error", ` failed: ${s.error ?? "unknown"}`);
 			lines.push(`${icon} mcp: ${t.fg("text", s.name)}${detail}`);
 		}
@@ -404,11 +668,48 @@ export default async function (pi: ExtensionAPI) {
 			await loadSdk();
 			if (state.config.url) {
 				state.transportKind = "http";
-				const transport = new httpTransportCtor!(new URL(state.config.url), {
-					requestInit: { headers: state.config.headers ?? {} },
-				});
+				// Capture the narrowed URL so the transport factory closure sees a string.
+				const serverUrl = state.config.url;
+				// Close a stale redirect server left by a previous (re)connect.
+				try {
+					state.authProvider?.close();
+				} catch {
+					// ignore
+				}
+				let provider: McpOAuthProvider | undefined;
+				if (state.config.auth === "oauth") {
+					provider = new McpOAuthProvider(state.name, state.config.authPort);
+					await provider.ready();
+					state.authProvider = provider;
+				}
+				const makeTransport = () =>
+					new httpTransportCtor!(new URL(serverUrl), {
+						requestInit: { headers: state.config.headers ?? {} },
+						...(provider ? { authProvider: provider } : {}),
+					});
+				let transport = makeTransport();
 				const client = new sdkClient!({ name: "pi-mcp-extension", version: "1.0.0" });
-				await client.connect(transport);
+				try {
+					await client.connect(transport);
+				} catch (err) {
+					if (!provider) throw err;
+					const { UnauthorizedError } = await import("@modelcontextprotocol/sdk/client/auth.js");
+					if (!(err instanceof UnauthorizedError)) throw err;
+					// The SDK started the browser flow (discovery, client
+					// registration, PKCE, redirect); now we wait for the user.
+					state.authPending = true;
+					updateWidget(ctx);
+					try {
+						const code = await provider.waitForCode();
+						await transport.finishAuth(code);
+						// A transport cannot be started twice — the SDK sample
+						// creates a fresh one after the auth flow.
+						transport = makeTransport();
+						await client.connect(transport);
+					} finally {
+						state.authPending = false;
+					}
+				}
 				const tools = await client.listTools();
 				state.client = client;
 				state.toolNames = tools.tools.map((t: { name: string }) => t.name);
@@ -440,6 +741,10 @@ export default async function (pi: ExtensionAPI) {
 		} catch (err) {
 			state.status = "failed";
 			state.error = err instanceof Error ? err.message : String(err);
+			// A 401 without an OAuth config is a config gap, not a network fault.
+			if (state.transportKind === "http" && !state.config.auth && /401|unauthor/i.test(state.error)) {
+				state.error += ` — the server requires authentication. Add "auth": "oauth" to the "${state.name}" entry in mcp.json, then run /mcp refresh ${state.name}.`;
+			}
 			try {
 				await (state.client as { close?: () => Promise<void> } | undefined)?.close?.();
 			} catch {
@@ -461,6 +766,13 @@ export default async function (pi: ExtensionAPI) {
 				// ignore
 			}
 			s.client = undefined;
+			try {
+				s.authProvider?.close();
+			} catch {
+				// ignore
+			}
+			s.authProvider = undefined;
+			s.authPending = false;
 			// Re-registration is idempotent for pi (tools refresh in place).
 			await connectServer(s, ctx);
 		}
@@ -500,7 +812,10 @@ export default async function (pi: ExtensionAPI) {
 					Promise.race([
 						connectServer(s),
 						new Promise((resolve) =>
-							setTimeout(resolve, (s.config.timeout ?? DEFAULT_CONNECT_TIMEOUT_MS) + 1000),
+								setTimeout(
+									resolve,
+									(s.config.timeout ?? DEFAULT_CONNECT_TIMEOUT_MS) + (s.config.auth === "oauth" ? AUTH_WAIT_TIMEOUT_MS : 0) + 1000,
+								),
 						),
 					]),
 				),
@@ -599,6 +914,12 @@ export default async function (pi: ExtensionAPI) {
 				// ignore — best-effort cleanup
 			}
 			s.client = undefined;
+			try {
+				s.authProvider?.close();
+			} catch {
+				// ignore
+			}
+			s.authProvider = undefined;
 		}
 	});
 }
