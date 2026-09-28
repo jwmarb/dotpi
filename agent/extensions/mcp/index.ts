@@ -29,6 +29,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "typebox";
+import type { TSchema } from "typebox";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadDotenv } from "../lib/dotenv.js";
@@ -174,6 +175,8 @@ interface McpServerState {
 	transportKind: "http" | "stdio";
 	toolNames: string[];
 	toolDescriptions: Map<string, string>;
+	/** The tool's inputSchema (plain JSON Schema) as reported by the server. */
+	toolSchemas: Map<string, unknown>;
 	status: "connecting" | "connected" | "failed";
 	error?: string;
 	connectedAt?: number;
@@ -230,6 +233,72 @@ function mapMcpContent(content: unknown[]): McpContentBlock[] {
 	return out;
 }
 
+/**
+ * Resolve a local JSON-pointer ($ref "#/...") against the schema root.
+ * Handles ~0/~1 escapes; returns undefined for external or dangling refs.
+ */
+function deref(ref: string, root: Record<string, unknown>): unknown {
+	if (!ref.startsWith("#/")) return undefined;
+	const parts = ref.slice(2).split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+	let cur: unknown = root;
+	for (const p of parts) {
+		if (cur && typeof cur === "object" && !Array.isArray(cur)) cur = (cur as Record<string, unknown>)[p];
+		else return undefined;
+	}
+	return cur;
+}
+
+/**
+ * Inline local $ref pointers so downstream consumers that do not follow
+ * references see concrete types. pi-ai's JSON-schema argument coercion walks
+ * properties without resolving $ref, so a value nested under a $defs entry
+ * would otherwise stay a string and fail the strict Compile validation;
+ * several LLM providers are also finicky about $ref inside tool schemas.
+ * External refs and cycles (depth cap) are left untouched.
+ */
+function resolveRefs(node: unknown, root: Record<string, unknown>, depth = 0): unknown {
+	if (depth > 16) return node;
+	if (Array.isArray(node)) return node.map((n) => resolveRefs(n, root, depth + 1));
+	if (!node || typeof node !== "object") return node;
+	const s = node as Record<string, unknown>;
+	if (typeof s.$ref === "string") {
+		const target = deref(s.$ref, root);
+		if (target && typeof target === "object") return resolveRefs(target, root, depth + 1);
+		return node;
+	}
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(s)) out[k] = resolveRefs(v, root, depth + 1);
+	return out;
+}
+
+/**
+ * Turn an MCP tool's inputSchema (plain JSON Schema from listTools()) into the
+ * `parameters` schema for registerTool.
+ *
+ * pi passes a plain JSON Schema through untouched: the provider serializes it
+ * into the LLM tool definition, pi-ai validates with typebox Compile, and
+ * coerces stringified arguments back to their declared types before execute()
+ * runs. That is what keeps numbers/booleans/arrays arriving as their real
+ * types instead of strings — with the previous empty-object schema the LLM
+ * saw no parameters at all and guessed, usually stringifying everything.
+ *
+ * Local $ref/$defs are inlined (see resolveRefs); the original schema object
+ * is never mutated. Falls back to an open object schema when the server
+ * reports none.
+ */
+function toParametersSchema(raw: unknown, description: string): TSchema {
+	if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+		const s = raw as Record<string, unknown>;
+		let schema = s;
+		if (s.$defs || s.definitions) {
+			schema = resolveRefs(s, s) as Record<string, unknown>;
+		}
+		// A tool's arguments are an object; some servers omit `type`.
+		if (schema.type === undefined) schema = { ...schema, type: "object" };
+		return schema as TSchema;
+	}
+	return Type.Object({}, { additionalProperties: true, description });
+}
 // --- Extension entry point ---------------------------------------------------
 
 export default async function (pi: ExtensionAPI) {
@@ -289,7 +358,7 @@ export default async function (pi: ExtensionAPI) {
 				label: `${state.name}:${mcpTool}`,
 				description: desc || `MCP tool ${mcpTool} from server ${state.name}`,
 				promptSnippet: desc ? desc.slice(0, 120) : `MCP tool ${mcpTool} (server ${state.name})`,
-				parameters: Type.Object({}, { additionalProperties: true, description: desc || "MCP tool input" }),
+				parameters: toParametersSchema(state.toolSchemas.get(mcpTool), desc || "MCP tool input"),
 				async execute(_toolCallId, params, signal) {
 					const stateNow = servers.get(state.name);
 					if (!stateNow || stateNow.status !== "connected" || !stateNow.client) {
@@ -344,6 +413,7 @@ export default async function (pi: ExtensionAPI) {
 				state.client = client;
 				state.toolNames = tools.tools.map((t: { name: string }) => t.name);
 				state.toolDescriptions = new Map(tools.tools.map((t: { name: string; description?: string }) => [t.name, t.description ?? ""]));
+				state.toolSchemas = new Map(tools.tools.map((t: { name: string; inputSchema?: unknown }) => [t.name, t.inputSchema]));
 				state.status = "connected";
 				state.connectedAt = Date.now();
 				registerServerTools(state);
@@ -360,6 +430,7 @@ export default async function (pi: ExtensionAPI) {
 				state.client = client;
 				state.toolNames = tools.tools.map((t: { name: string }) => t.name);
 				state.toolDescriptions = new Map(tools.tools.map((t: { name: string; description?: string }) => [t.name, t.description ?? ""]));
+				state.toolSchemas = new Map(tools.tools.map((t: { name: string; inputSchema?: unknown }) => [t.name, t.inputSchema]));
 				state.status = "connected";
 				state.connectedAt = Date.now();
 				registerServerTools(state);
@@ -417,6 +488,7 @@ export default async function (pi: ExtensionAPI) {
 				transportKind: cfg.url ? "http" : "stdio",
 				toolNames: [],
 				toolDescriptions: new Map(),
+				toolSchemas: new Map(),
 				status: "connecting",
 			});
 		}
