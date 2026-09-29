@@ -40,6 +40,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools; event-driven — no blocking wait, the child wakes the parent) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
 | Track multi-step work in a visible checklist | `agent/extensions/todo.ts` (`todo` tool, `/todos`; widget below the editor, state lives in tool-result `details` — no plan file) |
+| Record/read trading-journal observations | `agent/extensions/trade-journal/` (`trade_journal` tool; modes record/read/stats/dupes. Gated on the `technical-analysis` skill being active; grammar in `lib/trade-journal-store.ts`) |
 | Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget measuring/fitting, repo layout, agent parsing) |
 | Where a repo file lives (agent dir, agents/, skills/, .env, mcp.json) | `agent/extensions/lib/layout.ts` (single resolver — never throws, so top-level extension code can import it) |
@@ -49,8 +50,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ## CONVENTIONS
 
-- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions}.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
-- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync.
+- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
+- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened once here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both.
 - **Commits follow Conventional Commits** per `agent/prompts/git-commit.md`.
@@ -58,7 +59,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo tests (81)
+bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-activation/journal-store (163)
+bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic (30)
 bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (76)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
 bun test agent/extensions/lib/widget.test.ts            # one file
@@ -78,7 +80,7 @@ cd agent/extensions/mcp           && ./node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions/subagent-herdr && ../mcp/node_modules/.bin/tsc -p tsconfig.json
 ```
 
-`bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists. Beware the skew: `~/node_modules/@earendil-works/*` is 0.75.4 while the running pi is 0.85.1, so a test that passes here can still disagree with the live host. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
+`bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists. Beware the skew: `~/node_modules/@earendil-works/*` is 0.75.4 while the running pi is 0.87.1, so a test that passes here can still disagree with the live host. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
 
 ## NOTES
 

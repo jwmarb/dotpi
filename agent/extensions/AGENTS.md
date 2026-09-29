@@ -19,14 +19,55 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
 | `todo.ts` | `todo` tool + `/todos` — in-session checklist as a `belowEditor` widget. State replays from tool-result `details` on the current branch, so no file and no lock |
 | `auto-update/` | `/update` + `pi_update` tool — version check on `session_start`, at most every 4h |
 | `mcp/` | `/mcp status\|list\|refresh`; registers each MCP tool as `mcp__<server>__<tool>`. Docs: its `README.md` |
+| `trade-journal/` | `trade_journal` tool — trading journal in `~/.agentic-trading/journal/` (`AGENTIC_TRADING_JOURNAL` overrides). Modes `record`/`read`/`stats`/`dupes`. `index.ts` is wiring; `lib.ts` holds the tested mode logic; the markdown grammar is `lib/trade-journal-store.ts`. Mechanics only — judgment belongs to the `technical-analysis` skill's journal agents. Gated on that skill being active |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
 | `lib/layout.ts` | Where repo files live. **Never throws** — falls back to `~/.pi/agent` |
 | `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot |
-| `lib/agents.ts` | The single `agents/*.md` frontmatter parser (`discoverAgents`, `parseAgentFile`) |
+| `lib/agents.ts` | The single agent-definition frontmatter parser (`discoverAgents`, `discoverSkillAgents`, `mergeAgents`, `parseAgentFile`) — reads both `agents/*.md` and `skills/<skill>/agents/*.md`. Also owns the frontmatter *list* grammar (`extractStringList`, `frontmatterOf`), which `skill-activation.ts` imports rather than re-implementing |
+| `lib/skill-activation.ts` | Which skills are live this session (`SkillActivation`, `skillsInPrompt`, `isSkillLoad`, `gateTools`, `parseOwnedTools`, `skillDirFromPath`, `loadSkillToolOwners`, `clearSkillToolOwnersCache`) — the inference behind skill-gated tools and agents |
+| `lib/trade-journal-store.ts` | The single trading-journal markdown grammar (`parseDay`, `renderDay`, `parseDayDocument`, `renderDayDocument`, `recordObservations`, `mergeObservations`, `findDuplicates`, `summarize`) — same format the journal agents hand-edit |
 | `lib/widget.ts` | `fitLines`, `fittedWidget`, `row`, `frame`, `cachedByWidth` — the measuring seam |
 
 ## CONVENTIONS
 
+- **A skill can own tools and subagents, gated on being loaded.** A skill declares
+  `tools: <name>` in its `SKILL.md` frontmatter and ships agents in
+  `skills/<skill>/agents/*.md`; `dynamic-prompt.ts` withholds both until that skill is
+  active. Ownership is opt-in and one-directional — an unclaimed tool is always offered, so
+  adding the key to one skill cannot hide another's tool. A gated tool also withholds its
+  `promptGuidelines`: pi folds a tool's guidelines into the prompt only while the tool is in
+  the active set, so gating the tool and gating its advice are the same act.
+- **Skill activation is inferred, not reported, and the inference is load-bearing.** Probed
+  against pi 0.87.1: there is **no `skill_invoke` event**, and
+  `systemPromptOptions.skills` is the **catalogue** (all 40 discovered skills, every turn),
+  *not* the loaded set — reading it as "loaded" is a bug that silently ungates everything.
+  The two real signals are a `/skill:x` invocation, which pi expands into
+  `before_agent_start`'s `event.prompt` as `<skill name=… location=…>`, and a model-invoked
+  skill, which appears only as a `read_skill`/`read` tool call on a `SKILL.md`.
+  `lib/skill-activation.ts` owns both.
+- **`selectedTools` in `before_agent_start` is the gate for the current run; `pi.setActiveTools`
+  is the only way to change the next one.** `selectedTools` is mutable and is what the model is
+  offered. `registerTool` has no counterpart (there is no `unregisterTool`), and
+  `setActiveTools`/`getActiveTools` are **absent from that event's `ctx`** — verified, not
+  assumed. They do exist on the **`pi` API object** (`agent-session.js` wires them), and that
+  distinction is load-bearing: a model-invoked skill is only observable as a `tool_call`, which
+  fires *after* this run's gate already ran, and pi snapshots the tool set once per run
+  (`createContextSnapshot`, and it sets no `prepareNextTurn`). So without a `pi.setActiveTools`
+  refresh the model reads a `SKILL.md` telling it to call a tool that stays invisible for the
+  rest of the run. `dynamic-prompt.ts` does that refresh, additively — it only ever *adds*
+  ungated tools, so it cannot withdraw one another extension is relying on.
+- **Activation is sticky for the session.** A loaded skill's guidance stays in context, so
+  its tools must not vanish on the next turn. Only a genuinely new conversation resets the
+  set: `session_start` also fires with reason `reload` and `fork`, which keep the same
+  transcript, so the handler resets on `new`/`resume` only. A tool disappearing mid-task is
+  worse than one lingering.
+- **The two agent consumers gate differently on purpose.** `dynamic-prompt.ts` advertises a
+  skill's agents only while the skill is active. The spawn path in
+  `subagent-herdr/index.ts` deliberately does **not** gate: it runs with no session context,
+  so a skill loaded mid-session would otherwise be invisible and fail a delegation the model
+  was just told to make. A global `agents/*.md` name always wins a collision, so a skill
+  cannot silently redirect `worker`. Skill identity is the **directory** name (`skill.baseDir`,
+  or `basename(dirname(filePath))`) — the frontmatter `name` may differ.
 - **A subdirectory is invisible to pi unless it has `index.ts`.** That is what makes
   `lib/` safe for `*.test.ts` and `mcp/` loadable. Adding a bare `foo.ts` at this
   level ships it into every session whether you meant to or not.
@@ -54,9 +95,14 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
   having no file: state is replayed from tool-result `details` on the current
   branch, so there is exactly one writer and a rewind cannot leave a stale list
   describing work the agent no longer remembers doing.
-- **Keep pure logic out of `index.ts`.** Both subdirectory extensions split
+- **Keep pure logic out of `index.ts`.** Every subdirectory extension splits
   `lib.ts` (pure, tested) from `index.ts` (session wiring). New complexity at this
   level should follow that split rather than growing a 1000-line top-level file.
+  `trade-journal/` is the worked example of *why*: its mode logic (date-window
+  filtering, a newest-first window, four output shapes) wanted tests, and a
+  `*.test.ts` cannot sit beside a top-level extension — pi auto-loads it and the
+  `bun:test` import takes startup down. Logic that deserves a test is the signal to
+  become a directory, not a bigger file.
 
 ## COMMANDS
 
