@@ -1,6 +1,7 @@
 /**
- * Agent definition discovery — the single owner of the `agent/agents/*.md`
- * frontmatter grammar.
+ * Agent definition discovery — the single owner of the agent-definition
+ * frontmatter grammar, for both `agent/agents/*.md` (global) and
+ * `agent/skills/<skill>/agents/*.md` (skill-shipped).
  *
  * Two extensions used to parse these files — dynamic-prompt (the
  * orchestrator prompt's agent inventory) and subagent-herdr (the spawn
@@ -47,6 +48,14 @@ export interface AgentInfo {
   promptBody: string;
   /** The filename of the agent definition (e.g. `worker.md`). */
   filePath: string;
+  /**
+   * The skill that ships this agent (its directory name), or undefined for a
+   * global agent from `agent/agents/`. Set by {@link discoverSkillAgents}.
+   *
+   * Provenance, not decoration: a skill agent is only advertised while its skill
+   * is loaded, and an unknown-agent error can say which skill to load.
+   */
+  skill?: string;
 }
 
 /**
@@ -75,6 +84,69 @@ export async function discoverAgents(agentsDir: string): Promise<AgentInfo[]> {
     if (parsed) agents.push(parsed);
   }
   return agents.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Scans every `<skillsDir>/<skill>/agents/` for agent definitions.
+ *
+ * Skills may ship their own subagents beside the skill that drives them — a
+ * journal-writing agent belongs with the journal skill, not in the global roster
+ * where it is noise to every unrelated session. Each discovered agent carries
+ * {@link AgentInfo.skill} so callers can gate on, or report, its origin.
+ *
+ * `agents/` has long held an optional `openai.yaml` presentation file; only
+ * `.md` files with parseable frontmatter become agents, so existing skills are
+ * unaffected.
+ *
+ * @param skillsDir - Absolute path to the skills library (one dir per skill).
+ * @param only - When given, restrict discovery to these skill directory names
+ *               (the loaded set). Omit to scan every skill.
+ * @returns A sorted (by name) list of agents, or `[]` on any failure.
+ */
+export async function discoverSkillAgents(
+  skillsDir: string,
+  only?: Iterable<string>,
+): Promise<AgentInfo[]> {
+  let skills: string[];
+  try {
+    skills = await readdir(skillsDir);
+  } catch {
+    return [];
+  }
+  if (only) {
+    const allowed = new Set(only);
+    skills = skills.filter((s) => allowed.has(s));
+  }
+  const agents: AgentInfo[] = [];
+  for (const skill of skills) {
+    // One skill's unreadable agents/ dir costs only that skill: discoverAgents
+    // already returns [] rather than throwing.
+    for (const agent of await discoverAgents(join(skillsDir, skill, "agents"))) {
+      agents.push({ ...agent, skill });
+    }
+  }
+  return agents.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Merges global and skill-shipped agents into one roster.
+ *
+ * A global agent wins a name collision: the roster in `agent/agents/` is the
+ * stable contract every session depends on, and a skill must not be able to
+ * silently redirect `worker` or `reviewer` by shipping a file with that name.
+ * The shadowed skill agent is dropped, not renamed, so the collision shows up
+ * as "my agent isn't there" rather than as a subtly different `worker`.
+ *
+ * @param global - Agents from `agent/agents/`.
+ * @param skillAgents - Agents from every `<skill>/agents/`, across skills (not one
+ *                      skill's — {@link discoverSkillAgents} returns them merged).
+ * @returns One sorted roster, global definitions taking precedence.
+ */
+export function mergeAgents(global: AgentInfo[], skillAgents: AgentInfo[]): AgentInfo[] {
+  const taken = new Set(global.map((a) => a.name));
+  return [...global, ...skillAgents.filter((a) => !taken.has(a.name))].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
 }
 
 /**
@@ -115,10 +187,20 @@ function extractString(yaml: string, key: string): string {
 /**
  * List frontmatter value supporting both the inline (`tools: a, b`) and
  * block (`tools:\n  - a`) spellings used in the agent files.
+ *
+ * Exported because the same two spellings appear in `SKILL.md` frontmatter, and
+ * this module is the one owner of the grammar (see the module docstring — the
+ * drift that rule exists to prevent has already happened once here). A second
+ * copy in `skill-activation.ts` had *already* diverged on whether to `.trim()`
+ * before the `-` test, so a skill writing `tools:  - a` was read differently by
+ * the two readers.
+ *
+ * @param yaml - The frontmatter body (between the `---` fences).
+ * @param key - The frontmatter key to read.
  */
-function extractStringList(yaml: string, key: string): string[] {
+export function extractStringList(yaml: string, key: string): string[] {
   const inline = yaml.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  if (inline && !inline[1].startsWith("-")) {
+  if (inline && !inline[1].trim().startsWith("-")) {
     return inline[1].split(",").map((s) => s.trim()).filter(Boolean);
   }
   const block = yaml.match(new RegExp(`^${key}:\\n((?:\\s+- .+\\n?)+)`, "m"));
@@ -126,4 +208,15 @@ function extractStringList(yaml: string, key: string): string[] {
     return block[1].split("\n").map((l) => l.replace(/^\s+-\s*/, "").trim()).filter(Boolean);
   }
   return [];
+}
+
+/**
+ * The frontmatter block of a markdown file (between the leading `---` fences),
+ * or undefined when there is none.
+ *
+ * Shared with `skill-activation.ts` so "what counts as frontmatter" has one
+ * answer for agent files and `SKILL.md` alike.
+ */
+export function frontmatterOf(content: string): string | undefined {
+  return content.match(/^---\n([\s\S]*?)\n---/)?.[1];
 }

@@ -9,8 +9,18 @@
  * @module dynamic-prompt
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { discoverAgents, type AgentInfo } from './lib/agents.js';
-import { agentsDir } from './lib/layout.js';
+import {
+  discoverAgents,
+  discoverSkillAgents,
+  mergeAgents,
+  type AgentInfo,
+} from './lib/agents.js';
+import { agentsDir, skillsDir } from './lib/layout.js';
+import {
+  SkillActivation,
+  gateTools,
+  loadSkillToolOwners,
+} from './lib/skill-activation.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,11 +51,85 @@ const PLAN_TOOL = 'plan';
  * @param pi - The pi extension API.
  */
 export default function (pi: ExtensionAPI) {
+  // Which skills are live in this session. Sticky, and rebuilt per session —
+  // `systemPromptOptions.skills` cannot answer this: it is the catalogue of every
+  // discovered skill (40 here) on every turn, not the loaded set.
+  const activation = new SkillActivation();
+
+  // Only a genuinely new conversation resets the set. `reload` and `fork` keep the
+  // same transcript — a loaded skill's guidance is still in context, so dropping
+  // activation there would re-gate a tool mid-task, which is the one failure this
+  // is supposed to prevent. `startup` needs no reset (the set is already empty).
+  pi.on('session_start', async (event) => {
+    if (event.reason === 'new' || event.reason === 'resume') activation.reset();
+  });
+
+  // A model-invoked skill arrives as a read_skill/read of a SKILL.md, never in
+  // the prompt, so both signals have to be watched.
+  //
+  // This lands *after* this run's gate has already run, and pi snapshots the tool
+  // set once per run (`createContextSnapshot`; it sets no `prepareNextTurn`), so
+  // the newly-owned tool cannot appear until the next run. `pi.setActiveTools`
+  // rebuilds the tool set for the next one — without it the model reads a SKILL.md
+  // telling it to call a tool that stays invisible for the whole rest of the run.
+  pi.on('tool_call', async (event) => {
+    const activated = activation.noteToolCall(event.toolName, event.input);
+    if (activated.length > 0) await refreshActiveTools();
+    return undefined;
+  });
+
+  /**
+   * Re-offers any tool whose owning skill just became active.
+   *
+   * Additive only: it unions the currently-active tools with the ungated ones, so
+   * it can never withdraw a tool another extension is relying on. Guarded because
+   * `getActiveTools`/`setActiveTools` live on the `pi` API object, not on an
+   * event's `ctx` — older hosts may not have them, and a missing one must not
+   * throw inside an event handler.
+   */
+  async function refreshActiveTools(): Promise<void> {
+    if (typeof pi.getActiveTools !== 'function' || typeof pi.setActiveTools !== 'function') return;
+    try {
+      const owners = await loadSkillToolOwners(skillsDir());
+      if (owners.size === 0) return;
+      const active = new Set(pi.getActiveTools());
+      let changed = false;
+      for (const [tool, skill] of owners) {
+        if (!active.has(tool) && activation.has(skill)) {
+          active.add(tool);
+          changed = true;
+        }
+      }
+      if (changed) pi.setActiveTools([...active]);
+    } catch {
+      // A gating refresh is a convenience, never worth failing a tool call over.
+    }
+  }
+
   pi.on('before_agent_start', async (event, ctx) => {
     const opts = event.systemPromptOptions;
 
-    // --- Discover agents from ~/.pi/agent/agents/ ---
-    const agentInventory = await discoverAgents(agentsDir());
+    // A `/skill:name` invocation is expanded into this turn's prompt as
+    // `<skill name=… location=…>`, which is the only place it is observable.
+    activation.notePrompt(event.prompt ?? '');
+
+    // --- Gate skill-owned tools on their skill being active ---
+    // selectedTools is mutable here and is what the model is offered for this run.
+    // There is no unregisterTool, and setActiveTools is absent from this event's
+    // `ctx` (it lives on the `pi` object — see refreshActiveTools above).
+    const owners = await loadSkillToolOwners(skillsDir());
+    if (owners.size > 0 && Array.isArray(opts.selectedTools)) {
+      const { kept } = gateTools(opts.selectedTools, owners, (d) => activation.has(d));
+      opts.selectedTools = kept;
+    }
+
+    // --- Discover agents: global roster + agents shipped by ACTIVE skills ---
+    // A skill's agents become delegable once its skill is loaded, so an
+    // unrelated session is never advertised journal or research agents.
+    const agentInventory = mergeAgents(
+      await discoverAgents(agentsDir()),
+      await discoverSkillAgents(skillsDir(), activation.list()),
+    );
 
     // --- Build tool inventory ---
     // Only include tools that have a snippet available; fallback to empty description
@@ -168,9 +252,9 @@ Specialized subagents you can delegate tasks to via the \`subagent\` tool.
 Delegation runs in the background and returns a task id, not a result: you end
 your turn and the subagent wakes you when it has something to say.
 
-| Agent | Description | Model | Tools |
-|-------|-------------|-------|-------|
-${opts.agentInventory.map((a) => `| ${a.name} | ${a.description} | ${a.model ?? 'default'} | ${(a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all'} |`).join('\n')}
+| Agent | Description | Model | Tools | From |
+|-------|-------------|-------|-------|------|
+${opts.agentInventory.map((a) => `| ${a.name} | ${a.description} | ${a.model ?? 'default'} | ${(a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all'} | ${a.skill ? `skill: ${a.skill}` : 'global'} |`).join('\n')}
 
 **Agent usage notes:**
 - Each agent has a focused role — pick the right one for the task
@@ -210,22 +294,27 @@ The loop works like this:
       : '';
 
   // --- Skill inventory section ---
+  // The path is rendered, not just the name: a model-invoked skill is a
+  // `read_skill` of a SKILL.md, so without the path the only way in is the human
+  // typing `/skill:name`, and the model cannot load one on its own initiative.
   const skillSection =
     opts.skillInventory.length > 0
       ? `
 ## Available Skills
 
-Skills are specialized knowledge modules. Invoke them via \`/skill:name\`
-when their expertise matches the current task.
+Skills are specialized knowledge modules. Invoke one with \`/skill:name\`, or load
+it yourself by reading its path with \`read_skill\` when its expertise matches the
+task.
 
-| Skill | Description |
-|-------|-------------|
-${opts.skillInventory.map((s) => `| ${s.name} | ${s.description} |`).join('\n')}
+| Skill | Description | Path |
+|-------|-------------|------|
+${opts.skillInventory.map((s) => `| ${s.name} | ${s.description} | \`${s.filePath}\` |`).join('\n')}
 
 **Orchestration rules:**
-- Read the full skill content (via \`/skill:name\`) before delegating
+- Read the full skill content before acting on it — the table is only a summary
 - Skills are advisory — you decide when they apply
 - If a skill's guidance conflicts with the task, use your judgment
+- A skill may own tools that appear only once it is loaded
 `
       : '';
 

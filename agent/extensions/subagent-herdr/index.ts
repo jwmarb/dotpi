@@ -95,8 +95,13 @@ import {
   readReports,
   type RunResult,
 } from "./lib.js";
-import { type AgentInfo, discoverAgents } from "../lib/agents.js";
-import { agentDir, agentsDir } from "../lib/layout.js";
+import {
+  type AgentInfo,
+  discoverAgents,
+  discoverSkillAgents,
+  mergeAgents,
+} from "../lib/agents.js";
+import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
 import {
   exitPath,
   type FailedAttempt,
@@ -370,10 +375,20 @@ export async function launchAttempt(
  * decision for the caller, not a reflex here.
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
-  const agents = await discoverAgents(agentsDir());
+  // Resolve against the global roster PLUS every skill's agents. Unlike the
+  // prompt inventory this does not gate on the loaded set: spawning happens with
+  // no session context, and a skill loaded mid-session would otherwise be
+  // invisible here and fail a delegation the agent was just told to make.
+  const agents = mergeAgents(
+    await discoverAgents(agentsDir()),
+    await discoverSkillAgents(skillsDir()),
+  );
   const agent = agents.find((a) => a.name === params.agent);
   if (!agent) {
-    const available = agents.map((a) => a.name).join(", ") || "none";
+    const available =
+      agents
+        .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
+        .join(", ") || "none";
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
   }
 
