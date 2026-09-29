@@ -41,7 +41,39 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - [Node.js](https://nodejs.org) with npm — for the one extension with real npm dependencies (`agent/extensions/mcp/`)
 - [Docker](https://docs.docker.com) — optional; only the ralph-loop `--verify` runtime gate needs it
 
-### Steps
+### Quick install 🚀
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jwmarb/dotpi/master/install.sh | bash
+```
+
+Or read it before you run it, which is the better habit with any piped installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jwmarb/dotpi/master/install.sh -o install.sh
+less install.sh && bash install.sh
+```
+
+It installs pi if missing, clones to `~/.pi`, arms the git hooks, installs the one
+extension with npm dependencies, and copies `agent/.env.example` to `agent/.env` for
+you to fill in. It never writes credentials.
+
+An existing `~/.pi` is never clobbered: an existing dotpi clone is updated in place
+(and left alone if the tree is dirty), and anything else stops the install until you
+consent to a timestamped backup. Since `curl | bash` gives the script no terminal to
+prompt through, that case exits rather than guessing — pass `--yes` to accept the
+backup up front, or download and run it directly.
+
+| Flag | Effect |
+| --- | --- |
+| `--dir <path>` | Clone there and symlink `~/.pi` at it |
+| `--ref <ref>` | Branch or tag to check out (default `master`) |
+| `--yes` | Accept the backup prompt without a terminal |
+| `--no-pi` | Do not install pi even if it is missing |
+
+Flags go after `--` when piping: `... | bash -s -- --dir ~/src/dotpi`
+
+### Manual steps
 
 1. Clone the repository into `~/.pi` — the directory pi resolves its agent tree from:
 
