@@ -18,7 +18,7 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
 | `todo.ts` | `todo` tool + `/todos` — in-session checklist as a `belowEditor` widget. State replays from tool-result `details` on the current branch, so no file and no lock |
 | `auto-update/` | `/update` + `pi_update` tool — version check on `session_start`, at most every 4h |
-| `mcp/` | `/mcp status\|list\|refresh`; registers each MCP tool as `mcp__<server>__<tool>`. Docs: its `README.md` |
+| `mcp-gateway.ts` | No tool, no command. Registers the `litellm-gateway` MCP server with **pi's built-in MCP extension** via `pi.registerMcpServer()`. Exists only because the builtin validates `mcp.json` `url` with `URL.canParse()` *before* expansion, so the `${LITELLM_MCP_URL}` placeholder cannot live there. Servers, transport, OAuth, tool naming and `/mcp` are all the builtin's (`+builtin:mcp` in `settings.json`) |
 | `trade-journal/` | `trade_journal` tool — trading journal in `~/.agentic-trading/journal/` (`AGENTIC_TRADING_JOURNAL` overrides). Modes `record`/`read`/`stats`/`dupes`. `index.ts` is wiring; `lib.ts` holds the tested mode logic; the markdown grammar is `lib/trade-journal-store.ts`. Mechanics only — judgment belongs to the `technical-analysis` skill's journal agents. Gated on that skill being active |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
 | `lib/layout.ts` | Where repo files live. **Never throws** — falls back to `~/.pi/agent` |
@@ -107,12 +107,16 @@ helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
 ## COMMANDS
 
 ```sh
-cd mcp && npm install     # the one dir with real npm dependencies
+cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc)
 ```
 
-The two `tsc -p` scopes are in the root COMMANDS section. What matters here is what
-they do **not** cover: `lib/` and every top-level `*.ts` are in no typecheck scope at
-all — nothing type-checks `dynamic-prompt.ts` or `litellm.ts` but pi loading them.
+The one `tsc -p` scope is in the root COMMANDS section. What matters here is what it
+does **not** cover: `lib/` and every top-level `*.ts` are in no typecheck scope at
+all — nothing type-checks `dynamic-prompt.ts`, `litellm.ts` or `mcp-gateway.ts` but pi
+loading them. Beware the skew when you check one by hand: the `@earendil-works/*` in
+`~/node_modules` is 0.75.4, which predates `pi.registerMcpServer()`, so typechecking
+`mcp-gateway.ts` against *that* tree reports a phantom "does not exist on type
+`ExtensionAPI`". Point `types`/aliases at the running pi's bundled `dist/` instead.
 
 ## ANTI-PATTERNS
 

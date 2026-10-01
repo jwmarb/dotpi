@@ -3,9 +3,10 @@
 # Install the npm dependencies of every extension that declares them.
 #
 # node_modules/ is git-ignored, so a fresh clone has extension sources
-# without their dependencies: the mcp extension then fails to load with
-# "Cannot find module '@modelcontextprotocol/sdk/...'". This script is the
-# one step that turns a clone into a working config.
+# without their dependencies. Since MCP moved to pi's built-in extension,
+# what is left is dev-only (typescript + @types/node for the typecheck
+# scope) -- every extension LOADS without this script. It is still run
+# automatically so `tsc -p` works in a fresh clone.
 #
 # Called three ways, all best-effort and quiet on success:
 #   - .githooks/post-checkout and .githooks/post-merge, with --force —

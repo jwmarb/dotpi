@@ -9,13 +9,13 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## STRUCTURE
 
 - `agent/` — everything pi loads at runtime (extensions, agents, skills, prompts, themes, settings, machine state). Authoring grammars: `agent/AGENTS.md`
-- `agent/extensions/` — local pi extensions; **every top-level `*.ts` is auto-loaded by pi at startup** (subdirs are entered only via `index.ts`, e.g. `mcp/`). Per-file inventory: `agent/extensions/AGENTS.md`
+- `agent/extensions/` — local pi extensions; **every top-level `*.ts` is auto-loaded by pi at startup** (subdirs are entered only via `index.ts`, e.g. `subagent-herdr/`). Per-file inventory: `agent/extensions/AGENTS.md`
 - `agent/agents/` — subagent definitions (Markdown + YAML frontmatter)
 - `agent/skills/` — skills library, one dir per skill (`SKILL.md` + reference docs; mostly the matt-pocock set). Some skills are personal and gitignored, so this directory holds more locally than the repo publishes.
 - `agent/prompts/` — prompt templates (`git-commit.md`: Conventional Commits)
 - `agent/themes/` — TUI theme (`tokyo-night.json`)
 - `agent/settings.json` — pi config: default provider/model/thinking level, retry policy, installed packages (`git:`/`npm:` refs)
-- `agent/mcp.json` — MCP servers (litellm-gateway); URL and key sent as `${LITELLM_MCP_URL}` / `${LITELLM_MCP_KEY}` placeholders
+- `agent/mcp.json` — MCP servers for **pi's built-in MCP extension** (`+builtin:mcp`). Holds `robinhood` only; the litellm gateway is registered from `agent/extensions/mcp-gateway.ts` because the builtin rejects a `${VAR}` placeholder in `url`. Keys still use the `${LITELLM_MCP_KEY}` placeholder — the builtin expands `${VAR}` and `!cmd` in `headers`/`env`, but **never in `url`**
 - `agent/.env` — the ONLY file with live credentials (gitignored; `agent/.env.example` is the committed template)
 - `agent/docker/verify-base.Dockerfile` — tracked reference image for runtime verification
 - `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/`, `agent/subagent-runs/`, `agent/verify-images/` — machine state, all gitignored
@@ -26,13 +26,13 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 | Task | Path |
 |---|---|
-| Add a local extension | `agent/extensions/<name>.ts` (or a subdir with `index.ts`, like `mcp/`) |
+| Add a local extension | `agent/extensions/<name>.ts` (or a subdir with `index.ts`, like `subagent-herdr/`) |
 | What each extension owns | `agent/extensions/AGENTS.md` |
 | Add/modify a subagent | `agent/agents/<name>.md` (grammar: `agent/AGENTS.md`) |
 | Add a skill | `agent/skills/<name>/SKILL.md` (frontmatter keys: `agent/AGENTS.md`) |
 | Change default model / provider / thinking / retry | `agent/settings.json` |
 | Provider key, model catalog, pricing, thinking-level mapping | `agent/extensions/litellm.ts` + `agent/.env` |
-| Add/repair an MCP server | `agent/mcp.json` (docs: `agent/extensions/mcp/README.md`; runtime: `/mcp status` · `list` · `refresh`) |
+| Add/repair an MCP server | `agent/mcp.json` (schema: pi's built-in MCP extension; runtime: `/mcp`). A server needing a secret *URL* goes in `agent/extensions/mcp-gateway.ts` instead |
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
 | List/resume previous sessions | `agent/extensions/sessions.ts` (`/sessions` modal) |
@@ -53,7 +53,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
 - **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened once here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
-- **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both.
+- **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both. The gateway *URL* counts as sensitive too, which is the whole reason `mcp-gateway.ts` exists rather than an inlined `url` in `mcp.json`.
 - **Commits follow Conventional Commits** per `agent/prompts/git-commit.md`.
 
 ## COMMANDS
@@ -67,24 +67,23 @@ bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
 
 pi /update                                     # check for + install a pi update (checks at most every 4h)
-pi /mcp status | list [server] | refresh [server]  # MCP server health and tool registration
+pi /mcp                                        # builtin MCP manager: sign in, reconnect, enable/disable, change exposure
 pi /reload                                     # hot-reload extensions after editing them
 git config core.hooksPath .githooks            # normally done for you at pi startup by agent/extensions/git-hooks.ts
 bash scripts/setup-deps.sh                     # repair a missing extension node_modules
 ```
 
-Typecheck (`noEmit`) has two scopes; there is no root `tsconfig.json`:
+Typecheck (`noEmit`) has one scope; there is no root `tsconfig.json`:
 
 ```sh
-cd agent/extensions/mcp           && ./node_modules/.bin/tsc -p tsconfig.json
-cd agent/extensions/subagent-herdr && ../mcp/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 ```
 
 `bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists. Beware the skew: `~/node_modules/@earendil-works/*` is 0.75.4 while the running pi is 0.87.1, so a test that passes here can still disagree with the live host. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
 
 ## NOTES
 
-- **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime); only `agent/extensions/mcp/` has real npm dependencies.
+- **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime); only `agent/extensions/subagent-herdr/` has npm dependencies, and they are dev-only (`typescript`, `@types/node`) — nothing in the repo needs npm *at runtime* any more, now that the MCP SDK dependency is gone with the old `extensions/mcp/`.
 - **`thinking-indicator.ts` is half-inert right now.** It requires `"hideThinkingBlock": true` in `agent/settings.json` to relabel pi's collapsed thinking block ("Thought for 12s"); the setting is currently `false` (commit `0e30dff` deliberately shows thinking in the transcript). The live spinner still works; the transcript record silently does nothing. Flip the setting if you want both.
 - **The pre-commit hook is dormant.** `.githooks/pre-commit` invokes `scripts/check.sh`, which was removed in `7a54a3b` (along with the old herdr/plan/subagent extensions); the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time — `/reload` after editing is the only guard.
 - **`PATCHES.md`, `CONTEXT.md` and `docs/adr/` no longer exist** (removed in `1993878` and `a784c57`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical dead references.

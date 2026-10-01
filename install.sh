@@ -107,8 +107,8 @@ fi
 ok "bun $(bun --version 2>/dev/null)"
 
 if ! command -v npm >/dev/null 2>&1; then
-	warn "npm not found. agent/extensions/mcp/ needs it and will fail to load;"
-	warn "everything else works. Install Node.js, then: bash scripts/setup-deps.sh"
+	warn "npm not found. Only the dev-only typecheck deps need it (tsc);"
+	warn "pi itself runs fine without them. Install Node.js, then: bash scripts/setup-deps.sh"
 else
 	ok "npm $(npm --version 2>/dev/null)"
 fi
@@ -238,7 +238,8 @@ fi
 # 5. Extension dependencies
 #
 # node_modules/ is gitignored, so a fresh clone has extension sources without
-# their dependencies and agent/extensions/mcp/ fails to load.
+# their dependencies. These are dev-only now (typescript for the typecheck
+# scope): every extension loads without them.
 # ---------------------------------------------------------------------------
 step "Installing extension dependencies"
 if [ -x scripts/setup-deps.sh ] || [ -f scripts/setup-deps.sh ]; then
@@ -290,12 +291,12 @@ fi
 
 printf 'Then start it:\n\n    pi\n\n'
 printf '%sVerify it works:%s\n' "$B" "$R"
-printf '    pi /mcp status     %s# is the gateway reachable with your keys?%s\n' "$DIM" "$R"
+printf '    pi /mcp            %s# are the MCP servers reachable with your keys?%s\n' "$DIM" "$R"
 printf '    pi /sessions       %s# extensions loaded (this one is an extension)%s\n\n' "$DIM" "$R"
 # Deliberately not suggesting `bun test` here. The suites resolve the packages pi
 # injects (@earendil-works/pi-tui, typebox) by walking UP to a node_modules above
 # the checkout — which exists on the author's machine but is NOT created by
 # installing pi. Telling a new user to run them would hand them a confusing
 # "Cannot find module" on a correct install. See the repo AGENTS.md COMMANDS note.
-printf '%sIf pi starts and /mcp status is green, the install is good.%s\n' "$DIM" "$R"
+printf '%sIf pi starts and /mcp shows its servers connected, the install is good.%s\n' "$DIM" "$R"
 printf '%sExtension load errors surface at startup, not later.%s\n\n' "$DIM" "$R"

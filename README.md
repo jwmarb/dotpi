@@ -27,7 +27,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - 🃏 **A skills library with progressive disclosure:** 38 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you.
 - 🔁 **Completion loops with verification gates:** `/ralph-loop <goal>` re-prompts the agent until it signs off with a completion tag, and `--verify` can audit that claim with a read-only oracle pass and a Dockerized runtime pass before accepting it.
 - 🧑‍🤝‍🧑 **Event-driven delegation:** the `subagent` tool spawns each child in its own herdr tab and ends the turn — the child wakes the parent with a notice when it reports, so you can message a running child mid-flight.
-- 🌐 **MCP wired through placeholders:** [agent/mcp.json](agent/mcp.json) registers the LiteLLM MCP gateway with `${VAR}` fields, and `/mcp status|list|refresh` inspects and reconnects servers from the TUI.
+- 🌐 **MCP via pi's built-in extension:** [agent/mcp.json](agent/mcp.json) holds the servers, keys stay `${VAR}` placeholders, and `/mcp` signs in, reconnects, and changes tool exposure from the TUI. The LiteLLM gateway is registered by [agent/extensions/mcp-gateway.ts](agent/extensions/mcp-gateway.ts), because the builtin rejects a placeholder in `url`.
 - 🔐 **One file for secrets:** `agent/.env` is the only place live credentials exist, and it is gitignored; the provider and the MCP config read it through named placeholders.
 - 📦 **Self-repairing dependencies:** [scripts/setup-deps.sh](scripts/setup-deps.sh) runs at pi startup and on every checkout/merge, so a fresh clone loads its extensions without a manual `npm install`.
 
@@ -38,7 +38,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - [bun](https://bun.sh) — the runtime that installs and runs pi
 - [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) — install with `bun install -g @earendil-works/pi-coding-agent`
 - [git](https://git-scm.com)
-- [Node.js](https://nodejs.org) with npm — for the one extension with real npm dependencies (`agent/extensions/mcp/`)
+- [Node.js](https://nodejs.org) with npm — optional; only for the dev-only typecheck dependencies (`agent/extensions/subagent-herdr/`)
 - [Docker](https://docs.docker.com) — optional; only the ralph-loop `--verify` runtime gate needs it
 
 ### Quick install 🚀
@@ -128,7 +128,7 @@ All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example
 | `agent/prompts/`                  | Prompt templates (`git-commit.md`: Conventional Commits)                                |
 | `agent/themes/`                   | TUI theme (`tokyo-night.json`)                                                         |
 | `agent/settings.json`             | pi config: default provider/model/thinking level, retry policy, installed packages      |
-| `agent/mcp.json`                  | MCP servers — placeholders only; keys come from `agent/.env`                            |
+| `agent/mcp.json`                  | MCP servers for the builtin MCP extension — keys as placeholders, from `agent/.env`     |
 | `agent/.env`                      | The only file with live credentials (gitignored; template is `agent/.env.example`)      |
 | `agent/docker/`                   | Tracked reference image for runtime verification                                       |
 | `.githooks/`                      | Tracked `pre-commit`, `post-checkout`, `post-merge` hooks                              |
@@ -149,7 +149,7 @@ All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example
 | `sessions.ts`      | `/sessions` — resumable session list from pi's own session manager                                        |
 | `thinking-indicator.ts` | Live thinking spinner + transcript label for the collapsed thinking block                          |
 | `auto-update/`     | `/update` + `pi_update` tool — version check on session start, at most every 4 hours                       |
-| `mcp/`             | `/mcp status\|list\|refresh` — registers each MCP tool as `mcp__<server>__<tool>`                          |
+| `mcp-gateway.ts`   | Registers the LiteLLM gateway with pi's built-in MCP extension (reads the URL from `agent/.env`)           |
 | `ralph-loop/`      | `/ralph-loop`, `/ulw-loop`, `/loop-stop` — completion loop with `--verify` gates                           |
 | `subagent-herdr/`  | `subagent` / `subagent_tasks` tools — event-driven delegation into herdr tabs                              |
 | `lib/`             | Shared pi-free helpers: the `.env` parser, the layout resolver, the agent parser, widget measuring         |
@@ -177,7 +177,7 @@ Every agent declares `fallback_models`, tried when a child fails to *launch* (un
 
 ```sh
 pi /update                                         # check for + install a pi update
-pi /mcp status | list [server] | refresh [server]  # MCP server health and tool registration
+pi /mcp                                        # builtin MCP manager: sign in, reconnect, change exposure
 pi /reload                                         # hot-reload extensions after editing them
 pi /sessions                                       # list/resume previous sessions
 pi /diff                                           # review changed files (+/− counts)
@@ -197,7 +197,7 @@ flowchart LR
     DP --> TUI
     TUI -->|"tool calls"| EXT["Local extensions"]
     EXT -->|"chat completions"| LLM["litellm provider"]
-    EXT -->|"mcp__* tools"| MCP["mcp/ bridge"]
+    EXT -->|"mcp__* tools"| MCP["builtin:mcp"]
     LLM --> GW["LiteLLM gateway"]
     MCP --> GW
     EXT -->|"subagent tool"| HR["herdr workspace"]
@@ -217,11 +217,10 @@ bun test agent/extensions/subagent-herdr/lib.test.ts # herdr (49)
 bun test agent/extensions/ralph-loop/lib.test.ts     # ralph-loop (135)
 ```
 
-Typecheck has two scopes (there is no root `tsconfig.json`):
+Typecheck has one scope (there is no root `tsconfig.json`):
 
 ```sh
-cd agent/extensions/mcp && ./node_modules/.bin/tsc -p tsconfig.json
-cd agent/extensions/subagent-herdr && ../mcp/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 ```
 
 ## Conventions 📏
