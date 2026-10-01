@@ -21,7 +21,7 @@
   "packages": [
     "git:github.com/samfoy/pi-lsp-extension",
     "npm:@ff-labs/pi-fff",
-    "git:github.com/k0valik/pi-blackhole",
-    "npm:pi-better-edit"
+    "npm:pi-better-edit",
+    "npm:pi-blackhole"
   ]
 }
