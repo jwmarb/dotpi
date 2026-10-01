@@ -58,6 +58,14 @@
  * children finishing together wake the orchestrator once rather than three
  * times.
  *
+ * The briefing is delivered as **steering**, not as a follow-up. An idle
+ * orchestrator is woken either way, but a *busy* one — still chaining tool calls
+ * after delegating — only ever drains the follow-up queue once that chain is
+ * finished, so a finished child stayed invisible for the rest of the turn no
+ * matter how long it ran. Steering is drained every turn, so the result
+ * interrupts the loop at the next safe boundary instead of waiting behind the
+ * work it may well invalidate.
+ *
  * ## State
  *
  * Runs are recorded in `<agentDir>/subagent-runs/<runId>/` (gitignored): the
@@ -787,6 +795,11 @@ export default function (pi: ExtensionAPI) {
    * entire mechanism: the orchestrator ended its turn after delegating, and this
    * is what wakes it back up.
    *
+   * When the orchestrator is *mid-turn* it is delivered as **steering**, which
+   * interrupts its tool-call chain at the next turn boundary. See the comment on
+   * the `sendUserMessage` call for why follow-up delivery made a finished child
+   * structurally unreachable until the turn had already ended.
+   *
    * Wrapped, and for the reason ralph-loop documents: `sendUserMessage` calls
    * `assertActive()` synchronously and throws once the runtime is invalidated
    * (`/reload`, a new session, a session switch). An uncaught throw from a timer
@@ -807,16 +820,43 @@ export default function (pi: ExtensionAPI) {
       briefing = fallbackBriefing(batch);
     }
     try {
-      // deliverAs "followUp": if the orchestrator happens to be mid-turn (a
-      // notice landing while it works on something else), the briefing waits for
-      // that turn to finish instead of cutting into its tool calls.
+      // deliverAs "steer", not "followUp" — and the distinction is the whole
+      // reason a finished child used to be invisible until the orchestrator was
+      // completely done. pi's agent loop drains the two queues from
+      // structurally different places (`agent-loop.js`, measured against
+      // pi-agent-core 0.99.2):
+      //
+      //   inner loop, every turn:  pendingMessages = getSteeringMessages()
+      //   outer loop, after the inner `while` exits:  getFollowUpMessages()
+      //
+      // The inner loop runs `while (hasMoreToolCalls || pendingMessages.length)`.
+      // So a follow-up is only collected once the orchestrator has stopped
+      // calling tools altogether — i.e. when its turn is already over. An
+      // orchestrator that delegates and then keeps working (reads a file, greps,
+      // spawns a sibling) pauses for each tool result *inside* that inner loop,
+      // where the follow-up queue is never consulted, so the briefing sat there
+      // until the turn ended on its own. That is the bug: not a late wake, a
+      // structurally unreachable one.
+      //
+      // Steering is drained after the current assistant message's tool results
+      // are already in context and before the next LLM call, so it cuts into the
+      // tool-call chain at the first safe boundary without ever splitting a
+      // tool_call/tool_result pair. Cutting in is the point — a subagent's result
+      // is new information that should redirect the loop, not wait politely
+      // behind the work it invalidates.
+      //
+      // This does not change the idle path at all: `deliverAs` is only consulted
+      // when `isStreaming` is true (`agent-session.js` `prompt()`), and when the
+      // session is idle this still starts a fresh turn exactly as before.
+      //
+      // Steering mode defaults to "one-at-a-time", so two briefings landing in
+      // separate coalesce windows arrive on consecutive turns rather than merged.
+      // Both still arrive mid-turn; none is dropped.
       //
       // `expandPromptTemplates` is deliberately omitted rather than passed as
-      // false: false is already the default, and the option does not exist in the
-      // 0.75.4 type stubs tsc resolves here (the running pi is 0.85.1 — see the
-      // root AGENTS.md on that skew). The briefing always starts with "[", so it
-      // could never be taken for a slash command anyway.
-      pi.sendUserMessage(briefing, { deliverAs: "followUp" });
+      // false: false is already the default. The briefing always starts with "[",
+      // so it could never be taken for a slash command anyway.
+      pi.sendUserMessage(briefing, { deliverAs: "steer" });
     } catch {
       // The runtime went away under us. The run's state is on disk either way,
       // so the next `status`/`result` still reports it correctly.
