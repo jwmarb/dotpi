@@ -23,8 +23,13 @@ agent/.env.*
 # commit by accident and then hard to notice when they fill up.
 agent/auth.json
 agent/models-store.json
-# Per-server OAuth state (registered client + tokens) from mcp "auth": "oauth".
+# Per-server OAuth state (registered client + tokens) from an mcp.json "oauth" entry.
+# pi's built-in MCP extension keeps this in the mcp-auth.json FILE; agent/mcp-auth/
+# is the old local extension's directory, kept ignored so a leftover never lands in git.
+agent/mcp-auth.json
 agent/mcp-auth/
+# Connection log written by the built-in MCP extension.
+agent/mcp.log
 # Never commit a backup of a config that may contain a key.
 *.bak
 *.orig-backup

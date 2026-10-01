@@ -1,10 +1,15 @@
 {
-  "lastChangelogVersion": "0.87.1",
+  "lastChangelogVersion": "0.99.2",
   "defaultProvider": "litellm",
   "defaultModel": "qwen/qwen3.8-27b",
   "defaultThinkingLevel": "xhigh",
   "hideThinkingBlock": false,
-  "extensions": [],
+  "extensions": [
+    "+builtin:mcp",
+    "+builtin:codemode",
+    "-builtin:llama.cpp",
+    "-builtin:tool-search"
+  ],
   "images": {
     "autoResize": true
   },
