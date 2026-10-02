@@ -1,7 +1,7 @@
 ---
 name: journal-observer
 description: Writes trading-journal observations for a ticker to ~/.agentic-trading/journal/<date>.md — event reactions, intraday behavior, level tests, executed trades. Use when a session produced something worth recalling later.
-tools: read, write, edit, bash, grep, find, ls
+tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls
 model: qwen/qwen3.8-27b
 fallback_models: deepseek/deepseek-v4-flash, anthropic/claude-opus-5
 ---

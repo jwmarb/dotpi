@@ -1,7 +1,7 @@
 ---
 name: journal-curator
 description: Prunes the trading journal — merges duplicate notes, retires observations a later entry disproved, and consolidates a ticker's settled history. Use when the journal has grown noisy enough that recall is degrading.
-tools: read, write, edit, bash, grep, find, ls
+tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls
 model: qwen/qwen3.8-27b
 fallback_models: deepseek/deepseek-v4-flash, anthropic/claude-opus-5
 ---
