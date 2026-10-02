@@ -12,6 +12,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { frontmatterOf } from "../lib/agents.js";
 import {
   type ChildReport,
   type FailedAttempt,
@@ -66,16 +67,24 @@ export interface ChildLaunchOptions {
  * derived from the run id (see `rundir.ts`), so the record does not carry it,
  * but the child is a separate process and cannot derive it without knowing
  * pi's agent directory — so it crosses as env.
+ *
+ * `PI_SUBAGENT_LINEAGE` is the delegation-tree bound: the chain of agent names
+ * from the human's orchestrator down to and including this child. The parent
+ * writes it and only the child reads it, which is what makes
+ * {@link lineageRejection} unforgeable — nothing the child's model can say
+ * changes its own ancestry.
  */
 export function buildChildEnv(
   rec: { runId: string; agent: string },
   parentPaneId: string | undefined,
   runDir: string,
+  childLineage: string[] = [rec.agent],
 ): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_RUN_ID: rec.runId,
     PI_SUBAGENT_AGENT: rec.agent,
     PI_SUBAGENT_RUN_DIR: runDir,
+    PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
   return env;
@@ -134,6 +143,247 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   }
   if (opts.systemPromptPath) argv.push("--append-system-prompt", opts.systemPromptPath);
   return argv;
+}
+
+/** One skill as the catalogue needs it: what it is, and where to read it. */
+export interface SkillEntry {
+  /** Skill directory name — the identity `skills:` matches on. */
+  dir: string;
+  /** `name` from the SKILL.md frontmatter, falling back to the directory. */
+  name: string;
+  /** `description` from the frontmatter; may be empty. */
+  description: string;
+  /** Absolute path of the SKILL.md, for the agent to read. */
+  path: string;
+}
+
+/** `skills: *` — every discovered skill, rather than a named subset. */
+export const SKILLS_WILDCARD = "*";
+
+/**
+ * Picks the skills one agent may see, in the order the agent declared them.
+ *
+ * Declaration order is preserved deliberately: an agent that lists its primary
+ * skill first should see it first, and alphabetising would bury it. Unknown
+ * names are dropped rather than reported — a renamed skill must not break every
+ * delegation to an agent that mentions it.
+ *
+ * @param declared - The agent's `skills` frontmatter, or undefined for none.
+ * @param available - Every discovered skill.
+ */
+export function selectSkills(
+  declared: string[] | undefined,
+  available: SkillEntry[],
+): SkillEntry[] {
+  if (!declared || declared.length === 0) return [];
+  if (declared.includes(SKILLS_WILDCARD)) return available;
+
+  const byDir = new Map(available.map((s) => [s.dir, s]));
+  const out: SkillEntry[] = [];
+  const seen = new Set<string>();
+  for (const want of declared) {
+    const hit = byDir.get(want);
+    if (hit && !seen.has(hit.dir)) {
+      seen.add(hit.dir);
+      out.push(hit);
+    }
+  }
+  return out;
+}
+
+/**
+ * Appends a skills catalogue to an agent's prompt body.
+ *
+ * A subagent's system prompt is its prompt body verbatim, so a skill is
+ * invisible to it unless named here. The catalogue is a context pointer, not
+ * the skill content: it carries each skill's description (the wording that
+ * decides whether the agent reaches for it) plus the path to read, which keeps
+ * the cost one section instead of inlining whole skills the agent may not use.
+ *
+ * Returns the body unchanged when the agent declared no skills, so an agent
+ * without the key is byte-for-byte what it was before this existed.
+ *
+ * @param promptBody - The agent definition's body.
+ * @param skills - The already-selected skills (see {@link selectSkills}).
+ * @param canRead - Whether the agent has a tool that can read a file. With no
+ * such tool the paths are unusable, so the section says to delegate instead of
+ * pointing at files the agent cannot open.
+ */
+export function appendSkillCatalogue(
+  promptBody: string,
+  skills: SkillEntry[],
+  canRead: boolean,
+): string {
+  if (skills.length === 0) return promptBody;
+
+  const lines = [
+    "",
+    "## Available Skills",
+    "",
+    "Specialized knowledge modules available to you. Each line is a pointer: read the",
+    "file only when its description matches what you are doing.",
+    "",
+  ];
+
+  for (const s of skills) {
+    const desc = s.description.trim();
+    lines.push(`- **${s.name}** — ${desc || "(no description)"}`);
+    lines.push(`  \`${s.path}\``);
+  }
+
+  lines.push("");
+  lines.push(
+    canRead
+      ? "Read a skill's file before acting on it: these lines are summaries, not the skill."
+      : "You have no file-reading tool, so you cannot open these. Treat them as a map of " +
+          "what exists and delegate the work that needs one.",
+  );
+
+  return `${promptBody.trimEnd()}\n${lines.join("\n")}\n`;
+}
+
+/**
+ * Reads every skill's identity out of `<skillsDir>/<dir>/SKILL.md`.
+ *
+ * Uses the shared frontmatter grammar (`frontmatterOf` + `extractString`) rather
+ * than a local regex, because this repo has already been bitten by two readers
+ * of the same format drifting apart. A skill with no readable `SKILL.md` is
+ * skipped: one broken skill must not cost an agent its whole catalogue.
+ *
+ * @param skillsDirPath - Absolute path to the skills library (one dir per skill).
+ */
+export async function discoverSkills(skillsDirPath: string): Promise<SkillEntry[]> {
+  let dirs: string[];
+  try {
+    dirs = await readdir(skillsDirPath);
+  } catch {
+    return [];
+  }
+
+  const out: SkillEntry[] = [];
+  for (const dir of dirs.sort()) {
+    const path = join(skillsDirPath, dir, "SKILL.md");
+    let text: string;
+    try {
+      text = await readFile(path, "utf-8");
+    } catch {
+      continue; // not a skill directory, or unreadable
+    }
+    const fm = frontmatterOf(text);
+    if (!fm) continue;
+    out.push({
+      dir,
+      name: extractSkillString(fm, "name") || dir,
+      description: extractSkillString(fm, "description"),
+      path,
+    });
+  }
+  return out;
+}
+
+/**
+ * One scalar frontmatter value, unwrapping the quotes a `description:` often
+ * carries and collapsing a folded multi-line value onto one line.
+ *
+ * `agents.ts` keeps its own private `extractString` for agent files, which never
+ * quote or fold; a `SKILL.md` description does both, and the catalogue renders
+ * it on a single line.
+ */
+function extractSkillString(frontmatter: string, key: string): string {
+  const inline = frontmatter.match(new RegExp(`^${key}:[ \\t]*(.*)$`, "m"));
+  if (!inline) return "";
+
+  let value = inline[1].trim();
+
+  // Block scalar (`description: |` or `>`): take the indented lines below it.
+  if (value === "|" || value === ">" || value === "|-" || value === ">-") {
+    const after = frontmatter.slice(inline.index! + inline[0].length);
+    const block: string[] = [];
+    for (const line of after.split("\n").slice(1)) {
+      if (!/^\s+\S/.test(line)) break;
+      block.push(line.trim());
+    }
+    value = block.join(" ");
+  }
+
+  const quote = value[0];
+  if ((quote === '"' || quote === "'") && value.length >= 2 && value.endsWith(quote)) {
+    value = value.slice(1, -1);
+  }
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Parses a delegation lineage out of a raw env value.
+ *
+ * The lineage is the chain of agent names from the human's orchestrator down to
+ * this process, comma-separated — `worker,librarian` means a worker spawned the
+ * librarian this code is running inside. Absent or empty means "nothing above
+ * me": the human's orchestrator.
+ *
+ * @param raw - The env var's value, or undefined when unset.
+ */
+export function parseLineage(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Renders a lineage for the env var the child reads back. */
+export function formatLineage(lineage: string[]): string {
+  return lineage.join(",");
+}
+
+/**
+ * Why `callee` may not be spawned from this lineage, or undefined to allow it.
+ *
+ * Two rules, in the order they are reported:
+ *
+ * 1. **No cycles.** An agent already in its own ancestry may not be spawned
+ *    again. This is what makes `librarian → librarian` structurally impossible
+ *    rather than merely discouraged, and it bounds the tree without an arbitrary
+ *    depth number: every generation must introduce a *new* agent, and the roster
+ *    is finite. `lib/dotenv.ts` records a fork bomb in this repo's history; a
+ *    self-spawning agent is exactly that shape.
+ * 2. **`callable_by` is honoured.** An agent that declares callers may only be
+ *    spawned by one of them (or by the human's orchestrator, which has an empty
+ *    lineage and is never something an agent can forge). This is what makes a
+ *    helper agent private to the one agent that owns it.
+ *
+ * Both refusals name the rule and the fix, because a bare denial reads as a
+ * broken tool and invites a retry loop.
+ *
+ * @param callee - The agent being spawned.
+ * @param calleeCallableBy - Its `callable_by` frontmatter, or undefined for public.
+ * @param lineage - Ancestry of the spawning process, oldest first.
+ */
+export function lineageRejection(
+  callee: string,
+  calleeCallableBy: string[] | undefined,
+  lineage: string[],
+): string | undefined {
+  if (lineage.includes(callee)) {
+    const chain = [...lineage, callee].join(" → ");
+    return (
+      `"${callee}" is already in this delegation's ancestry (${chain}), so spawning it ` +
+      `again would be a cycle. Do this part with your own tools, or report what you ` +
+      `need so the agent above you can take it from here.`
+    );
+  }
+
+  if (calleeCallableBy && calleeCallableBy.length > 0) {
+    // An empty lineage is the human's orchestrator: it may spawn anything, and
+    // an agent cannot fake it (the value is written by the parent process).
+    const caller = lineage.at(-1);
+    if (caller !== undefined && !calleeCallableBy.includes(caller)) {
+      return (
+        `"${callee}" can only be spawned by: ${calleeCallableBy.join(", ")}. ` +
+        `You are "${caller}", so this delegation was refused. It is a helper owned by ` +
+        `another agent, not a general-purpose one.`
+      );
+    }
+  }
+
+  return undefined;
 }
 
 /**

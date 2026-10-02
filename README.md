@@ -23,7 +23,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 ## Features 🚀
 
 - 🧩 **Local extensions, auto-loaded:** every top-level `agent/extensions/*.ts` ships into every session — a `questionnaire` tool that asks you multiple-choice questions in the TUI, a `/sessions` browser for resuming past work, a `/diff` widget for session changes, a dynamic system prompt built from your discovered inventory, and an update check that runs at most every 4 hours.
-- 🤖 **A subagent fleet you can delegate to:** eight specialized definitions (explorer, librarian, oracle, planner, reviewer, spiker, verifier, worker), each with its own model, fallback chain, and tool allowlist — read-only by construction where a verdict needs to be independent.
+- 🤖 **A subagent fleet you can delegate to:** nine specialized definitions (explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker), each with its own model, fallback chain, and tool allowlist — read-only by construction where a verdict needs to be independent.
 - 🃏 **A skills library with progressive disclosure:** 38 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you.
 - 🔁 **Completion loops with verification gates:** `/ralph-loop <goal>` re-prompts the agent until it signs off with a completion tag, and `--verify` can audit that claim with a read-only oracle pass and a Dockerized runtime pass before accepting it.
 - 🧑‍🤝‍🧑 **Event-driven delegation:** the `subagent` tool spawns each child in its own herdr tab and ends the turn — the child wakes the parent with a notice when it reports, so you can message a running child mid-flight.
@@ -160,11 +160,12 @@ All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example
 | Agent       | Role                                                          | Model             |
 | ----------- | ------------------------------------------------------------- | ----------------- |
 | `explorer`  | Read-only codebase recon; returns a compressed map with `file:line` references | deepseek-v4-flash |
-| `librarian` | Read-only external research; looks up library/API docs with the `firecrawl` CLI | deepseek-v4-flash |
+| `librarian` | External research: docs via the `firecrawl` CLI, plus dependency source and live behavior | deepseek-v4-flash |
 | `oracle`    | High-stakes architecture consultation; last-resort debugging             | gpt-5.6-sol       |
 | `planner`   | Read-only implementation planning; ordered, file-specific steps          | gpt-5.6-sol       |
 | `reviewer`  | Read-only code review; findings reported by severity                   | claude-opus-5     |
 | `spiker`    | Proves an API's real behavior with a throwaway spike                     | qwen3.8-27b       |
+| `summarizer`| Extracts a long page down to what a question needs — the librarian's own helper | deepseek-v4-flash |
 | `verifier`  | Runs the project's tests/build in Docker; reports pass/fail              | claude-opus-5     |
 | `worker`    | Implements a single well-specified change end to end                   | qwen3.8-27b       |
 

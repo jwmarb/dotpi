@@ -92,16 +92,21 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import {
+  appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
   childNameRejection,
   candidateModels,
   describeLaunchFailure,
+  discoverSkills,
   extractRunResult,
   herdrAgentName,
+  lineageRejection,
   makeRunId,
+  parseLineage,
   readReports,
   type RunResult,
+  selectSkills,
 } from "./lib.js";
 import {
   type AgentInfo,
@@ -174,6 +179,32 @@ const PROMPT_SETTLE_MS = 1500;
 
 /** How long to wait for a turn to start after a recovery Enter. */
 const PROMPT_RECOVERY_MS = 15_000;
+
+/**
+ * Tools that can open a skill file. An agent whose allowlist has none of these
+ * gets the catalogue as a map only, with the "delegate it" wording instead of
+ * paths it cannot read (`--tools` is an allowlist, so an undeclared reader is
+ * genuinely absent). `read_skill` is the intended route; a plain `read` works.
+ */
+const READING_TOOLS = new Set(["read", "read_skill"]);
+
+/**
+ * Env var carrying this process's delegation ancestry: the agent names from the
+ * human's orchestrator down to and including this one, comma-separated.
+ *
+ * Absent means the human's orchestrator, which may spawn anything. A child is
+ * launched with this set by its *parent*, so no model can forge its own
+ * ancestry — which is what makes {@link lineageRejection} trustworthy.
+ *
+ * This replaced a numeric depth cap. A number had to be tuned (and was wrong
+ * once — a cap of 1 silently refused the orchestrator's own child), and it
+ * bounded the tree without expressing the actual rule. The lineage encodes the
+ * rule directly: no agent may appear twice in its own ancestry, so every
+ * generation must introduce a new agent and a finite roster ends the chain by
+ * itself. `librarian → librarian` is impossible by construction rather than by
+ * arithmetic.
+ */
+const LINEAGE_ENV = "PI_SUBAGENT_LINEAGE";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -287,7 +318,14 @@ export async function launchAttempt(
   // The child's pane env: its run identity, and — the key to child →
   // orchestrator messaging — this orchestrator's own pane id, which herdr
   // injects into our process as HERDR_PANE_ID.
-  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir);
+  //
+  // The child's lineage is ours plus the child: our own comes from the env our
+  // parent stamped, so ancestry is accumulated by processes rather than trusted
+  // from a model.
+  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir, [
+    ...parseLineage(process.env[LINEAGE_ENV]),
+    rec.agent,
+  ]);
   const label = `${agent.name} ${rec.runId}`;
   const pane = await launcher.createChildPane(rec.cwd, label, env);
   if (!pane) {
@@ -391,14 +429,26 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     await discoverAgents(agentsDir()),
     await discoverSkillAgents(skillsDir()),
   );
+  // This process's ancestry, written by whoever spawned us. Drives both the
+  // cycle check and `callable_by`, and is the one input here a model cannot
+  // influence.
+  const lineage = parseLineage(process.env[LINEAGE_ENV]);
+
   const agent = agents.find((a) => a.name === params.agent);
   if (!agent) {
+    // List only what this caller could actually spawn. Advertising a private
+    // helper it may not use turns one refusal into two round trips.
     const available =
       agents
+        .filter((a) => !lineageRejection(a.name, a.callableBy, lineage))
         .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
         .join(", ") || "none";
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
   }
+
+  // Refuse before spending anything: no run dir, no registry entry, no pane.
+  const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage);
+  if (lineageProblem) return { ok: false, error: lineageProblem };
 
   const models = candidateModels(params.model, agent);
   const runId = makeRunId();
@@ -426,9 +476,20 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // same process (the disk registry is what a *restarted* parent rebuilds).
   runs.set(rec.runId, rec);
 
+  // The child's system prompt. Its body is the agent definition verbatim, plus
+  // a skills catalogue when the agent declared one: pi builds `## Available
+  // Skills` for the orchestrator only, so a subagent cannot otherwise know a
+  // skill exists. Discovery failing costs the catalogue, never the launch.
   const promptPath = systemPromptPath(dir);
+  let promptBody = agent.promptBody;
+  if (agent.skills && agent.skills.length > 0) {
+    const selected = selectSkills(agent.skills, await discoverSkills(skillsDir()));
+    const canRead = !agent.tools || agent.tools.length === 0 ||
+      agent.tools.some((t) => READING_TOOLS.has(t));
+    promptBody = appendSkillCatalogue(promptBody, selected, canRead);
+  }
   try {
-    writeFileSync(promptPath, agent.promptBody);
+    writeFileSync(promptPath, promptBody);
   } catch {
     return { ok: false, error: `Could not write the child's system prompt to ${promptPath}.` };
   }

@@ -44,6 +44,33 @@ export interface AgentInfo {
    * appears). An explicit model on the delegation call suppresses them.
    */
   fallbackModels?: string[];
+  /**
+   * Agent names allowed to spawn this one, from the file's `callable_by` key
+   * (**snake_case** — a camelCase key silently never matches).
+   *
+   * Absent means public: anything may spawn it, which is every agent that
+   * existed before this key did. Naming callers makes the agent a *private
+   * helper* — `callable_by: librarian` is a research sub-agent only the
+   * librarian may fan out to, so it never clutters another agent's options and
+   * cannot be mistaken for a general-purpose worker.
+   *
+   * The human's orchestrator is always allowed: it has an empty lineage, which
+   * an agent cannot forge because the lineage is written by the parent process.
+   */
+  callableBy?: string[];
+  /**
+   * Skill directory names this agent may see, from the file's `skills` key.
+   *
+   * A subagent's system prompt is its `promptBody` *verbatim* — pi's dynamic
+   * prompt (and so the whole `## Available Skills` catalogue) is built for the
+   * orchestrator only. Without this key an agent cannot know a skill exists, so
+   * the catalogue is opt-in per agent rather than global: a reviewer has no use
+   * for the trading-journal skills, and an undeclared skill stays invisible.
+   *
+   * `skills: *` means every discovered skill. Absent or empty means none, which
+   * keeps every existing agent exactly as it was.
+   */
+  skills?: string[];
   /** The agent's system-prompt body: the markdown after the frontmatter. */
   promptBody: string;
   /** The filename of the agent definition (e.g. `worker.md`). */
@@ -158,7 +185,9 @@ export function mergeAgents(global: AgentInfo[], skillAgents: AgentInfo[]): Agen
  *          has no `name` (such a file is skipped by discovery).
  */
 export function parseAgentFile(content: string, fileName: string): AgentInfo | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---\r?\n?([\s\S]*)$/);
+  // CRLF-tolerant on both fences: a `\n`-only opening fence reads a CRLF file
+  // as having no frontmatter, which drops the definition silently.
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) return null;
 
   const raw = match[1];
@@ -166,6 +195,8 @@ export function parseAgentFile(content: string, fileName: string): AgentInfo | n
   if (!name) return null;
 
   const fallbackModels = extractStringList(raw, "fallback_models");
+  const skills = extractStringList(raw, "skills");
+  const callableBy = extractStringList(raw, "callable_by");
 
   return {
     name,
@@ -173,6 +204,8 @@ export function parseAgentFile(content: string, fileName: string): AgentInfo | n
     tools: extractStringList(raw, "tools"),
     model: extractString(raw, "model") || undefined,
     fallbackModels: fallbackModels.length > 0 ? fallbackModels : undefined,
+    callableBy: callableBy.length > 0 ? callableBy : undefined,
+    skills: skills.length > 0 ? skills : undefined,
     promptBody: match[2].trim(),
     filePath: fileName,
   };
@@ -216,7 +249,12 @@ export function extractStringList(yaml: string, key: string): string[] {
  *
  * Shared with `skill-activation.ts` so "what counts as frontmatter" has one
  * answer for agent files and `SKILL.md` alike.
+ *
+ * Tolerates CRLF. Four `SKILL.md` files in this repo are CRLF-encoded, and a
+ * `\n`-only pattern silently read them as having no frontmatter at all — so they
+ * vanished from every consumer rather than failing loudly. A line-ending is not
+ * a reason to drop a skill.
  */
 export function frontmatterOf(content: string): string | undefined {
-  return content.match(/^---\n([\s\S]*?)\n---/)?.[1];
+  return content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
 }

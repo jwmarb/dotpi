@@ -99,6 +99,12 @@ agent/git/
 # Scratch materialisation of the git index by scripts/check.sh (CHECK_STAGED=1).
 .git-check/
 
+# Scratch space for the librarian's research: scraped pages, and shallow clones
+# of third-party source under src/ that it points the explorer at. Written by
+# the `firecrawl` CLI's -o convention, never by a human, and never part of the
+# repo -- a clone in here is someone else's git history, not ours.
+.firecrawl/
+
 # ---- Editor and OS noise ----------------------------------------------------
 .DS_Store
 *.swp

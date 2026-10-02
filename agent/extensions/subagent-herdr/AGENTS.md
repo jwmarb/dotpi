@@ -11,11 +11,11 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 | File | Owns |
 |---|---|
 | `index.ts` | Tool registration; parent-side lifecycle (spawn → classify → backstop pane close) **and the `input` hook that turns an arriving notice into a coalesced briefing** |
-| `lib.ts` | Pure launch contract: run ids, `buildChildArgv`, child env, report/result extraction — side-effect free, unit-testable |
+| `lib.ts` | Pure launch contract: run ids, `buildChildArgv`, child env, report/result extraction, the skills catalogue (`discoverSkills`/`selectSkills`/`appendSkillCatalogue`) and the ancestry guard (`parseLineage`/`formatLineage`/`lineageRejection`) — side-effect free bar the documented fs reads, unit-testable |
 | `herdr.ts` | Thin CLI wrapper over the herdr 0.9.0 CLI; the measured behaviours it relies on are documented in its header |
 | `rundir.ts` | The run-directory contract (paths + JSON shapes) **and the wake-notice grammar** — both span the parent/child process seam |
 | `child-done.ts` | Child half of the handshake; loaded into the child with pi `-e`, writes the `<session>.exit` sidecar and sends the `report`/`done` notices |
-| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (76 tests) |
+| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (112 tests) |
 
 ## CONVENTIONS (local)
 
@@ -25,6 +25,8 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 - **Pinned to herdr 0.9.0.** Re-verify the "measured behaviours" in `herdr.ts`'s header against the version before changing any of them.
 - **Completion is two signals:** the `subagent_done` tool (injected into every child's allowlist) or a clean `agent_end`. A failed turn writes no sidecar, so the parent classifies from its absence.
 - **The notice grammar lives in `rundir.ts` and is parsed strictly.** The parent *swallows* every input that matches it, so a loose pattern would eat a human's typing. Both ids are constrained (`sub-` + four hex; herdr's agent-name rule), and anything that does not match is passed through untouched.
+- **A child's prompt is its definition body plus whatever `skills:` names.** pi builds `## Available Skills` for the orchestrator only, so without that key a subagent cannot know any skill exists. An agent that declares no skills gets a byte-identical prompt, which is what makes the feature safe to leave off. Discovery failing costs the catalogue, never the launch.
+- **Ancestry is accumulated by processes, not trusted from models.** `buildChildEnv` stamps `PI_SUBAGENT_LINEAGE` (the agent-name chain, oldest first) into the child; `lineageRejection` reads it back one process later and refuses *before* a run dir, registry entry or pane exists. Two rules, cycle first: an agent in its own ancestry is refused (so `librarian → librarian` cannot happen), then `callable_by` is honoured (so `summarizer` is the librarian's alone). An empty lineage is the human's orchestrator and may spawn anything. This replaced a numeric `MAX_DEPTH`, which had to be tuned and whose obvious value of 1 refused the orchestrator's own child; ancestry needs no constant because the roster is finite. `../lib/dotenv.ts` records the fork bomb this interlock exists to prevent.
 - **A `done` notice is only a prompt to look, never the evidence.** The `.exit` sidecar on disk is what classifies a run; a notice that never lands costs promptness, not correctness — which is why every read path calls `reconcile` first.
 - **The child's notice is `spawn`ed detached.** `closeOwnPane()` kills the child's process group moments later, and a delivery still attached would die with it.
 - **herdr agent names are unique among *live* agents server-wide (a name frees when its agent exits or is released), so children register as `<agent>-<runId>`** (`herdrAgentName`). The bare definition name let the first live `librarian` own it and made every concurrent sibling unlaunchable with `agent_name_taken`. The *bare* name still goes in the notice grammar and `PI_SUBAGENT_AGENT` — only the herdr registration is scoped. herdr's 32-char ceiling applies to the **scoped** name, which leaves a definition name 23.

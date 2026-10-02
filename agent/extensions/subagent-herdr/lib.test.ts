@@ -4,12 +4,13 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { discoverAgents } from "../lib/agents.js";
+import { discoverAgents, parseAgentFile } from "../lib/agents.js";
 import {
+  appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
   agentNameRejection,
@@ -20,8 +21,14 @@ import {
   extractRunResult,
   herdrAgentName,
   makeRunId,
+  formatLineage,
+  discoverSkills,
+  lineageRejection,
+  parseLineage,
   readReports,
   REPORT_TOOL_NAME,
+  selectSkills,
+  SKILLS_WILDCARD,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
 import { classifyExecFailure, errorPayload } from "./herdr.js";
@@ -219,6 +226,8 @@ describe("buildChildEnv", () => {
       PI_SUBAGENT_AGENT: "worker",
       PI_SUBAGENT_RUN_DIR: "/runs/sub-0008",
       PI_SUBAGENT_PARENT_PANE: "w5:p1",
+      // The delegation-tree bound travels with every child (see lineageRejection).
+      PI_SUBAGENT_LINEAGE: "worker",
     });
   });
 
@@ -819,5 +828,308 @@ describe("classifyExecFailure", () => {
   test("always preserves raw stderr for diagnosis", () => {
     expect(classifyExecFailure({ code: 1, stderr: "boom" }).stderr).toBe("boom");
     expect(classifyExecFailure({ code: 1 }).stderr).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Skill catalogue for subagents
+//
+// A subagent's system prompt is its definition body VERBATIM — pi builds
+// `## Available Skills` for the orchestrator only, so without this an agent
+// cannot know a skill exists. The catalogue is opt-in per agent.
+// ---------------------------------------------------------------------------
+
+/** Writes `<dir>/<name>/SKILL.md` with the given frontmatter body. */
+function writeSkill(root: string, name: string, frontmatter: string): void {
+  mkdirSync(join(root, name), { recursive: true });
+  writeFileSync(join(root, name, "SKILL.md"), `---\n${frontmatter}\n---\n\nbody\n`);
+}
+
+describe("discoverSkills", () => {
+  test("reads name and description, and unwraps a quoted description", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sub-herdr-skills-"));
+    writeSkill(root, "firecrawl", 'name: firecrawl\ndescription: "Scrape the web, politely."');
+
+    const found = await discoverSkills(root);
+    expect(found).toHaveLength(1);
+    expect(found[0].dir).toBe("firecrawl");
+    expect(found[0].name).toBe("firecrawl");
+    // The quotes are the YAML's, not part of the description.
+    expect(found[0].description).toBe("Scrape the web, politely.");
+    expect(found[0].path).toBe(join(root, "firecrawl", "SKILL.md"));
+  });
+
+  test("folds a block-scalar description onto one line", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sub-herdr-skills-"));
+    writeSkill(root, "multi", "name: multi\ndescription: |\n  First line.\n  Second line.");
+
+    const found = await discoverSkills(root);
+    // The catalogue renders one line per skill, so a folded value must collapse
+    // rather than inject newlines into the middle of the section.
+    expect(found[0].description).toBe("First line. Second line.");
+  });
+
+  test("falls back to the directory name when frontmatter omits one", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sub-herdr-skills-"));
+    writeSkill(root, "unnamed", "description: no name key");
+    const found = await discoverSkills(root);
+    expect(found[0].name).toBe("unnamed");
+  });
+
+  test("one unreadable skill costs only itself", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sub-herdr-skills-"));
+    writeSkill(root, "good", "name: good\ndescription: fine");
+    mkdirSync(join(root, "no-skill-md"), { recursive: true }); // no SKILL.md
+    writeFileSync(join(root, "stray.txt"), "not a skill");
+
+    const found = await discoverSkills(root);
+    expect(found.map((s) => s.dir)).toEqual(["good"]);
+  });
+
+  test("reads a CRLF-encoded SKILL.md", async () => {
+    // Four SKILL.md files in this repo are CRLF. A \n-only frontmatter pattern
+    // read them as having NO frontmatter, so they silently vanished from every
+    // consumer — the agent asked for five skills and got two, with no error.
+    const root = mkdtempSync(join(tmpdir(), "sub-herdr-skills-"));
+    mkdirSync(join(root, "crlf"), { recursive: true });
+    writeFileSync(
+      join(root, "crlf", "SKILL.md"),
+      '---\r\nname: crlf\r\ndescription: "Windows line endings"\r\n---\r\n\r\nbody\r\n',
+    );
+
+    const found = await discoverSkills(root);
+    expect(found).toHaveLength(1);
+    expect(found[0].name).toBe("crlf");
+    expect(found[0].description).toBe("Windows line endings");
+    // And no carriage return leaks into the rendered catalogue line.
+    expect(found[0].description).not.toContain("\r");
+  });
+
+  test("a missing skills directory is empty, not a throw", async () => {
+    // Discovery runs on the launch path: it must never cost a delegation.
+    expect(await discoverSkills(join(tmpdir(), "definitely-not-here-xyz"))).toEqual([]);
+  });
+});
+
+describe("selectSkills", () => {
+  const available = [
+    { dir: "a", name: "a", description: "A", path: "/s/a/SKILL.md" },
+    { dir: "b", name: "b", description: "B", path: "/s/b/SKILL.md" },
+    { dir: "c", name: "c", description: "C", path: "/s/c/SKILL.md" },
+  ];
+
+  test("no declaration selects nothing, which is the pre-feature behaviour", () => {
+    expect(selectSkills(undefined, available)).toEqual([]);
+    expect(selectSkills([], available)).toEqual([]);
+  });
+
+  test("the wildcard selects every skill", () => {
+    expect(selectSkills([SKILLS_WILDCARD], available)).toHaveLength(3);
+  });
+
+  test("named skills come back in the order the agent declared them", () => {
+    // Declaration order is the agent's priority order; alphabetising would bury
+    // the skill it listed first.
+    expect(selectSkills(["c", "a"], available).map((s) => s.dir)).toEqual(["c", "a"]);
+  });
+
+  test("an unknown name is dropped rather than failing the launch", () => {
+    // A renamed or deleted skill must not break every delegation to an agent
+    // whose frontmatter still mentions it.
+    expect(selectSkills(["a", "ghost"], available).map((s) => s.dir)).toEqual(["a"]);
+  });
+
+  test("a duplicate declaration is listed once", () => {
+    expect(selectSkills(["a", "a"], available).map((s) => s.dir)).toEqual(["a"]);
+  });
+});
+
+describe("appendSkillCatalogue", () => {
+  const skills = [{ dir: "firecrawl", name: "firecrawl", description: "Scrape", path: "/s/f/SKILL.md" }];
+
+  test("an agent with no skills gets a byte-identical prompt", () => {
+    // The whole feature has to be invisible to the seven agents that do not
+    // opt in, or it is a silent rewrite of every existing subagent prompt.
+    const body = "You are a worker.\n";
+    expect(appendSkillCatalogue(body, [], true)).toBe(body);
+  });
+
+  test("the catalogue carries each skill's description and path", () => {
+    const out = appendSkillCatalogue("Body.", skills, true);
+    expect(out).toContain("## Available Skills");
+    expect(out).toContain("**firecrawl**");
+    expect(out).toContain("Scrape");
+    expect(out).toContain("/s/f/SKILL.md");
+    expect(out.startsWith("Body.")).toBe(true);
+  });
+
+  test("a reader-less agent is told to delegate instead of to read", () => {
+    const withRead = appendSkillCatalogue("B.", skills, true);
+    const without = appendSkillCatalogue("B.", skills, false);
+    expect(withRead).toContain("Read a skill's file");
+    expect(without).toContain("no file-reading tool");
+    expect(without).toContain("delegate");
+  });
+
+  test("an empty description still renders a usable line", () => {
+    const out = appendSkillCatalogue("B.", [{ dir: "x", name: "x", description: "", path: "/p" }], true);
+    expect(out).toContain("(no description)");
+  });
+});
+
+describe("parseAgentFile skills key", () => {
+  test("reads inline and block spellings, and absent means undefined", () => {
+    const mk = (fm: string) => parseAgentFile(`---\nname: a\n${fm}\n---\nbody`, "a.md");
+    expect(mk("skills: firecrawl, tdd")?.skills).toEqual(["firecrawl", "tdd"]);
+    expect(mk("skills:\n  - firecrawl\n  - tdd")?.skills).toEqual(["firecrawl", "tdd"]);
+    expect(mk("skills: *")?.skills).toEqual(["*"]);
+    // Absent must stay undefined, not [], so the spawn path's guard is honest.
+    expect(mk("model: x")?.skills).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delegation lineage: cycles and callable_by
+//
+// Nothing else bounds the delegation tree, and `lib/dotenv.ts` records a fork
+// bomb in this repo's history. The bound is the agent's own ancestry, carried
+// in an env var its PARENT stamped: no agent may appear twice in its lineage,
+// so every generation must introduce a new agent and a finite roster ends the
+// chain by itself. This replaced a numeric depth cap, which had to be tuned and
+// was wrong once (a cap of 1 silently refused the orchestrator's own child).
+// ---------------------------------------------------------------------------
+
+describe("parseLineage / formatLineage", () => {
+  test("an unset or empty value is the human's orchestrator", () => {
+    expect(parseLineage(undefined)).toEqual([]);
+    expect(parseLineage("")).toEqual([]);
+  });
+
+  test("round-trips a chain", () => {
+    expect(parseLineage("worker,librarian")).toEqual(["worker", "librarian"]);
+    expect(formatLineage(["worker", "librarian"])).toBe("worker,librarian");
+  });
+
+  test("tolerates padding and empty segments", () => {
+    // A hand-edited or shell-mangled value must not invent a nameless ancestor,
+    // which would make `lineage.at(-1)` an empty-string caller.
+    expect(parseLineage(" worker , librarian ")).toEqual(["worker", "librarian"]);
+    expect(parseLineage("worker,,librarian,")).toEqual(["worker", "librarian"]);
+  });
+});
+
+describe("lineageRejection: cycles", () => {
+  test("the orchestrator may spawn anything", () => {
+    expect(lineageRejection("librarian", undefined, [])).toBeUndefined();
+    expect(lineageRejection("worker", undefined, [])).toBeUndefined();
+  });
+
+  test("librarian -> librarian is refused", () => {
+    // The case that motivated this design: a librarian spawning librarians is
+    // the fork-bomb shape, and it is now impossible rather than discouraged.
+    expect(lineageRejection("librarian", undefined, ["librarian"])).toBeDefined();
+  });
+
+  test("an agent anywhere in the ancestry is refused, not just the direct parent", () => {
+    // worker -> librarian -> spiker -> librarian must fail at the last hop.
+    expect(
+      lineageRejection("librarian", undefined, ["worker", "librarian", "spiker"]),
+    ).toBeDefined();
+  });
+
+  test("the refusal shows the chain and names the way out", () => {
+    const msg = lineageRejection("librarian", undefined, ["worker", "librarian"]) ?? "";
+    expect(msg).toContain("worker → librarian → librarian");
+    expect(msg).toMatch(/your own tools|report what you need/);
+  });
+
+  test("the intended chains are allowed", () => {
+    // worker -> librarian (ask a research question)
+    expect(lineageRejection("librarian", undefined, ["worker"])).toBeUndefined();
+    // librarian -> spiker (confirm external code really behaves as documented)
+    expect(lineageRejection("spiker", undefined, ["worker", "librarian"])).toBeUndefined();
+    // librarian -> summarizer (condense a huge page)
+    expect(lineageRejection("summarizer", ["librarian"], ["worker", "librarian"])).toBeUndefined();
+  });
+});
+
+describe("lineageRejection: callable_by", () => {
+  test("an agent with no callable_by is public", () => {
+    expect(lineageRejection("worker", undefined, ["oracle"])).toBeUndefined();
+    expect(lineageRejection("worker", [], ["oracle"])).toBeUndefined();
+  });
+
+  test("a private helper refuses a caller not on its list", () => {
+    expect(lineageRejection("summarizer", ["librarian"], ["worker"])).toBeDefined();
+    expect(lineageRejection("summarizer", ["librarian"], ["reviewer", "spiker"])).toBeDefined();
+  });
+
+  test("a private helper accepts its declared caller", () => {
+    expect(lineageRejection("summarizer", ["librarian"], ["librarian"])).toBeUndefined();
+  });
+
+  test("only the DIRECT caller counts, not a distant ancestor", () => {
+    // A librarian high in the chain must not let an unrelated agent below it
+    // borrow its private helper.
+    expect(lineageRejection("summarizer", ["librarian"], ["librarian", "spiker"])).toBeDefined();
+  });
+
+  test("the human's orchestrator may spawn a private helper directly", () => {
+    // Empty lineage is the human, which an agent cannot forge: the value is
+    // written by the parent process. Being able to run a helper by hand is how
+    // you debug one.
+    expect(lineageRejection("summarizer", ["librarian"], [])).toBeUndefined();
+  });
+
+  test("the refusal names the permitted callers and the caller it saw", () => {
+    const msg = lineageRejection("summarizer", ["librarian"], ["worker"]) ?? "";
+    expect(msg).toContain("librarian");
+    expect(msg).toContain("worker");
+  });
+
+  test("a cycle is reported ahead of callable_by", () => {
+    // Both rules fire; the cycle is the more fundamental fact, and reporting
+    // "you may not call yourself" is more useful than a permissions list.
+    const msg = lineageRejection("librarian", ["librarian"], ["librarian"]) ?? "";
+    expect(msg).toContain("ancestry");
+  });
+});
+
+describe("buildChildEnv lineage stamping", () => {
+  const rec = { runId: "sub-1234", agent: "librarian" };
+
+  test("defaults to just the child, so a direct spawn is depth-1 ancestry", () => {
+    expect(buildChildEnv(rec, undefined, "/run")["PI_SUBAGENT_LINEAGE"]).toBe("librarian");
+  });
+
+  test("accumulates the chain the parent passes", () => {
+    expect(buildChildEnv(rec, undefined, "/run", ["worker", "librarian"])["PI_SUBAGENT_LINEAGE"]).toBe(
+      "worker,librarian",
+    );
+  });
+
+  test("the stamped chain is what terminates the tree one process later", () => {
+    // The round trip that matters: a parent stamps, a child reads it back, and
+    // the guard refuses the repeat. No arithmetic, no tuning.
+    const stamped = buildChildEnv(rec, undefined, "/run", ["worker", "librarian"]);
+    const asChildSees = parseLineage(stamped["PI_SUBAGENT_LINEAGE"]);
+    expect(lineageRejection("librarian", undefined, asChildSees)).toBeDefined();
+    expect(lineageRejection("spiker", undefined, asChildSees)).toBeUndefined();
+  });
+});
+
+describe("parseAgentFile callable_by key", () => {
+  test("reads both spellings; absent means public", () => {
+    const mk = (fm: string) => parseAgentFile(`---\nname: a\n${fm}\n---\nbody`, "a.md");
+    expect(mk("callable_by: librarian")?.callableBy).toEqual(["librarian"]);
+    expect(mk("callable_by: librarian, oracle")?.callableBy).toEqual(["librarian", "oracle"]);
+    expect(mk("callable_by:\n  - librarian")?.callableBy).toEqual(["librarian"]);
+    // Absent must stay undefined — that is what "public" means to the guard.
+    expect(mk("model: x")?.callableBy).toBeUndefined();
+  });
+
+  test("a camelCase key does not match, as the frontmatter contract warns", () => {
+    const a = parseAgentFile(`---\nname: a\ncallableBy: librarian\n---\nbody`, "a.md");
+    expect(a?.callableBy).toBeUndefined();
   });
 });
