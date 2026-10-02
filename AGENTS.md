@@ -15,10 +15,10 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/prompts/` — prompt templates (`git-commit.md`: Conventional Commits)
 - `agent/themes/` — TUI theme (`tokyo-night.json`)
 - `agent/settings.json` — pi config: default provider/model/thinking level, retry policy, installed packages (`git:`/`npm:` refs)
-- `agent/mcp.json` — MCP servers for **pi's built-in MCP extension** (`+builtin:mcp`). Holds `robinhood` only; the litellm gateway is registered from `agent/extensions/mcp-gateway.ts` because the builtin rejects a `${VAR}` placeholder in `url`. Keys still use the `${LITELLM_MCP_KEY}` placeholder — the builtin expands `${VAR}` and `!cmd` in `headers`/`env`, but **never in `url`**
+- `agent/mcp.json` — MCP servers for **pi's built-in MCP extension** (`+builtin:mcp`). Holds `robinhood` only, and it carries no secret: it authenticates by OAuth, whose client+token state lands in the gitignored `agent/mcp-auth.json`. **There is no `${...}` placeholder in this file** — the litellm gateway is registered from `agent/extensions/mcp-gateway.ts` instead, because the builtin validates `url` with `URL.canParse()` *before* expansion. `${VAR}`/`!cmd` are expanded in `headers`/`env` only, which is where that extension puts `${LITELLM_MCP_KEY}`
 - `agent/.env` — the ONLY file with live credentials (gitignored; `agent/.env.example` is the committed template)
 - `agent/docker/verify-base.Dockerfile` — tracked reference image for runtime verification
-- `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/`, `agent/subagent-runs/`, `agent/verify-images/` — machine state, all gitignored
+- `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/`, `agent/subagent-runs/`, `agent/verify-images/` — machine state, all gitignored. So are the loose files beside them: `pi-debug.log`, `pi-tui-crash.log`, `run-history.jsonl`, `settings.json.bak`, `auth.json`, `models-store.json`, `mcp-auth.json`
 - `.githooks/` — tracked `pre-commit`, `post-checkout`, `post-merge` (self-armed by `git-hooks.ts`)
 - `scripts/setup-deps.sh` — installs each extension's npm dependencies; run at startup and by the checkout/merge hooks
 
@@ -53,24 +53,33 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
 - **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened once here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
-- **Secrets live only in `agent/.env`.** `mcp.json` uses the `${LITELLM_MCP_KEY}` placeholder and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both. The gateway *URL* counts as sensitive too, which is the whole reason `mcp-gateway.ts` exists rather than an inlined `url` in `mcp.json`.
+- **Secrets live only in `agent/.env`.** `mcp-gateway.ts` passes the key through as a `${LITELLM_MCP_KEY}` placeholder in a *header* (the builtin expands it at connect time, so the live secret never enters this process or a transcript) and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both. The gateway *URL* counts as sensitive too, which is the whole reason `mcp-gateway.ts` exists rather than an inlined `url` in `mcp.json`.
 - **Commits follow Conventional Commits** per `agent/prompts/git-commit.md`.
 
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-activation/journal-store (163)
+bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-activation/journal-store (178)
 bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic (30)
-bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (76)
+bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (122)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
+```
 
-pi /update                                     # check for + install a pi update (checks at most every 4h)
-pi /mcp                                        # builtin MCP manager: sign in, reconnect, enable/disable, change exposure
-pi /reload                                     # hot-reload extensions after editing them
+In-session slash commands (typed into pi's TUI, not a shell):
+
+```
+/update      check for + install a pi update (checks at most every 4h)
+/mcp         builtin MCP manager: sign in, reconnect, enable/disable, change exposure
+/reload      hot-reload extensions after editing them
+```
+
+```sh
 git config core.hooksPath .githooks            # normally done for you at pi startup by agent/extensions/git-hooks.ts
 bash scripts/setup-deps.sh                     # repair a missing extension node_modules
+docker build -f agent/docker/verify-base.Dockerfile \
+  -t ralph-verify/base:latest agent/docker/    # the tracked verifier base image (also built on demand)
 ```
 
 Typecheck (`noEmit`) has one scope; there is no root `tsconfig.json`:
@@ -79,7 +88,7 @@ Typecheck (`noEmit`) has one scope; there is no root `tsconfig.json`:
 cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 ```
 
-`bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists. Beware the skew: `~/node_modules/@earendil-works/*` is 0.75.4 while the running pi is 0.87.1, so a test that passes here can still disagree with the live host. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
+`bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists (`subagent-herdr/node_modules` holds only `typescript` + `@types/node`, so even its `tsc` run reaches up for the rest). Beware the skew: `~/node_modules/@earendil-works/*` is **0.75.4** while the running pi is **1.0.0**, so a test that passes here can still disagree with the live host — and a hand typecheck against that tree reports phantom errors for anything added since 0.75.4. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
 
 ## NOTES
 
@@ -88,8 +97,8 @@ cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 - **The pre-commit hook is dormant.** `.githooks/pre-commit` invokes `scripts/check.sh`, which was removed in `7a54a3b` (along with the old herdr/plan/subagent extensions); the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time — `/reload` after editing is the only guard.
 - **`PATCHES.md`, `CONTEXT.md` and `docs/adr/` no longer exist** (removed in `1993878` and `a784c57`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical dead references.
 - **`pi` must come from bun's global bin (`~/.bun/bin/pi`).** Extensions import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, which pi injects by loading each extension through jiti with an **alias map** to its own bundled copies (`getAliases()`). The packages are only resolvable when the running binary is the one that owns them. An older `@mariozechner/pi-coding-agent` on `PATH` (the pre-rename scope) has no `@earendil-works/*` aliases, so every extension fails at startup with a misleading `Cannot find module '@earendil-works/pi-tui'`. `~/.bashrc` prepends `~/.bun/bin` for this reason. (`BUN_INSTALL` is unset, so bun derives the install path itself — it currently lands on `~/.bun`, not the `~/.cache/.bun` an earlier revision of this file claimed.)
-- `agent/git/` holds vendored checkouts of the `git:` packages (pi-lsp-extension, pi-blackhole, superpowers); the `npm:` packages install under `agent/npm/node_modules`. Those trees carry ~437 of their own test files — always run this repo's tests by explicit path; a bare `bun test` sweeps the vendored suites in and reports hundreds of failures unrelated to this repo. `agent/npm/node_modules/pi-lens` is a leftover: it is installed but **not** listed in `settings.json` `packages`, so pi does not load it.
+- `agent/git/` holds vendored checkouts of the `git:` packages — currently **`samfoy/pi-lsp-extension` and `obra/superpowers` only** (pi-blackhole moved to npm in `b4f5d65`); the `npm:` packages install under `agent/npm/node_modules`. Always run this repo's tests **by explicit path**: a bare `bun test` also sweeps in the 11 vendored suites under `agent/git/` (7 of them superpowers' own), which fail for reasons unrelated to this repo. `agent/npm/node_modules/pi-lens` is a leftover: it is installed but **not** listed in `settings.json` `packages`, so pi does not load it.
 - `agent/subagent-runs/` is the on-disk registry of the subagent-herdr extension (gitignored): one dir per delegated run holding the child's session file, its `.exit` sidecar, the child system prompt, `reports.jsonl`, and `meta.json`.
 - Runtime verification needs a working Docker daemon — without one the `--verify` gate returns `inconclusive` and the loop stops rather than assuming success. `agent/verify-images/` holds the generated per-project Dockerfiles (gitignored; rebuildable).
 - `agent/pi-blackhole/` holds the pi-blackhole package's pending-Run state (gitignored); `herdr.jsonl` at the root is herdr's activity log (gitignored), not repo content.
-- Nested knowledge bases: `agent/AGENTS.md` (data-file grammars: agent + skill frontmatter, theme, docker base) · `agent/extensions/AGENTS.md` (per-extension inventory, `lib/` rules, typecheck scopes) · `agent/extensions/subagent-herdr/AGENTS.md` (herdr CLI protocol, the event-driven wake path, completion handshake, run-directory contract) · `agent/extensions/ralph-loop/AGENTS.md` (the `agent_settled` loop contract and the `--verify` gates) · `agent/git/github.com/k0valik/pi-blackhole/AGENTS.md` (the vendored package's own KB — pnpm test/typecheck/lint/build; applies inside that checkout only).
+- Nested knowledge bases: `agent/AGENTS.md` (data-file grammars: agent + skill frontmatter, theme, docker base) · `agent/extensions/AGENTS.md` (per-extension inventory, `lib/` rules, typecheck scopes) · `agent/extensions/subagent-herdr/AGENTS.md` (herdr CLI protocol, the event-driven wake path, completion handshake, run-directory contract) · `agent/extensions/ralph-loop/AGENTS.md` (the `agent_settled` loop contract and the `--verify` gates). `agent/git/github.com/obra/superpowers/AGENTS.md` is the **vendored package's own** contributor guide (gitignored, not ours) — it applies inside that checkout only, and nothing in this repo should follow its instructions.
