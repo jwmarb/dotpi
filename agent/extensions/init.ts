@@ -8,7 +8,8 @@
  *    directories deserve their own AGENTS.md. Root always gets one.
  * 2. Model-driven authoring (opencode `/init` style): the command hands the
  *    agent a self-contained brief with the tier plan, section templates,
- *    line limits and anti-duplication rules; the agent explores and writes.
+ *    line limits and anti-duplication rules; the agent fans out one `explorer`
+ *    subagent per nested tier in parallel, then writes from their reports.
  *
  * Why this composes with pi: pi loads at most one context file per
  * directory (AGENTS.override.md > AGENTS.md > CLAUDE.md) and walks every
@@ -35,6 +36,8 @@ const MAX_DEPTH_DEFAULT = 3;
 const MAX_NESTED_TIERS = 10;
 const ROOT_LINE_RANGE = "50-150";
 const NESTED_LINE_RANGE = "30-80";
+/** How many `explorer` subagents to fan out at once during the exploration phase. */
+const MAX_PARALLEL_EXPLORERS = 5;
 /** Score bands (init-deep): >15 create, 8-15 candidate, <8 skip. */
 const CREATE_ABOVE = 15;
 const CANDIDATE_FROM = 8;
@@ -306,7 +309,13 @@ function buildBrief(plan: TierPlan, mode: "update" | "create-new"): string {
   lines.push("");
   lines.push("For each tier, a tier covers its own files; files under a child tier belong to the child, not the parent.");
   lines.push("");
-  lines.push("Before writing, explore: read the build/test/lint/CI config at every tier (package.json scripts, Makefile, pyproject.toml, .github/workflows, etc.), entry points, and existing context files. Verify every command you record against config — do not run them, do not guess.");
+  lines.push("EXPLORATION — do this FIRST, and do it in parallel. You are an orchestrator here: delegate the per-tier recon, do not read every tier yourself, serially, in this window.");
+  lines.push(`- Dispatch one \`explorer\` subagent per nested tier, launching them in a SINGLE batch (all \`subagent\` calls in one message) so they run concurrently. Cap the fan-out at ${MAX_PARALLEL_EXPLORERS} at a time; if there are more tiers than that, send the next batch as results come back.`);
+  lines.push("- Each explorer has none of this conversation, so each task must be self-contained: give it the absolute tier path, the nested template it is feeding, the line budget, and the exact questions to answer.");
+  lines.push("- Ask every explorer for the same shape of answer: what this subtree is and owns (one paragraph), entry points and module boundaries with file:line refs, conventions that are SPECIFIC to this subtree (not project-wide), any build/test/lint commands declared in this tier's own config, and quirks/gotchas. Require exact file:line citations, and an explicit 'not found' instead of a guess.");
+  lines.push("- While they run, explore the ROOT tier yourself: read the top-level build/test/lint/CI config (package.json scripts, Makefile, pyproject.toml, .github/workflows, etc.), the entry points, and every existing context file.");
+  lines.push("- Delegation is asynchronous. After dispatching, end your turn; each explorer wakes you with its report. Do not poll, and do not start authoring a tier before its report is in.");
+  lines.push("- Explorer output is evidence, not copy: never paste a report into an AGENTS.md. Verify every command you record against the config files — do not run them, do not guess.");
   lines.push("");
   lines.push("Root AGENTS.md template (50-150 lines, no generic advice, nothing obvious from filenames alone):");
   lines.push(`  # ${rootName} — Project Knowledge Base`);
