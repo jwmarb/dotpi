@@ -4,10 +4,14 @@ import {
 	activeItem,
 	applyOp,
 	counts,
+	demotedBy,
 	emptyState,
+	nudgeFor,
+	progressSignature,
 	summarize,
 	TodoError,
 	type TodoState,
+	unfinished,
 } from "./todo.js";
 
 /** Build a state by folding ops, the way the extension does across calls. */
@@ -187,5 +191,128 @@ describe("counts, activeItem and summarize", () => {
 		);
 		expect(summarize(state)).toContain("1 blocked");
 		expect(summarize(state)).toContain("nothing in progress");
+	});
+});
+
+describe("unfinished", () => {
+	test("counts pending and in_progress, but not done or blocked", () => {
+		// blocked is excluded on purpose: it has already been accounted for with a
+		// note, so it is not work the agent silently forgot.
+		const state = build(
+			{ op: "add", texts: ["a", "b", "c", "d"] },
+			{ op: "start", id: "t1" },
+			{ op: "block", id: "t2", note: "waiting" },
+			{ op: "complete", id: "t3" },
+		);
+		expect(unfinished(state).map((i) => i.id)).toEqual(["t1", "t4"]);
+	});
+
+	test("an empty or fully-settled list owes nothing", () => {
+		expect(unfinished(emptyState())).toEqual([]);
+		const settled = build(
+			{ op: "add", texts: ["a", "b"] },
+			{ op: "complete", id: "t1" },
+			{ op: "block", id: "t2", note: "waiting" },
+		);
+		expect(unfinished(settled)).toEqual([]);
+	});
+});
+
+describe("demotedBy", () => {
+	test("names the item a start knocked back to pending", () => {
+		const before = build({ op: "add", texts: ["one", "two"] }, { op: "start", id: "t1" });
+		const after = applyOp(before, { op: "start", id: "t2" });
+		expect(demotedBy(before, after)?.id).toBe("t1");
+	});
+
+	test("reports nothing when the start displaced no one", () => {
+		const before = build({ op: "add", texts: ["one", "two"] });
+		expect(demotedBy(before, applyOp(before, { op: "start", id: "t1" }))).toBeUndefined();
+	});
+
+	test("a completed item is not a demotion", () => {
+		// complete moves in_progress -> done, which is the agent doing the right
+		// thing. Only a slide back to pending is worth warning about.
+		const before = build({ op: "add", texts: ["one"] }, { op: "start", id: "t1" });
+		expect(demotedBy(before, applyOp(before, { op: "complete", id: "t1" }))).toBeUndefined();
+	});
+});
+
+describe("progressSignature", () => {
+	test("changes when a status changes", () => {
+		const state = build({ op: "add", texts: ["one", "two"] });
+		const started = applyOp(state, { op: "start", id: "t1" });
+		expect(progressSignature(state)).not.toBe(progressSignature(started));
+	});
+
+	test("ignores note-only changes, which are not progress", () => {
+		// The signature gates the settle-time reminder. Blocking an already-blocked
+		// item with a new note must not re-arm it, or an agent that keeps rewording
+		// a note could be nudged forever.
+		const a = build({ op: "add", texts: ["one"] }, { op: "block", id: "t1", note: "first" });
+		const b = applyOp(a, { op: "block", id: "t1", note: "second" });
+		expect(progressSignature(a)).toBe(progressSignature(b));
+	});
+});
+
+describe("nudgeFor", () => {
+	test("stays silent on an empty list", () => {
+		expect(nudgeFor(emptyState())).toBeUndefined();
+	});
+
+	test("stays silent once every item is resolved", () => {
+		const state = build(
+			{ op: "add", texts: ["a", "b"] },
+			{ op: "complete", id: "t1" },
+			{ op: "block", id: "t2", note: "waiting on CI" },
+		);
+		expect(nudgeFor(state)).toBeUndefined();
+	});
+
+	test("names each open item and its state", () => {
+		const state = build(
+			{ op: "add", texts: ["parse header", "write test"] },
+			{ op: "start", id: "t1" },
+		);
+		const nudge = nudgeFor(state);
+		expect(nudge?.text).toContain("t1 (in progress) parse header");
+		expect(nudge?.text).toContain("t2 (pending) write test");
+		expect(nudge?.text).toContain("2 todo items are still open");
+	});
+
+	test("offers all three exits and forbids the dishonest one", () => {
+		// The failure mode a bare "you forgot" reminder would create: the model
+		// completes unfinished work to silence the warning.
+		const nudge = nudgeFor(build({ op: "add", texts: ["one"] }));
+		expect(nudge?.text).toContain("'complete'");
+		expect(nudge?.text).toContain("'block'");
+		expect(nudge?.text).toContain("'drop'");
+		expect(nudge?.text).toMatch(/[Nn]ever mark an item done just to clear/);
+	});
+
+	test("uses singular phrasing for one item", () => {
+		expect(nudgeFor(build({ op: "add", texts: ["one"] }))?.text).toContain("1 todo item is");
+	});
+
+	test("caps the list it names but still reports the true total", () => {
+		const texts = Array.from({ length: 11 }, (_, i) => `task ${i + 1}`);
+		const nudge = nudgeFor(build({ op: "add", texts }));
+		expect(nudge?.text).toContain("11 todo items are still open");
+		expect(nudge?.text).toContain("task 8");
+		expect(nudge?.text).not.toContain("task 9");
+		expect(nudge?.text).toContain("3 more");
+	});
+
+	test("carries the signature of the state that produced it", () => {
+		// This is what the extension dedupes on, so it must match the state the
+		// nudge describes rather than being recomputed later.
+		const state = build({ op: "add", texts: ["one"] });
+		expect(nudgeFor(state)?.signature).toBe(progressSignature(state));
+	});
+
+	test("completing the last open item ends the nagging", () => {
+		const state = build({ op: "add", texts: ["one"] }, { op: "start", id: "t1" });
+		expect(nudgeFor(state)).toBeDefined();
+		expect(nudgeFor(applyOp(state, { op: "complete", id: "t1", note: "tests pass" }))).toBeUndefined();
 	});
 });

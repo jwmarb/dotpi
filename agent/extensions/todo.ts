@@ -11,6 +11,34 @@
  * - Renders the list below the editor whenever it is non-empty; hides itself
  *   when empty, so a session that never plans anything costs no screen space.
  * - Registers `/todos` to print the list into the transcript on demand.
+ * - Holds the turn open on `agent_before_settle` when items are still open, so
+ *   an abandoned list is corrected rather than silently left behind.
+ *
+ * WHY A SETTLE-TIME GUARD AND NOT JUST A STRONGER PROMPT
+ *
+ * `promptGuidelines` already say to complete each item as it lands. Guidelines
+ * are read once, at the top of a long run, and the forgetting happens at the
+ * end — the model finishes the work, writes its summary and stops, with the list
+ * still claiming nothing finished. Prose cannot fix a recency problem, so the
+ * reminder is moved to the moment it is about to be wrong: `agent_before_settle`
+ * fires when the agent would stop, and returning `{ continue: true }` with a
+ * `custom_message` draft puts the open items back in front of the model as a
+ * user-role turn (pi maps `role: "custom"` to `user` in `convertToLlm`).
+ *
+ * Two things keep that from becoming a trap:
+ *
+ *  - **One reminder per distinct list state** (`nudgedSignatures`). The nudge is
+ *    keyed on every item's status, so completing an item re-arms it but an
+ *    ignored reminder is never repeated. Without that cap a model declining to
+ *    update its list would be asked forever and the session would wedge.
+ *  - **Only on `outcome: "completed"`.** An aborted or errored run is not a
+ *    forgotten checklist; injecting work there would fight the user's Esc.
+ *
+ * `context.canContinue` is deliberately *not* consulted: at handler time the
+ * last message is the assistant's, so it reads `false`. pi recomputes it after
+ * committing the draft, and the committed `custom_message` is what makes the
+ * continuation legal. Gating on the value seen here would disable the guard
+ * entirely while looking correct.
  *
  * WHY BELOW THE EDITOR AND NOT IN THE FOOTER
  *
@@ -42,7 +70,9 @@ import {
 	activeItem,
 	applyOp,
 	counts,
+	demotedBy,
 	emptyState,
+	nudgeFor,
 	STATUS_GLYPH,
 	summarize,
 	TodoError,
@@ -135,6 +165,15 @@ export default function (pi: ExtensionAPI) {
 	let state: TodoState = emptyState();
 
 	/**
+	 * List states already reminded about, so each is raised at most once.
+	 *
+	 * In memory rather than derived from the branch: it is a property of this
+	 * conversation's nagging, not of the todo list, and a reminder the model
+	 * ignored must not come back on every subsequent settle.
+	 */
+	const nudgedSignatures = new Set<string>();
+
+	/**
 	 * Rebuild the list from the current branch's `todo` tool results.
 	 *
 	 * The last snapshot wins: each result carries the whole state after its op,
@@ -208,8 +247,9 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Track multi-step work in a visible todo list (add/start/complete/block).",
 		promptGuidelines: [
 			"For work of three or more non-trivial steps, call todo with op 'add' to write the steps down before starting. Skip it for single-step or trivial requests — a plan for trivial work is noise.",
-			"Mark exactly one item in progress with op 'start' before working on it, and op 'complete' immediately after finishing it, not batched at the end. Starting an item automatically demotes the previous one.",
+			"Mark exactly one item in progress with op 'start' before working on it, and op 'complete' immediately after finishing it, not batched at the end. Starting an item automatically demotes the previous one, so complete or block the current item before starting the next.",
 			"Only complete an item when it is genuinely finished. If tests fail, the implementation is partial, or you hit an unresolved error, use op 'block' with a note saying what is wrong instead.",
+			"Before you finish your reply, every item must be resolved: complete, blocked with a note, or dropped. Leaving items pending or in progress holds the turn open and asks you to account for them, so settle the list as you go rather than being reminded.",
 			"Do not restate the todo list in your replies after calling the tool — the user already sees it below the editor.",
 		],
 		parameters: TodoParams,
@@ -218,6 +258,7 @@ export default function (pi: ExtensionAPI) {
 			// in-memory copy may describe a branch the session has left.
 			reconstruct(ctx);
 
+			const before = state;
 			try {
 				state = applyOp(state, toOp(params as TodoParamsType));
 			} catch (err) {
@@ -233,8 +274,22 @@ export default function (pi: ExtensionAPI) {
 
 			refreshWidget(ctx);
 
+			// A `start` that silently demoted the previous item is the first half of
+			// the forgetting this extension guards against: the agent moves on and
+			// the abandoned item sits at pending for the rest of the session. Say it
+			// here, where the fix is still one call away — lib/todo.ts promises the
+			// caller reports this rather than demoting in silence.
+			const demoted = demotedBy(before, state);
+			const lines = [summarize(state)];
+			if (demoted) {
+				lines.push(
+					`Note: ${demoted.id} (${demoted.text}) went back to pending. ` +
+						"If it is finished, complete it; if something is in the way, block it with a note.",
+				);
+			}
+
 			return {
-				content: [{ type: "text", text: summarize(state) }],
+				content: [{ type: "text", text: lines.join("\n") }],
 				details: { state },
 			};
 		},
@@ -270,5 +325,46 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => {
 		reconstruct(ctx);
 		refreshWidget(ctx);
+		// A rewind can land on a state that was already nudged. Keeping those
+		// signatures would suppress the reminder for work now unfinished again, so
+		// a branch change forgets them and the guard re-arms.
+		nudgedSignatures.clear();
+	});
+
+	/**
+	 * The guard: refuse to let the agent stop while items are still open.
+	 *
+	 * Returns a `custom_message` draft plus `continue: true`, which pi commits
+	 * and then re-runs the agent against — see the header note on why
+	 * `context.canContinue` is not consulted here.
+	 */
+	pi.on("agent_before_settle", async (event, ctx) => {
+		// Esc or a crash is not a forgotten checklist. Leave those alone.
+		if (event.outcome !== "completed") return;
+
+		reconstruct(ctx);
+		refreshWidget(ctx);
+
+		const nudge = nudgeFor(state);
+		if (!nudge) return;
+		// Already asked about exactly this list, and nothing moved since. Asking
+		// again would loop a model that has decided not to update it.
+		if (nudgedSignatures.has(nudge.signature)) return;
+		nudgedSignatures.add(nudge.signature);
+
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message" as const,
+					customType: "todo-reminder",
+					content: nudge.text,
+					// Visible: the user should see why the turn did not end, and the
+					// widget alone does not explain the extra round trip.
+					display: true,
+				},
+			],
+			continue: true,
+		};
 	});
 }

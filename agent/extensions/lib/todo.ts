@@ -22,6 +22,15 @@
  *    storage choice pi's own `examples/extensions/todo.ts` documents, and the
  *    reason the removed `plan` extension's `agent/plans/*.jsonl` could describe
  *    work the agent no longer remembered doing.
+ *
+ * 3. **An unfinished list is not allowed to settle quietly.**
+ *    Forgetting to mark an item done is the dominant failure mode: the work
+ *    happens, the list keeps claiming it did not. `nudgeFor` and
+ *    `progressSignature` are the pure half of the guard the extension installs
+ *    on `agent_before_settle` — one reminder per distinct list state, so real
+ *    progress re-arms it while an ignored reminder cannot wedge the session.
+ *    `demotedBy` catches the same mistake one step earlier, at the `start` that
+ *    silently knocked the previous item back to pending.
  */
 
 /** Lifecycle of a single item. `blocked` needs no WIP rule, so it is uncapped. */
@@ -159,6 +168,85 @@ export function counts(state: TodoState): TodoCounts {
 /** The item the widget highlights: whatever is in flight. */
 export const activeItem = (state: TodoState): TodoItem | undefined =>
 	state.items.find((i) => i.status === "in_progress");
+
+/**
+ * The items that still owe an outcome: nothing has been said about whether they
+ * happened. `blocked` is excluded deliberately — it has already been accounted
+ * for, with a note naming what it is waiting on.
+ */
+export const unfinished = (state: TodoState): TodoItem[] =>
+	state.items.filter((i) => i.status === "pending" || i.status === "in_progress");
+
+/**
+ * The item a `start` knocked back to pending, recovered by diffing snapshots.
+ *
+ * `applyOp` demotes the incumbent silently so switching focus stays one call
+ * (see `start`), but the comment there promises the caller *says so* — this is
+ * how. A diff rather than a second return value from `applyOp`, so the reducer
+ * keeps its one-in-one-out shape and a replayed history cannot disagree with a
+ * recomputed advisory.
+ *
+ * Why this earns a function: "agent starts the next item and never completes the
+ * previous one" is the most common way a list drifts out of agreement with
+ * reality, and the demotion is the last moment where the fix is one call away.
+ */
+export function demotedBy(prev: TodoState, next: TodoState): TodoItem | undefined {
+	for (const after of next.items) {
+		if (after.status !== "pending") continue;
+		const before = prev.items.find((i) => i.id === after.id);
+		if (before?.status === "in_progress") return after;
+	}
+	return undefined;
+}
+
+/**
+ * Fingerprint of every item's status. Two states sharing a signature describe
+ * the same unfinished work, which is what makes the settle-time reminder safe to
+ * cap: one per signature fires again after real progress, but never twice for a
+ * list the agent has not touched.
+ */
+export const progressSignature = (state: TodoState): string =>
+	state.items.map((i) => `${i.id}:${i.status}`).join(",");
+
+/** Cap on items named in a reminder, so a long list cannot dominate the turn. */
+const NUDGE_MAX_LISTED = 8;
+
+export interface TodoNudge {
+	/** The message injected back into the conversation. */
+	text: string;
+	/** Signature of the state that produced it; one reminder per signature. */
+	signature: string;
+}
+
+/**
+ * The reminder to inject when the agent tries to finish with work still open, or
+ * `undefined` when the list is genuinely settled.
+ *
+ * Names every open item and spells out all three legitimate exits. A reminder
+ * that only said "you forgot" would push the model toward the one wrong repair —
+ * marking unfinished work done to clear the warning — so it says not to.
+ */
+export function nudgeFor(state: TodoState): TodoNudge | undefined {
+	const open = unfinished(state);
+	if (open.length === 0) return undefined;
+
+	const shown = open.slice(0, NUDGE_MAX_LISTED);
+	const listed = shown
+		.map((i) => `${i.id} (${i.status === "in_progress" ? "in progress" : "pending"}) ${i.text}`)
+		.join("; ");
+	const more = open.length > shown.length ? `; … ${open.length - shown.length} more` : "";
+	const subject = open.length === 1 ? "1 todo item is" : `${open.length} todo items are`;
+
+	return {
+		signature: progressSignature(state),
+		text:
+			`Not done yet: ${subject} still open — ${listed}${more}. ` +
+			"For each one do exactly one of: todo op 'complete' if it is genuinely finished, " +
+			"op 'block' with a note if something is in the way, or op 'drop' if it turned out " +
+			"not to be needed. If the work itself is unfinished, keep working instead of " +
+			"marking it. Never mark an item done just to clear this message.",
+	};
+}
 
 /**
  * One-line text for the tool result. Deliberately terse: Codex's own
