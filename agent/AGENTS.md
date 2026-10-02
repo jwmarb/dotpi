@@ -11,9 +11,9 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 | Question | Answer |
 |---|---|
 | Which agents exist, on what model | `agents/*.md` frontmatter — 9: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker |
-| Which skills the model may auto-invoke | `skills/*/SKILL.md` — 38 local dirs, 15 slash-only (`disable-model-invocation: true`); plus 15 from the `superpowers` package, so the live catalogue reads 53 |
+| Which skills the model may auto-invoke | `skills/<category>/<skill>/SKILL.md` — 37 local skills in 9 categories, 15 slash-only (`disable-model-invocation: true`); plus 15 from the `superpowers` package, so the live catalogue reads 52 |
 | Why a skill dir has extra `.md` files | Progressive disclosure: `SKILL.md` is the entry point, siblings (`tests.md`, `REPORT.md`) load on demand |
-| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `agent-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; 24 skills ship `skills/<skill>/agents/` |
+| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `automate-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; 24 skills have an `agents/` dir but only `technical-analysis` defines real agents there — the other 23 hold `openai.yaml` alone |
 | What a theme key may be | `themes/tokyo-night.json` `$schema` → pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
@@ -42,8 +42,12 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   `read_skill` to open what the catalogue points at: `tools` is an allowlist, so an
   undeclared reader is genuinely absent. A declaration may name a **package** skill
   (`test-driven-development`), because resolution goes through pi's catalogue rather than
-  a scan of `skills/` — which is also why `skills/` must stay **flat**: the directory name
-  is the identity both `skills:` and `skill-activation.ts` match on.
+  a scan of `skills/`. The skill's **directory name** is the identity both `skills:` and
+  `skill-activation.ts` match on, which is why a skill may be filed under a category
+  (`skills/finance/technical-analysis/`) without any declaration changing: the category is
+  in the path, the identity is the leaf. Finding a skill in that tree belongs to
+  `extensions/lib/skill-tree.ts` alone — three readers once each did their own one-level
+  `readdir`, and nesting broke all three *silently*.
 - **`callable_by` makes an agent a private helper.** Absent means public. `callable_by:
   librarian` on `summarizer` means only the librarian may spawn it; the human's
   orchestrator is always allowed, which is how you debug one by hand. Unspawnable agents
@@ -72,14 +76,17 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   *different* tree: the librarian that clones into `.firecrawl/src/<repo>` and then spawns
   the explorer without `cwd` gets a confident, well-formatted map of the user's project
   instead of the dependency — a wrong answer that looks right.
-- **`skills/*/agents/openai.yaml` is optional presentation** (`display_name`,
-  `short_description`); 24 of 38 have one and its absence changes nothing functional.
-- **Interview- and workflow-style skills set `disable-model-invocation: true`** (grilling,
-  triage, wayfinder, handoff): they need a human in the loop, so model-initiated
+- **`skills/<category>/<skill>/agents/openai.yaml` is optional presentation**
+  (`display_name`, `short_description`); 23 of 37 have one and its absence changes nothing
+  functional. An `agents/` directory holding only this file defines **no agents** — which is
+  why discovery gates on `agents/*.md`, not on the directory existing.
+- **Interview- and workflow-style skills set `disable-model-invocation: true`**
+  (`stress-test-thinking`, `triage`, `wayfinder`, `compact-session-for-handoff`): they need a
+  human in the loop, so model-initiated
   invocation is a bug. `argument-hint` prefills the slash prompt.
 - **Personal-identity skills stay on disk and untracked**, not placeholdered —
-  `skills/uarizona-hpc/` is the live example. Add a `.gitignore` path rather than
-  sanitising in place.
+  a gitignored skill directory under its category is the pattern (there is none on disk
+  right now). Add a `.gitignore` path rather than sanitising in place.
 - **The superpowers bootstrap extension is deliberately disabled.** Its package entry is
   the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only the 15
   skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block every turn
@@ -94,6 +101,12 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   those names are now dangling (`git log` has them). Two were kept because they differ:
   `code-review` is fixed-point, two-axis and tracker-aware where `requesting-code-review`
   is not, and `writing-for-agents` covers `AGENTS.md`, which `writing-skills` does not.
+- **15 local skills were renamed when the library was categorized**, because the prompt now
+  offers the model a skill's *name* and not its description, and a name like `wait-what` or
+  `ask-matt` is no signal at all. The old names are gone rather than aliased; the was/now
+  table lives in `skills/dialogue-and-handoff/which-skill-fits/SKILL.md`, the skill whose
+  job is answering "which skill was that?". The `firecrawl` and `agent-browser` **CLI
+  binaries** keep their names — only the skills documenting them moved.
 
 ## ANTI-PATTERNS
 
