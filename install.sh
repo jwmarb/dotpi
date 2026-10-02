@@ -15,9 +15,10 @@
 #   2. clones the repo to ~/.pi, or to --dir with ~/.pi symlinked at it
 #   3. arms the git hooks (core.hooksPath -> .githooks)
 #   4. installs the one extension that has real npm dependencies
-#   5. copies agent/.env.example to agent/.env for you to fill in
+#   5. installs the firecrawl CLI, which the librarian agent researches with
+#   6. copies agent/.env.example to agent/.env for you to fill in
 #
-# It never writes credentials. Step 5 leaves placeholders; you edit the file.
+# It never writes credentials. Step 6 leaves placeholders; you edit the file.
 #
 # Flags:
 #   --dir <path>   clone here and symlink ~/.pi at it (default: clone to ~/.pi)
@@ -253,6 +254,34 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5b. The firecrawl CLI
+#
+# The librarian agent researches by running `firecrawl`, so without this binary
+# that agent launches and then cannot do its job. Optional on purpose: pi and
+# every other agent work without it, and a global npm install is not something
+# to force on someone who only wanted a pi config.
+#
+# npm, not bun: the package publishes a `firecrawl` bin that resolves through
+# npm's global prefix, which is also where `npm ls -g` can see it again.
+# ---------------------------------------------------------------------------
+step "Installing the firecrawl CLI"
+if command -v firecrawl >/dev/null 2>&1; then
+	ok "firecrawl $(firecrawl --version 2>/dev/null | tail -1)"
+elif ! command -v npm >/dev/null 2>&1; then
+	warn "npm not found, so the firecrawl CLI was not installed."
+	warn "The librarian agent needs it: install Node.js, then: npm install -g firecrawl-cli"
+else
+	if npm install -g firecrawl-cli >/dev/null 2>&1; then
+		ok "firecrawl $(firecrawl --version 2>/dev/null | tail -1)"
+	else
+		# A global install can fail on a root-owned prefix, which is a
+		# permissions problem to fix deliberately rather than with sudo here.
+		warn "could not install firecrawl-cli (a global npm prefix often needs a permission fix)."
+		warn "The librarian agent needs it; install it yourself: npm install -g firecrawl-cli"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Credentials
 #
 # The template only. Writing real keys is the user's job: a script that prompts
@@ -287,6 +316,9 @@ if [ "$ENV_WAS_CREATED" -eq 1 ]; then
 	printf '  LITELLM_MCP_KEY    gateway key    (x-litellm-api-key header)\n'
 	printf '  LITELLM_MCP_URL    gateway URL\n\n'
 	printf '  %sMCP_KEY and API_KEY are different credentials, not the same value twice.%s\n\n' "$DIM" "$R"
+	printf '%sOptional — the librarian agent researches through this:%s\n' "$B" "$R"
+	printf '  FIRECRAWL_API_URL  your Firecrawl endpoint, e.g. http://firecrawl.lan:3002\n'
+	printf '  %sNo API key: a self-hosted URL makes the CLI skip key validation.%s\n\n' "$DIM" "$R"
 fi
 
 printf 'Then start it:\n\n    pi\n\n'
