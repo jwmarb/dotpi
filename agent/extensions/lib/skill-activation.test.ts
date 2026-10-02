@@ -223,8 +223,29 @@ describe("parseOwnedTools", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadSkillToolOwners", () => {
+  /**
+   * A fake skills tree keyed by path relative to `/skills`.
+   *
+   * `readdir` is path-aware on purpose. It used to ignore its argument and
+   * always return the top-level listing, which worked only because the reader
+   * scanned exactly one level; against a recursive walker that fake describes an
+   * infinitely self-repeating tree. Deriving each directory's real children is
+   * what lets these fixtures describe the nested layout the library actually has.
+   */
   const fake = (files: Record<string, string>) => ({
-    readdir: async () => [...new Set(Object.keys(files).map((p) => p.split("/")[0]))],
+    readdir: async (p: string) => {
+      const rel = p.replace(/^\/skills\/?/, "");
+      const prefix = rel ? `${rel}/` : "";
+      const children = new Set<string>();
+      for (const path of Object.keys(files)) {
+        if (!path.startsWith(prefix)) continue;
+        const next = path.slice(prefix.length).split("/")[0];
+        if (next) children.add(next);
+      }
+      // A path with no children is not a directory; the real readdir throws.
+      if (children.size === 0) throw new Error("ENOTDIR");
+      return [...children];
+    },
     readFile: async (p: string) => {
       const rel = p.replace(/^\/skills\//, "");
       if (!(rel in files)) throw new Error("ENOENT");
@@ -234,17 +255,21 @@ describe("loadSkillToolOwners", () => {
 
   test("maps a declared tool to its owning skill directory", async () => {
     const f = fake({
-      "technical-analysis/SKILL.md": "---\nname: technical-analysis\ntools: trade_journal\n---\nbody",
-      "tdd/SKILL.md": "---\nname: tdd\ndescription: no tools\n---\nbody",
+      "finance/technical-analysis/SKILL.md":
+        "---\nname: technical-analysis\ntools: trade_journal\n---\nbody",
+      "review/tdd/SKILL.md": "---\nname: tdd\ndescription: no tools\n---\nbody",
     });
     const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    // Keyed by the skill directory, never `finance/technical-analysis`: the
+    // category is organizational and must not leak into the identity the gate
+    // compares against the active set.
     expect([...owners]).toEqual([["trade_journal", "technical-analysis"]]);
   });
 
   test("a missing or unreadable SKILL.md costs only that skill", async () => {
     const f = fake({
-      "broken/notes.md": "no skill file here",
-      "technical-analysis/SKILL.md": "---\nname: ta\ntools: trade_journal\n---\n",
+      "meta/broken/notes.md": "no skill file here",
+      "finance/technical-analysis/SKILL.md": "---\nname: ta\ntools: trade_journal\n---\n",
     });
     const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
     expect(owners.get("trade_journal")).toBe("technical-analysis");
@@ -252,11 +277,36 @@ describe("loadSkillToolOwners", () => {
 
   test("first claimant wins a contested tool, so it stays reachable", async () => {
     const f = fake({
-      "aaa/SKILL.md": "---\nname: aaa\ntools: shared\n---\n",
-      "zzz/SKILL.md": "---\nname: zzz\ntools: shared\n---\n",
+      "one/aaa/SKILL.md": "---\nname: aaa\ntools: shared\n---\n",
+      "two/zzz/SKILL.md": "---\nname: zzz\ntools: shared\n---\n",
     });
     const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    // Ordered by skill name, so the winner does not depend on which category
+    // happens to sort first.
     expect(owners.get("shared")).toBe("aaa");
+  });
+
+  test("still finds a skill sitting directly in the skills root", async () => {
+    // Categories are the convention, not a hard requirement: pi itself loads a
+    // flat skill, so a newly-added one must not lose its tools before it is
+    // filed. The live-tree test is what keeps the real library tidy.
+    const f = fake({
+      "loose-skill/SKILL.md": "---\nname: loose-skill\ntools: solo\n---\n",
+    });
+    const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    expect(owners.get("solo")).toBe("loose-skill");
+  });
+
+  test("does not descend into a skill's own directory", async () => {
+    // A reference doc named SKILL.md inside a skill would otherwise register as
+    // a second skill and could outrank its own parent for a contested tool.
+    const f = fake({
+      "research/digger/SKILL.md": "---\nname: digger\ntools: shovel\n---\n",
+      "research/digger/nested/SKILL.md": "---\nname: nested\ntools: shovel\n---\n",
+    });
+    const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    expect(owners.get("shovel")).toBe("digger");
+    expect([...owners.values()]).not.toContain("nested");
   });
 
   test("an unreadable skills directory yields an empty map, gating nothing", async () => {

@@ -25,6 +25,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { findSkills } from "./skill-tree.js";
+
 /**
  * Metadata for a subagent definition parsed from `agent/agents/<name>.md`.
  * The union of what both consumers need: the prompt renders
@@ -114,7 +116,8 @@ export async function discoverAgents(agentsDir: string): Promise<AgentInfo[]> {
 }
 
 /**
- * Scans every `<skillsDir>/<skill>/agents/` for agent definitions.
+ * Scans every skill's `agents/` directory for agent definitions, wherever that
+ * skill sits in the category tree.
  *
  * Skills may ship their own subagents beside the skill that drives them — a
  * journal-writing agent belongs with the journal skill, not in the global roster
@@ -125,31 +128,33 @@ export async function discoverAgents(agentsDir: string): Promise<AgentInfo[]> {
  * `.md` files with parseable frontmatter become agents, so existing skills are
  * unaffected.
  *
- * @param skillsDir - Absolute path to the skills library (one dir per skill).
+ * @param skillsDir - Absolute path to the skills library (skills live under
+ *                    category directories; `skill-tree.ts` finds them).
  * @param only - When given, restrict discovery to these skill directory names
- *               (the loaded set). Omit to scan every skill.
+ *               (the loaded set) — matched on the skill's own directory name,
+ *               not its category path. Omit to scan every skill.
  * @returns A sorted (by name) list of agents, or `[]` on any failure.
  */
 export async function discoverSkillAgents(
   skillsDir: string,
   only?: Iterable<string>,
 ): Promise<AgentInfo[]> {
-  let skills: string[];
-  try {
-    skills = await readdir(skillsDir);
-  } catch {
-    return [];
-  }
+  // Locating skills belongs to `skill-tree.ts`: skills are nested under a
+  // category, and the one-level readdir this used to do returned no agents at
+  // all once a skill moved — with no error, so the agents just vanished.
+  let skills = await findSkills(skillsDir);
   if (only) {
+    // Filter on the skill directory name, not the path, so `skills:
+    // technical-analysis` keeps working regardless of which category files it.
     const allowed = new Set(only);
-    skills = skills.filter((s) => allowed.has(s));
+    skills = skills.filter((s) => allowed.has(s.dir));
   }
   const agents: AgentInfo[] = [];
   for (const skill of skills) {
     // One skill's unreadable agents/ dir costs only that skill: discoverAgents
     // already returns [] rather than throwing.
-    for (const agent of await discoverAgents(join(skillsDir, skill, "agents"))) {
-      agents.push({ ...agent, skill });
+    for (const agent of await discoverAgents(join(skill.root, "agents"))) {
+      agents.push({ ...agent, skill: skill.dir });
     }
   }
   return agents.sort((a, b) => a.name.localeCompare(b.name));

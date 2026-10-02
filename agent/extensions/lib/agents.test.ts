@@ -128,12 +128,30 @@ describe("discoverAgents", () => {
 // discoverSkillAgents
 // ---------------------------------------------------------------------------
 
-/** Builds a throwaway skills library: <root>/<skill>/agents/<file>.md */
+/**
+ * Builds a throwaway skills library shaped like the real one:
+ * `<root>/<category>/<skill>/{SKILL.md,agents/<file>.md}`.
+ *
+ * The `SKILL.md` is not decoration. Discovery identifies a skill by that file
+ * (the same rule pi applies), so a fixture without one describes a directory
+ * that is not a skill at all — and the agents inside it are correctly ignored.
+ * The earlier flat, SKILL.md-less fixture passed only against a reader that
+ * assumed every child of the root was a skill.
+ *
+ * Every skill is filed under `cat-<skill>` so the category differs per skill,
+ * which is what proves the identity comes from the skill directory and not from
+ * its position.
+ */
 function skillsFixture(label: string, layout: Record<string, Record<string, string>>): string {
   const root = join(tmpdir(), `skills-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   for (const [skill, files] of Object.entries(layout)) {
-    const dir = join(root, skill, "agents");
+    const skillRoot = join(root, `cat-${skill}`, skill);
+    const dir = join(skillRoot, "agents");
     mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(skillRoot, "SKILL.md"),
+      `---\nname: ${skill}\ndescription: ${skill} skill\n---\nBody.`,
+    );
     for (const [file, body] of Object.entries(files)) {
       writeFileSync(join(dir, file), body);
     }
@@ -186,7 +204,10 @@ describe("discoverSkillAgents", () => {
         "openai.yaml": "interface:\n  display_name: \"TA\"\n",
       },
     });
-    mkdirSync(join(root, "plain-skill"), { recursive: true }); // no agents/ at all
+    // A real skill (it has a SKILL.md) that ships no agents/ at all.
+    const plain = join(root, "cat-plain", "plain-skill");
+    mkdirSync(plain, { recursive: true });
+    writeFileSync(join(plain, "SKILL.md"), "---\nname: plain-skill\ndescription: x\n---\n");
     const agents = await discoverSkillAgents(root);
     expect(agents.map((a) => a.name)).toEqual(["observer"]);
   });

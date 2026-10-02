@@ -26,10 +26,11 @@
  *
  * @module extensions/lib/skill-activation
  */
-import { readdir as fsReaddir, readFile as fsReadFile } from "node:fs/promises";
+import { readFile as fsReadFile } from "node:fs/promises";
 import { basename, dirname, sep } from "node:path";
 
 import { extractStringList, frontmatterOf } from "./agents.js";
+import { findSkills } from "./skill-tree.js";
 
 /**
  * Matches pi's expanded skill block: `<skill name="x" location="/path/SKILL.md">`.
@@ -211,18 +212,23 @@ export function parseOwnedTools(frontmatter: string): string[] {
  *
  * Returns an empty map on any failure, and skips an unreadable `SKILL.md`, so a
  * broken skill costs only its own gating rather than every tool in the session.
- * When two skills claim one tool the first by directory order wins, and the
+ * When two skills claim one tool the first by skill-name order wins, and the
  * duplicate is ignored — a contested tool stays reachable through one owner
  * rather than becoming unreachable.
  *
+ * Finds skills at any depth via `skill-tree.ts`, so a skill keeps its tool when
+ * it is filed under a category. The key is always the skill *directory* name,
+ * never its category path, because that is what the active set holds.
+ *
  * Reads every skill's frontmatter once per process and memoizes the result: the
- * gate runs on every `before_agent_start`, and re-reading 40 `SKILL.md` files per
- * turn buys nothing — a new skill needs a pi restart to be loadable anyway.
- * An explicit reader/lister bypasses the cache so tests stay deterministic.
+ * gate runs on every `before_agent_start`, and re-reading 50-odd `SKILL.md`
+ * files per turn buys nothing — a new skill needs a pi restart to be loadable
+ * anyway. An explicit reader/lister bypasses the cache so tests stay
+ * deterministic.
  *
  * @param skillsDirPath - Absolute path to the skills library.
  * @param readFile - Injectable reader (tests pass a fake; the extension uses fs).
- * @param readdir - Injectable directory lister.
+ * @param readdir - Injectable directory lister, forwarded to the tree walker.
  */
 export async function loadSkillToolOwners(
   skillsDirPath: string,
@@ -235,28 +241,27 @@ export async function loadSkillToolOwners(
     if (cached) return cached;
   }
 
-  const rd = readdir ?? ((p: string) => fsReaddir(p));
   const rf = readFile ?? ((p: string) => fsReadFile(p, "utf-8"));
 
-  let dirs: string[];
-  try {
-    dirs = (await rd(skillsDirPath)).sort();
-  } catch {
-    return new Map();
-  }
+  // Location is `skill-tree.ts`'s job, not this module's: a skill is nested
+  // under its category, and a local `readdir` here would silently stop finding
+  // `tools:` the moment one moved (verified — it returned an empty map).
+  const located = await findSkills(skillsDirPath, readdir);
 
   const owners = new Map<string, string>();
-  for (const dir of dirs) {
+  for (const skill of located) {
     let text: string;
     try {
-      text = await rf(`${skillsDirPath}/${dir}/SKILL.md`);
+      text = await rf(skill.path);
     } catch {
-      continue; // no SKILL.md, or unreadable: this skill simply owns nothing
+      continue; // unreadable: this skill simply owns nothing
     }
     const fm = frontmatterOf(text);
     if (!fm) continue;
     for (const tool of parseOwnedTools(fm)) {
-      if (!owners.has(tool)) owners.set(tool, dir);
+      // The skill *directory* name, not its path: that is the identity the gate
+      // checks against the active set.
+      if (!owners.has(tool)) owners.set(tool, skill.dir);
     }
   }
 

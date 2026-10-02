@@ -13,6 +13,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { frontmatterOf } from "../lib/agents.js";
+import { findSkills } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
 import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
@@ -258,37 +259,36 @@ export function appendSkillCatalogue(
 }
 
 /**
- * Reads every skill's identity out of `<skillsDir>/<dir>/SKILL.md`.
+ * Reads every skill's identity out of its `SKILL.md`.
  *
  * Uses the shared frontmatter grammar (`frontmatterOf` + `extractString`) rather
  * than a local regex, because this repo has already been bitten by two readers
  * of the same format drifting apart. A skill with no readable `SKILL.md` is
  * skipped: one broken skill must not cost an agent its whole catalogue.
  *
- * Scans one level deep only, matching `agent/skills/`, which is flat by
- * construction: the directory name is the identity that `skills:` and
- * `skill-activation.ts` both match on. This is the **fallback** path — normally a
- * child's catalogue comes from pi's own resolved skill list via
- * {@link skillEntriesFromPi}, which also covers packages and project scope.
+ * Locating the skills is `../lib/skill-tree.ts`'s job for the same reason: they
+ * are nested under category directories, and the one-level scan this used to do
+ * silently returned nothing for a skill that had moved. The entry's `dir` stays
+ * the skill's own directory name — the identity `skills:` and
+ * `skill-activation.ts` both match on — never its category path.
  *
- * @param skillsDirPath - Absolute path to the skills library (one dir per skill).
+ * This is the **fallback** path — normally a child's catalogue comes from pi's
+ * own resolved skill list via {@link skillEntriesFromPi}, which also covers
+ * packages and project scope.
+ *
+ * @param skillsDirPath - Absolute path to the skills library.
  */
 export async function discoverSkills(skillsDirPath: string): Promise<SkillEntry[]> {
-  let dirs: string[];
-  try {
-    dirs = await readdir(skillsDirPath);
-  } catch {
-    return [];
-  }
+  const located = await findSkills(skillsDirPath);
 
   const out: SkillEntry[] = [];
-  for (const dir of dirs.sort()) {
-    const path = join(skillsDirPath, dir, "SKILL.md");
+  for (const skill of located) {
+    const { dir, path } = skill;
     let text: string;
     try {
       text = await readFile(path, "utf-8");
     } catch {
-      continue; // not a skill directory, or unreadable
+      continue; // unreadable: skip this skill, keep the rest of the catalogue
     }
     const fm = frontmatterOf(text);
     if (!fm) continue;
