@@ -40,6 +40,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - [git](https://git-scm.com)
 - [Node.js](https://nodejs.org) with npm — optional; only for the dev-only typecheck dependencies (`agent/extensions/subagent-herdr/`)
 - [Docker](https://docs.docker.com) — optional; only the ralph-loop `--verify` runtime gate needs it
+- [firecrawl-cli](https://docs.firecrawl.dev/cli) — optional; the `librarian` agent's research tool, installed with `npm install -g firecrawl-cli`. Needs `FIRECRAWL_API_URL` in `agent/.env` (no API key required for a self-hosted instance)
 
 ### Quick install 🚀
 
@@ -159,7 +160,7 @@ All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example
 | Agent       | Role                                                          | Model             |
 | ----------- | ------------------------------------------------------------- | ----------------- |
 | `explorer`  | Read-only codebase recon; returns a compressed map with `file:line` references | deepseek-v4-flash |
-| `librarian` | Read-only external research; looks up library/API docs via the MCP gateway    | deepseek-v4-flash |
+| `librarian` | Read-only external research; looks up library/API docs with the `firecrawl` CLI | deepseek-v4-flash |
 | `oracle`    | High-stakes architecture consultation; last-resort debugging             | gpt-5.6-sol       |
 | `planner`   | Read-only implementation planning; ordered, file-specific steps          | gpt-5.6-sol       |
 | `reviewer`  | Read-only code review; findings reported by severity                   | claude-opus-5     |

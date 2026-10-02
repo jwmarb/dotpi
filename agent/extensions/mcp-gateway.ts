@@ -52,7 +52,7 @@ export default async function (pi: ExtensionAPI) {
 		url,
 		headers: { "x-litellm-api-key": "Bearer ${LITELLM_MCP_KEY}" },
 		description:
-			"LiteLLM gateway: firecrawl web search/scrape, context7 library docs, and the GitHub API.",
+			"LiteLLM gateway: context7 library docs and the GitHub API. (Web search/scrape moved to the `firecrawl` CLI — see extensions/firecrawl-cli.ts.)",
 		// Default exposure. Tools stay out of the model's declarations and are
 		// reached from codemode scripts via searchTools() — which matters here
 		// because this one server offers 59 tools.
