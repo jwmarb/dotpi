@@ -16,6 +16,8 @@ import {
   type AgentInfo,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
+import { groupByCategory } from './lib/skill-categories.js';
+import { categoryFromPath } from './lib/skill-tree.js';
 import {
   SkillActivation,
   gateTools,
@@ -142,10 +144,16 @@ export default function (pi: ExtensionAPI) {
         })) ?? [];
 
     // --- Build skill inventory ---
+    // The category comes from the skill's own path when it has one, so the tree
+    // on disk is the source of truth and refiling a skill needs no code edit.
+    // `skillsDir()` is this repo's library; a package or project-local skill
+    // lies outside it and falls through to the name-keyed map instead.
+    const library = skillsDir();
     const skillInventory = (opts.skills ?? []).map((skill) => ({
       name: skill.name,
       description: skill.description,
       filePath: skill.filePath,
+      pathCategory: categoryFromPath(library, skill.filePath),
     }));
 
     // --- Build context file inventory ---
@@ -183,11 +191,84 @@ export default function (pi: ExtensionAPI) {
       customPrompt: opts.customPrompt,
       appendSystemPrompt: opts.appendSystemPrompt,
       cwd: opts.cwd,
+      skillsLibrary: library,
     });
 
     // Replace the default prompt entirely with the orchestrator prompt
     return { systemPrompt: orchestratorPrompt };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Skill catalogue rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Renders the skill catalogue as category headings with bare names.
+ *
+ * Names only, because that is the whole point of the two-tier format — but a
+ * name is only useful if the model can turn it into a file to open. Rather than
+ * print 52 absolute paths, each *root* is declared once and the names under it
+ * are bare.
+ *
+ * The library root is declared by the caller's prose. Every other root (the
+ * vendored `superpowers` checkout, a project-local `.pi/skills`) gets its own
+ * `↳ <root>/<name>/SKILL.md` line here, which is what kept the 15 package
+ * skills from costing more in repeated path text than the descriptions they
+ * replaced.
+ *
+ * A skill whose path fits no root at all is printed with its full path inline:
+ * unusual, but a name the model cannot resolve is a skill it cannot open, and
+ * silence there would be the one failure this format must not have.
+ *
+ * @param skills - The inventory, each with the category from its path if any.
+ * @param library - Absolute path to this repo's skills library.
+ */
+function renderSkillCategories(
+  skills: Array<{ name: string; filePath: string; pathCategory?: string }>,
+  library: string,
+): string {
+  /** The directory a skill's root would be, if it follows `<root>/<name>/SKILL.md`. */
+  const rootOf = (s: { name: string; filePath: string }): string | undefined => {
+    const suffix = `/${s.name}/SKILL.md`;
+    return s.filePath.endsWith(suffix) ? s.filePath.slice(0, -suffix.length) : undefined;
+  };
+
+  const inLibrary = (s: { name: string; filePath: string; pathCategory?: string }) =>
+    s.pathCategory !== undefined &&
+    s.filePath === `${library}/${s.pathCategory}/${s.name}/SKILL.md`;
+
+  // Roots worth declaring: those outside the library that more than one skill
+  // shares. A one-off root costs the same either way and reads better inline.
+  const counts = new Map<string, number>();
+  for (const s of skills) {
+    if (inLibrary(s)) continue;
+    const root = rootOf(s);
+    if (root) counts.set(root, (counts.get(root) ?? 0) + 1);
+  }
+  const shared = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([r]) => r));
+
+  const body = groupByCategory(skills)
+    .map(({ category, skills: list }) => {
+      const names = list
+        .map((s) => {
+          if (inLibrary(s)) return s.name;
+          const root = rootOf(s);
+          if (root && shared.has(root)) return s.name;
+          return `${s.name} (\`${s.filePath}\`)`;
+        })
+        .join(', ');
+      return `**${category}**: ${names}`;
+    })
+    .join('\n');
+
+  if (shared.size === 0) return body;
+  // Sorted so the prompt stays byte-stable run to run.
+  const roots = [...shared]
+    .sort()
+    .map((r) => `↳ also at \`${r}/<name>/SKILL.md\``)
+    .join('\n');
+  return `${body}\n\n${roots}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +285,17 @@ export default function (pi: ExtensionAPI) {
 function buildOrchestratorPrompt(opts: {
   agentInventory: AgentInfo[];
   toolInventory: Array<{ name: string; description: string }>;
-  skillInventory: Array<{ name: string; description: string; filePath: string }>;
+  /**
+   * Every discovered skill. `pathCategory` is set when the skill's location
+   * declares its category (a local one); package and project skills leave it
+   * undefined and are grouped by name instead.
+   */
+  skillInventory: Array<{
+    name: string;
+    description: string;
+    filePath: string;
+    pathCategory?: string;
+  }>;
   contextInventory: Array<{ path: string }>;
   guidelines: string[];
   /** True when the `ask-user` extension's questionnaire tool is available. */
@@ -214,6 +305,8 @@ function buildOrchestratorPrompt(opts: {
   customPrompt?: string;
   appendSystemPrompt?: string;
   cwd: string;
+  /** Absolute path to this repo's skills library, for the path-rule sentence. */
+  skillsLibrary: string;
 }): string {
   const now = new Date();
   // ISO date format for consistent prompt output
@@ -294,24 +387,35 @@ The loop works like this:
       : '';
 
   // --- Skill inventory section ---
-  // The path is rendered, not just the name: a model-invoked skill is a
-  // `read_skill` of a SKILL.md, so without the path the only way in is the human
-  // typing `/skill:name`, and the model cannot load one on its own initiative.
+  // Two-tier by design: categories and names here, descriptions on demand.
+  //
+  // The full table cost ~4.2k tokens of every request (52 skills × a paragraph
+  // each) to describe skills that a given session overwhelmingly does not use.
+  // What the model actually needs up front is enough to decide *what to open*,
+  // and the grouped name is that. The description is one `read_skill` away, and
+  // it is the authoritative copy rather than a summary of itself.
+  //
+  // This is a real trade, not a free win: a name is a weaker routing signal than
+  // a sentence. It is paid for by the names themselves — the opaque ones were
+  // renamed to verb phrases — and by stating the path rule so the model can
+  // open any skill without being handed 52 absolute paths.
   const skillSection =
     opts.skillInventory.length > 0
       ? `
 ## Available Skills
 
-Skills are specialized knowledge modules. Invoke one with \`/skill:name\`, or load
-it yourself by reading its path with \`read_skill\` when its expertise matches the
-task.
+Skills are specialized knowledge modules, grouped by domain. Only names are
+listed — to use one, read its \`SKILL.md\` with \`read_skill\` first, or let the
+human invoke it with \`/skill:name\`.
 
-| Skill | Description | Path |
-|-------|-------------|------|
-${opts.skillInventory.map((s) => `| ${s.name} | ${s.description} | \`${s.filePath}\` |`).join('\n')}
+Most live at \`${opts.skillsLibrary}/<category>/<name>/SKILL.md\`; the ones that do
+not carry their path inline below.
+
+${renderSkillCategories(opts.skillInventory, opts.skillsLibrary)}
 
 **Orchestration rules:**
-- Read the full skill content before acting on it — the table is only a summary
+- A name is a hint, not a contract: open the skill before acting on it
+- Prefer reading a plausible skill over guessing at what it contains
 - Skills are advisory — you decide when they apply
 - If a skill's guidance conflicts with the task, use your judgment
 - A skill may own tools that appear only once it is loaded

@@ -30,7 +30,7 @@
  * @module extensions/lib/skill-tree
  */
 import { readdir as fsReaddir } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 /** The filename that marks a directory as a skill root. */
 const SKILL_FILE = "SKILL.md";
@@ -132,4 +132,32 @@ export async function findSkills(
   // A skill at the root has no category segment and yields dir "" — drop it
   // rather than letting an empty identity match an empty `skills:` entry.
   return out.filter((s) => s.dir !== "").sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
+/**
+ * The category directory a skill's `SKILL.md` sits under, if any.
+ *
+ * Derived from the path rather than read from frontmatter, so the tree the human
+ * can see is the only thing that decides where a skill is filed. There is no
+ * second declaration to drift from it.
+ *
+ * Returns undefined for a path outside `skillsDirPath` — a package or
+ * project-local skill. That is not a failure: those are categorized by name
+ * instead (`skill-categories.ts`), because this repo does not own their layout.
+ *
+ * @param skillsDirPath - Absolute path to the skills library.
+ * @param skillFilePath - Absolute path to a skill's `SKILL.md`.
+ */
+export function categoryFromPath(
+  skillsDirPath: string,
+  skillFilePath: string,
+): string | undefined {
+  const rel = relative(skillsDirPath, skillFilePath);
+  // `relative` escapes with ".." when the target is outside the root; on Windows
+  // it can also return an absolute path across drives. Either means "not ours".
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return undefined;
+  // <category…>/<skill>/SKILL.md — anything above the skill directory is the
+  // category, so a deeper tier joins into one POSIX-separated label.
+  const segments = rel.split(sep).filter(Boolean);
+  return segments.length > 2 ? segments.slice(0, -2).join("/") : undefined;
 }
