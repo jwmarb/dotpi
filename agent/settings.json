@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.99.2",
+  "lastChangelogVersion": "1.0.0",
   "defaultProvider": "litellm",
   "defaultModel": "qwen/qwen3.8-27b",
   "defaultThinkingLevel": "xhigh",
