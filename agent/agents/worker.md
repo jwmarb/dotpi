@@ -2,7 +2,7 @@
 name: worker
 description: Implements a single well-specified change end to end — edits files, runs tests, reports what changed. Use when the task is already decided.
 tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
-skills: firecrawl, test-driven-development, verification-before-completion, typescript-style, python-style, rust-style
+skills: scrape-web-as-markdown, test-driven-development, verification-before-completion, typescript-style, python-style, rust-style
 model: qwen/qwen3.8-27b
 fallback_models: anthropic/claude-opus-5
 ---
