@@ -33,6 +33,10 @@ import { writeFile, mkdtemp } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseAgentFile } from "../lib/agents.js";
 import { agentsDir } from "../lib/layout.js";
+// The chain rule and the router id are owned by the modules that define them:
+// one parser per format, so the gate cannot drift from the launcher.
+import { childFallbackChain } from "../subagent-herdr/lib.js";
+import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
 	VERIFY_TIMEOUT_MS,
 	type LoopState,
@@ -42,15 +46,68 @@ import {
 	renderVerificationPrompt,
 } from "./lib.js";
 
+/**
+ * Run `spawn` with {@link CHAIN_ENV} set, restoring the previous value after.
+ *
+ * `pi.exec()` exposes no `env` option and pi's `execCommand` calls `spawn`
+ * without one, so a child inherits this process's `process.env` — verified by
+ * reading `core/exec.js` and by probing that a runtime mutation does reach a
+ * child. Setting the variable around the spawn is therefore the only way to
+ * hand a headless gate child its fallback chain.
+ *
+ * Lives here rather than in `lib.ts` because `lib.ts` is documented as
+ * side-effect free so it can be unit-tested without a session; a function that
+ * mutates `process.env` has no business there.
+ *
+ * ## The race this accepts, and why it is safe here
+ *
+ * Mutating global env around an `await` is not reentrant: a second concurrent
+ * caller would see the first one's value. That is acceptable *only* because the
+ * loop runs its gates one at a time (`index.ts` awaits the static pass before
+ * the runtime pass) and the value is the same for every gate in a session. The
+ * previous value is restored rather than deleted because this process may itself
+ * be a delegated child with its own chain, and clobbering that would silently
+ * re-route the loop's own model requests.
+ *
+ * If a future caller ever needs two gates in flight, this must become an
+ * explicit `env` on a direct `spawn` instead of a global mutation.
+ */
+export async function withChainEnv<T>(
+	chain: readonly string[] | undefined,
+	active: boolean,
+	spawn: () => Promise<T>,
+): Promise<T> {
+	if (!active || !chain || chain.length < 2) return spawn();
+	const previous = process.env[CHAIN_ENV];
+	process.env[CHAIN_ENV] = chain.join(",");
+	try {
+		return await spawn();
+	} finally {
+		if (previous === undefined) delete process.env[CHAIN_ENV];
+		else process.env[CHAIN_ENV] = previous;
+	}
+}
+
 /** Tools the gate child is allowed, when the agent definition declares none. */
 const DEFAULT_GATE_TOOLS = ["read", "grep", "find", "ls", "bash"];
 
 /**
- * Resolve the gate's model and tools from its agent definition.
+ * Resolve the gate's model, chain and tools from its agent definition.
  *
  * Read from `agent/agents/<name>.md` so the gate tracks the fleet definition
  * rather than duplicating a model id. Falls back rather than throwing: a
  * missing or malformed definition must not take the loop down.
+ *
+ * ## Why a chain and not just a model
+ *
+ * The gate is an agent like any other, and the goal is that *any* agent which
+ * errors moves to its next fallback. This resolver read `info.model` alone, so
+ * the oracle's two declared `fallback_models` were inert here: a gate audit on
+ * an erroring provider burned pi's retry budget against one dead model and
+ * returned `inconclusive`, which stops the loop. The chain is handed to the
+ * child the same way a subagent gets one (`PI_FALLBACK_CHAIN` plus
+ * `--model fallback/auto`), so one declaration covers the launcher, a running
+ * subagent, and now the gate.
  *
  * @param name Agent name, e.g. `oracle`.
  * @param fallbackModel Model to use when the definition yields none.
@@ -58,7 +115,7 @@ const DEFAULT_GATE_TOOLS = ["read", "grep", "find", "ls", "bash"];
 export async function resolveGateAgent(
 	name: string,
 	fallbackModel: string,
-): Promise<{ model: string; tools: string[]; promptBody: string }> {
+): Promise<{ model: string; chain?: string[]; tools: string[]; promptBody: string }> {
 	try {
 		const file = join(agentsDir(), `${name}.md`);
 		const content = await readFile(file, "utf8");
@@ -66,6 +123,9 @@ export async function resolveGateAgent(
 		if (info) {
 			return {
 				model: info.model ?? fallbackModel,
+				// `undefined` when the definition declares no usable chain, which
+				// leaves the launch byte-identical to pre-feature.
+				chain: childFallbackChain(undefined, info),
 				tools: info.tools?.length ? info.tools : DEFAULT_GATE_TOOLS,
 				promptBody: info.promptBody,
 			};
@@ -145,7 +205,7 @@ export async function runGate(
 	pi: ExtensionAPI,
 	req: GateRequest,
 ): Promise<VerificationResult> {
-	const { model, tools, promptBody } = await resolveGateAgent(
+	const { model, chain, tools, promptBody } = await resolveGateAgent(
 		req.agent,
 		req.fallbackModel,
 	);
@@ -178,14 +238,19 @@ export async function runGate(
 
 	// Note: --no-extensions is deliberately NOT passed. The provider serving the
 	// gate model is itself a local extension (`litellm.ts`), so disabling
-	// extension discovery would make the model unresolvable.
+	// extension discovery would make the model unresolvable. That is also what
+	// makes the fallback router available to the child.
+	//
+	// With a chain, the child launches on `fallback/auto` instead of one model, so
+	// a provider error during the audit hops rather than burning pi's retry budget
+	// against a dead model and returning `inconclusive` (which stops the loop).
+	const useChain = !!chain && chain.length > 1;
 	const args = [
 		"-p",
 		"--no-session",
-		"--provider",
-		req.provider,
+		...(useChain ? [] : ["--provider", req.provider]),
 		"--model",
-		model,
+		useChain ? FALLBACK_MODEL_REF : model,
 		"--tools",
 		tools.join(","),
 	];
@@ -194,10 +259,19 @@ export async function runGate(
 
 	let result: Awaited<ReturnType<ExtensionAPI["exec"]>>;
 	try {
-		result = await pi.exec(req.piBinary, args, {
-			cwd: req.evidence.cwd,
-			timeout: VERIFY_TIMEOUT_MS,
-		});
+		// `pi.exec()` exposes no `env` option and `execCommand` spawns without one,
+		// so the child inherits this process's `process.env` — verified against
+		// `core/exec.js`. The chain therefore crosses by setting the variable for
+		// the duration of the spawn and restoring it afterwards. Restoring the
+		// *previous* value rather than deleting matters: this process may itself be
+		// a delegated child with its own chain, and clobbering it would change how
+		// the loop's own model requests are routed.
+		result = await withChainEnv(chain, useChain, () =>
+			pi.exec(req.piBinary, args, {
+				cwd: req.evidence.cwd,
+				timeout: VERIFY_TIMEOUT_MS,
+			}),
+		);
 	} catch (err) {
 		return {
 			verdict: "inconclusive",

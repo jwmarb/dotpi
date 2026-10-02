@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { discoverAgents, parseAgentFile } from "../lib/agents.js";
+import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   appendSkillCatalogue,
   buildChildArgv,
@@ -16,6 +17,7 @@ import {
   agentNameRejection,
   childNameRejection,
   candidateModels,
+  childFallbackChain,
   describeLaunchFailure,
   DONE_TOOL_NAME,
   extractRunResult,
@@ -236,6 +238,95 @@ describe("buildChildEnv", () => {
     const env = buildChildEnv({ runId: "sub-0009", agent: "worker" }, undefined, "/runs/sub-0009");
     expect(env.PI_SUBAGENT_PARENT_PANE).toBeUndefined();
     expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0009");
+  });
+
+  test("carries the runtime fallback chain when the child has one", () => {
+    // The chain is what makes a running child hop on error rather than
+    // re-asking the model that just failed.
+    const env = buildChildEnv({ runId: "sub-0010", agent: "worker" }, "w5:p1", "/runs", ["worker"], [
+      "qwen/qwen3.8-27b",
+      "anthropic/claude-opus-5",
+    ]);
+    expect(env.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b,anthropic/claude-opus-5");
+  });
+
+  test("omits the chain var entirely when there is nothing to hop between", () => {
+    // An absent var must leave the child byte-identical to pre-feature: a
+    // one-model "chain" would register a router that can only ever pick one
+    // model, which is a selectable model that silently does nothing.
+    const none = buildChildEnv({ runId: "sub-0011", agent: "worker" }, "w5:p1", "/runs");
+    expect(none.PI_FALLBACK_CHAIN).toBeUndefined();
+    const single = buildChildEnv({ runId: "sub-0012", agent: "worker" }, "w5:p1", "/runs", [
+      "worker",
+    ], ["qwen/qwen3.8-27b"]);
+    expect(single.PI_FALLBACK_CHAIN).toBeUndefined();
+    const empty = buildChildEnv({ runId: "sub-0013", agent: "worker" }, "w5:p1", "/runs", [
+      "worker",
+    ], []);
+    expect(empty.PI_FALLBACK_CHAIN).toBeUndefined();
+  });
+});
+
+describe("childFallbackChain", () => {
+  test("is the declared model followed by its fallbacks", () => {
+    expect(
+      childFallbackChain(undefined, {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
+      }),
+    ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5", "qwen/qwen3.8-27b"]);
+  });
+
+  test("an explicitly requested model suppresses the chain", () => {
+    // Same rule candidateModels applies: the caller pinned a model, so hopping
+    // off it mid-task would be a surprise rather than a recovery.
+    expect(
+      childFallbackChain("my/pinned", {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["qwen/qwen3.8-27b"],
+      }),
+    ).toBeUndefined();
+  });
+
+  test("an agent with no fallbacks gets no chain", () => {
+    expect(childFallbackChain(undefined, { model: "qwen/qwen3.8-27b" })).toBeUndefined();
+    expect(
+      childFallbackChain(undefined, { model: "qwen/qwen3.8-27b", fallbackModels: [] }),
+    ).toBeUndefined();
+  });
+
+  test("an agent with no declared model gets no chain", () => {
+    // Without a primary there is no "original model" to come back to, and the
+    // chain's first entry would silently become the first fallback.
+    expect(childFallbackChain(undefined, { fallbackModels: ["qwen/qwen3.8-27b"] })).toBeUndefined();
+  });
+
+  test("drops a fallback that repeats the primary, leaving no chain", () => {
+    // The dedupe collapses this to one model, which is the no-chain case.
+    expect(
+      childFallbackChain(undefined, {
+        model: "qwen/qwen3.8-27b",
+        fallbackModels: ["qwen/qwen3.8-27b"],
+      }),
+    ).toBeUndefined();
+  });
+
+  test("keeps declared order and drops later duplicates", () => {
+    expect(childFallbackChain(undefined, { model: "a", fallbackModels: ["c", "b", "c"] })).toEqual([
+      "a",
+      "c",
+      "b",
+    ]);
+  });
+
+  test("agrees with candidateModels on which models are in play", () => {
+    // The two functions read the same declaration for different jobs; if they
+    // disagreed, a child could launch on a model its router cannot route to.
+    const agent = {
+      model: "openai/gpt-5.6-sol",
+      fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
+    };
+    expect(childFallbackChain(undefined, agent)).toEqual(candidateModels(undefined, agent));
   });
 });
 
@@ -519,6 +610,50 @@ describe("childNameRejection", () => {
     }
   });
 
+  // The whole launch composition, against the real agent files rather than a
+  // fixture: this is the invariant a delegated child's model actually depends
+  // on, and it spans two modules, so neither unit test alone would catch a
+  // drift between them.
+  test("every agent in this repo composes a consistent launch", async () => {
+    const agents = await discoverAgents(join(import.meta.dir, "..", "..", "agents"));
+    expect(agents.length).toBeGreaterThan(0);
+    for (const a of agents) {
+      const chain = childFallbackChain(undefined, a);
+      const models = candidateModels(undefined, a);
+      const env = buildChildEnv({ runId: "sub-0001", agent: a.name }, "w5:p1", "/runs", [a.name], chain);
+      const argv = buildChildArgv({
+        childDonePath: "/x/child-done.ts",
+        runDir: "/runs",
+        runId: "sub-0001",
+        model: chain && chain.length > 1 ? FALLBACK_MODEL_REF : models[0],
+        tools: a.tools,
+      });
+      const flagModel = argv[argv.indexOf("--model") + 1];
+
+      if (chain) {
+        // A chain means the router runs, and the env must describe it.
+        expect(flagModel).toBe(FALLBACK_MODEL_REF);
+        expect(env.PI_FALLBACK_CHAIN).toBe(chain.join(","));
+        // The primary must be the model the agent declared, or the agent's
+        // stated preference is silently not what runs first.
+        expect(chain[0]).toBe(a.model);
+        expect(chain).toEqual(models as string[]);
+      } else {
+        // No chain: launch exactly as before this feature existed.
+        expect(flagModel).not.toBe(FALLBACK_MODEL_REF);
+        expect(env.PI_FALLBACK_CHAIN).toBeUndefined();
+      }
+
+      // The handshake and the cycle check must survive either way.
+      expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0001");
+      expect(env.PI_SUBAGENT_AGENT).toBe(a.name);
+      expect(env.PI_SUBAGENT_LINEAGE).toContain(a.name);
+
+      // A pinned model suppresses the chain for every agent, with no exception.
+      expect(childFallbackChain("some/pinned", a)).toBeUndefined();
+    }
+  });
+
   // 32 is herdr's ceiling and the suffix costs 9, so a definition name has 23
   // to spend. This is the gap the bare-name check left open: legal alone,
   // illegal once scoped, and it used to fail only after a pane was opened.
@@ -749,6 +884,96 @@ describe("launchAttempt fatal classification", () => {
   test("a fatal name refusal reports no pane id", async () => {
     const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
     expect(out.paneId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// launchAttempt — the runtime fallback chain handoff
+// ---------------------------------------------------------------------------
+
+/** A launcher that succeeds, recording the env and argv it was handed. */
+function recordingLauncher(): {
+  launcher: Launcher;
+  env: () => Record<string, string> | undefined;
+  argv: () => string[] | undefined;
+} {
+  let seenEnv: Record<string, string> | undefined;
+  let seenArgv: string[] | undefined;
+  const launcher: Launcher = {
+    createChildPane: async (_cwd: string, _label: string, env?: Record<string, string>) => {
+      seenEnv = env;
+      return { paneId: "w9:p1", tabId: "w9:t1" };
+    },
+    renamePane: async () => true,
+    startAgent: async (_name: string, _paneId: string, argv: string[]) => {
+      seenArgv = argv;
+      return { ok: true, error: null };
+    },
+    closePane: async () => true,
+  };
+  return { launcher, env: () => seenEnv, argv: () => seenArgv };
+}
+
+describe("launchAttempt fallback chain handoff", () => {
+  const chain = ["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"];
+
+  test("a child with a chain launches on the router, with the chain in its env", async () => {
+    // The two halves must agree: launching on `fallback/auto` without the chain
+    // would register a router with nothing to route between, and the chain
+    // without the router would never be consulted.
+    const r = recordingLauncher();
+    const out = await launchAttempt(
+      stubAgent,
+      stubRec,
+      "/tmp",
+      "/tmp/p.md",
+      "openai/gpt-5.6-sol",
+      true,
+      r.launcher,
+      chain,
+    );
+    expect(out.ok).toBe(true);
+    expect(r.env()?.PI_FALLBACK_CHAIN).toBe("openai/gpt-5.6-sol,qwen/qwen3.8-27b");
+    const argv = r.argv()!;
+    expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
+  });
+
+  test("without a chain the model passes through unchanged", async () => {
+    // The no-regression case: a pinned or fallback-less agent must launch
+    // exactly as it did before this feature.
+    const r = recordingLauncher();
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "openai/gpt-5.6-sol", true, r.launcher);
+    expect(r.env()?.PI_FALLBACK_CHAIN).toBeUndefined();
+    const argv = r.argv()!;
+    expect(argv[argv.indexOf("--model") + 1]).toBe("openai/gpt-5.6-sol");
+  });
+
+  test("a one-model chain is treated as no chain", async () => {
+    const r = recordingLauncher();
+    await launchAttempt(
+      stubAgent,
+      stubRec,
+      "/tmp",
+      "/tmp/p.md",
+      "openai/gpt-5.6-sol",
+      true,
+      r.launcher,
+      ["openai/gpt-5.6-sol"],
+    );
+    expect(r.env()?.PI_FALLBACK_CHAIN).toBeUndefined();
+    const argv = r.argv()!;
+    expect(argv[argv.indexOf("--model") + 1]).toBe("openai/gpt-5.6-sol");
+  });
+
+  test("the chain never displaces the run identity or lineage env", async () => {
+    // Regression guard: the chain is an addition, and the vars the handshake
+    // and the cycle check depend on must survive it.
+    const r = recordingLauncher();
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, r.launcher, chain);
+    const env = r.env()!;
+    expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-9622");
+    expect(env.PI_SUBAGENT_AGENT).toBe("librarian");
+    expect(env.PI_SUBAGENT_LINEAGE).toContain("librarian");
   });
 
   // The contrast that matters: a real launch failure IS model-specific, so it

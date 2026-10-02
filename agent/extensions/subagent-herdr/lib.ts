@@ -13,6 +13,9 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { frontmatterOf } from "../lib/agents.js";
+// The chain env var's name is owned by the extension that reads it, so the two
+// halves of the handoff cannot drift apart (one parser per format).
+import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   type ChildReport,
   type FailedAttempt,
@@ -73,12 +76,19 @@ export interface ChildLaunchOptions {
  * writes it and only the child reads it, which is what makes
  * {@link lineageRejection} unforgeable — nothing the child's model can say
  * changes its own ancestry.
+ *
+ * `PI_FALLBACK_CHAIN` is the child's *runtime* fallback chain, read by the
+ * `model-fallback` extension (see {@link childFallbackChain}). It crosses as env
+ * rather than as an argv flag because the chain belongs to the child's model
+ * routing, not to its launch: `--model fallback/auto` names the router, and this
+ * tells the router what to route between.
  */
 export function buildChildEnv(
   rec: { runId: string; agent: string },
   parentPaneId: string | undefined,
   runDir: string,
   childLineage: string[] = [rec.agent],
+  fallbackChain?: readonly string[],
 ): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_RUN_ID: rec.runId,
@@ -87,6 +97,11 @@ export function buildChildEnv(
     PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
+  // Only when there is something to hop between: an absent var leaves the
+  // child's model selection exactly as it was before this feature.
+  if (fallbackChain && fallbackChain.length > 1) {
+    env[CHAIN_ENV] = fallbackChain.join(",");
+  }
   return env;
 }
 
@@ -566,6 +581,43 @@ export function candidateModels(
     if (!out.includes(m)) out.push(m);
   }
   return out;
+}
+
+/**
+ * The runtime fallback chain for a child, or `undefined` for none.
+ *
+ * This is the *second* job of an agent's `fallback_models`. {@link candidateModels}
+ * uses the same list to get the child **launched** — one attempt per model until
+ * one accepts the task. That covered a model being unreachable at spawn time
+ * and nothing after: once a child was running, its own mid-task provider errors
+ * were pi's generic retry, which asks the same failing model again.
+ *
+ * So the list is also handed to the child as {@link CHAIN_ENV}, where the
+ * `model-fallback` extension turns it into `fallback/auto` and hops on error.
+ * One declaration, two jobs: the launcher's and the running child's.
+ *
+ * Returns `undefined` when there is nothing to hop *between* — an explicit
+ * `model` on the delegation call (the caller pinned it, so a silent switch would
+ * be a surprise, the same rule {@link candidateModels} applies), or an agent
+ * with no declared fallbacks. In both cases the child launches exactly as it
+ * did before this feature existed.
+ *
+ * @param requested - The model named on the delegation call, if any.
+ * @param agent - The agent definition, for its model and fallbacks.
+ * @returns Model references in priority order, or `undefined`.
+ */
+export function childFallbackChain(
+  requested: string | undefined,
+  agent: { model?: string; fallbackModels?: string[] },
+): string[] | undefined {
+  if (requested) return undefined;
+  if (!agent.model || !agent.fallbackModels || agent.fallbackModels.length === 0) return undefined;
+  const chain = [agent.model];
+  for (const m of agent.fallbackModels) {
+    if (!chain.includes(m)) chain.push(m);
+  }
+  // A chain of one is the no-fallback case: nothing to hop to.
+  return chain.length > 1 ? chain : undefined;
 }
 
 /**

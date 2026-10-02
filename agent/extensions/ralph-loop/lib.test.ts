@@ -6,7 +6,7 @@
  * agent that quotes its own instructions, a goal that starts with a slash, and
  * flag values that are not numbers.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
 	COMPLETION_TAIL_CHARS,
 	DEFAULT_MAX_ITERATIONS,
@@ -32,6 +32,8 @@ import {
 	stopMessage,
 } from "./lib.js";
 import { parseRuntimeVerdict, renderRuntimePrompt } from "./runtime-gate.js";
+import { withChainEnv } from "./gate.js";
+import { CHAIN_ENV } from "../model-fallback/lib.js";
 import {
 	REFERENCE_IMAGE,
 	detectsWebProject,
@@ -1128,5 +1130,73 @@ describe("renderRuntimePrompt — UI guidance", () => {
 			true,
 		);
 		expect(text).toContain("--pids-limit=512");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// withChainEnv — handing a headless gate child its fallback chain
+// ---------------------------------------------------------------------------
+
+describe("withChainEnv", () => {
+	const KEY = CHAIN_ENV;
+
+	afterEach(() => {
+		delete process.env[KEY];
+	});
+
+	test("sets the chain for the spawn and restores the absence after", async () => {
+		// `pi.exec()` has no `env` option and pi spawns without one, so the child
+		// inherits process.env. This is the only seam that can reach it.
+		delete process.env[KEY];
+		let seen: string | undefined = "unset-marker";
+		await withChainEnv(["a/1", "b/2"], true, async () => {
+			seen = process.env[KEY];
+		});
+		expect(seen).toBe("a/1,b/2");
+		expect(process.env[KEY]).toBeUndefined();
+	});
+
+	test("restores a PREVIOUS value rather than deleting it", async () => {
+		// The loop may itself be a delegated child with its own chain. Deleting
+		// instead of restoring would silently re-route the loop's own requests
+		// for the rest of the session.
+		process.env[KEY] = "outer/1,outer/2";
+		await withChainEnv(["inner/1", "inner/2"], true, async () => {
+			expect(process.env[KEY]).toBe("inner/1,inner/2");
+		});
+		expect(process.env[KEY]).toBe("outer/1,outer/2");
+	});
+
+	test("restores even when the spawn throws", async () => {
+		process.env[KEY] = "outer/1,outer/2";
+		await expect(
+			withChainEnv(["inner/1", "inner/2"], true, async () => {
+				throw new Error("spawn failed");
+			}),
+		).rejects.toThrow("spawn failed");
+		expect(process.env[KEY]).toBe("outer/1,outer/2");
+	});
+
+	test("does nothing when inactive or when there is nothing to hop between", async () => {
+		// Each of these must leave the launch byte-identical to pre-feature.
+		for (const [chain, active] of [
+			[["a/1", "b/2"], false],
+			[["a/1"], true],
+			[[], true],
+			[undefined, true],
+		] as const) {
+			delete process.env[KEY];
+			let seen: string | undefined = "unset-marker";
+			await withChainEnv(chain, active, async () => {
+				seen = process.env[KEY];
+			});
+			expect(seen).toBeUndefined();
+			expect(process.env[KEY]).toBeUndefined();
+		}
+	});
+
+	test("passes the spawn's result through", async () => {
+		expect(await withChainEnv(["a/1", "b/2"], true, async () => 42)).toBe(42);
+		expect(await withChainEnv(undefined, false, async () => "x")).toBe("x");
 	});
 });

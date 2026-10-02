@@ -1,7 +1,7 @@
 {
   "lastChangelogVersion": "1.0.0",
-  "defaultProvider": "litellm",
-  "defaultModel": "qwen/qwen3.8-27b",
+  "defaultProvider": "fallback",
+  "defaultModel": "auto",
   "defaultThinkingLevel": "xhigh",
   "hideThinkingBlock": false,
   "extensions": [
@@ -16,12 +16,23 @@
   "theme": "tokyo-night",
   "retry": {
     "enabled": true,
-    "maxRetries": 10,
+    "maxRetries": 30,
     "baseDelayMs": 2000,
     "provider": {
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
     }
+  },
+  "modelFallback": {
+    "chain": [
+      "qwen/qwen3.8-27b",
+      "openai/gpt-5.6-sol",
+      "anthropic/claude-opus-5"
+    ],
+    "maxCycles": 10,
+    "maxProbes": 2,
+    "contextWindow": 262144,
+    "maxTokens": 32768
   },
   "packages": [
     "git:github.com/samfoy/pi-lsp-extension",

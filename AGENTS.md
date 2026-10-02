@@ -32,6 +32,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Add a skill | `agent/skills/<name>/SKILL.md` (frontmatter keys: `agent/AGENTS.md`) |
 | Change default model / provider / thinking / retry | `agent/settings.json` |
 | Provider key, model catalog, pricing, thinking-level mapping | `agent/extensions/litellm.ts` + `agent/.env` |
+| Fall back to another model when one errors | `agent/extensions/model-fallback/` (`fallback/auto` virtual model, `/fallback-chain`; chain in `settings.json` `modelFallback`, own AGENTS.md) |
 | Add/repair an MCP server | `agent/mcp.json` (schema: pi's built-in MCP extension; runtime: `/mcp`). A server needing a secret *URL* goes in `agent/extensions/mcp-gateway.ts` instead |
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
@@ -50,8 +51,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ## CONVENTIONS
 
-- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`.
-- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*. Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened once here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`.
+- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`, `agent/extensions/model-fallback/lib.test.ts`.
+- **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*, `model-fallback/lib.ts` owns the model-reference grammar and the `PI_FALLBACK_CHAIN` handoff (`subagent-herdr` imports `CHAIN_ENV`/`FALLBACK_MODEL_REF` from it rather than restating either). Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened once here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `mcp-gateway.ts` passes the key through as a `${LITELLM_MCP_KEY}` placeholder in a *header* (the builtin expands it at connect time, so the live secret never enters this process or a transcript) and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both. The gateway *URL* counts as sensitive too, which is the whole reason `mcp-gateway.ts` exists rather than an inlined `url` in `mcp.json`.
 - **Commits follow Conventional Commits** per `agent/prompts/git-commit.md`.
@@ -61,8 +62,9 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ```sh
 bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-activation/journal-store (178)
 bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic (30)
-bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (122)
-bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (135)
+bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (136)
+bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (140)
+bun test agent/extensions/model-fallback/lib.test.ts    # fallback-chain state machine (155)
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
 ```
@@ -82,11 +84,17 @@ docker build -f agent/docker/verify-base.Dockerfile \
   -t ralph-verify/base:latest agent/docker/    # the tracked verifier base image (also built on demand)
 ```
 
-Typecheck (`noEmit`) has one scope; there is no root `tsconfig.json`:
+Typecheck (`noEmit`) has three scopes; there is no root `tsconfig.json`:
 
 ```sh
 cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/model-fallback && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
+
+`model-fallback` resolves `@earendil-works/*` through a `paths` entry pointing at the
+**running pi's** bundle, because the 0.75.4 tree described below has no virtual-model API at
+all. Copy that pattern for anything new that touches a post-0.75.4 API.
 
 `bun test` resolves the packages pi normally injects (`@earendil-works/pi-tui`, `typebox`) and tsc's `types: ["node"]` by **walking up to `~/node_modules`** — an ancestor of both `~/.pi` and `~/Nextcloud/.pi`. There is no `node_modules/` in this repo, and none is needed while that tree exists (`subagent-herdr/node_modules` holds only `typescript` + `@types/node`, so even its `tsc` run reaches up for the rest). Beware the skew: `~/node_modules/@earendil-works/*` is **0.75.4** while the running pi is **1.0.0**, so a test that passes here can still disagree with the live host — and a hand typecheck against that tree reports phantom errors for anything added since 0.75.4. If that tree ever disappears, symlink what is missing into a gitignored root `node_modules/` from `~/.bun/install/global/node_modules`.
 

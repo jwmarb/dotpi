@@ -148,10 +148,24 @@ export interface RunRecord {
 	finishedAt?: number;
 	/**
 	 * The model the run actually launched on, set only when it is *not* the model
-	 * first requested (i.e. a fallback was used). Absent is the common case and
-	 * means `model` ran.
+	 * first requested (i.e. a launch fallback was used). Absent is the common case
+	 * and means `model` ran.
+	 *
+	 * This is the *launch* model, not necessarily what answered a given request:
+	 * a child with a `fallbackChain` launches on the router and its requests are
+	 * dispatched across the chain, so the authority for "what answered" is the
+	 * child's own transcript, where each assistant message names its physical
+	 * model. Reading this field as "the model that did the work" was true before
+	 * the runtime chain existed and is not any more.
 	 */
 	resolvedModel?: string;
+	/**
+	 * The runtime fallback chain handed to the child, when it has one.
+	 *
+	 * Recorded so a reader of a finished run can tell a child that *could* hop
+	 * from one that could not, which `resolvedModel` alone no longer answers.
+	 */
+	fallbackChain?: string[];
 	/** Launch attempts that failed before this run started, in order. */
 	failedAttempts?: FailedAttempt[];
 }

@@ -34,6 +34,9 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseAgentFile } from "../lib/agents.js";
 import { agentsDir } from "../lib/layout.js";
+import { childFallbackChain } from "../subagent-herdr/lib.js";
+import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import { withChainEnv } from "./gate.js";
 import {
 	type LoopState,
 	type VerificationEvidence,
@@ -239,6 +242,7 @@ export async function runRuntimeGate(
 	req: RuntimeGateRequest,
 ): Promise<VerificationResult> {
 	let model = RUNTIME_FALLBACK_MODEL;
+	let chain: string[] | undefined;
 	let tools = DEFAULT_RUNTIME_TOOLS;
 	let promptBody = "";
 	try {
@@ -246,6 +250,11 @@ export async function runRuntimeGate(
 		const info = parseAgentFile(content, `${RUNTIME_AGENT}.md`);
 		if (info) {
 			model = info.model ?? RUNTIME_FALLBACK_MODEL;
+			// The verifier's own `fallback_models`, in the same second role the
+			// launcher and the static gate give it: a provider error mid-audit hops
+			// instead of burning the retry budget on one dead model and returning
+			// `inconclusive`, which stops the loop.
+			chain = childFallbackChain(undefined, info);
 			tools = info.tools?.length ? info.tools : DEFAULT_RUNTIME_TOOLS;
 			promptBody = info.promptBody;
 		}
@@ -275,13 +284,13 @@ export async function runRuntimeGate(
 
 	// --no-extensions is deliberately absent: the provider serving the model is
 	// itself a local extension.
+	const useChain = !!chain && chain.length > 1;
 	const args = [
 		"-p",
 		"--no-session",
-		"--provider",
-		req.provider,
+		...(useChain ? [] : ["--provider", req.provider]),
 		"--model",
-		model,
+		useChain ? FALLBACK_MODEL_REF : model,
 		"--tools",
 		tools.join(","),
 	];
@@ -290,10 +299,13 @@ export async function runRuntimeGate(
 
 	let result: Awaited<ReturnType<ExtensionAPI["exec"]>>;
 	try {
-		result = await pi.exec(req.piBinary, args, {
-			cwd: req.evidence.cwd,
-			timeout: RUNTIME_TIMEOUT_MS,
-		});
+		// See withChainEnv in gate.ts for why the chain crosses as env.
+		result = await withChainEnv(chain, useChain, () =>
+			pi.exec(req.piBinary, args, {
+				cwd: req.evidence.cwd,
+				timeout: RUNTIME_TIMEOUT_MS,
+			}),
+		);
 	} catch (err) {
 		return {
 			verdict: "inconclusive",

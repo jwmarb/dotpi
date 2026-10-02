@@ -1,7 +1,8 @@
 # agent/extensions — the local pi extensions pi auto-loads at startup
 
 Each of the 12 top-level `*.ts` is one independent extension; `lib/` is the shared,
-pi-free helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.md.
+pi-free helper layer. `ralph-loop/`, `subagent-herdr/` and `model-fallback/` have their own
+AGENTS.md.
 
 ## WHERE TO LOOK
 
@@ -15,6 +16,7 @@ pi-free helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.
 | `git-hooks.ts` | No tool. Self-arms `core.hooksPath` and runs `scripts/setup-deps.sh` at startup; swallows every failure |
 | `init.ts` | `/init` — local deterministic tiering (score > 15 create, >= 8 candidate, `--max-depth` default 3; root 50–150 lines, nested 30–80), then hands the model a brief |
 | `litellm.ts` | `registerProvider("litellm")` — model catalog, per-token + cache costs, `contextWindow`, thinking-level maps |
+| `model-fallback/` | `registerVirtualModel("fallback/auto")` + `/fallback-chain` — on an error, route the retry to the **next** model in a chain, then hand the following request back to the original. One full lap of the chain is one logical retry. Consumed by the orchestrator (settings), delegated children (`PI_FALLBACK_CHAIN`) and both ralph-loop gates. Own AGENTS.md |
 | `mcp-gateway.ts` | No tool, no command. Registers the `litellm-gateway` MCP server with pi's built-in MCP extension via `pi.registerMcpServer()`. Exists only because the builtin validates `mcp.json` `url` with `URL.canParse()` *before* expansion, so a `${LITELLM_MCP_URL}` placeholder cannot live there. Servers, transport, OAuth, tool naming and `/mcp` are all the builtin's |
 | `sessions.ts` | `/sessions` — resumable session list from pi's own `SessionManager.list()`; no JSONL re-parsing |
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
@@ -99,6 +101,20 @@ pi-free helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.
   tested) from `index.ts` (session wiring). `trade-journal/` is the worked example of *why*:
   its mode logic wanted tests, and a `*.test.ts` cannot sit beside a top-level extension.
   Logic that deserves a test is the signal to become a directory, not a bigger file.
+- **Not every action method exists during extension load.** `registerTool`,
+  `registerProvider`, `registerVirtualModel` and `registerMcpServer` are **queued**
+  (`core/extensions/loader.js`), but `getSettings`, `setActiveTools`, `getCommands`,
+  `setModel` and `getThinkingLevel` are *throwing stubs* until the runner binds its context
+  — calling one at load kills the extension with "Extension runtime not initialized", which
+  is how `model-fallback` first failed. Configuration a registration depends on must be read
+  from disk (`model-fallback/settings.ts`); anything else belongs inside a handler, where
+  the live value is also the correct one after `/reload`.
+- **A model reference is not a `provider/id` pair.** pi resolves one by trying canonical
+  `provider/id`, then provider+id, then an unambiguous **bare id**
+  (`core/model-resolver.js` `findExactModelReferenceMatch`). That last step is the only
+  reason `model: qwen/qwen3.8-27b` works in an agent file: the whole string is one litellm
+  model *id*. Any new reader of a model reference must keep it whole and resolve it the same
+  way — splitting on a slash invents a provider that does not exist.
 
 ## COMMANDS
 
@@ -106,14 +122,18 @@ pi-free helper layer. `ralph-loop/` and `subagent-herdr/` have their own AGENTS.
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3)
 ```
 
-The one `tsc -p` scope is in the root COMMANDS section, and it covers only
-`subagent-herdr`'s four sources. What matters here is what it does **not** cover: `lib/`
-and every top-level `*.ts` are in no typecheck scope at all — nothing type-checks
-`dynamic-prompt.ts`, `litellm.ts` or `mcp-gateway.ts` but pi loading them. Beware the skew
-when you check one by hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a
-running pi of 1.0.0, so typechecking `mcp-gateway.ts` there reports a phantom
-"`registerMcpServer` does not exist on type `ExtensionAPI`" — it exists in the live bundle
-(`core/mcp-servers.js`). Point `types`/aliases at the running pi's `dist/` instead.
+There are now **three** `tsc -p` scopes: `subagent-herdr`'s four sources,
+`model-fallback`'s three, and `ralph-loop`'s five (added when the gates gained a fallback
+chain — a change to a spawn argv deserves a typecheck). What matters here is what they do **not** cover: `lib/` and every
+top-level `*.ts` are in no typecheck scope at all — nothing type-checks `dynamic-prompt.ts`,
+`litellm.ts` or `mcp-gateway.ts` but pi loading them. Beware the skew when you check one by
+hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.0,
+so typechecking `mcp-gateway.ts` there reports a phantom "`registerMcpServer` does not exist
+on type `ExtensionAPI`" — it exists in the live bundle (`core/mcp-servers.js`). 0.75.4 has
+no virtual-model API at all, so `model-fallback` cannot typecheck against it even nominally.
+Point `types`/aliases at the running pi's `dist/` instead, as `model-fallback/tsconfig.json`
+does with a `paths` entry — that is the pattern to copy, and `Model<Api>` comes from
+`@earendil-works/pi-ai`, not from `pi-coding-agent`.
 
 ## ANTI-PATTERNS
 

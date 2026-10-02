@@ -97,6 +97,7 @@ import {
   buildChildEnv,
   childNameRejection,
   candidateModels,
+  childFallbackChain,
   describeLaunchFailure,
   discoverSkills,
   extractRunResult,
@@ -110,6 +111,8 @@ import {
   type SkillEntry,
   skillEntriesFromPi,
 } from "./lib.js";
+// The router model id, owned by the extension that registers it.
+import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   type AgentInfo,
   discoverAgents,
@@ -331,6 +334,7 @@ export async function launchAttempt(
   model: string | undefined,
   keepPaneOnFailure: boolean,
   launcher: Launcher = realLauncher,
+  fallbackChain?: readonly string[],
 ): Promise<AttemptOutcome> {
   // The child's pane env: its run identity, and — the key to child →
   // orchestrator messaging — this orchestrator's own pane id, which herdr
@@ -339,10 +343,13 @@ export async function launchAttempt(
   // The child's lineage is ours plus the child: our own comes from the env our
   // parent stamped, so ancestry is accumulated by processes rather than trusted
   // from a model.
-  const env = buildChildEnv(rec, process.env.HERDR_PANE_ID, dir, [
-    ...parseLineage(process.env[LINEAGE_ENV]),
-    rec.agent,
-  ]);
+  const env = buildChildEnv(
+    rec,
+    process.env.HERDR_PANE_ID,
+    dir,
+    [...parseLineage(process.env[LINEAGE_ENV]), rec.agent],
+    fallbackChain,
+  );
   const label = `${agent.name} ${rec.runId}`;
   const pane = await launcher.createChildPane(rec.cwd, label, env);
   if (!pane) {
@@ -355,11 +362,15 @@ export async function launchAttempt(
   }
   await launcher.renamePane(pane.paneId, label);
 
+  // A child with a chain launches on the router, not on one model: that is
+  // what lets it hop mid-task instead of re-asking a model that just failed.
+  // Without a chain the model passes through unchanged, so a pinned or
+  // fallback-less agent launches exactly as it did before.
   const argv = buildChildArgv({
     childDonePath: join(SELF_DIR, "child-done.ts"),
     runDir: dir,
     runId: rec.runId,
-    model,
+    model: fallbackChain && fallbackChain.length > 1 ? FALLBACK_MODEL_REF : model,
     tools: agent.tools,
     systemPromptPath: promptPath,
   });
@@ -468,6 +479,10 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   if (lineageProblem) return { ok: false, error: lineageProblem };
 
   const models = candidateModels(params.model, agent);
+  // The same `fallback_models` list, in its second role: the chain the running
+  // child hops along when its own requests error. `undefined` when the caller
+  // pinned a model or the agent declares no fallbacks.
+  const fallbackChain = childFallbackChain(params.model, agent);
   const runId = makeRunId();
 
   // Validate the name herdr will actually receive, not the definition name:
@@ -485,6 +500,9 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     model: models[0],
     status: "running",
     startedAt: Date.now(),
+    // Recorded even before a launch succeeds: a reader of a failed run should
+    // still see whether this child would have been able to hop.
+    ...(fallbackChain ? { fallbackChain: [...fallbackChain] } : {}),
   };
   const dir = dirFor(runId);
   mkdirSync(dir, { recursive: true });
@@ -523,7 +541,16 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   let launched: AttemptOutcome | undefined;
   for (const [i, model] of models.entries()) {
     const isLast = i === models.length - 1;
-    const attempt = await launchAttempt(agent, rec, dir, promptPath, model, isLast);
+    const attempt = await launchAttempt(
+      agent,
+      rec,
+      dir,
+      promptPath,
+      model,
+      isLast,
+      realLauncher,
+      fallbackChain,
+    );
     if (!attempt.ok) {
       failures.push({ model, error: attempt.error ?? "unknown launch failure" });
       // Nothing model-specific went wrong (herdr unavailable, or it refused

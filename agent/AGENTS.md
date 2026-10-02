@@ -47,8 +47,16 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   orchestrator is always allowed, which is how you debug one by hand. Unspawnable agents
   are filtered out of the "Available agents" error list too, so a caller is never
   advertised what it cannot use.
-- **Every agent declares `fallback_models`** (all 9 do). They cover a failure to
-  *launch* — unknown model, provider down or rate-limiting — not a failed task. Recon
+- **Every agent declares `fallback_models`** (all 9 do), and the list now has **two jobs**.
+  It still covers a failure to *launch* — unknown model, provider down or rate-limiting —
+  which is `candidateModels` in `extensions/subagent-herdr/lib.ts`: one spawn attempt per
+  model until one accepts the task. It is now **also** the child's runtime chain: the same
+  list crosses as `PI_FALLBACK_CHAIN` (`childFallbackChain`), the child launches on
+  `fallback/auto`, and a provider error *mid-task* moves work to the next model instead of
+  re-asking the one that just failed — then hands the following request back to the primary.
+  So the order now matters twice, and a chain whose later entries are unreachable degrades a
+  running child as well as a launching one. An explicit `model` on the delegation call
+  suppresses both: the caller pinned it. See `extensions/model-fallback/AGENTS.md`. Recon
   agents lead with a flash model and keep the expensive ones in the chain.
 - **A searching agent declares `ffgrep`/`fffind`**, not just `grep`/`find`.
   `npm:@ff-labs/pi-fff` adds those as *extra* names and `tools` is an allowlist, so

@@ -70,6 +70,25 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 
 ## CONVENTIONS (local)
 
+- **Both gates run on a fallback chain, not one model.** `resolveGateAgent` (static) and
+  the inline resolve in `runtime-gate.ts` now read the agent's `fallback_models` through
+  `childFallbackChain` and launch the headless child on `fallback/auto` with the chain in
+  `PI_FALLBACK_CHAIN`. Before this they read `info.model` alone, so the oracle's and
+  verifier's declared fallbacks were inert here: a gate audit against an erroring provider
+  burned pi's retry budget on one dead model and returned `inconclusive`, which **stops the
+  loop**. A gate is an agent like any other, so "any agent that errors moves to its next
+  fallback" has to include it.
+- **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
+  calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
+  `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the
+  *previous* value — not `delete` — because the loop may itself be a delegated child with
+  its own chain. It lives in `gate.ts` rather than `lib.ts` on purpose: `lib.ts` is
+  documented side-effect free, and a function that mutates `process.env` has no business
+  there. It is **not reentrant**, which is sound only while the loop awaits its gates one
+  at a time; two gates in flight would need an explicit `env` on a direct `spawn`.
+- **`--provider` is omitted when the router is used.** The router's provider is `fallback`,
+  not the gate's `GATE_PROVIDER`, so passing both made the model unresolvable.
+
 - **Continuations dispatch from `setTimeout(0)`, never inline.** Not for the obvious
   reason: `agent_settled` is emitted inside `_runAgentPrompt`'s `finally` *after*
   `_isAgentRunActive` is already false, so `prompt()` would **not** refuse the call — it
