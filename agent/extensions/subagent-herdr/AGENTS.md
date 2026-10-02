@@ -4,8 +4,8 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 
 **Delegation is event-driven: there is deliberately no blocking wait.** The orchestrator delegates, ends its turn, and is woken by a *notice* the child types into its pane (`herdr agent prompt`) when the child reports or finishes. A blocking wait is what the module used to do, and it made mid-run messaging structurally impossible: the wait ran inside a tool call, so the parent was streaming, so a child's report could only queue as a follow-up and stayed invisible until the child was already dead. Do not reintroduce one.
 
-**The briefing is delivered as `deliverAs: "steer"`, and that word is load-bearing.** pi's agent loop drains its two queues from different places (`pi-agent-core/dist/agent-loop.js`, measured at 0.99.2): steering at the end of *every* turn inside `while (hasMoreToolCalls || pendingMessages.length > 0)`, follow-ups only *after* that inner loop exits. So a follow-up reaches an orchestrator that is still calling tools only once it has stopped calling them — i.e. once its turn is already over. Delegating and then continuing to work (a read, a grep, another spawn) kept the loop inside the inner `while`, where the follow-up queue is never polled, so a finished child was unreachable for the rest of the turn however long it lasted. Steering cuts in at the next turn boundary, after the current tool results are in context and before the next LLM call, so it never splits a `tool_call`/`tool_result` pair. Interrupting is the intent: a subagent's answer is new information that should redirect the loop, not queue behind the work it invalidates. The idle path is untouched — `deliverAs` is only consulted while `isStreaming`.
-**The briefing is delivered as `deliverAs: "steer"`, and that word is load-bearing.** pi's agent loop drains its two queues from different places (`pi-agent-core/dist/agent-loop.js`): steering at the end of *every* turn inside `while (hasMoreToolCalls || pendingMessages.length > 0)`, follow-ups only *after* that inner loop exits. So a follow-up reaches an orchestrator that is still calling tools only once it has stopped calling them — i.e. once its turn is already over. Delegating and then continuing to work (a read, a grep, another spawn) kept the loop inside the inner `while`, where the follow-up queue is never polled, so a finished child was unreachable for the rest of the turn however long it lasted. Steering cuts in at the next turn boundary, after the current tool results are in context and before the next LLM call, so it never splits a `tool_call`/`tool_result` pair. Interrupting is the intent: a subagent's answer is new information that should redirect the loop, not queue behind the work it invalidates. The idle path is untouched — `deliverAs` is only consulted while `isStreaming`. (Both the queue structure and `deliverAs` re-verified against the installed pi 1.0.0; `index.ts`'s comment still cites the 0.99.2 measurement.)
+**The briefing is delivered as `deliverAs: "steer"`, and that word is load-bearing.** pi's agent loop drains its two queues from different places (`pi-agent-core/dist/agent-loop.js`): steering at the end of *every* turn inside `while (hasMoreToolCalls || pendingMessages.length > 0)`, follow-ups only *after* that inner loop exits. So a follow-up reaches an orchestrator that is still calling tools only once it has stopped calling them — i.e. once its turn is already over. Delegating and then continuing to work (a read, a grep, another spawn) kept the loop inside the inner `while`, where the follow-up queue is never polled, so a finished child was unreachable for the rest of the turn however long it lasted. Steering cuts in at the next turn boundary, after the current tool results are in context and before the next LLM call, so it never splits a `tool_call`/`tool_result` pair. Interrupting is the intent: a subagent's answer is new information that should redirect the loop, not queue behind the work it invalidates. The idle path is untouched — `deliverAs` is only consulted while `isStreaming`. (Both the queue structure and `deliverAs` re-verified against the installed pi 1.0.0; `index.ts`'s comment still cites the original 0.99.2 measurement.)
+
 ## WHERE TO LOOK
 
 | File | Owns |
@@ -15,7 +15,7 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 | `herdr.ts` | Thin CLI wrapper over the herdr 0.9.0 CLI; the measured behaviours it relies on are documented in its header |
 | `rundir.ts` | The run-directory contract (paths + JSON shapes) **and the wake-notice grammar** — both span the parent/child process seam |
 | `child-done.ts` | Child half of the handshake; loaded into the child with pi `-e`, writes the `<session>.exit` sidecar and sends the `report`/`done` notices |
-| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (122 tests) |
+| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (136 tests) |
 
 ## CONVENTIONS (local)
 
@@ -38,7 +38,7 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/subagent-herdr/lib.test.ts   # 122 tests
+bun test agent/extensions/subagent-herdr/lib.test.ts   # 136 tests
 ```
 
 This is the repo's **only** `tsc -p` scope (`tsconfig.json` includes `lib.ts`, `herdr.ts`,

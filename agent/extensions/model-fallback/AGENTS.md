@@ -6,7 +6,7 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 | File | Owns |
 |---|---|
-| `lib.ts` | The state machine and every message. Pure, pi-free, 149 tests |
+| `lib.ts` | The state machine and every message. Pure, pi-free, 95 tests |
 | `index.ts` | Session wiring: `registerVirtualModel`, `/fallback-chain`, the footer notice |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
 
@@ -247,7 +247,7 @@ This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At th
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/model-fallback/lib.test.ts   # 149 tests
+bun test agent/extensions/model-fallback/lib.test.ts   # 95 tests
 cd agent/extensions/model-fallback && \
   ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```

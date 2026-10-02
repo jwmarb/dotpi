@@ -119,7 +119,7 @@ AGENTS.md.
 ## COMMANDS
 
 ```sh
-cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3)
+cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
 There are now **three** `tsc -p` scopes: `subagent-herdr`'s four sources,

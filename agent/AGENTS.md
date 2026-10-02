@@ -11,18 +11,20 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 | Question | Answer |
 |---|---|
 | Which agents exist, on what model | `agents/*.md` frontmatter — 9: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker |
-| Which skills the model may auto-invoke | `skills/*/SKILL.md` — 37 local dirs, 15 slash-only (`disable-model-invocation: true`); plus 15 from the `superpowers` package, so the catalogue reads 52 |
+| Which skills the model may auto-invoke | `skills/*/SKILL.md` — 38 local dirs, 15 slash-only (`disable-model-invocation: true`); plus 15 from the `superpowers` package, so the live catalogue reads 53 |
 | Why a skill dir has extra `.md` files | Progressive disclosure: `SKILL.md` is the entry point, siblings (`tests.md`, `REPORT.md`) load on demand |
-| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); 24 skills ship `skills/<skill>/agents/` |
+| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `agent-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; 24 skills ship `skills/<skill>/agents/` |
 | What a theme key may be | `themes/tokyo-night.json` `$schema` → pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
 
 ## CONVENTIONS
 
-- **`agents/*.md` frontmatter is exactly seven keys**, parsed only by
+- **`agents/*.md` frontmatter draws on a seven-key vocabulary**, parsed only by
   `extensions/lib/agents.ts`: `name`, `description`, `tools` (comma-separated; omit for
-  all), `model`, `fallback_models`, `skills`, `callable_by`. Multi-word keys are
+  all), `model`, `fallback_models`, and the two optional keys `skills` and `callable_by`.
+  Only the first five are required, so no file carries all seven — `explorer.md` has five,
+  `summarizer.md` is the sole user of `callable_by`. Multi-word keys are
   **snake_case** — a camelCase key silently never matches, which `parseAgentFile`'s tests
   pin both ways. Body after the closing `---` is the child's system prompt, verbatim
   except for the appended skills catalogue.
@@ -71,7 +73,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   the explorer without `cwd` gets a confident, well-formatted map of the user's project
   instead of the dependency — a wrong answer that looks right.
 - **`skills/*/agents/openai.yaml` is optional presentation** (`display_name`,
-  `short_description`); 23 of 37 have one and its absence changes nothing functional.
+  `short_description`); 24 of 38 have one and its absence changes nothing functional.
 - **Interview- and workflow-style skills set `disable-model-invocation: true`** (grilling,
   triage, wayfinder, handoff): they need a human in the loop, so model-initiated
   invocation is a bug. `argument-hint` prefills the slash prompt.
