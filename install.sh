@@ -16,6 +16,7 @@
 #   3. arms the git hooks (core.hooksPath -> .githooks)
 #   4. installs the one extension that has real npm dependencies
 #   5. installs the firecrawl CLI, which the librarian agent researches with
+#   5b. installs the agent-browser CLI, which the agent-browser skill drives
 #   6. copies agent/.env.example to agent/.env for you to fill in
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
@@ -278,6 +279,44 @@ else
 		# permissions problem to fix deliberately rather than with sudo here.
 		warn "could not install firecrawl-cli (a global npm prefix often needs a permission fix)."
 		warn "The librarian agent needs it; install it yourself: npm install -g firecrawl-cli"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5c. The agent-browser CLI
+#
+# The agent-browser skill drives browser automation through this CLI, and the
+# browser binary it downloads is the other half of the install. Optional on
+# purpose, like the firecrawl CLI: pi and every other agent work without it,
+# and a global npm install plus a browser download is not something to force
+# on someone who only wanted a pi config.
+#
+# `agent-browser install` is idempotent — a no-op when the browser binary is
+# already present — so it runs even when the CLI was already on PATH.
+# ---------------------------------------------------------------------------
+step "Installing the agent-browser CLI"
+if command -v agent-browser >/dev/null 2>&1; then
+	ok "agent-browser $(agent-browser --version 2>/dev/null | tail -1 | sed 's/^agent-browser[[:space:]]*//')"
+elif ! command -v npm >/dev/null 2>&1; then
+	warn "npm not found, so the agent-browser CLI was not installed."
+	warn "The agent-browser skill needs it: install Node.js, then: npm i -g agent-browser"
+else
+	if npm install -g agent-browser >/dev/null 2>&1; then
+		ok "agent-browser $(agent-browser --version 2>/dev/null | tail -1 | sed 's/^agent-browser[[:space:]]*//')"
+	else
+		# A global install can fail on a root-owned prefix, which is a
+		# permissions problem to fix deliberately rather than with sudo here.
+		warn "could not install agent-browser (a global npm prefix often needs a permission fix)."
+		warn "The agent-browser skill needs it; install it yourself: npm i -g agent-browser"
+	fi
+fi
+
+# The browser binary itself — the CLI is a hollow shell without it.
+if command -v agent-browser >/dev/null 2>&1; then
+	if agent-browser install >/dev/null 2>&1; then
+		ok "browser binaries"
+	else
+		warn "could not download the browser binaries; run: agent-browser install"
 	fi
 fi
 
