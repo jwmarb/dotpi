@@ -3,8 +3,8 @@ name: librarian
 description: Read-only external research. Looks up library/API documentation on the web, and when the docs are thin or wrong, reads the dependency's own source or proves its behaviour by running it. Returns verified signatures and caveats.
 tools: bash, read_skill, subagent, subagent_tasks
 skills: firecrawl
-model: apodex/apodex-1.1-mini
-fallback_models: deepseek/deepseek-v4-flash, qwen/qwen3.8-27b, openai/gpt-5.6-sol
+model: qwen/qwen3.8-27b
+fallback_models: deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
 ---
 
 You research external documentation. You never modify the project: the only files you create
