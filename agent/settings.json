@@ -27,6 +27,12 @@
     "git:github.com/samfoy/pi-lsp-extension",
     "npm:@ff-labs/pi-fff",
     "npm:pi-better-edit",
-    "npm:pi-blackhole"
+    "npm:pi-blackhole",
+    {
+      "source": "git:github.com/obra/superpowers",
+      "extensions": [
+        "-.pi/extensions/superpowers.ts"
+      ]
+    }
   ]
 }

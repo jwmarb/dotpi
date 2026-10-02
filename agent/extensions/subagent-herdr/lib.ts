@@ -10,7 +10,7 @@
  * @module subagent-herdr/lib
  */
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { frontmatterOf } from "../lib/agents.js";
 import {
@@ -250,6 +250,12 @@ export function appendSkillCatalogue(
  * of the same format drifting apart. A skill with no readable `SKILL.md` is
  * skipped: one broken skill must not cost an agent its whole catalogue.
  *
+ * Scans one level deep only, matching `agent/skills/`, which is flat by
+ * construction: the directory name is the identity that `skills:` and
+ * `skill-activation.ts` both match on. This is the **fallback** path — normally a
+ * child's catalogue comes from pi's own resolved skill list via
+ * {@link skillEntriesFromPi}, which also covers packages and project scope.
+ *
  * @param skillsDirPath - Absolute path to the skills library (one dir per skill).
  */
 export async function discoverSkills(skillsDirPath: string): Promise<SkillEntry[]> {
@@ -279,6 +285,57 @@ export async function discoverSkills(skillsDirPath: string): Promise<SkillEntry[
     });
   }
   return out;
+}
+
+/**
+ * Converts pi's own resolved skill list into catalogue entries.
+ *
+ * pi resolves skills from every source — `agent/skills/`, each installed
+ * package's declared `pi.skills`, and project-local `.pi/skills` — and hands the
+ * result to `before_agent_start` as `systemPromptOptions.skills`. Reusing that
+ * list is what lets a subagent declare a package skill at all: discovery here
+ * reads `agent/skills/` alone, so `skills: test-driven-development` (a
+ * superpowers skill) used to resolve to *nothing*, and {@link selectSkills} drops
+ * unknown names by design — no error, the agent just silently lacked its skill.
+ *
+ * Taking pi's list rather than re-deriving it also means the human's resource
+ * filters are already applied: a `-skills/foo` exclusion, an include-list, or
+ * `autoload: false` have all been honoured upstream, so a child can never be
+ * handed a skill the orchestrator itself was denied. Re-reading `settings.json`
+ * here would be a second parser of a format pi already owns, and this repo has
+ * been bitten by exactly that (see `skill-activation.ts` in `AGENTS.md`).
+ *
+ * Keyed on the **directory** name, not the frontmatter `name`: `selectSkills`
+ * matches `SkillEntry.dir`, and the two are free to drift. Skills whose
+ * frontmatter sets `disable-model-invocation` are kept — pi filters those only
+ * when *rendering* the orchestrator's prompt, and a subagent that explicitly
+ * declares one should still get it.
+ *
+ * Pure and defensive: a malformed entry is skipped rather than throwing, because
+ * this runs on the launch path.
+ *
+ * @param skills - `systemPromptOptions.skills` from `before_agent_start`.
+ */
+export function skillEntriesFromPi(skills: readonly unknown[]): SkillEntry[] {
+  const out: SkillEntry[] = [];
+  const seen = new Set<string>();
+  for (const s of skills ?? []) {
+    if (!s || typeof s !== "object") continue;
+    const { name, description, filePath, baseDir } = s as Record<string, unknown>;
+    if (typeof filePath !== "string" || !filePath) continue;
+    // `baseDir` is the skill's own directory; fall back to the SKILL.md's parent.
+    const dirPath = typeof baseDir === "string" && baseDir ? baseDir : dirname(filePath);
+    const dir = basename(dirPath);
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    out.push({
+      dir,
+      name: typeof name === "string" && name ? name : dir,
+      description: typeof description === "string" ? description : "",
+      path: filePath,
+    });
+  }
+  return out.sort((a, b) => a.dir.localeCompare(b.dir));
 }
 
 /**

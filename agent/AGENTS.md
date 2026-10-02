@@ -9,7 +9,7 @@ directories. The code that reads them lives in `extensions/` (own AGENTS.md).
 | Question | Answer |
 |---|---|
 | Which agents exist and on what model | `agents/*.md` frontmatter — 9 today: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker (summarizer is `callable_by: librarian` — a private helper, not a delegation target) |
-| Which skills the model may auto-invoke | `skills/*/SKILL.md` — 37 dirs; 15 carry `disable-model-invocation: true` (slash-only) |
+| Which skills the model may auto-invoke | `skills/*/SKILL.md` — 37 local dirs; 15 carry `disable-model-invocation: true` (slash-only). Plus 15 from the `superpowers` package (see the package-skills convention below), for 52 in the catalogue |
 | Why a skill dir has extra `.md` files | Progressive disclosure: `SKILL.md` is the entry point, siblings (`tests.md`, `REPORT.md`, `PATTERNS.md`) are loaded on demand |
 | What a theme key may be | `themes/tokyo-night.json` `$schema` points at pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header |
@@ -26,7 +26,7 @@ directories. The code that reads them lives in `extensions/` (own AGENTS.md).
 - **A subagent sees no skills unless its `skills:` key names them.** pi's
   `dynamic-prompt.ts` builds `## Available Skills` for the *orchestrator* only, so a
   child's prompt is otherwise its definition body and nothing else: a skill is
-  invisible to it, including one the orchestrator just loaded. `skills: firecrawl, tdd`
+  invisible to it, including one the orchestrator just loaded. `skills: firecrawl, writing-plans`
   appends a catalogue of those skills' descriptions and paths (`skills: *` for all);
   omitting the key leaves the prompt byte-identical to what it was before the feature
   existed. The agent needs `read` or `read_skill` to open what the catalogue points at
@@ -87,6 +87,36 @@ directories. The code that reads them lives in `extensions/` (own AGENTS.md).
 - **Personal-identity skills are kept on disk and untracked**, not placeholdered —
   see the `.gitignore` rationale (`skills/uarizona-hpc/` is the live example). Add a
   path to `.gitignore` rather than sanitising a file in place.
+- **Some skills come from a package, and the catalogue is the union.** `settings.json`
+  `packages` carries `git:github.com/obra/superpowers`, which declares its own
+  `pi.skills` root; pi discovers those 15 and offers them alongside `skills/`. Three local
+  skills were *retired* in favour of its versions — `tdd` → `test-driven-development`,
+  and `diagnose`/`diagnosing-bugs` → `systematic-debugging` — so a reference to the
+  old names is now dangling (`git log` has them if one is needed back). Where this
+  repo's version is genuinely different it was kept: `code-review` does a
+  fixed-point, two-axis, tracker-aware review that `requesting-code-review` does not,
+  and `writing-for-agents` covers `AGENTS.md`, which `writing-skills` does not.
+- **The superpowers bootstrap extension is deliberately disabled.** The package entry
+  is the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only its
+  skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block on every turn
+  which mandates skill invocation before any response — it fights `dynamic-prompt.ts`
+  (which owns the orchestrator prompt and frames skills as advisory), pressures against
+  the 15 skills that set `disable-model-invocation: true` *because* they need a human in
+  the loop, and its bundled tool mapping is wrong for this config (it claims pi has no
+  subagent or task-list tool; `subagent` and `todo` both exist here). Re-enabling it
+  means owning all four conflicts. `pi list` prints `(filtered)` when the exclusion is
+  live.
+- **A subagent's catalogue comes from pi's resolved skill list, not from a directory
+  scan.** `subagent-herdr`'s `before_agent_start` hook captures
+  `systemPromptOptions.skills` and `skillEntriesFromPi` maps it, so `skills:` can name
+  a package skill (`test-driven-development`) or a project-local one, and the human's
+  resource filters are already applied upstream — a child can never be handed a skill
+  the orchestrator was denied. Without this a declaration resolves to *nothing* and
+  `selectSkills` drops it silently, which reads as "my agent ignores its skill".
+  **Do not re-derive this from `settings.json`**: pi owns that format, and the first
+  draft of this feature drifted from it on pinned `git:...@ref` sources and on per-skill
+  excludes. **`agent/skills/` stays flat** regardless: the directory name is the identity
+  `skills:` and `skill-activation.ts` both match on.
 
 ## ANTI-PATTERNS
 
@@ -98,5 +128,10 @@ directories. The code that reads them lives in `extensions/` (own AGENTS.md).
   `install --with-deps`, Chrome landing in root's `$HOME`, the versioned Chrome
   directory). `AGENT_BROWSER_VERSION` is pinned because the CLI is pre-1.0 and the
   image depends on install-path behaviour that is not a documented API.
-- Duplicating a skill to tweak one section. `skills/diagnose/` and
-  `skills/diagnosing-bugs/` are already a near-duplicate pair, and they now drift.
+- Duplicating a skill to tweak one section. The `skills/diagnose/` +
+  `skills/diagnosing-bugs/` pair was exactly this, drifted, and is now gone in favour of
+  the package's `systematic-debugging`. Prefer retiring one, or pointing it at the other.
+- Adding a local skill that restates one the `superpowers` package already ships. Check
+  the union first (`ls agent/skills` plus the package's `skills/`), and keep a local
+  version only when it does something upstream's does not — the two kept exceptions above
+  each name that difference.

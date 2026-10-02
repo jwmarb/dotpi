@@ -28,6 +28,7 @@ import {
   readReports,
   REPORT_TOOL_NAME,
   selectSkills,
+  skillEntriesFromPi,
   SKILLS_WILDCARD,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
@@ -908,6 +909,114 @@ describe("discoverSkills", () => {
   test("a missing skills directory is empty, not a throw", async () => {
     // Discovery runs on the launch path: it must never cost a delegation.
     expect(await discoverSkills(join(tmpdir(), "definitely-not-here-xyz"))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// skillEntriesFromPi
+// ---------------------------------------------------------------------------
+
+/** One entry shaped like pi's `Skill`, as `systemPromptOptions.skills` carries it. */
+function piSkill(dir: string, over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: dir,
+    description: `desc of ${dir}`,
+    filePath: `/root/${dir}/SKILL.md`,
+    baseDir: `/root/${dir}`,
+    disableModelInvocation: false,
+    ...over,
+  };
+}
+
+describe("skillEntriesFromPi", () => {
+  test("maps pi's resolved list into catalogue entries", () => {
+    const got = skillEntriesFromPi([piSkill("firecrawl")]);
+    expect(got).toEqual([
+      {
+        dir: "firecrawl",
+        name: "firecrawl",
+        description: "desc of firecrawl",
+        path: "/root/firecrawl/SKILL.md",
+      },
+    ]);
+  });
+
+  test("keys on the DIRECTORY, not the frontmatter name", () => {
+    // `selectSkills` matches `SkillEntry.dir`, and the two are free to drift. A
+    // name-keyed version passes for every skill where they agree and breaks on
+    // the first package where they do not.
+    const got = skillEntriesFromPi([
+      piSkill("test-driven-development", { name: "Test-Driven Development (TDD)" }),
+    ]);
+    expect(got[0].dir).toBe("test-driven-development");
+    expect(got[0].name).toBe("Test-Driven Development (TDD)");
+    expect(selectSkills(["test-driven-development"], got)).toHaveLength(1);
+  });
+
+  test("a package skill is selectable, which is the bug this fixes", () => {
+    // Before this, a child's catalogue came from `agent/skills/` alone, so
+    // `skills: test-driven-development` resolved to nothing and selectSkills
+    // dropped it silently.
+    const entries = skillEntriesFromPi([
+      piSkill("tdd-local"),
+      piSkill("test-driven-development", {
+        filePath: "/home/u/.pi/agent/git/github.com/obra/superpowers/skills/test-driven-development/SKILL.md",
+        baseDir: "/home/u/.pi/agent/git/github.com/obra/superpowers/skills/test-driven-development",
+      }),
+    ]);
+    const sel = selectSkills(["test-driven-development"], entries);
+    expect(sel).toHaveLength(1);
+    expect(sel[0].path).toContain("superpowers");
+  });
+
+  test("keeps disable-model-invocation skills", () => {
+    // pi filters those only when *rendering* the orchestrator's prompt. An agent
+    // that explicitly declares one should still get it.
+    const got = skillEntriesFromPi([piSkill("handoff", { disableModelInvocation: true })]);
+    expect(got.map((s) => s.dir)).toEqual(["handoff"]);
+  });
+
+  test("falls back to the SKILL.md's parent when baseDir is absent", () => {
+    const got = skillEntriesFromPi([piSkill("x", { baseDir: undefined })]);
+    expect(got[0].dir).toBe("x");
+  });
+
+  test("falls back to the directory when the name is empty", () => {
+    expect(skillEntriesFromPi([piSkill("y", { name: "" })])[0].name).toBe("y");
+    expect(skillEntriesFromPi([piSkill("z", { description: 42 })])[0].description).toBe("");
+  });
+
+  test("skips malformed entries rather than throwing", () => {
+    // This runs on the launch path: a bad entry must cost itself, never the spawn.
+    const got = skillEntriesFromPi([
+      null,
+      undefined,
+      "nonsense",
+      42,
+      {},
+      { filePath: "" },
+      piSkill("good"),
+    ] as unknown[]);
+    expect(got.map((s) => s.dir)).toEqual(["good"]);
+  });
+
+  test("an empty or absent list is empty, not a throw", () => {
+    expect(skillEntriesFromPi([])).toEqual([]);
+    expect(skillEntriesFromPi(undefined as unknown as unknown[])).toEqual([]);
+  });
+
+  test("dedups by directory, keeping the first", () => {
+    const got = skillEntriesFromPi([
+      piSkill("dup", { description: "first" }),
+      piSkill("dup", { description: "second" }),
+    ]);
+    expect(got).toHaveLength(1);
+    expect(got[0].description).toBe("first");
+  });
+
+  test("sorts by directory, so the catalogue order is stable", () => {
+    const got = skillEntriesFromPi([piSkill("zebra"), piSkill("alpha"), piSkill("middle")]);
+    expect(got.map((s) => s.dir)).toEqual(["alpha", "middle", "zebra"]);
   });
 });
 

@@ -2,7 +2,7 @@
 name: oracle
 description: Read-only consultation for high-stakes architecture decisions and last-resort debugging. Call it when a decision is expensive to reverse, or when something has failed repeatedly and you are out of hypotheses. Advises, never acts.
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
-skills: firecrawl, codebase-design, diagnosing-bugs
+skills: firecrawl, codebase-design, systematic-debugging
 model: openai/gpt-5.6-sol
 fallback_models: anthropic/claude-opus-5, qwen/qwen3.8-27b
 ---

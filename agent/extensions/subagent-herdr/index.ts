@@ -107,6 +107,8 @@ import {
   readReports,
   type RunResult,
   selectSkills,
+  type SkillEntry,
+  skillEntriesFromPi,
 } from "./lib.js";
 import {
   type AgentInfo,
@@ -209,6 +211,21 @@ const LINEAGE_ENV = "PI_SUBAGENT_LINEAGE";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 const runs = new Map<string, RunRecord>();
+
+/**
+ * pi's resolved skill catalogue for this session, captured from the most recent
+ * `before_agent_start`.
+ *
+ * A child's catalogue must cover installed packages and project-local skills, not
+ * just `agent/skills/` — and it must respect the human's resource filters. pi has
+ * already done both by the time it builds the orchestrator's prompt, so the list
+ * is taken from there rather than re-derived from `settings.json` (which would be
+ * a second parser of a format pi owns, the mistake `AGENTS.md` warns about).
+ *
+ * Undefined until the first turn starts, which `spawnRun` falls back around. A
+ * spawn can only happen inside a tool call, so in practice it is always set.
+ */
+let piSkillCatalogue: SkillEntry[] | undefined;
 
 function saveMeta(rec: RunRecord): void {
   try {
@@ -483,7 +500,11 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   const promptPath = systemPromptPath(dir);
   let promptBody = agent.promptBody;
   if (agent.skills && agent.skills.length > 0) {
-    const selected = selectSkills(agent.skills, await discoverSkills(skillsDir()));
+    // pi's own resolved list covers packages and project scope and has the
+    // human's resource filters already applied; scanning `agent/skills/` is the
+    // fallback for the case where no turn has started yet.
+    const available = piSkillCatalogue ?? (await discoverSkills(skillsDir()));
+    const selected = selectSkills(agent.skills, available);
     const canRead = !agent.tools || agent.tools.length === 0 ||
       agent.tools.some((t) => READING_TOOLS.has(t));
     promptBody = appendSkillCatalogue(promptBody, selected, canRead);
@@ -750,6 +771,27 @@ function fallbackBriefing(batch: readonly Notice[]): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  // -------------------------------------------------------------------------
+  // Skill catalogue capture
+  // -------------------------------------------------------------------------
+
+  /**
+   * Takes pi's resolved skill list for this turn, so a spawned child can be
+   * given a catalogue that includes package and project-local skills.
+   *
+   * Read-only: this handler returns nothing, so it cannot perturb the
+   * orchestrator's own prompt. A malformed list costs the catalogue (the spawn
+   * path falls back to scanning `agent/skills/`), never the turn.
+   */
+  pi.on("before_agent_start", (event) => {
+    try {
+      const skills = event.systemPromptOptions?.skills;
+      if (Array.isArray(skills)) piSkillCatalogue = skillEntriesFromPi(skills);
+    } catch {
+      // Leave the previous catalogue (or undefined) in place.
+    }
+  });
+
   // -------------------------------------------------------------------------
   // subagent
   // -------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 
 This repo is my `.pi` configuration — the home directory of the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent, published the way others publish a dotfiles repo. It lives at `~/.pi`, the directory pi reads for its agent configuration.
 
-It owns everything I tune: local TypeScript extensions that pi auto-loads at startup, a fleet of eight subagent definitions, a library of 38 skills, prompt templates, the tokyo-night TUI theme, the default model/provider settings, the LiteLLM provider wiring, and the MCP gateway config. Everything a pi session *generates* — session transcripts, caches, vendored package checkouts, run directories — is gitignored, per the rule written into [.gitignore](.gitignore): if deleting it costs nothing but a re-run, it is ignored.
+It owns everything I tune: local TypeScript extensions that pi auto-loads at startup, a fleet of nine subagent definitions, a library of 52 skills (37 local plus the 15 from the [superpowers](https://github.com/obra/superpowers) package), prompt templates, the tokyo-night TUI theme, the default model/provider settings, the LiteLLM provider wiring, and the MCP gateway config. Everything a pi session *generates* — session transcripts, caches, vendored package checkouts, run directories — is gitignored, per the rule written into [.gitignore](.gitignore): if deleting it costs nothing but a re-run, it is ignored.
 
 ## Why use .pi?
 
@@ -24,7 +24,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 
 - 🧩 **Local extensions, auto-loaded:** every top-level `agent/extensions/*.ts` ships into every session — a `questionnaire` tool that asks you multiple-choice questions in the TUI, a `/sessions` browser for resuming past work, a `/diff` widget for session changes, a dynamic system prompt built from your discovered inventory, and an update check that runs at most every 4 hours.
 - 🤖 **A subagent fleet you can delegate to:** nine specialized definitions (explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker), each with its own model, fallback chain, and tool allowlist — read-only by construction where a verdict needs to be independent.
-- 🃏 **A skills library with progressive disclosure:** 38 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you.
+- 🃏 **A skills library with progressive disclosure:** 52 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you. 37 are maintained here; the other 15 come from the [superpowers](https://github.com/obra/superpowers) package, whose always-on bootstrap extension is deliberately left disabled so it does not override the orchestrator prompt.
 - 🔁 **Completion loops with verification gates:** `/ralph-loop <goal>` re-prompts the agent until it signs off with a completion tag, and `--verify` can audit that claim with a read-only oracle pass and a Dockerized runtime pass before accepting it.
 - 🧑‍🤝‍🧑 **Event-driven delegation:** the `subagent` tool spawns each child in its own herdr tab and ends the turn — the child wakes the parent with a notice when it reports, so you can message a running child mid-flight.
 - 🌐 **MCP via pi's built-in extension:** [agent/mcp.json](agent/mcp.json) holds the servers, keys stay `${VAR}` placeholders, and `/mcp` signs in, reconnects, and changes tool exposure from the TUI. The LiteLLM gateway is registered by [agent/extensions/mcp-gateway.ts](agent/extensions/mcp-gateway.ts), because the builtin rejects a placeholder in `url`.
@@ -41,6 +41,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - [Node.js](https://nodejs.org) with npm — optional; only for the dev-only typecheck dependencies (`agent/extensions/subagent-herdr/`)
 - [Docker](https://docs.docker.com) — optional; only the ralph-loop `--verify` runtime gate needs it
 - [firecrawl-cli](https://docs.firecrawl.dev/cli) — optional; the `librarian` agent's research tool, installed with `npm install -g firecrawl-cli`. Needs `FIRECRAWL_API_URL` in `agent/.env` (no API key required for a self-hosted instance)
+- [agent-browser](https://github.com/vercel-labs/agent-browser) — optional; the `agent-browser` skill's browser automation CLI, installed with `npm i -g agent-browser && agent-browser install` (the second command downloads the browser binary)
 
 ### Quick install 🚀
 
