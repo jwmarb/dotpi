@@ -19,9 +19,9 @@ import {
 	row,
 } from "./widget.js";
 
-/** The exact line that crashed a 13-column Run Pane, styling and all. */
+/** The exact line shape that crashed a 13-column Run Pane, styling and all. */
 const MCP_LINE =
-	"\u001b[38;2;158;206;106m●\u001b[39m mcp: \u001b[38;2;192;202;245mlitellm-gateway\u001b[39m\u001b[38;2;86;95;137m 59 tools\u001b[39m";
+	"\u001b[38;2;158;206;106m●\u001b[39m mcp: \u001b[38;2;192;202;245mexample-gateway\u001b[39m\u001b[38;2;86;95;137m 59 tools\u001b[39m";
 
 describe("fitLines", () => {
 	test("truncates the line that crashed a narrow Run Pane", () => {

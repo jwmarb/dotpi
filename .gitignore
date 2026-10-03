@@ -4,19 +4,17 @@
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
 
 # ---- Secrets ----------------------------------------------------------------
-# The real .env: the ONLY file here holding live credentials, plus both
-# gateway URLs. Everything agent/mcp.json and agent/extensions/litellm.ts
-# need is read from it (docs/adr/0042) — LITELLM_API_KEY and LITELLM_BASE_URL
-# for the litellm provider, LITELLM_MCP_KEY and LITELLM_MCP_URL for the
-# mcp.json gateway.
-# Losing this file means re-minting two keys from the gateway; losing a key to
-# git history would mean rotating them under pressure.
+# The real .env: the ONLY file here holding live credentials, plus the provider
+# base URL. Everything agent/extensions/litellm.ts and firecrawl-cli.ts need is
+# read from it — LITELLM_API_KEY and LITELLM_BASE_URL for the litellm provider,
+# FIRECRAWL_API_URL for the librarian's research CLI.
+# Losing this file means re-minting the provider key; losing it to git history
+# would mean rotating it under pressure.
 agent/.env
 agent/.env.*
 !agent/.env.example
-# NOTE: agent/mcp.json and agent/extensions/litellm.ts used to be ignored here,
-# each because it hardcoded a key. Both now read from agent/.env, so both are
-# committed — mcp.json via a "Bearer ${LITELLM_MCP_KEY}" placeholder. This is
+# NOTE: agent/extensions/litellm.ts used to be ignored here because it
+# hardcoded a key. It now reads from agent/.env, so it is committed. This is
 # the change the old comment on litellm.ts anticipated: its doc comments always
 # claimed LITELLM_API_KEY came from the environment, and now that is true.
 # Credential stores. Empty right now, which is exactly why they are easy to

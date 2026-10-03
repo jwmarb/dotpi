@@ -12,9 +12,9 @@
  * missing API key, which reads like a network fault rather than a config gap.
  *
  * Deliberately NOT `requireEnv`: a missing URL must not take pi's startup down,
- * and the same reasoning as `mcp-gateway.ts` applies — pi has to start without
- * the research stack. The shortfall is reported here, once, naming the variable
- * and the file, because the failure it replaces (a 402/401 from the Firecrawl
+ * because pi has to start without the research stack. The shortfall is reported
+ * here, once, naming the variable and the file, because the failure it replaces
+ * (a 402/401 from the Firecrawl
  * cloud) does not mention either.
  *
  * No API key is set or needed. Any non-default `apiUrl` makes the CLI skip key
@@ -43,7 +43,7 @@ const QUIET_DEFAULTS: Record<string, string> = {
 };
 
 export default function () {
-	// `force` for the same reason as mcp-gateway.ts: loadDotenv caches, and this
+	// `force` because loadDotenv caches, and this
 	// must win over a stale cache populated earlier in startup. It only fills
 	// vars that are unset, so a real environment variable still takes precedence.
 	loadDotenv({ force: true });

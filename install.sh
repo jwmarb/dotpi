@@ -490,14 +490,11 @@ printf '\n%sInstalled.%s  %s\n\n' "$GRN$B" "$R" "$TARGET"
 
 if [ "$ENV_WAS_CREATED" -eq 1 ]; then
 	printf '%sOne step left — pi will not reach a model until you do it.%s\n' "$B" "$R"
-	printf 'Fill in the four LITELLM_* values:\n\n'
+	printf 'Fill in the two LITELLM_* values:\n\n'
 	# shellcheck disable=SC2016  # $EDITOR is shown to the user, not expanded here
 	printf '    %s${EDITOR:-nano} %s/agent/.env%s\n\n' "$DIM" "$TARGET" "$R"
 	printf '  LITELLM_API_KEY    provider key   (Authorization: Bearer <key>)\n'
-	printf '  LITELLM_BASE_URL   provider URL\n'
-	printf '  LITELLM_MCP_KEY    gateway key    (x-litellm-api-key header)\n'
-	printf '  LITELLM_MCP_URL    gateway URL\n\n'
-	printf '  %sMCP_KEY and API_KEY are different credentials, not the same value twice.%s\n\n' "$DIM" "$R"
+	printf '  LITELLM_BASE_URL   provider URL\n\n'
 	printf '%sOptional — the librarian agent researches through this:%s\n' "$B" "$R"
 	printf '  FIRECRAWL_API_URL  your Firecrawl endpoint, e.g. http://firecrawl.lan:3002\n'
 	printf '  %sNo API key: a self-hosted URL makes the CLI skip key validation.%s\n\n' "$DIM" "$R"

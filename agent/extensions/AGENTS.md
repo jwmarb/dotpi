@@ -17,7 +17,6 @@ AGENTS.md.
 | `init.ts` | `/init` — local deterministic tiering (score > 15 create, >= 8 candidate, `--max-depth` default 3; root 50–150 lines, nested 30–80), then hands the model a brief |
 | `litellm.ts` | `registerProvider("litellm")` — model catalog, per-token + cache costs, `contextWindow`, thinking-level maps |
 | `model-fallback/` | `registerVirtualModel("fallback/auto")` + `/fallback-chain` — on an error, route the retry to the **next** model in a chain, then hand the following request back to the original. One full lap of the chain is one logical retry. Consumed by the orchestrator (settings), delegated children (`PI_FALLBACK_CHAIN`) and both ralph-loop gates. Own AGENTS.md |
-| `mcp-gateway.ts` | No tool, no command. Registers the `litellm-gateway` MCP server with pi's built-in MCP extension via `pi.registerMcpServer()`. Exists only because the builtin validates `mcp.json` `url` with `URL.canParse()` *before* expansion, so a `${LITELLM_MCP_URL}` placeholder cannot live there. Servers, transport, OAuth, tool naming and `/mcp` are all the builtin's |
 | `sessions.ts` | `/sessions` — resumable session list from pi's own `SessionManager.list()`; no JSONL re-parsing |
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
 | `todo.ts` | `todo` tool + `/todos` — in-session checklist as a `belowEditor` widget. State replays from tool-result `details` on the current branch, so no file and no lock. Also holds the turn open on `agent_before_settle` while items are still pending/in-progress, injecting a `custom_message` nudge — once per distinct list state, and only on `outcome: "completed"` |
@@ -128,10 +127,10 @@ There are now **three** `tsc -p` scopes: `subagent-herdr`'s four sources,
 `model-fallback`'s three, and `ralph-loop`'s five (added when the gates gained a fallback
 chain — a change to a spawn argv deserves a typecheck). What matters here is what they do **not** cover: `lib/` and every
 top-level `*.ts` are in no typecheck scope at all — nothing type-checks `dynamic-prompt.ts`,
-`litellm.ts` or `mcp-gateway.ts` but pi loading them. Beware the skew when you check one by
+`litellm.ts` or `firecrawl-cli.ts` but pi loading them. Beware the skew when you check one by
 hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.0,
-so typechecking `mcp-gateway.ts` there reports a phantom "`registerMcpServer` does not exist
-on type `ExtensionAPI`" — it exists in the live bundle (`core/mcp-servers.js`). 0.75.4 has
+so typechecking against it reports phantom errors for APIs that exist only in the live
+bundle (for example `registerMcpServer`, from `core/mcp-servers.js`). 0.75.4 has
 no virtual-model API at all, so `model-fallback` cannot typecheck against it even nominally.
 Point `types`/aliases at the running pi's `dist/` instead, as `model-fallback/tsconfig.json`
 does with a `paths` entry — that is the pattern to copy, and `Model<Api>` comes from

@@ -27,8 +27,8 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - 🃏 **A skills library with progressive disclosure:** 52 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you. 37 are maintained here; the other 15 come from the [superpowers](https://github.com/obra/superpowers) package, whose always-on bootstrap extension is deliberately left disabled so it does not override the orchestrator prompt.
 - 🔁 **Completion loops with verification gates:** `/ralph-loop <goal>` re-prompts the agent until it signs off with a completion tag, and `--verify` can audit that claim with a read-only oracle pass and a Dockerized runtime pass before accepting it.
 - 🧑‍🤝‍🧑 **Event-driven delegation:** the `subagent` tool spawns each child in its own herdr tab and ends the turn — the child wakes the parent with a notice when it reports, so you can message a running child mid-flight.
-- 🌐 **MCP via pi's built-in extension:** [agent/mcp.json](agent/mcp.json) holds the servers, keys stay `${VAR}` placeholders, and `/mcp` signs in, reconnects, and changes tool exposure from the TUI. The LiteLLM gateway is registered by [agent/extensions/mcp-gateway.ts](agent/extensions/mcp-gateway.ts), because the builtin rejects a placeholder in `url`.
-- 🔐 **One file for secrets:** `agent/.env` is the only place live credentials exist, and it is gitignored; the provider and the MCP config read it through named placeholders.
+- 🌐 **MCP via pi's built-in extension:** [agent/mcp.json](agent/mcp.json) holds the servers, keys stay `${VAR}` placeholders, and `/mcp` signs in, reconnects, and changes tool exposure from the TUI.
+- 🔐 **One file for secrets:** `agent/.env` is the only place live credentials exist, and it is gitignored; the provider reads it through named placeholders.
 - 📦 **Self-repairing dependencies:** [scripts/setup-deps.sh](scripts/setup-deps.sh) runs at pi startup and on every checkout/merge, so a fresh clone loads its extensions without a manual `npm install`.
 
 ## How to Install ⚡
@@ -115,14 +115,12 @@ Flags go after `--` when piping: `... | bash -s -- --dir ~/src/dotpi`
 
 ### Environment Variables 🔧
 
-All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example)):
+Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), alongside the optional `FIRECRAWL_API_URL`:
 
 | Variable            | Required | Default | Description                                                                                                                          |
 | ------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `LITELLM_API_KEY`   | yes      | —       | Provider key used by `agent/extensions/litellm.ts` (`Authorization: Bearer <key>`)                                                     |
 | `LITELLM_BASE_URL`  | yes      | —       | Provider base URL used by `agent/extensions/litellm.ts`                                                                               |
-| `LITELLM_MCP_KEY`   | yes      | —       | Gateway key sent by `agent/mcp.json` as the `x-litellm-api-key` header — a **different** credential from `LITELLM_API_KEY`            |
-| `LITELLM_MCP_URL`   | yes      | —       | Gateway base URL used by `agent/mcp.json`                                                                                              |
 
 ## Repository Layout 📁
 
@@ -155,7 +153,6 @@ All four live in `agent/.env` (template: [agent/.env.example](agent/.env.example
 | `sessions.ts`      | `/sessions` — resumable session list from pi's own session manager                                        |
 | `thinking-indicator.ts` | Live thinking spinner + transcript label for the collapsed thinking block                          |
 | `auto-update/`     | `/update` + `pi_update` tool — version check on session start, at most every 4 hours                       |
-| `mcp-gateway.ts`   | Registers the LiteLLM gateway with pi's built-in MCP extension (reads the URL from `agent/.env`)           |
 | `ralph-loop/`      | `/ralph-loop`, `/ulw-loop`, `/loop-stop` — completion loop with `--verify` gates                           |
 | `subagent-herdr/`  | `subagent` / `subagent_tasks` tools — event-driven delegation into herdr tabs                              |
 | `lib/`             | Shared pi-free helpers: the `.env` parser, the layout resolver, the agent parser, widget measuring         |
@@ -235,7 +232,7 @@ cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 - **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there breaks pi startup. Tests live in subdirectories.
 - **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter, `subagent-herdr/rundir.ts` owns the run-directory shapes and the wake-notice grammar. Two parsers drift, and drift is how credentials and spawn arguments get out of sync.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the process.
-- **Secrets live only in `agent/.env`.** `mcp.json` uses `${LITELLM_MCP_KEY}` placeholders and `litellm.ts` reads `LITELLM_API_KEY` lazily; a literal key in a tracked file defeats both.
+- **Secrets live only in `agent/.env`.** `litellm.ts` reads `LITELLM_API_KEY` lazily and `firecrawl-cli.ts` loads `FIRECRAWL_API_URL` into the real `process.env`; a literal key in a tracked file defeats both.
 - **Commits follow Conventional Commits** per [`agent/prompts/git-commit.md`](agent/prompts/git-commit.md).
 
 ## OS Compatibility
