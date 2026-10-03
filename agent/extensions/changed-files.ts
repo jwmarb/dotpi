@@ -86,40 +86,79 @@ interface ChangedFile {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse `git status --porcelain` output into a map of changed files.
+ * Decode `git status --porcelain -z` output into one record per changed file.
+ *
+ * Exported as the module's test surface: this is a grammar, and a grammar wants
+ * tests more than the `execFileSync` call around it does. Invocation stays
+ * private — see the AGENTS.md anti-pattern on wrapping the four `git` call sites,
+ * which share no error contract worth unifying.
+ *
+ * ## Why `-z`
+ *
+ * The newline form quotes any path containing a space, a quote or a non-ASCII
+ * byte (`"src/a b.ts"`), and separates a rename with a literal ` -> `, which is
+ * itself a legal substring of a filename. Both ambiguities disappear with `-z`:
+ * paths are NUL-separated and never quoted, and a rename emits *two* NUL records
+ * (new path, then old). So this parser reads a record list, not lines.
+ *
+ * ## The XY field
+ *
+ * Porcelain's status is two columns — X is the index, Y the worktree — so a
+ * staged delete is `"D "`, not `"D"`. {@link GIT_STATUS_MAP} is keyed on the
+ * single letter, and this function used to look it up with the raw two-character
+ * field: every key except `??` missed, and the `?? "modified"` fallback made a
+ * staged add, delete and rename all render as "modified" with nothing to show it
+ * was a bug. X wins over Y when both are set, because what is staged is what a
+ * commit would record.
+ *
  * Line counts are filled in later by {@link enrichWithCounts}.
+ *
+ * @param output - Raw `git status --porcelain -z` bytes, as a string.
+ * @returns One entry per path, keyed by the path, in the order git reported it.
+ */
+export function parseGitStatusOutput(output: string): Map<string, ChangedFile> {
+	const map = new Map<string, ChangedFile>();
+	// Trailing NUL yields a final empty record; `-z` never emits a blank path.
+	const records = output.split("\0").filter((r) => r.length > 0);
+
+	for (let i = 0; i < records.length; i++) {
+		const record = records[i]!;
+		// "XY " + path: a record shorter than that cannot carry one.
+		if (record.length < 4) continue;
+
+		const x = record[0]!;
+		const y = record[1]!;
+		const path = record.slice(3);
+
+		// A rename or copy spends a second record on the OLD path. Consume it so
+		// it is not reported as a change of its own, and keep the new path only.
+		const isRename = RENAME_STATUS_PREFIXES.includes(x as "R" | "C");
+		if (isRename) i++;
+
+		// `??` is untracked and occupies both columns; otherwise X (staged) wins
+		// over Y (unstaged), and a space means "nothing in this column".
+		const code = x === "?" ? "??" : x !== " " ? x : y;
+		const label = (GIT_STATUS_MAP[code as keyof typeof GIT_STATUS_MAP] ??
+			"modified") as ChangeStatus;
+
+		map.set(path, { path, status: label, added: -1, removed: -1, binary: false });
+	}
+
+	return map;
+}
+
+/**
+ * Run `git status --porcelain -z` and decode it.
+ *
  * Returns null if git is not available or not in a repo.
  */
 async function parseGitStatus(
 	cwd: string,
 ): Promise<Map<string, ChangedFile> | null> {
 	try {
-		const output = execSyncGit(cwd, ["status", "--porcelain"]);
+		const output = execSyncGit(cwd, ["status", "--porcelain", "-z"]);
 		if (!output) return new Map();
-
-		const map = new Map<string, ChangedFile>();
-
-		for (const line of output.split("\n")) {
-			if (line.length < 2) continue;
-
-			const status = line.slice(0, 2);
-			let file: string;
-
-			// Renamed/copied files have format "R100 old -> new"
-			if (RENAME_STATUS_PREFIXES.includes(status[0] as "R" | "C")) {
-				const arrowIndex = line.indexOf(" -> ");
-				if (arrowIndex === -1) continue;
-				file = line.slice(arrowIndex + 4);
-			} else {
-				file = line.slice(3); // skip "X " prefix
-			}
-
-			const label = (GIT_STATUS_MAP[status as keyof typeof GIT_STATUS_MAP] ??
-				"modified") as ChangeStatus;
-			map.set(file, { path: file, status: label, added: -1, removed: -1, binary: false });
-		}
-
-		return map;
+		return parseGitStatusOutput(output);
 	} catch {
 		// Not a git repo, git not installed, or timeout — return null
 		return null;

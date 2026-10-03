@@ -218,7 +218,7 @@ function scoreDir(root: string, d: DirStats, allFiles: string[]): TierScore {
   return { score, reasons, files: files.length, symbols, refs };
 }
 
-interface Tier {
+export interface Tier {
   rel: string;
   depth: number;
   score: number;
@@ -230,14 +230,28 @@ interface Tier {
   existing: string[];
 }
 
-interface TierPlan {
+export interface TierPlan {
   root: string;
   isGit: boolean;
   tiers: Tier[];
   maxDepth: number;
 }
 
-function planTiers(cwd: string, scopeRel: string | undefined, maxDepth: number): TierPlan {
+/**
+ * Score every directory under `scopeRel` and decide which ones get a tier.
+ *
+ * Exported as the decision surface for `/init`: what this returns is what the
+ * model is told to write, so a test should cross this seam rather than poke at
+ * the scoring helpers behind it. Reads the filesystem (and git, when there is
+ * one) and is otherwise a pure function of them — point it at a temp dir.
+ *
+ * @param cwd - Session working directory; also where git is invoked.
+ * @param scopeRel - Optional subdirectory to restrict the scan to.
+ * @param maxDepth - How deep to consider directories (1-10).
+ * @returns The root tier first, then up to {@link MAX_NESTED_TIERS} nested ones,
+ *   highest score first.
+ */
+export function planTiers(cwd: string, scopeRel: string | undefined, maxDepth: number): TierPlan {
   const gitRoot = git(cwd, ["rev-parse", "--show-toplevel"]);
   const isGit = gitRoot.length > 0;
   const repoRoot = isGit ? gitRoot : cwd;
@@ -265,10 +279,10 @@ function planTiers(cwd: string, scopeRel: string | undefined, maxDepth: number):
   for (const [rel, d] of [...dirs.entries()].sort((a, b) => a[0].length - b[0].length)) {
     if (rel === "") continue;
     const s = scoreDir(scopeAbs, d, files.map(strip));
-    const status: Tier["status"] = s.score > CREATE_ABOVE ? "create" : s.score >= CANDIDATE_FROM ? "candidate" : "skip" as never;
-    if (status === ("skip" as never)) continue;
+    const status = tierStatus(s.score);
+    if (status === undefined) continue;
     const existing = CONTEXT_FILE_CANDIDATES.filter((name) => existsSync(join(scopeAbs, rel, name)));
-    tiers.push({ rel, depth: d.depth, score: s.score, reasons: s.reasons, fileCount: s.files, status: status as Tier["status"], existing });
+    tiers.push({ rel, depth: d.depth, score: s.score, reasons: s.reasons, fileCount: s.files, status, existing });
   }
   tiers.sort((a, b) => b.score - a.score);
   const kept = tiers.slice(0, MAX_NESTED_TIERS);
@@ -350,7 +364,31 @@ function buildBrief(plan: TierPlan, mode: "update" | "create-new"): string {
 // Command
 // ---------------------------------------------------------------------------
 
-function parseArgs(args: string): { scope: string | undefined; maxDepth: number; createNew: boolean; unknown: string[] } {
+/**
+ * Classify a directory's score into the tier it earns.
+ *
+ * The two thresholds decide what `/init` writes, so they are worth pinning
+ * directly: `undefined` means "not worth a tier". Named rather than inlined
+ * because the old expression smuggled a third state through `"skip" as never`,
+ * which type-checked while lying about the return type.
+ *
+ * @param score - A directory's score from `scoreDir`.
+ */
+export function tierStatus(score: number): Tier["status"] | undefined {
+  if (score > CREATE_ABOVE) return "create";
+  if (score >= CANDIDATE_FROM) return "candidate";
+  return undefined;
+}
+
+/**
+ * Parse the `/init` argument string.
+ *
+ * Exported for tests: an unparsed flag must land in `unknown` rather than being
+ * silently dropped, which is the behaviour a caller depends on to report it.
+ *
+ * @param args - Raw argument text as typed after `/init`.
+ */
+export function parseInitArgs(args: string): { scope: string | undefined; maxDepth: number; createNew: boolean; unknown: string[] } {
   const out = { scope: undefined as string | undefined, maxDepth: MAX_DEPTH_DEFAULT, createNew: false, unknown: [] as string[] };
   for (const raw of args.trim().split(/\s+/).filter(Boolean)) {
     if (raw === "--create-new") out.createNew = true;
@@ -372,7 +410,7 @@ export default function (pi: ExtensionAPI) {
         ? ["--create-new", "--max-depth="].filter((f) => f.startsWith(prefix))
         : [],
     handler: async (args, ctx) => {
-      const parsed = parseArgs(args);
+      const parsed = parseInitArgs(args);
       if (parsed.unknown.length > 0) {
         ctx.ui.notify(`init: unknown option(s): ${parsed.unknown.join(", ")} (use --create-new, --max-depth=N)`, "warning");
         return;
