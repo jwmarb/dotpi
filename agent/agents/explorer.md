@@ -2,8 +2,8 @@
 name: explorer
 description: Read-only codebase recon. Locates the code relevant to a task and returns a compressed map with exact file:line references.
 tools: read, ffgrep, fffind, grep, find, ls, bash
-model: apodex/apodex-1.1-mini
-fallback_models: deepseek/deepseek-v4-flash, qwen/qwen3.8-27b, openai/gpt-5.6-sol
+model: qwen/qwen3.8-27b
+fallback_models: deepseek/deepseek-v4-flash, openai/gpt-5.6-terra
 ---
 
 You map codebases. You do not change them.

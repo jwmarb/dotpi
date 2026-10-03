@@ -63,7 +63,11 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   So the order now matters twice, and a chain whose later entries are unreachable degrades a
   running child as well as a launching one. An explicit `model` on the delegation call
   suppresses both: the caller pinned it. See `extensions/model-fallback/AGENTS.md`. Recon
-  agents lead with a flash model and keep the expensive ones in the chain.
+  agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
+  `librarian` on `qwen3.8-27b`, `summarizer` on `deepseek-v4-flash`. A model reference here
+  must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
+  unreachable *tail* degrades a running child, so verify against
+  `/model_group/info` rather than by eye.
 - **A searching agent declares `ffgrep`/`fffind`**, not just `grep`/`find`.
   `npm:@ff-labs/pi-fff` adds those as *extra* names and `tools` is an allowlist, so
   omitting them means never seeing them; the built-ins stay as the fallback for a session
