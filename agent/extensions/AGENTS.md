@@ -1,8 +1,9 @@
 # agent/extensions — the local pi extensions pi auto-loads at startup
 
-Each of the 12 top-level `*.ts` is one independent extension; `lib/` is the shared,
-pi-free helper layer. `ralph-loop/`, `subagent-herdr/` and `model-fallback/` have their own
-AGENTS.md.
+Every top-level `*.ts` here is one independent extension (the inventory below is the list —
+the count is whatever `ls agent/extensions/*.ts` says, not a number restated in prose);
+`lib/` is the shared, pi-free helper layer. `ralph-loop/`, `subagent-herdr/` and
+`model-fallback/` have their own AGENTS.md.
 
 ## WHERE TO LOOK
 
@@ -23,7 +24,7 @@ AGENTS.md.
 | `auto-update/` | `/update` + `pi_update` tool — version check on `session_start`, at most every 4h |
 | `trade-journal/` | `trade_journal` tool — journal in `~/.agentic-trading/journal/` (`AGENTIC_TRADING_JOURNAL` overrides). Modes `record`/`read`/`stats`/`dupes`. Mechanics only — judgment belongs to the `technical-analysis` skill's agents, and the tool is gated on that skill being active |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
-| `lib/layout.ts` | Where repo files live. **Never throws** — falls back to `~/.pi/agent` |
+| `lib/layout.ts` | Resolves the agent dir, plus the named paths with more than one caller. **Never throws** — falls back to `~/.pi/agent`. Single-owner segments live with their owner, not here (`subagent-runs/` → `subagent-herdr/rundir.ts`; `docker/`, `verify-images/` → `ralph-loop/image.ts`) |
 | `lib/agents.ts` | The single agent-frontmatter parser (`discoverAgents`, `discoverSkillAgents`, `mergeAgents`, `parseAgentFile`) — reads both `agents/*.md` and `skills/<category>/<skill>/agents/*.md`. Also owns the frontmatter *list* grammar (`extractStringList`, `frontmatterOf`), which `skill-activation.ts` imports rather than re-implementing |
 | `lib/skill-tree.ts` | Where skills live on disk (`findSkills`, `categoryFromPath`, `SkillLocation`) — the single walker of `skills/<category>/<skill>/`, mirroring pi's rule that a dir holding `SKILL.md` is a skill root. The three readers below it each did their own one-level `readdir` once, and nesting broke all three *silently* |
 | `lib/skill-categories.ts` | Which category a skill belongs to (`groupByCategory`, `categoryFor`, `CATEGORY_ORDER`, `PACKAGE_SKILL_CATEGORIES`) — path wins for a local skill, a name-keyed map covers the vendored package skills, and an unmapped one degrades to `other` rather than vanishing |
@@ -79,12 +80,15 @@ AGENTS.md.
   `.ts` — that is what pi's jiti loader resolves, and what `moduleResolution: "bundler"`
   expects.
 - **Emit a prompt section only for a tool that exists.** `dynamic-prompt.ts` emits its
-  questionnaire and planning sections only when the `questionnaire` / `plan` tools are
-  actually in `selectedTools`. The `plan` extension was removed in `7a54a3b`, so the
-  planning branch is currently dead but harmless.
-- **`todo.ts` is not the old `plan` extension and must not grow into it.** That dead branch
-  gates on a tool named `plan`; `todo` is a different tool and deliberately does not re-arm
-  it. What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a
+  questionnaire section only when the `questionnaire` tool is actually in `selectedTools`.
+  It carried a second such branch for the `plan` tool long after the `plan` extension was
+  removed in `7a54a3b`; "dead but harmless" was the wrong reading, because the branch still
+  *described* a tool with ops (add/status/revise/seed/attach/archive/show) that no longer
+  exists, and any future tool named `plan` would have silently inherited that stale
+  contract. It is gone — a new planning tool brings its own prompt section.
+- **`todo.ts` is not the old `plan` extension and must not grow into it.** `todo` is a
+  different tool, and now that the stale `plan` prompt branch is deleted nothing re-arms it.
+  What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a
   live kanban Board in its own pane, which needed a *second* writer and then a cross-process
   lock that could still lose updates, and whose last commits before deletion were all
   stale-card fixes. `todo` avoids all of it by having no file — state replays from
@@ -98,10 +102,20 @@ AGENTS.md.
   makes the continuation legal. Reading that flag as a precondition is a silent no-op that
   looks like a safety check. Pair any such continuation with a cap keyed on real progress
   (`progressSignature`): an unconditional one re-asks forever and wedges the session.
+- **A test may import a top-level extension; only the test *file* is barred from this
+  directory.** The constraint is where the file sits, not what it may reach: pi auto-loads
+  every top-level `*.ts`, so a `*.test.ts` here imports `bun:test` and kills startup. A test
+  in `lib/` is invisible to pi and can import `../<extension>.js` freely —
+  `lib/sessions.test.ts` has done exactly that all along, and all 11 top-level extensions
+  import cleanly from there (measured, 11/11). Export the pure logic and test it in place.
 - **Keep pure logic out of `index.ts`.** Every subdirectory extension splits `lib.ts` (pure,
-  tested) from `index.ts` (session wiring). `trade-journal/` is the worked example of *why*:
-  its mode logic wanted tests, and a `*.test.ts` cannot sit beside a top-level extension.
-  Logic that deserves a test is the signal to become a directory, not a bigger file.
+  tested) from `index.ts` (session wiring). `trade-journal/` is the worked example. But
+  become a directory when it improves the module's **interface** or **locality** — not
+  merely to make testing possible, which it never gated. This file claimed the opposite for
+  several revisions, and the cost was not a bad refactor: it was ~2,400 lines of pure logic
+  (the whole orchestrator prompt in `dynamic-prompt.ts`, `/init`'s tiering thresholds, the
+  porcelain decoder in `changed-files.ts`) left untested because the cheap option looked
+  illegal and the legal option looked expensive.
 - **Not every action method exists during extension load.** `registerTool`,
   `registerProvider`, `registerVirtualModel` and `registerMcpServer` are **queued**
   (`core/extensions/loader.js`), but `getSettings`, `setActiveTools`, `getCommands`,
@@ -123,7 +137,9 @@ AGENTS.md.
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
-There are now **three** `tsc -p` scopes: `subagent-herdr`'s four sources,
+There are now **three** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
+reached transitively for a while but not *declared*, which left the module owning a
+cross-process grammar outside the stated scope),
 `model-fallback`'s three, and `ralph-loop`'s five (added when the gates gained a fallback
 chain — a change to a spawn argv deserves a typecheck). What matters here is what they do **not** cover: `lib/` and every
 top-level `*.ts` are in no typecheck scope at all — nothing type-checks `dynamic-prompt.ts`,
@@ -143,9 +159,21 @@ does with a `paths` entry — that is the pattern to copy, and `Model<Api>` come
 - Doing real work at module top level. Register inside the default export; anything eager
   becomes a startup hazard for *every* session, and the failure surfaces before pi can
   report which extension caused it.
-- Growing a top-level `*.ts` past the point where its logic wants tests. That logic cannot
-  live at this level (see above) — it is the signal to move the extension into a
-  subdirectory and split `lib.ts` from `index.ts`.
+- Moving an extension into a subdirectory *just* to test it. Pure logic at this level is
+  testable from `lib/` already (see CONVENTIONS) — split for interface or locality, or not
+  at all.
+- Building a shared wrapper over operations that merely *look* alike. The four `git` call
+  sites (`init.ts:72`, `changed-files.ts:166`, `ralph-loop/gate.ts:159`, `git-hooks.ts:43`)
+  have four different error contracts **because they do four different jobs**: a 64 MB
+  repo-wide grep, a latency-capped status, an async baseline snapshot that treats failure as
+  empty evidence, and a startup probe that needs exit codes and must swallow everything. A
+  `lib/git.ts` would either expose all four policies — an interface as complex as its
+  implementation — or erase distinctions callers rely on, and forcing the two `pi.exec`
+  callers onto synchronous `execFileSync` would block pi's event loop at startup. Two
+  adapters exist; no shared *behaviour* does, so the seam is hypothetical. What is worth
+  owning is the **porcelain grammar**, and only `changed-files.ts` has one —
+  `gate.ts` keeps `git status --porcelain` deliberately opaque as baseline evidence, so it
+  is not a second parser.
 
 (The repo-wide rules those imply — one parser per format, widgets measure through
 `lib/widget.ts` — are in the root CONVENTIONS.)

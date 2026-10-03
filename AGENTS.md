@@ -11,7 +11,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/` — everything pi loads at runtime (extensions, agents, skills, prompts, themes, settings, machine state). Authoring grammars: `agent/AGENTS.md`
 - `agent/extensions/` — local pi extensions; **every top-level `*.ts` is auto-loaded by pi at startup** (subdirs are entered only via `index.ts`, e.g. `subagent-herdr/`). Per-file inventory: `agent/extensions/AGENTS.md`
 - `agent/agents/` — subagent definitions (Markdown + YAML frontmatter)
-- `agent/skills/` — skills library, **grouped by category**: `skills/<category>/<skill>/SKILL.md` (+ reference docs; mostly the matt-pocock set). The *skill directory* name is the identity, never its category path — that is what makes refiling a skill a pure `git mv`. 9 categories, 37 tracked local skills, plus 15 discovered from the `superpowers` package (`settings.json` `packages`), so the live catalogue reads 52. The category of a package skill lives in `extensions/lib/skill-categories.ts`, since its checkout is vendored and gitignored. Grammar and the package-skill rules: `agent/AGENTS.md`.
+- `agent/skills/` — skills library, **grouped by category**: `skills/<category>/<skill>/SKILL.md` (+ reference docs; mostly the matt-pocock set). The *skill directory* name is the identity, never its category path — that is what makes refiling a skill a pure `git mv`. Every skill sits under a category, including a gitignored personal one (`lib/skill-catalogue.test.ts` walks the **live tree** and fails on one left loose). The live set is whatever is on disk plus whatever the `superpowers` package contributes (`settings.json` `packages`) — count it with `find agent/skills -name SKILL.md` rather than trusting a number here; every hand-maintained total in this repo has drifted at least once. The category of a package skill lives in `extensions/lib/skill-categories.ts`, since its checkout is vendored and gitignored. Grammar and the package-skill rules: `agent/AGENTS.md`.
 - `agent/prompts/` — prompt templates (`git-commit.md`: Conventional Commits)
 - `agent/themes/` — TUI theme (`tokyo-night.json`)
 - `agent/settings.json` — pi config: default provider/model/thinking level, retry policy, installed packages (`git:`/`npm:` refs)
@@ -20,7 +20,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/docker/verify-base.Dockerfile` — tracked reference image for runtime verification
 - `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/`, `agent/subagent-runs/`, `agent/verify-images/` — machine state, all gitignored. So are the loose files beside them: `pi-debug.log`, `pi-tui-crash.log`, `run-history.jsonl`, `settings.json.bak`, `auth.json`, `models-store.json`, `mcp-auth.json`, and the `agent/mcp-auth/` directory that supersedes it (one file per OAuth'd server, e.g. `robinhood.json`)
 - `.githooks/` — tracked `pre-commit`, `post-checkout`, `post-merge` (self-armed by `git-hooks.ts`)
-- `scripts/setup-deps.sh` — installs each extension's npm dependencies; run at startup and by the checkout/merge hooks
+- `scripts/setup-deps.sh` — installs the npm dependencies declared under `agent/extensions/` **and** `agent/skills/` (a skill's are what its own tool imports at run time); run at startup and by the checkout/merge hooks
+- `scripts/check.sh` — the load/typecheck/test guard the pre-commit hook runs (see NOTES)
 
 ## WHERE TO LOOK
 
@@ -46,14 +47,15 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Record/read trading-journal observations | `agent/extensions/trade-journal/` (`trade_journal` tool; modes record/read/stats/dupes. Gated on the `technical-analysis` skill being active; grammar in `lib/trade-journal-store.ts`) |
 | Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget measuring/fitting, repo layout, agent parsing) |
-| Where a repo file lives (agent dir, agents/, skills/, .env, mcp.json) | `agent/extensions/lib/layout.ts` (single resolver — never throws, so top-level extension code can import it) |
+| Where a repo file lives (agent dir, agents/, skills/, .env, settings.json) | `agent/extensions/lib/layout.ts` (resolves the agent dir — never throws, so top-level extension code can import it). It owns *resolution* plus the paths with more than one caller; a segment with a single owner stays with that owner — `subagent-runs/` in `subagent-herdr/rundir.ts`, `docker/` and `verify-images/` in `ralph-loop/image.ts` |
 | Agent definition grammar (`agents/*.md`) | `agent/extensions/lib/agents.ts` (single parser — prompt + spawn import it; one parser per format, like dotenv) |
 | Commit message style | `agent/prompts/git-commit.md` |
-| Install extension npm dependencies | `scripts/setup-deps.sh` |
+| Install declared npm dependencies (extensions + skills) | `scripts/setup-deps.sh` |
+| Check the repo loads, type-checks and passes tests | `scripts/check.sh` (`CHECK_STAGED=1` for the index) |
 
 ## CONVENTIONS
 
-- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests live in subdirectories — currently `agent/extensions/lib/{widget,agents,layout,sessions,todo,skill-activation,skill-categories,skill-catalogue,trade-journal-store}.test.ts`, `agent/extensions/trade-journal/lib.test.ts`, `agent/extensions/subagent-herdr/lib.test.ts`, `agent/extensions/ralph-loop/lib.test.ts`, `agent/extensions/model-fallback/lib.test.ts`.
+- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests therefore live in subdirectories, which pi enters only via `index.ts` — `agent/extensions/lib/*.test.ts` plus one `lib.test.ts` per subdirectory extension (`trade-journal/`, `subagent-herdr/`, `ralph-loop/`, `model-fallback/`); `bun test agent/extensions/lib/` and the COMMANDS block below are the live list. **This bars the test file's location, not its imports:** a test in `lib/` may import `../<extension>.js` and exercise a top-level extension's pure logic directly, which `lib/sessions.test.ts` already does. Needing a test is not by itself a reason to make an extension a directory.
 - **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/skill-tree.ts` owns the **shape of `agent/skills/`** (where a skill is, and what category it is in), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*, `model-fallback/lib.ts` owns the model-reference grammar and the `PI_FALLBACK_CHAIN` handoff (`subagent-herdr` imports `CHAIN_ENV`/`FALLBACK_MODEL_REF` from it rather than restating either). Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened twice here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`, and three separate readers each hardcoded a flat `skills/` layout, so categorizing the library silently cost every nested skill its tools and agents until `skill-tree.ts` became the one walker.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `litellm.ts` reads `LITELLM_API_KEY` lazily and `firecrawl-cli.ts` loads `FIRECRAWL_API_URL` into the real `process.env` so the `firecrawl` CLI can see it; a literal key in a tracked file defeats both.
@@ -62,11 +64,14 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-*/journal-store (207)
-bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic (30)
-bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr tests (136)
-bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop tests (140)
-bun test agent/extensions/model-fallback/lib.test.ts    # fallback-chain state machine (95)
+./scripts/check.sh                                      # all five suites + every typecheck scope + every source loads
+bun test agent/extensions/lib/                          # widget/agents/layout/sessions/todo/skill-*/journal-store
+                                                        #   + dynamic-prompt/changed-files/init (top-level extensions,
+                                                        #     imported from here — legal, and the only legal place)
+bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic
+bun test agent/extensions/subagent-herdr/lib.test.ts    # herdr
+bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop
+bun test agent/extensions/model-fallback/lib.test.ts    # fallback-chain state machine
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
 ```
@@ -81,7 +86,9 @@ In-session slash commands (typed into pi's TUI, not a shell):
 
 ```sh
 git config core.hooksPath .githooks            # normally done for you at pi startup by agent/extensions/git-hooks.ts
-bash scripts/setup-deps.sh                     # repair a missing extension node_modules
+bash scripts/setup-deps.sh                     # repair a missing node_modules (extensions + skills)
+./scripts/check.sh                             # every gate the pre-commit hook runs
+CHECK_STAGED=1 ./scripts/check.sh              # ...against the git index, as the hook does
 docker build -f agent/docker/verify-base.Dockerfile \
   -t ralph-verify/base:latest agent/docker/    # the tracked verifier base image (also built on demand)
 ```
@@ -104,7 +111,7 @@ all. Copy that pattern for anything new that touches a post-0.75.4 API.
 
 - **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime); only `agent/extensions/subagent-herdr/` has npm dependencies, and they are dev-only (`typescript`, `@types/node`) — nothing in the repo needs npm *at runtime* any more, now that the MCP SDK dependency is gone with the old `extensions/mcp/`.
 - **`thinking-indicator.ts` is half-inert right now.** It requires `"hideThinkingBlock": true` in `agent/settings.json` to relabel pi's collapsed thinking block ("Thought for 12s"); the setting is currently `false` (commit `0e30dff` deliberately shows thinking in the transcript). The live spinner still works; the transcript record silently does nothing. Flip the setting if you want both.
-- **The pre-commit hook is dormant.** `.githooks/pre-commit` invokes `scripts/check.sh`, which was removed in `7a54a3b` (along with the old herdr/plan/subagent extensions); the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time — `/reload` after editing is the only guard.
+- **The pre-commit hook enforces `scripts/check.sh`.** The script answers one question — "does the committed repo load, type-check and pass its tests?" — over three gates: every `agent/extensions/**/*.ts` is *imported* (a shebang marks a CLI entrypoint, which is parsed instead), a top-level `*.test.ts` is rejected by name, every discovered `tsconfig.json` scope runs `tsc -p`, and every discovered `*.test.ts` runs. `CHECK_STAGED=1` (what the hook sets) materialises the **git index** into `.git-check/` and checks that, so a partially staged file cannot pass here and ship broken; typecheck is skipped in that mode because the scratch copy cannot resolve the running pi's bundle. Gates two and three discover their inputs rather than listing them, so a new scope or suite is covered the day it is added. It was deleted in `7a54a3b` as collateral damage and the hook then `|| exit 0`'d for every commit after — silently, while `git-hooks.ts` kept advertising the protection. The hook now **refuses the commit** when the script is missing: the failure being guarded is silence, so the guard must not be able to vanish quietly. Bypass a single commit with `--no-verify`.
 - **`PATCHES.md`, `CONTEXT.md` and `docs/adr/` no longer exist** (removed in `1993878` and `a784c57`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical dead references.
 - **`pi` must come from bun's global bin (`~/.bun/bin/pi`).** Extensions import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, which pi injects by loading each extension through jiti with an **alias map** to its own bundled copies (`getAliases()`). The packages are only resolvable when the running binary is the one that owns them. An older `@mariozechner/pi-coding-agent` on `PATH` (the pre-rename scope) has no `@earendil-works/*` aliases, so every extension fails at startup with a misleading `Cannot find module '@earendil-works/pi-tui'`. `~/.bashrc` prepends `~/.bun/bin` for this reason. (`BUN_INSTALL` is unset, so bun derives the install path itself — it currently lands on `~/.bun`, not the `~/.cache/.bun` an earlier revision of this file claimed.)
 - `agent/git/` holds vendored checkouts of the `git:` packages — currently **`samfoy/pi-lsp-extension` and `obra/superpowers` only** (pi-blackhole moved to npm in `b4f5d65`); the `npm:` packages install under `agent/npm/node_modules`. Always run this repo's tests **by explicit path**: a bare `bun test` also sweeps in the 11 vendored suites under `agent/git/` (7 of them superpowers' own), which fail for reasons unrelated to this repo. `agent/npm/node_modules/pi-lens` is a leftover: it is installed but **not** listed in `settings.json` `packages`, so pi does not load it.

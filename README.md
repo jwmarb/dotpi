@@ -12,7 +12,7 @@
 
 This repo is my `.pi` configuration — the home directory of the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent, published the way others publish a dotfiles repo. It lives at `~/.pi`, the directory pi reads for its agent configuration.
 
-It owns everything I tune: local TypeScript extensions that pi auto-loads at startup, a fleet of nine subagent definitions, a library of 52 skills (37 local plus the 15 from the [superpowers](https://github.com/obra/superpowers) package), prompt templates, the tokyo-night TUI theme, the default model/provider settings, the LiteLLM provider wiring, and the MCP gateway config. Everything a pi session *generates* — session transcripts, caches, vendored package checkouts, run directories — is gitignored, per the rule written into [.gitignore](.gitignore): if deleting it costs nothing but a re-run, it is ignored.
+It owns everything I tune: local TypeScript extensions that pi auto-loads at startup, a fleet of subagent definitions, a categorized skills library (local skills plus the ones from the [superpowers](https://github.com/obra/superpowers) package), prompt templates, the tokyo-night TUI theme, the default model/provider settings, the LiteLLM provider wiring, and the MCP config. Everything a pi session *generates* — session transcripts, caches, vendored package checkouts, run directories — is gitignored, per the rule written into [.gitignore](.gitignore): if deleting it costs nothing but a re-run, it is ignored.
 
 ## Why use .pi?
 
@@ -24,7 +24,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 
 - 🧩 **Local extensions, auto-loaded:** every top-level `agent/extensions/*.ts` ships into every session — a `questionnaire` tool that asks you multiple-choice questions in the TUI, a `/sessions` browser for resuming past work, a `/diff` widget for session changes, a dynamic system prompt built from your discovered inventory, and an update check that runs at most every 4 hours.
 - 🤖 **A subagent fleet you can delegate to:** nine specialized definitions (explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker), each with its own model, fallback chain, and tool allowlist — read-only by construction where a verdict needs to be independent.
-- 🃏 **A skills library with progressive disclosure:** 52 skills, each a `SKILL.md` entry point plus reference docs loaded on demand; 15 are slash-only, so interview and workflow skills never fire mid-task without you. 37 are maintained here; the other 15 come from the [superpowers](https://github.com/obra/superpowers) package, whose always-on bootstrap extension is deliberately left disabled so it does not override the orchestrator prompt.
+- 🃏 **A skills library with progressive disclosure:** each skill is a `SKILL.md` entry point plus reference docs loaded on demand, filed under a category directory; the slash-only ones never fire mid-task without you. Most are maintained here; the rest come from the [superpowers](https://github.com/obra/superpowers) package, whose always-on bootstrap extension is deliberately left disabled so it does not override the orchestrator prompt.
 - 🔁 **Completion loops with verification gates:** `/ralph-loop <goal>` re-prompts the agent until it signs off with a completion tag, and `--verify` can audit that claim with a read-only oracle pass and a Dockerized runtime pass before accepting it.
 - 🧑‍🤝‍🧑 **Event-driven delegation:** the `subagent` tool spawns each child in its own herdr tab and ends the turn — the child wakes the parent with a notice when it reports, so you can message a running child mid-flight.
 - 🌐 **MCP via pi's built-in extension:** [agent/mcp.json](agent/mcp.json) holds the servers, keys stay `${VAR}` placeholders, and `/mcp` signs in, reconnects, and changes tool exposure from the TUI.
@@ -128,7 +128,7 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `agent/extensions/`               | Local pi extensions; every top-level `*.ts` is auto-loaded at startup (inventory: [`agent/extensions/AGENTS.md`](agent/extensions/AGENTS.md)) |
 | `agent/agents/`                   | Subagent definitions — Markdown + YAML frontmatter                                     |
-| `agent/skills/`                   | Skills library, one directory per skill (`SKILL.md` + reference docs)                   |
+| `agent/skills/`                   | Skills library, `<category>/<skill>/SKILL.md` + reference docs                          |
 | `agent/prompts/`                  | Prompt templates (`git-commit.md`: Conventional Commits)                                |
 | `agent/themes/`                   | TUI theme (`tokyo-night.json`)                                                         |
 | `agent/settings.json`             | pi config: default provider/model/thinking level, retry policy, installed packages      |
@@ -175,7 +175,12 @@ Every agent declares `fallback_models`, tried when a child fails to *launch* (un
 
 ## Skills 🃏
 
-38 skill directories under [`agent/skills/`](agent/skills/). Each skill is a `SKILL.md` entry point with sibling docs (`tests.md`, `REPORT.md`, `PATTERNS.md`, …) loaded on demand — progressive disclosure. 15 skills set `disable-model-invocation: true`: interview and workflow skills that need a human in the loop fire only from a slash command. Personal-identity skills are kept on disk and gitignored rather than placeholdered.
+Every skill lives under a category directory — `agent/skills/<category>/<skill>/SKILL.md` — and the skill directory's *name* is its identity, so refiling one is a pure `git mv`. A test walks the live tree and fails if a skill is left loose at the top level. Each skill is a `SKILL.md` entry point with sibling docs (`tests.md`, `REPORT.md`, `PATTERNS.md`, …) loaded on demand — progressive disclosure. Some set `disable-model-invocation: true`: interview and workflow skills that need a human in the loop fire only from a slash command. Personal-identity skills are kept on disk and gitignored rather than placeholdered, under a category like everything else.
+
+```sh
+find agent/skills -name SKILL.md | wc -l                        # the local set, as it actually is
+grep -rl 'disable-model-invocation: true' agent/skills | wc -l   # how many are slash-only
+```
 
 ## Commands ⌨️
 
@@ -213,18 +218,38 @@ Notice that everything pi loads at startup — the prompt it writes, the tools i
 
 ## Testing 🧪
 
-Unit tests are run **by explicit path** — a bare `bun test` sweeps in the vendored suites under `agent/git/` and `agent/npm/` (~437 test files) and reports hundreds of failures unrelated to this repo:
+The one command that checks everything — what the pre-commit hook runs:
 
 ```sh
-bun test agent/extensions/lib/                       # widget/agents/layout/sessions (59)
-bun test agent/extensions/subagent-herdr/lib.test.ts # herdr (49)
-bun test agent/extensions/ralph-loop/lib.test.ts     # ralph-loop (135)
+./scripts/check.sh                 # every source imports, every typecheck scope, every suite
+CHECK_STAGED=1 ./scripts/check.sh  # ...against the git index, so a partial stage cannot pass
 ```
 
-Typecheck has one scope (there is no root `tsconfig.json`):
+To run a suite directly, use an **explicit path**: a bare `bun test` sweeps in the vendored
+checkouts under `agent/git/` and `agent/npm/` and reports hundreds of failures unrelated to
+this repo.
+
+```sh
+bun test agent/extensions/lib/                        # shared helpers, plus the top-level
+                                                      #   extensions imported from here
+bun test agent/extensions/trade-journal/lib.test.ts   # trade-journal mode logic
+bun test agent/extensions/subagent-herdr/lib.test.ts  # herdr
+bun test agent/extensions/ralph-loop/lib.test.ts      # ralph-loop
+bun test agent/extensions/model-fallback/lib.test.ts  # fallback-chain state machine
+```
+
+A test file may **not** sit directly in `agent/extensions/` — pi auto-loads every top-level
+`*.ts` there, so a `bun:test` import would break startup. That bars the test file's
+*location*, not its imports: a test in `lib/` imports `../<extension>.js` and exercises a
+top-level extension's logic directly.
+
+Typecheck has one scope per subdirectory extension that declares a `tsconfig.json` (there is
+no root one). `check.sh` discovers and runs them all; by hand:
 
 ```sh
 cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/model-fallback && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
 
 ## Conventions 📏

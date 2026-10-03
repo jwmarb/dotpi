@@ -10,10 +10,10 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 
 | Question | Answer |
 |---|---|
-| Which agents exist, on what model | `agents/*.md` frontmatter — 9: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker |
-| Which skills the model may auto-invoke | `skills/<category>/<skill>/SKILL.md` — 37 local skills in 9 categories, 15 slash-only (`disable-model-invocation: true`); plus 15 from the `superpowers` package, so the live catalogue reads 52 |
+| Which agents exist, on what model | `agents/*.md` frontmatter — the directory is the list: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker |
+| Which skills the model may auto-invoke | `skills/<category>/<skill>/SKILL.md`, minus the slash-only ones (`disable-model-invocation: true`), plus whatever the `superpowers` package contributes. Derive it — `find agent/skills -name SKILL.md` for the local set, `grep -rl 'disable-model-invocation: true' agent/skills` for the slash-only ones — rather than trusting a count written here |
 | Why a skill dir has extra `.md` files | Progressive disclosure: `SKILL.md` is the entry point, siblings (`tests.md`, `REPORT.md`) load on demand |
-| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `automate-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; 24 skills have an `agents/` dir but only `technical-analysis` defines real agents there — the other 23 hold `openai.yaml` alone |
+| Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `automate-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; many skills have an `agents/` dir but only `technical-analysis` defines real agents there — the rest hold `openai.yaml` alone. The live answer: `find agent/skills -path '*/agents/*.md'` |
 | What a theme key may be | `themes/tokyo-night.json` `$schema` → pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
@@ -77,7 +77,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   the explorer without `cwd` gets a confident, well-formatted map of the user's project
   instead of the dependency — a wrong answer that looks right.
 - **`skills/<category>/<skill>/agents/openai.yaml` is optional presentation**
-  (`display_name`, `short_description`); 23 of 37 have one and its absence changes nothing
+  (`display_name`, `short_description`); most skills have one and its absence changes nothing
   functional. An `agents/` directory holding only this file defines **no agents** — which is
   why discovery gates on `agents/*.md`, not on the directory existing.
 - **Interview- and workflow-style skills set `disable-model-invocation: true`**
