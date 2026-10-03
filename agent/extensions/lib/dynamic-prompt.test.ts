@@ -137,7 +137,73 @@ describe("the retired plan tool leaves no trace", () => {
 describe("the skill catalogue", () => {
   const lib = "/home/u/.pi/agent/skills";
 
-  test("groups library skills by their path category and prints bare names", () => {
+  test("groups library skills by their path category, one line each", () => {
+    const p = build({
+      skillInventory: [
+        {
+          name: "rust-style",
+          description: "Idiomatic Rust",
+          filePath: `${lib}/language-style/rust-style/SKILL.md`,
+          pathCategory: "language-style",
+        },
+        {
+          name: "cpp-style",
+          description: "Idiomatic C++",
+          filePath: `${lib}/language-style/cpp-style/SKILL.md`,
+          pathCategory: "language-style",
+        },
+      ],
+      skillsLibrary: lib,
+    });
+    expect(p).toContain("**language-style**");
+    expect(p).toContain("- **cpp-style** — Idiomatic C++");
+    expect(p).toContain("- **rust-style** — Idiomatic Rust");
+    // Names sort alphabetically within a category (`groupByCategory`), not in
+    // discovery order, so the prompt is byte-stable across runs — asserted here
+    // against insertion order deliberately, which was the reverse.
+    expect(p.indexOf("cpp-style")).toBeLessThan(p.indexOf("rust-style"));
+    // A library skill's path is implied by the root, so it must not be repeated.
+    expect(p).not.toContain(`${lib}/language-style/rust-style/SKILL.md`);
+  });
+
+  test("carries every skill's description, which is the whole routing signal", () => {
+    // The catalogue was names-only for several revisions and the model mostly
+    // did not open anything: a bare name is not enough to justify a read_skill,
+    // so a description going missing silently de-fangs the section.
+    const p = build({
+      skillInventory: [
+        {
+          name: "wayfinder",
+          description: "Find your way around an unfamiliar repo",
+          filePath: `${lib}/planning-and-tickets/wayfinder/SKILL.md`,
+          pathCategory: "planning-and-tickets",
+        },
+      ],
+      skillsLibrary: lib,
+    });
+    expect(p).toContain("Find your way around an unfamiliar repo");
+  });
+
+  test("a description-less skill still renders a line that says to open it", () => {
+    // Dropping the dash would be cosmetic; dropping the skill would hide a
+    // capability, so the degenerate case points at the file instead.
+    const p = build({
+      skillInventory: [
+        {
+          name: "mute",
+          description: "   ",
+          filePath: `${lib}/other/mute/SKILL.md`,
+          pathCategory: "other",
+        },
+      ],
+      skillsLibrary: lib,
+    });
+    expect(p).toContain("- **mute** — (no description — open it to find out)");
+  });
+
+  test("frames the catalogue as the opening move, not as advisory", () => {
+    // The stance is the feature: this section used to say "Skills are advisory —
+    // you decide when they apply", which read as a licence to skip and was.
     const p = build({
       skillInventory: [
         {
@@ -146,21 +212,14 @@ describe("the skill catalogue", () => {
           filePath: `${lib}/language-style/rust-style/SKILL.md`,
           pathCategory: "language-style",
         },
-        {
-          name: "cpp-style",
-          description: "d",
-          filePath: `${lib}/language-style/cpp-style/SKILL.md`,
-          pathCategory: "language-style",
-        },
       ],
       skillsLibrary: lib,
     });
-    // Names sort alphabetically within a category (`groupByCategory`), not in
-    // discovery order, so the prompt is byte-stable across runs — asserted here
-    // in the sorted order deliberately, since insertion order was the input.
-    expect(p).toContain("**language-style**: cpp-style, rust-style");
-    // A library skill's path is implied by the root, so it must not be repeated.
-    expect(p).not.toContain(`${lib}/language-style/rust-style/SKILL.md`);
+    expect(p).toContain("default opening move");
+    expect(p).toContain("Name any skip");
+    expect(p).not.toContain("Skills are advisory");
+    // A push toward skills must not become a mandate that outranks the task.
+    expect(p).toContain("the task wins");
   });
 
   test("declares a shared non-library root once instead of per skill", () => {
@@ -185,7 +244,7 @@ describe("the skill catalogue", () => {
       skillInventory: [{ name: "solo", description: "d", filePath: odd }],
       skillsLibrary: lib,
     });
-    expect(p).toContain(`solo (\`${odd}\`)`);
+    expect(p).toContain(`- **solo** (\`${odd}\`) — d`);
   });
 
   test("falls back to the uncategorized bucket rather than dropping a skill", () => {

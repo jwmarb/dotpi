@@ -94,20 +94,26 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 - **The superpowers bootstrap extension is deliberately disabled.** Its package entry is
   the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only the 15
   skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block every turn
-  mandating skill invocation before any response: it fights `dynamic-prompt.ts` (which
-  owns the orchestrator prompt and frames skills as advisory), pressures the 15 skills
-  that are slash-only *because* they need a human, and its bundled tool mapping is wrong
-  here (it claims pi has no subagent or task-list tool; `subagent` and `todo` both exist).
-  Re-enabling means owning all four conflicts. `pi list` prints `(filtered)` while the
-  exclusion is live.
+  mandating skill invocation before any response. `dynamic-prompt.ts` now pushes hard
+  toward skills itself — the catalogue carries descriptions again and is framed as the
+  default opening move, with a skip allowed only if it is named — so the *stance* no
+  longer conflicts. What still does is the degree and the detail: a hard every-turn
+  mandate pressures the 15 skills that are slash-only *because* they need a human, and
+  its bundled tool mapping is wrong here (it claims pi has no subagent or task-list tool;
+  `subagent` and `todo` both exist). Re-enabling means owning those two conflicts and
+  accepting a second, louder voice on a question this repo's own prompt already answers.
+  `pi list` prints `(filtered)` while the exclusion is live.
 - **Three local skills were retired in favour of the package's** — `tdd` →
   `test-driven-development`, `diagnose`/`diagnosing-bugs` → `systematic-debugging` — so
   those names are now dangling (`git log` has them). Two were kept because they differ:
   `code-review` is fixed-point, two-axis and tracker-aware where `requesting-code-review`
   is not, and `writing-for-agents` covers `AGENTS.md`, which `writing-skills` does not.
-- **15 local skills were renamed when the library was categorized**, because the prompt now
-  offers the model a skill's *name* and not its description, and a name like `wait-what` or
-  `ask-matt` is no signal at all. The old names are gone rather than aliased; the was/now
+- **15 local skills were renamed when the library was categorized.** The reason at the
+  time was that the prompt had been reduced to bare *names*, so a name like `wait-what`
+  or `ask-matt` was no signal at all. The prompt carries descriptions again, which means
+  the names no longer have to do that job alone — but they still lead every catalogue
+  line and are what a `/skill:` invocation types, so the verb-phrase convention stands.
+  The old names are gone rather than aliased; the was/now
   table lives in `skills/dialogue-and-handoff/which-skill-fits/SKILL.md`, the skill whose
   job is answering "which skill was that?". The `firecrawl` and `agent-browser` **CLI
   binaries** keep their names — only the skills documenting them moved.
