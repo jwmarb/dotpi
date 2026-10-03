@@ -18,9 +18,7 @@ import {
 	ENV_AGENT_DIR,
 	envExampleFile,
 	envFile,
-	mcpConfigFile,
 	repoRoot,
-	runsDir,
 	settingsFile,
 	skillsDir,
 } from "./layout.js";
@@ -89,11 +87,9 @@ describe("the files and directories inside it", () => {
 		process.env[ENV_AGENT_DIR] = "/srv/agent";
 		expect(agentsDir()).toBe("/srv/agent/agents");
 		expect(skillsDir()).toBe("/srv/agent/skills");
-		expect(runsDir()).toBe("/srv/agent/subagent-runs");
 		expect(envFile()).toBe("/srv/agent/.env");
 		expect(envExampleFile()).toBe("/srv/agent/.env.example");
 		expect(settingsFile()).toBe("/srv/agent/settings.json");
-		expect(mcpConfigFile()).toBe("/srv/agent/mcp.json");
 	});
 
 	test("the repo root is the parent of the agent directory", () => {
@@ -104,9 +100,9 @@ describe("the files and directories inside it", () => {
 
 	test("relocating the agent directory moves every path with it", () => {
 		process.env[ENV_AGENT_DIR] = "/a/one";
-		const before = [agentsDir(), envFile(), runsDir()];
+		const before = [agentsDir(), envFile(), skillsDir()];
 		process.env[ENV_AGENT_DIR] = "/b/two";
-		const after = [agentsDir(), envFile(), runsDir()];
+		const after = [agentsDir(), envFile(), skillsDir()];
 		for (const [i, p] of after.entries()) {
 			expect(p).not.toBe(before[i]);
 			expect(p.startsWith("/b/two")).toBe(true);

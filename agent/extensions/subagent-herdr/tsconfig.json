@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["lib.ts", "herdr.ts", "child-done.ts", "index.ts"]
+  "include": ["lib.ts", "rundir.ts", "herdr.ts", "child-done.ts", "index.ts"]
 }

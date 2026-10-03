@@ -7,9 +7,18 @@
  * but "the agent directory" is one fact, and a fact with four implementations
  * drifts the moment one of them is corrected.
  *
- * So this module is the one place that knows the layout. Callers ask for the
- * thing they want (`agentsDir()`, `runsDir()`, `envFile()`) rather than joining
- * a path onto a directory they resolved themselves.
+ * So this module is the one place that knows how to *resolve* the agent
+ * directory, plus the named paths more than one caller wants. Callers ask for the
+ * thing they want (`agentsDir()`, `envFile()`) rather than joining a path onto a
+ * directory they resolved themselves.
+ *
+ * It deliberately does **not** collect every path in the repo. A segment with one
+ * owner belongs to that owner: `subagent-herdr/rundir.ts` owns `subagent-runs/`
+ * (it spans the parent/child process seam and takes its root as a *parameter* so
+ * it is testable against a temp dir), and `ralph-loop/image.ts` owns `docker/`
+ * and `verify-images/`. An accessor here for any of those would be a second
+ * answer to a question that already has one — which is the drift this module
+ * exists to prevent, not an instance of preventing it.
  *
  * ## Why the resolution is hand-rolled rather than pi's `getAgentDir()`
  *
@@ -68,10 +77,10 @@ export function skillsDir(): string {
 	return path.join(agentDir(), "skills");
 }
 
-/** Per-run state for delegated subagents (gitignored). */
-export function runsDir(): string {
-	return path.join(agentDir(), "subagent-runs");
-}
+// `runsDir()` used to live here and had no production caller: every use resolved
+// to `subagent-herdr/rundir.ts`'s same-named function, which takes the agent dir
+// as a parameter. Two modules hardcoding "subagent-runs" is the drift this file
+// exists to prevent, so the copy without callers is the one that goes.
 
 /** The only file holding live credentials (gitignored). */
 export function envFile(): string {
@@ -88,10 +97,8 @@ export function settingsFile(): string {
 	return path.join(agentDir(), "settings.json");
 }
 
-/** MCP server definitions. */
-export function mcpConfigFile(): string {
-	return path.join(agentDir(), "mcp.json");
-}
+// `mcpConfigFile()` was removed too: nothing but its own test ever called it.
+// `agent/mcp.json` is read by pi's built-in MCP extension, not by this repo.
 
 /**
  * The repo root: the working tree that contains the agent directory.
