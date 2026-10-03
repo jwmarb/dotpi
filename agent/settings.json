@@ -3,7 +3,7 @@
   "defaultProvider": "fallback",
   "defaultModel": "auto",
   "defaultThinkingLevel": "xhigh",
-  "hideThinkingBlock": false,
+  "hideThinkingBlock": true,
   "extensions": [
     "+builtin:mcp",
     "+builtin:codemode",
