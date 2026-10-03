@@ -40,8 +40,11 @@ agent/mcp.log
 # Kept on disk so the skill still loads locally, untracked so publishing this
 # repo cannot leak an identity. Placeholdering was rejected — such a file's
 # value is being specific, so a placeholdered copy just gets re-personalised.
-# Add a path here rather than sanitising in place.
-agent/skills/uarizona-hpc/
+# Add a path here rather than sanitising in place. The path carries the skill's
+# category, because a skill sitting loose at the top level of the library breaks
+# the layout the library asserts (`lib/skill-catalogue.test.ts`) — a gitignored
+# skill is still a skill, and the guard walks the live tree, not the index.
+agent/skills/other/uarizona-hpc/
 
 # ---- Dependencies -----------------------------------------------------------
 node_modules/
