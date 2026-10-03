@@ -42,6 +42,7 @@ This repo makes the whole setup versioned and portable — clone it, point `~/.p
 - [Docker](https://docs.docker.com) — optional; only the ralph-loop `--verify` runtime gate needs it
 - [firecrawl-cli](https://docs.firecrawl.dev/cli) — optional; the `librarian` agent's research tool, installed with `npm install -g firecrawl-cli`. Needs `FIRECRAWL_API_URL` in `agent/.env` (no API key required for a self-hosted instance)
 - [agent-browser](https://github.com/vercel-labs/agent-browser) — optional; the `agent-browser` skill's browser automation CLI, installed with `npm i -g agent-browser && agent-browser install` (the second command downloads the browser binary)
+- [herdr](https://herdr.dev) — optional; the `subagent` tool opens a herdr tab per delegated child, so delegation is unavailable without it. Installed with `curl -fsSL https://herdr.dev/install.sh | sh` (also on Homebrew and mise). **Not an npm package** — `npm install -g herdr` is an unrelated placeholder
 
 ### Quick install 🚀
 
@@ -57,8 +58,11 @@ less install.sh && bash install.sh
 ```
 
 It installs pi if missing, clones to `~/.pi`, arms the git hooks, installs the one
-extension with npm dependencies, and copies `agent/.env.example` to `agent/.env` for
-you to fill in. It never writes credentials.
+extension with npm dependencies, offers to install the [herdr](https://herdr.dev) CLI
+that `subagent` delegates through, adds `~/.bun/bin` and `~/.local/bin` to your shell
+rc (`.bashrc` or `.zshrc`, autodetected from `$SHELL`, skipped when already present),
+and copies `agent/.env.example` to `agent/.env` for you to fill in. It never writes
+credentials.
 
 An existing `~/.pi` is never clobbered: an existing dotpi clone is updated in place
 (and left alone if the tree is dirty), and anything else stops the install until you

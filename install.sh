@@ -17,6 +17,8 @@
 #   4. installs the one extension that has real npm dependencies
 #   5. installs the firecrawl CLI, which the librarian agent researches with
 #   5b. installs the agent-browser CLI, which the agent-browser skill drives
+#   5c. offers to install the herdr CLI, which the subagent tool delegates through
+#   5d. adds ~/.bun/bin and ~/.local/bin to your shell rc PATH, when missing
 #   6. copies agent/.env.example to agent/.env for you to fill in
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
@@ -24,7 +26,7 @@
 # Flags:
 #   --dir <path>   clone here and symlink ~/.pi at it (default: clone to ~/.pi)
 #   --ref <ref>    branch or tag to check out (default: master)
-#   --yes          assume yes for the backup prompt (for unattended installs)
+#   --yes          assume yes for the backup and herdr prompts (unattended installs)
 #   --no-pi        do not install pi even if it is missing
 #   --help
 #
@@ -321,6 +323,147 @@ if command -v agent-browser >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# 5c. The herdr CLI
+#
+# The subagent/subagent_tasks tools delegate by opening a herdr tab and running
+# pi inside it, so without this binary that entire surface is inert. Unlike the
+# two optionals above it is NOT an npm package — `npm install -g herdr` fetches
+# an unrelated 0.0.0 placeholder. The real distribution is a static binary from
+# herdr.dev, whose installer checksum-verifies the download against the same
+# manifest `herdr update` uses and drops it in ~/.local/bin.
+#
+# Prompted rather than automatic, because this pipes a third-party script into
+# sh: --yes accepts it unattended, and no terminal means no consent, exactly as
+# the backup prompt treats it. Missing herdr is a warning, never fatal.
+# ---------------------------------------------------------------------------
+HERDR_BIN=""
+HERDR_URL="https://herdr.dev/install.sh"
+
+# `herdr --version` prints "herdr 0.9.3"; keep just the number.
+herdr_version() { "$1" --version 2>/dev/null | tail -1 | sed 's/^[Hh]erdr[[:space:]]*//'; }
+
+step "Installing the herdr CLI"
+if command -v herdr >/dev/null 2>&1; then
+	HERDR_BIN="$(command -v herdr)"
+	ok "herdr $(herdr_version herdr)"
+elif [ -x "$HOME/.local/bin/herdr" ]; then
+	# Present, but this shell's PATH predates it. Step 5d writes the export.
+	HERDR_BIN="$HOME/.local/bin/herdr"
+	ok "herdr $(herdr_version "$HERDR_BIN") (in ~/.local/bin, not yet on this PATH)"
+else
+	printf '\n'
+	printf '  %sThe subagent tool spawns every child agent in a herdr tab, so without%s\n' "$DIM" "$R"
+	printf '  %sherdr that one tool cannot run. pi and every skill work without it.%s\n' "$DIM" "$R"
+	printf '  %sThis runs:%s curl -fsSL %s | sh\n' "$DIM" "$R" "$HERDR_URL"
+	printf '  %swhich verifies a checksum and installs into ~/.local/bin.%s\n\n' "$DIM" "$R"
+	if confirm "  Install herdr now?"; then
+		if curl -fsSL "$HERDR_URL" | sh >/dev/null 2>&1; then
+			# Resolve by path too: the installer just created a binary in a
+			# directory that may not be on this process's PATH yet.
+			if command -v herdr >/dev/null 2>&1; then
+				HERDR_BIN="$(command -v herdr)"
+			elif [ -x "$HOME/.local/bin/herdr" ]; then
+				HERDR_BIN="$HOME/.local/bin/herdr"
+			fi
+			if [ -n "$HERDR_BIN" ]; then
+				ok "herdr $(herdr_version "$HERDR_BIN")"
+			else
+				warn "the herdr installer exited 0 but no binary turned up; install it by hand"
+			fi
+		else
+			warn "could not install herdr. Install it yourself:"
+			warn "  curl -fsSL $HERDR_URL | sh"
+			warn "  (or: brew install herdr · mise use -g herdr)"
+		fi
+	else
+		# Also the no-terminal path: confirm() treats "cannot ask" as "no".
+		warn "skipping herdr; the subagent tool stays unavailable until you install it:"
+		warn "  curl -fsSL $HERDR_URL | sh      (or re-run with --yes)"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5d. PATH entries in the shell rc file
+#
+# Two binaries this script depends on land in directories a fresh machine often
+# has not got on PATH: pi in ~/.bun/bin and herdr in ~/.local/bin. herdr's
+# installer only *prints* the export line it needs, and bun's only patches the
+# rc that existed when bun was installed — which is why "installed, but the
+# shell cannot find it" is the most common thing left broken after an install.
+#
+# Idempotent, and deliberately matched on the directory suffix rather than the
+# exact text we would write: an entry already in the file as
+# /home/you/.bun/bin, ~/.bun/bin or $HOME/.bun/bin all name the same directory,
+# and only a suffix match recognises all three instead of adding a duplicate.
+# ---------------------------------------------------------------------------
+step "Checking shell PATH"
+
+# $SHELL is the user's login shell — the one that will actually read this file
+# in the next terminal. It is not necessarily the shell running this script,
+# which is bash whenever this was curl-piped into bash.
+SHELL_RC=""
+case "${SHELL:-}" in
+	*/zsh)  SHELL_RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
+	*/bash) SHELL_RC="$HOME/.bashrc" ;;
+	*)
+		# Unknown or unset $SHELL: fall back to an rc that already exists.
+		if   [ -f "$HOME/.zshrc" ];  then SHELL_RC="$HOME/.zshrc"
+		elif [ -f "$HOME/.bashrc" ]; then SHELL_RC="$HOME/.bashrc"
+		fi ;;
+esac
+
+PATH_LINES_ADDED=0
+RC_DISPLAY=""
+
+# Append one export, unless some form of that directory is already on PATH there.
+ensure_path_line() {
+	local rel="$1"
+	# Require the line to mention PATH as well as the directory, and ignore
+	# comments: a stray `# see ~/.local/bin/herdr` is not a PATH entry, and
+	# treating it as one would silently leave PATH unset.
+	if grep -v '^[[:space:]]*#' "$SHELL_RC" 2>/dev/null | grep -F "$rel" | grep -q 'PATH'; then
+		ok "~/$rel already in $RC_DISPLAY"
+		return 0
+	fi
+	# A final line with no trailing newline would otherwise get our export
+	# glued onto the end of it, producing one broken line instead of two.
+	if [ -s "$SHELL_RC" ] && [ -n "$(tail -c 1 "$SHELL_RC" 2>/dev/null)" ]; then
+		printf '\n' >> "$SHELL_RC" 2>/dev/null || true
+	fi
+	# One header for the block, before the first line we add.
+	if [ "$PATH_LINES_ADDED" -eq 0 ]; then
+		printf '\n# added by dotpi install.sh\n' >> "$SHELL_RC" 2>/dev/null || true
+	fi
+	# $HOME stays unexpanded in the file, so the line survives being copied
+	# to another account.
+	if printf 'export PATH="$HOME/%s:$PATH"\n' "$rel" >> "$SHELL_RC" 2>/dev/null; then
+		PATH_LINES_ADDED=$((PATH_LINES_ADDED + 1))
+		ok "added ~/$rel to $RC_DISPLAY"
+	else
+		warn "could not write $RC_DISPLAY; add by hand:"
+		warn "  export PATH=\"\$HOME/$rel:\$PATH\""
+	fi
+}
+
+if [ -z "$SHELL_RC" ]; then
+	warn "could not tell which shell rc to use (SHELL='${SHELL:-unset}'); add these by hand:"
+	warn '  export PATH="$HOME/.bun/bin:$PATH"'
+	warn '  export PATH="$HOME/.local/bin:$PATH"'
+else
+	# The ~ must be quoted: unquoted it is tilde-expanded back to $HOME, which
+	# would substitute $HOME for $HOME and print the full path instead.
+	RC_DISPLAY="${SHELL_RC/#$HOME/"~"}"
+	if [ ! -f "$SHELL_RC" ] && ! touch "$SHELL_RC" 2>/dev/null; then
+		warn "could not create $RC_DISPLAY; add the two PATH exports by hand"
+	else
+		# bun's bin first in the file, so ~/.local/bin ends up ahead of it on
+		# PATH — each line prepends, so the last one written wins.
+		ensure_path_line ".bun/bin"
+		ensure_path_line ".local/bin"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Credentials
 #
 # The template only. Writing real keys is the user's job: a script that prompts
@@ -358,6 +501,14 @@ if [ "$ENV_WAS_CREATED" -eq 1 ]; then
 	printf '%sOptional — the librarian agent researches through this:%s\n' "$B" "$R"
 	printf '  FIRECRAWL_API_URL  your Firecrawl endpoint, e.g. http://firecrawl.lan:3002\n'
 	printf '  %sNo API key: a self-hosted URL makes the CLI skip key validation.%s\n\n' "$DIM" "$R"
+fi
+
+# A PATH line only takes effect in a *new* shell, so without this the user is
+# told to run a command their current shell still cannot resolve.
+if [ "$PATH_LINES_ADDED" -gt 0 ]; then
+	printf '%sPATH updated in %s — reload it before running pi:%s\n\n' "$B" "$RC_DISPLAY" "$R"
+	printf '    source %s\n' "$RC_DISPLAY"
+	printf '  %sor just open a new terminal.%s\n\n' "$DIM" "$R"
 fi
 
 printf 'Then start it:\n\n    pi\n\n'
