@@ -35,13 +35,6 @@ import {
  */
 const QUESTIONNAIRE_TOOL = 'questionnaire';
 
-/**
- * Name of the tool registered by the `plan` extension. When this tool is
- * available, the orchestrator prompt gains a Planning Discipline section that
- * mandates maintaining a Plan for any work requiring careful execution.
- */
-const PLAN_TOOL = 'plan';
-
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -171,14 +164,6 @@ export default function (pi: ExtensionAPI) {
       (opts.selectedTools ?? []).includes(QUESTIONNAIRE_TOOL) ||
       toolInventory.some((t) => t.name === QUESTIONNAIRE_TOOL);
 
-    // --- Detect the plan extension ---
-    // plan/index.ts registers a tool named `plan`. If it is loaded we inject
-    // the Planning Discipline section; without the tool the section would
-    // dangle, so it is emitted only then (same pattern as the questionnaire).
-    const hasPlanTool =
-      (opts.selectedTools ?? []).includes(PLAN_TOOL) ||
-      toolInventory.some((t) => t.name === PLAN_TOOL);
-
     // --- Build the orchestrator system prompt ---
     const orchestratorPrompt = buildOrchestratorPrompt({
       agentInventory,
@@ -187,7 +172,6 @@ export default function (pi: ExtensionAPI) {
       contextInventory,
       guidelines,
       hasQuestionnaire,
-      hasPlanTool,
       customPrompt: opts.customPrompt,
       appendSystemPrompt: opts.appendSystemPrompt,
       cwd: opts.cwd,
@@ -279,10 +263,21 @@ function renderSkillCategories(
  * Assembles the full orchestrator system prompt from discovered inventories
  * and configuration options.
  *
+ * Exported as the **one** seam for this module: callers and tests cross the same
+ * interface, so a test asserts on the prompt the model actually receives rather
+ * than on nine private section builders. The nine sections stay private on
+ * purpose — exporting them would widen the interface without adding leverage,
+ * and section *ordering* is part of what a test should be able to pin.
+ *
+ * Pure: every input arrives in `opts`, the only ambient read is the clock (see
+ * `now`). Safe to import from `lib/*.test.ts` — pi auto-loads this file as an
+ * extension, but importing it only registers nothing; the default export is what
+ * wires the session.
+ *
  * @param opts - Inventories and configuration for building the prompt.
  * @returns A formatted markdown string ready to be injected as a system prompt.
  */
-function buildOrchestratorPrompt(opts: {
+export function buildOrchestratorPrompt(opts: {
   agentInventory: AgentInfo[];
   toolInventory: Array<{ name: string; description: string }>;
   /**
@@ -300,15 +295,19 @@ function buildOrchestratorPrompt(opts: {
   guidelines: string[];
   /** True when the `ask-user` extension's questionnaire tool is available. */
   hasQuestionnaire: boolean;
-  /** True when the `plan` extension's plan tool is available. */
-  hasPlanTool: boolean;
   customPrompt?: string;
   appendSystemPrompt?: string;
   cwd: string;
   /** Absolute path to this repo's skills library, for the path-rule sentence. */
   skillsLibrary: string;
+  /**
+   * The clock, for the `Current date:` footer. Injected rather than read so a
+   * test can pin the footer without freezing time globally; production omits it
+   * and gets `new Date()`.
+   */
+  now?: Date;
 }): string {
-  const now = new Date();
+  const now = opts.now ?? new Date();
   // ISO date format for consistent prompt output
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
@@ -477,48 +476,6 @@ end a turn hoping the user volunteers the missing information.
 `
     : '';
 
-  // --- Planning discipline section ---
-  // Emitted whenever the plan extension is loaded (it is a global extension,
-  // so this is every session — orchestrator and subagents alike, since
-  // subagent children load the same user extensions).
-  const planSection = opts.hasPlanTool
-    ? `
-## Planning Discipline
-
-Before you act, keep a **Plan** — the ordered list of what you are doing,
-what is left, and what has landed. You maintain it with the \`${PLAN_TOOL}\` tool.
-
-**When a plan is required:**
-- Before any work that is a procedure requiring careful execution: multiple
-  steps, multiple files, destructive or hard-to-reverse operations,
-  unfamiliar code, or delegation to subagents.
-- When in doubt, make a plan. A one-item plan is cheap; losing track of work
-  costs the task.
-- Only a purely conversational reply — no tools, no file changes — needs no plan.
-
-**How to maintain it:**
-- Use the \`${PLAN_TOOL}\` tool exclusively (add / status / revise / seed / attach / archive / show) —
-  never edit the plan file by hand.
-- The plan is session-wide: it accumulates across requests. New work appends
-  items; do not discard the running list.
-- Keep at most one item active: mark an item active before you start it, and
-  review or failed before you move on.
-- Groom an item to \`ready\` when it is specified enough to start, rather than
-  jumping \`backlog\` → \`active\`. Grooming is where a Review Route is normally
-  chosen, and it is the moment to notice an item is vaguer than it looked.
-- When you delegate a step, record the returned Task ID on that plan item with
-  op "attach", and mark the item done (or failed) when the Task's Result arrives.
-- Before delegating, pass the child's Starter Plan as the \`subagent\` tool's
-  "plan" parameter — it is seeded into the child's plan file at spawn, before
-  the Run starts, and never crosses inside the delegation text. The child owns
-  its plan file from then on — you will never read it back.
-- The plan survives compaction: it is re-injected into your context
-  automatically. If it is ever missing from your context, call \`${PLAN_TOOL}\` op
-  "show" before continuing.
-- When every item is done or failed the plan archives itself; you can also
-  call \`${PLAN_TOOL}\` op "archive" explicitly.
-`
-    : '';
 
   // --- Custom prompt ---
   const customSection = opts.customPrompt ? `\n${opts.customPrompt}\n` : '';
@@ -560,5 +517,5 @@ When given a task:
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 
-${askUserSection}${planSection}${toolSection}${agentSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
+${askUserSection}${toolSection}${agentSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
 }
