@@ -33,7 +33,21 @@ fi
 
 root=$(git rev-parse --show-toplevel)
 check="$root/scripts/check.sh"
-[ -x "$check" ] || exit 0
+
+# A missing guard is a failure, not a pass. This used to be `|| exit 0`, and when
+# `scripts/check.sh` was deleted in 7a54a3b as collateral damage the hook went on
+# exiting 0 for every commit after it — silently, while `git-hooks.ts` kept
+# telling the user their commits were protected against unloadable sources. The
+# whole argument above is that the failure mode being guarded is *silence*, so a
+# guard that can disappear quietly defeats itself. Fail loudly instead: a real
+# absence is then a two-second fix rather than an invisible regression.
+if [ ! -x "$check" ]; then
+	echo "Commit refused: $check is missing or not executable." >&2
+	echo "It is the one check that a committed source actually loads — pi dies at" >&2
+	echo "startup on a file that cannot be parsed, before it can say which one." >&2
+	echo "Restore it (git log -- scripts/check.sh), or bypass with --no-verify." >&2
+	exit 1
+fi
 
 # CHECK_STAGED=1: check.sh materialises the index in a scratch dir and checks
 # that — what the commit records — not the working tree. A partially staged
