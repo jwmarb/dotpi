@@ -6,8 +6,7 @@
         "clientName": "pi"
       },
       "description": "Robinhood trading: account positions, quotes, and order history.",
-      "timeout": 60,
-      "enabled": false
+      "timeout": 60
     }
   }
 }
