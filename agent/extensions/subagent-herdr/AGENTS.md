@@ -5,7 +5,7 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 **Delegation is event-driven: there is deliberately no blocking wait.** The orchestrator delegates, ends its turn, and is woken by a *notice* the child types into its pane (`herdr agent prompt`) when the child reports or finishes. A blocking wait is what the module used to do, and it made mid-run messaging structurally impossible: the wait ran inside a tool call, so the parent was streaming, so a child's report could only queue as a follow-up and stayed invisible until the child was already dead. Do not reintroduce one.
 
 **The briefing is delivered as `deliverAs: "steer"`, and that word is load-bearing.** pi's agent loop drains its two queues from different places (`pi-agent-core/dist/agent-loop.js`): steering at the end of *every* turn inside `while (hasMoreToolCalls || pendingMessages.length > 0)`, follow-ups only *after* that inner loop exits. So a follow-up reaches an orchestrator that is still calling tools only once it has stopped calling them — i.e. once its turn is already over. Delegating and then continuing to work (a read, a grep, another spawn) kept the loop inside the inner `while`, where the follow-up queue is never polled, so a finished child was unreachable for the rest of the turn however long it lasted. Steering cuts in at the next turn boundary, after the current tool results are in context and before the next LLM call, so it never splits a `tool_call`/`tool_result` pair. Interrupting is the intent: a subagent's answer is new information that should redirect the loop, not queue behind the work it invalidates. The idle path is untouched — `deliverAs` is only consulted while `isStreaming`. (Both the queue structure and `deliverAs` re-verified against the installed pi 1.0.0; `index.ts`'s comment still cites the original 0.99.2 measurement.)
-
+(Both the queue structure and `deliverAs` re-verified against the installed pi 1.0.2; `index.ts`'s comment still cites the original 0.99.2 measurement.)
 ## WHERE TO LOOK
 
 | File | Owns |
@@ -15,12 +15,12 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 | `herdr.ts` | Thin CLI wrapper over the herdr 0.9.0 CLI; the measured behaviours it relies on are documented in its header |
 | `rundir.ts` | The run-directory contract (paths + JSON shapes) **and the wake-notice grammar** — both span the parent/child process seam |
 | `child-done.ts` | Child half of the handshake; loaded into the child with pi `-e`, writes the `<session>.exit` sidecar and sends the `report`/`done` notices |
-| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (136 tests) |
+| `lib.test.ts` | The pure parts, plus the launch seam via a stub `Launcher` (137 tests) |
 
 ## CONVENTIONS (local)
 
 - **The contract is spelled once.** The child is launched with `-e` and imports only shared modules (`rundir.ts`, and `../lib/agents.ts` for agent definitions) — run-dir paths and JSON shapes change there, never in both halves.
-- **IDs come from herdr responses, never predicted** (pane, tab, agent).
+- **Pane and tab ids come from herdr responses, never predicted.** The *agent name* and the run id are the opposite: constructed locally (`herdrAgentName` = `<agent>-<runId>`, `makeRunId`), with herdr's `agent_name_taken` the collision detector.
 - **`herdr.ts` never throws.** Every entry point resolves a structured value; the delegation surface must not take down the session hosting it.
 - **Pinned to herdr 0.9.0.** Re-verify the "measured behaviours" in `herdr.ts`'s header against the version before changing any of them.
 - **Completion is two signals:** the `subagent_done` tool (injected into every child's allowlist) or a clean `agent_end`. A failed turn writes no sidecar, so the parent classifies from its absence.
@@ -38,11 +38,11 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/subagent-herdr/lib.test.ts   # 136 tests
+bun test agent/extensions/subagent-herdr/lib.test.ts   # 137 tests
 ```
 
-This is the repo's **only** `tsc -p` scope (`tsconfig.json` includes `lib.ts`, `herdr.ts`,
-`child-done.ts`, `index.ts`), and the only dir with a `package.json` — dev-only
+Its `tsconfig.json` includes `lib.ts`, `herdr.ts`,
+`child-done.ts`, `index.ts`, `rundir.ts`; this is the only dir with a `package.json` (the other two typecheck scopes — `model-fallback/`, `ralph-loop/` — borrow this `tsc`) — dev-only
 (`typescript`, `@types/node`); pi loads `index.ts` directly and needs none of it at
 runtime. Run it from here with the local binary:
 
@@ -51,7 +51,7 @@ runtime. Run it from here with the local binary:
 ```
 
 The `@earendil-works/*` types it resolves come from `~/node_modules` (0.75.4) rather than
-the running pi (1.0.0) — see the root AGENTS.md for that skew.
+the running pi (1.0.2) — see the root AGENTS.md for that skew.
 
 ## ANTI-PATTERNS
 

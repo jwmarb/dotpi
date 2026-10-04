@@ -17,7 +17,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 | What a theme key may be | `themes/tokyo-night.json` `$schema` → pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
-
+| Which builtins are on/off | `settings.json` `extensions` — one `+builtin:`/`-builtin:` entry each; currently `mcp` and `codemode` enabled, `llama.cpp` and `tool-search` disabled |
 ## CONVENTIONS
 
 - **`agents/*.md` frontmatter draws on a seven-key vocabulary**, parsed only by
@@ -84,13 +84,16 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   (`display_name`, `short_description`); most skills have one and its absence changes nothing
   functional. An `agents/` directory holding only this file defines **no agents** — which is
   why discovery gates on `agents/*.md`, not on the directory existing.
-- **Interview- and workflow-style skills set `disable-model-invocation: true`**
-  (`stress-test-thinking`, `triage`, `wayfinder`, `compact-session-for-handoff`): they need a
+- **Interview-, workflow- and teaching-style skills set `disable-model-invocation: true`**
+  (15 of them: `compact-session-for-handoff`, `explain-bigger-picture`, `implement-from-spec`,
+  `improve-codebase-architecture`, `interview-my-plan`, `interview-plan-with-docs`,
+  `repitch-last-message`, `setup-engineering-skills`, `teach-concept`, `to-questionnaire`,
+  `to-spec`, `to-tickets`, `triage`, `wayfinder`, `which-skill-fits`): they need a
   human in the loop, so model-initiated
   invocation is a bug. `argument-hint` prefills the slash prompt.
 - **Personal-identity skills stay on disk and untracked**, not placeholdered —
-  a gitignored skill directory under its category is the pattern (there is none on disk
-  right now). Add a `.gitignore` path rather than sanitising in place.
+  a gitignored skill directory under its category is the pattern (one is on disk
+  right now: `other/uarizona-hpc/`). Add a `.gitignore` path rather than sanitising in place.
 - **The superpowers bootstrap extension is deliberately disabled.** Its package entry is
   the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only the 15
   skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block every turn

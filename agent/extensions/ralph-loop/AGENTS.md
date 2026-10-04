@@ -26,19 +26,20 @@ first stall nudges once; hitting `maxIterations` asks the user to extend.
 
 ## THE `--verify` GATES
 
-Off by default. `--verify` runs **both**; `=static`, `=runtime`, `=off` narrow it. A
+Off by default. `--verify` runs **both** (bare `--no-verify` and `=off`/`=none` disable it; an unknown `=X` falls back to both, never off); `=static`, `=runtime` narrow it. A
 completion claim is accepted only if every active gate agrees. They run in sequence,
 static first, and a static rejection short-circuits — no point spending a container run to
 prove a defect already found. `maxVerifications` (default 3) bounds gate rounds per loop.
 
-**Static** (`gate.ts`, `oracle`) *reads* the repo: goal, starting `HEAD` + `git status`,
+**Static** (`gate.ts`, `oracle`, fallback `openai/gpt-5.6-sol`) *reads* the repo: goal, starting `HEAD` + `git status`,
 touched paths, and the agent's claim. Catches "runs green but does the wrong thing". ~20s.
 
-**Runtime** (`runtime-gate.ts`, `verifier`) *executes* the project's own tests in Docker.
+**Runtime** (`runtime-gate.ts`, `verifier`, fallback `anthropic/claude-opus-5`) *executes* the project's own tests in Docker.
+
 Catches "reads fine but does not run". Minutes cold, ~20s once the image is cached:
 
 ```
-docker run --rm --network none --memory=2g --pids-limit=256 \
+docker run --rm --network none --memory=2g --pids-limit=512 \
   -v <project>:/project:ro -w /project \
   --user "$(id -u):$(id -g)" -e HOME=/tmp <image> <test command>
 ```
@@ -48,13 +49,12 @@ refused, the **live working tree** visible (so edits need no rebuild), real exit
 propagated. Artifacts go to a per-audit host scratch dir mounted at `/artifacts`, because
 `/project` is read-only by design.
 
-Images are three layers: the tracked reference base
+Images are at most three layers: the tracked reference base
 (`../../docker/verify-base.Dockerfile`, tag `ralph-verify/base:latest` — Node 24 + Chrome +
-the pinned `agent-browser` CLI, ~30s warm, 1.5 GB); the project image, preferring the
+the pinned `agent-browser` CLI, ~30s warm, 1.5 GB), which a project image `FROM`s **only when it is a web project without its own Dockerfile** — a project-supplied Dockerfile never pulls it; the project image itself, preferring the
 project's own `Dockerfile` and otherwise synthesised (web projects `FROM` the base, non-web
 use a plain language image); and the live tree, bind-mounted `:ro` at run time. The tag is
 `ralph-verify/<slug>:<digest>` where the digest hashes manifests, lockfiles **and** the web
-flag, so a dependency change or a web/non-web flip forces a rebuild and nothing else does
 (measured: 15s cold, 0.0s warm). Web detection reads `package.json` dependency *names* — a
 declaration of intent, unlike the presence of an `index.html`; malformed JSON falls back to
 a quoted-name scan rather than to `false`, since over-detecting costs a bigger image while
@@ -147,7 +147,7 @@ bun test agent/extensions/ralph-loop/lib.test.ts   # 140 tests
 ```
 
 ```
-/ralph-loop <goal> [--verify[=static|runtime|both]] [--max-iterations=N] [--promise=WORD]
+/ralph-loop <goal> [--verify[=static|runtime|both]] [--no-verify] [--max-iterations=N] [--promise=WORD]
 /ulw-loop   <goal>      # same loop, plus the ultrawork intensity directive
 /loop-stop              # stop the running loop
 ```

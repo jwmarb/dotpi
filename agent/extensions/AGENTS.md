@@ -144,7 +144,7 @@ cross-process grammar outside the stated scope),
 chain — a change to a spawn argv deserves a typecheck). What matters here is what they do **not** cover: `lib/` and every
 top-level `*.ts` are in no typecheck scope at all — nothing type-checks `dynamic-prompt.ts`,
 `litellm.ts` or `firecrawl-cli.ts` but pi loading them. Beware the skew when you check one by
-hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.0,
+hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.2,
 so typechecking against it reports phantom errors for APIs that exist only in the live
 bundle (for example `registerMcpServer`, from `core/mcp-servers.js`). 0.75.4 has
 no virtual-model API at all, so `model-fallback` cannot typecheck against it even nominally.

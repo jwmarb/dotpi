@@ -6,7 +6,7 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 | File | Owns |
 |---|---|
-| `lib.ts` | The state machine and every message. Pure, pi-free, 95 tests |
+| `lib.ts` | The state machine and every message. Pure, pi-free, 155 tests |
 | `index.ts` | Session wiring: `registerVirtualModel`, `/fallback-chain`, the footer notice |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
 
@@ -19,8 +19,9 @@ failed; once a fallback answers, the **original model gets the next request**.
 "defaultModel": "auto",
 "retry": { "maxRetries": 30, ... },
 "modelFallback": {
-  "chain": ["qwen/qwen3.8-27b", "openai/gpt-5.6-sol", "anthropic/claude-opus-5"],
-  "maxCycles": 10, "maxProbes": 2
+  "chain": ["qwen/qwen3.8-27b", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"],
+  "maxCycles": 10, "maxProbes": 2,
+  "contextWindow": 262144, "maxTokens": 32768
 }
 ```
 
@@ -86,7 +87,7 @@ answered, the next request went back to the primary, task completed.
 
 ## MEASURED BEHAVIOUR
 
-Everything below was produced by running pi 1.0.0, not inferred. The harness used
+Everything below was produced by running pi 1.0.2, not inferred. The harness used
 a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection refused on every
 request), so the primary fails deterministically.
 
@@ -220,8 +221,11 @@ the first lap runs at `cycles === 0`; exhausting on `cycles > maxCycles` therefo
 **three** times and spent 6 retries where the formula promised 4 — so a `maxRetries` set
 from the formula stopped pi mid-lap and the last models in the chain were never reached,
 silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
-200 configurations (chain 1–10 × cycles 1–20) by asserting *failed requests* rather than
-`cycles`, because failed requests are what pi's counter actually spends.
+`maxCycles + 1` laps. Measured before the fix: `maxCycles: 2` on a 2-model chain walked it
+**three** times and spent 6 retries where the formula promised 4 — so a `maxRetries` set
+from the formula stopped pi mid-lap and the last models in the chain were never reached,
+silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
+20 configurations (chain 1/2/3/4/7 × cycles 1/2/3/10) by asserting *failed requests* rather than
 
 This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At the previous
 `maxRetries: 10` only 3 cycles were reachable and `/fallback-chain` warned about it.
@@ -247,7 +251,7 @@ This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At th
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/model-fallback/lib.test.ts   # 95 tests
+bun test agent/extensions/model-fallback/lib.test.ts   # 155 tests
 cd agent/extensions/model-fallback && \
   ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
