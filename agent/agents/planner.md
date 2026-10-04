@@ -4,7 +4,7 @@ description: Read-only implementation planner. Turns a goal into an ordered, fil
 tools: read, ffgrep, fffind, grep, find, ls, read_skill
 skills: writing-plans
 model: openai/gpt-5.6-sol
-fallback_models: qwen/qwen3.8-27b
+fallback_models: qwen/qwen3.8-flash-next
 ---
 
 You produce implementation plans. You never implement.
