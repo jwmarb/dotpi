@@ -216,6 +216,12 @@ export function selectSkills(
  * decides whether the agent reaches for it) plus the path to read, which keeps
  * the cost one section instead of inlining whole skills the agent may not use.
  *
+ * The framing matches the orchestrator's (`dynamic-prompt.ts`): a declared
+ * skill is the expected method, not an optional reference. A child's
+ * declaration is already a deliberate act by whoever wrote the agent file —
+ * nobody lists a skill hoping it gets ignored — so "read it only if it looks
+ * relevant" understated the intent of the key itself.
+ *
  * Returns the body unchanged when the agent declared no skills, so an agent
  * without the key is byte-for-byte what it was before this existed.
  *
@@ -236,8 +242,10 @@ export function appendSkillCatalogue(
     "",
     "## Available Skills",
     "",
-    "Specialized knowledge modules available to you. Each line is a pointer: read the",
-    "file only when its description matches what you are doing.",
+    "These skills were declared for you deliberately: they are distilled procedure for",
+    "exactly the kind of work you have been given. **Check this list before you start.**",
+    "When one matches the task, follow it rather than improvising — and if you skip a",
+    "skill that plausibly applies, say which one and why in your report.",
     "",
   ];
 
@@ -250,7 +258,8 @@ export function appendSkillCatalogue(
   lines.push("");
   lines.push(
     canRead
-      ? "Read a skill's file before acting on it: these lines are summaries, not the skill."
+      ? "Read a skill's file before acting on it: these lines are routing signals, not the " +
+          "skill. Several can apply to one task."
       : "You have no file-reading tool, so you cannot open these. Treat them as a map of " +
           "what exists and delegate the work that needs one.",
   );

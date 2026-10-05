@@ -188,28 +188,36 @@ export default function (pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 
 /**
- * Renders the skill catalogue as category headings with bare names.
+ * Renders the skill catalogue as category headings with one line per skill:
+ * name, path when it is not implied, and description.
  *
- * Names only, because that is the whole point of the two-tier format — but a
- * name is only useful if the model can turn it into a file to open. Rather than
- * print 52 absolute paths, each *root* is declared once and the names under it
- * are bare.
+ * The description is here on purpose. An earlier format printed bare names to
+ * save the tokens 52 descriptions cost on every request, and the saving was
+ * real — but a name is the entire basis on which the model decides what to
+ * `read_skill`, and names like `triage` or `wayfinder` do not carry enough to
+ * earn that call. The catalogue has to be a routing table, not an index.
  *
- * The library root is declared by the caller's prose. Every other root (the
+ * What that earlier format got right is kept: each *root* is declared once and
+ * the names under it are bare, rather than printing 52 absolute paths. The
+ * library root is declared by the caller's prose; every other root (the
  * vendored `superpowers` checkout, a project-local `.pi/skills`) gets its own
- * `↳ <root>/<name>/SKILL.md` line here, which is what kept the 15 package
- * skills from costing more in repeated path text than the descriptions they
- * replaced.
+ * `↳ <root>/<name>/SKILL.md` line here.
  *
  * A skill whose path fits no root at all is printed with its full path inline:
  * unusual, but a name the model cannot resolve is a skill it cannot open, and
  * silence there would be the one failure this format must not have.
  *
- * @param skills - The inventory, each with the category from its path if any.
+ * @param skills - The inventory, each with its description and the category
+ * from its path if any.
  * @param library - Absolute path to this repo's skills library.
  */
 function renderSkillCategories(
-  skills: Array<{ name: string; filePath: string; pathCategory?: string }>,
+  skills: Array<{
+    name: string;
+    description: string;
+    filePath: string;
+    pathCategory?: string;
+  }>,
   library: string,
 ): string {
   /** The directory a skill's root would be, if it follows `<root>/<name>/SKILL.md`. */
@@ -234,17 +242,20 @@ function renderSkillCategories(
 
   const body = groupByCategory(skills)
     .map(({ category, skills: list }) => {
-      const names = list
-        .map((s) => {
-          if (inLibrary(s)) return s.name;
-          const root = rootOf(s);
-          if (root && shared.has(root)) return s.name;
-          return `${s.name} (\`${s.filePath}\`)`;
-        })
-        .join(', ');
-      return `**${category}**: ${names}`;
+      const lines = list.map((s) => {
+        const root = rootOf(s);
+        // The path is printed only when neither the library prose nor a
+        // declared root already implies it.
+        const where = inLibrary(s) || (root && shared.has(root)) ? '' : ` (\`${s.filePath}\`)`;
+        // An empty description would leave a dangling dash, and a skill the
+        // model cannot route to is the failure this section exists to avoid —
+        // so say that the description is missing rather than printing nothing.
+        const desc = s.description.trim() || '(no description — open it to find out)';
+        return `- **${s.name}**${where} — ${desc}`;
+      });
+      return `**${category}**\n${lines.join('\n')}`;
     })
-    .join('\n');
+    .join('\n\n');
 
   if (shared.size === 0) return body;
   // Sorted so the prompt stays byte-stable run to run.
@@ -447,38 +458,60 @@ change too trivial to grade, say that you skipped it and why; do not skip silent
       : '';
 
   // --- Skill inventory section ---
-  // Two-tier by design: categories and names here, descriptions on demand.
+  // Descriptions, and the instruction to reach for them first. Both are
+  // deliberate reversals of an earlier design, so the reasoning matters.
   //
-  // The full table cost ~4.2k tokens of every request (52 skills × a paragraph
-  // each) to describe skills that a given session overwhelmingly does not use.
-  // What the model actually needs up front is enough to decide *what to open*,
-  // and the grouped name is that. The description is one `read_skill` away, and
-  // it is the authoritative copy rather than a summary of itself.
+  // This section used to be two-tier — category headings with bare names — and
+  // framed skills as purely advisory ("you decide when they apply"). That cost
+  // ~4.2k tokens less per request, and what it bought was a model that mostly
+  // did not open them: a bare name is a weak routing signal, and "advisory" is
+  // a licence to skip. The result is the expensive failure, because every skill
+  // in that library exists for a reason — improvising that work went badly at
+  // least once already.
   //
-  // This is a real trade, not a free win: a name is a weaker routing signal than
-  // a sentence. It is paid for by the names themselves — the opaque ones were
-  // renamed to verb phrases — and by stating the path rule so the model can
-  // open any skill without being handed 52 absolute paths.
+  // So the trade is now the other way round: pay the tokens to make skill
+  // selection a decision the model can actually make, and state that consulting
+  // the catalogue is the opening move rather than a fallback. It stops short of
+  // a hard mandate — a skip is allowed, but it has to be *named*, which is what
+  // makes a wrong default visible in the transcript instead of silent.
+  //
+  // Not a free win either way: a prompt that pushes skills can over-apply one to
+  // a task it does not fit, which is why the last rules keep the file (not the
+  // name) authoritative and keep the task above the skill in a real conflict.
   const skillSection =
     opts.skillInventory.length > 0
       ? `
 ## Available Skills
 
-Skills are specialized knowledge modules, grouped by domain. Only names are
-listed — to use one, read its \`SKILL.md\` with \`read_skill\` first, or let the
-human invoke it with \`/skill:name\`.
+Skills are specialized knowledge modules: distilled, already-debugged procedure
+for work that has been done badly before. **Consulting this catalogue is the
+default opening move, not a fallback.** When one matches the task it beats
+anything you will improvise, because it encodes the failures you have not hit yet.
+
+To use a skill, read its \`SKILL.md\` with \`read_skill\`: the line below is a
+routing signal, the file is the method. The human can also invoke one with
+\`/skill:name\`.
 
 Most live at \`${opts.skillsLibrary}/<category>/<name>/SKILL.md\`; the ones that do
 not carry their path inline below.
 
 ${renderSkillCategories(opts.skillInventory, opts.skillsLibrary)}
 
-**Orchestration rules:**
-- A name is a hint, not a contract: open the skill before acting on it
-- Prefer reading a plausible skill over guessing at what it contains
-- Skills are advisory — you decide when they apply
-- If a skill's guidance conflicts with the task, use your judgment
-- A skill may own tools that appear only once it is loaded
+**How to use this catalogue:**
+- **Check it before you plan.** For any task beyond a one-line answer, scan for a
+  matching skill and open it *before* designing your approach — not after the
+  approach fails.
+- **Prefer the skill to your own default.** If one matches, follow it.
+- **Name any skip.** If a plausible skill exists and you choose not to use it,
+  say which one and why, in one line. Silently ignoring the catalogue is the
+  failure this section exists to prevent.
+- **Composition is normal.** Several skills can apply to one task (plan it, then
+  verify it); loading one does not rule out another.
+- A name is a hint, not a contract: open the file rather than guessing at what it
+  contains, and act on what it says rather than on the summary here.
+- If a skill's guidance genuinely conflicts with the task, the task wins — but
+  state which skill you set aside and why.
+- A skill may own tools that appear only once it is loaded.
 `
       : '';
 
@@ -557,7 +590,7 @@ skill invocations in the right order.
 ## Core Responsibilities
 
 1. **Decompose** — Break complex user requests into discrete, verifiable steps. If a request has gaps or is unclear, ask${opts.hasQuestionnaire ? ` using the \`${QUESTIONNAIRE_TOOL}\` tool` : ''} before planning.
-2. **Plan** — Determine the optimal sequence of tool calls and skill invocations
+2. **Plan** — Consult the skills catalogue first, then determine the optimal sequence of tool calls and skill invocations
 3. **Execute** — Call tools and skills in the correct order, handling errors gracefully
 4. **Verify** — Confirm each step's result before proceeding to the next
 5. **Adapt** — If something fails, diagnose and try a different approach
@@ -566,7 +599,7 @@ skill invocations in the right order.
 
 When given a task:
 1. Identify the goal and any constraints
-2. Check which tools and skills are available (see sections below)
+2. Check which tools are available, and scan the skills catalogue for a match — open any plausible skill before designing the plan
 3. Design a step-by-step plan
 4. Execute the plan, verifying each step
 5. Report back with results and any issues
@@ -574,7 +607,7 @@ When given a task:
 ## Error Handling
 
 - If a tool call fails, read the error and adjust your approach
-- If a skill doesn't apply, skip it and use a different tool
+- If no skill fits, say so in one line and proceed with tools — but check the catalogue before concluding that
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 

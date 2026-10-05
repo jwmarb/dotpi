@@ -32,7 +32,16 @@ set -uo pipefail
 force=0
 [ "${1:-}" = "--force" ] && force=1
 
-root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$(cd "$(dirname "$0")/.." && pwd)
+# Resolve THIS repo, not the caller's. git-hooks.ts runs this script at every pi
+# startup, in whatever workspace pi was opened in -- so a bare `git rev-parse`
+# answers about that workspace instead: in another git repo it resolved to that
+# repo's root, the globs matched nothing, and the found==0 guard below cried
+# "no package.json found" on every startup outside this clone. Anchoring git to
+# the script's own directory asks the question that was always meant: where is
+# the repo containing this script? (It is the same repo, so the symlinked ~/.pi
+# path resolves identically.)
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || root=$(dirname "$here")
 cd "$root" || exit 0
 
 if ! command -v npm >/dev/null 2>&1; then

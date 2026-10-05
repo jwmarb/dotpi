@@ -1309,6 +1309,17 @@ describe("appendSkillCatalogue", () => {
     const out = appendSkillCatalogue("B.", [{ dir: "x", name: "x", description: "", path: "/p" }], true);
     expect(out).toContain("(no description)");
   });
+
+  test("tells the child a declared skill is the expected method, not a reference", () => {
+    // Matches the orchestrator's stance (`dynamic-prompt.ts`). The earlier
+    // wording — "read the file only when its description matches what you are
+    // doing" — made an opt-in declaration sound optional, which is the one thing
+    // it is not: somebody wrote that `skills:` key on purpose.
+    const out = appendSkillCatalogue("B.", skills, true);
+    expect(out).toContain("Check this list before you start");
+    expect(out).toContain("rather than improvising");
+    expect(out).not.toContain("only when its description matches");
+  });
 });
 
 describe("parseAgentFile skills key", () => {
