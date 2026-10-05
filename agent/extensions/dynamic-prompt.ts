@@ -396,6 +396,67 @@ The loop works like this:
 `
       : '';
 
+  // --- Quality pass section ---
+  // Gated on the grading agents actually being spawnable, like askUserSection is
+  // gated on the questionnaire tool: a prompt that orders a delegation to an
+  // agent this install does not have is an instruction the model cannot obey.
+  //
+  // The orchestrator is the one agent with no parent to grade it. A `worker`
+  // ends its run by handing the diff to `reviewer`/`verifier`, so work routed
+  // through delegation is graded by construction — but the orchestrator edits
+  // files directly too, and that path had no gate at all. This closes it, so
+  // "who checks the implementation" has the same answer either way.
+  const graders = ['reviewer', 'verifier'].filter((g) =>
+    opts.agentInventory.some((a) => a.name === g),
+  );
+  const qualityPassSection =
+    graders.length > 0
+      ? `
+## Quality Pass
+
+When **you** implemented something yourself — edited files, wrote a feature, fixed
+a bug — you are the worst available judge of it. A \`worker\` you delegate to ends
+its run by having its diff graded by an agent that did not write it. Hold yourself
+to the same standard: finish your own implementation work the same way.
+
+Before you tell the user an implementation is done, delegate a quality pass:
+
+\`\`\`
+${graders.map((g) => `subagent(agent: "${g}", task: "${g === 'verifier' ? '<goal + absolute project path + the command that checks it>' : '<goal + the exact files you touched, as absolute paths>'}")`).join('\n')}
+\`\`\`
+
+Ask for exactly this: **a full and thorough quality pass over the implementation
+for any remaining bugs, issues, or quality-of-life improvements.**
+
+**When it applies:** you changed code, config, or anything executable, and the
+change is more than a typo or a one-line string. It does **not** apply to work you
+only read, planned, or researched, nor to a change a subagent already had graded —
+do not re-grade a \`worker\`'s diff it has itself passed through these agents.
+
+**How to delegate it well:**
+- Write the task self-contained: the child cannot see this conversation. Name the
+  goal, the absolute paths, and the command that checks it.
+- **List the files explicitly rather than saying \`git diff\`** — an uncommitted new
+  file is untracked, and a diff alone will not show it.
+- Launch the graders in one turn so they run concurrently, then end your turn.
+${graders.includes('verifier') ? `- \`verifier\` expects a container image tag that already exists. Check
+  \`docker image ls 'ralph-verify/*'\` and pass a fitting tag, or say plainly that
+  none was prebuilt — an honest INCONCLUSIVE beats a verdict from a container that
+  was missing the toolchain. Skip it for changes execution cannot settle (docs,
+  naming, prose) or when Docker is unavailable.
+` : ''}
+**Then act on what comes back.** Fix every Critical and every in-scope Warning,
+re-run the project's own checks, and take the small local Suggestions. Report
+findings you deliberately did not act on, with the severity the grader gave them,
+rather than quietly dropping them. A quality pass you did not act on is a quality
+pass you wasted — and a \`FAIL\` means the work is not done, whatever your own
+earlier command reported.
+
+Tell the user what the pass found and what you changed in response. If you judge a
+change too trivial to grade, say that you skipped it and why; do not skip silently.
+`
+      : '';
+
   // --- Skill inventory section ---
   // Descriptions, and the instruction to reach for them first. Both are
   // deliberate reversals of an earlier design, so the reasoning matters.
@@ -550,5 +611,5 @@ When given a task:
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 
-${askUserSection}${toolSection}${agentSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
+${askUserSection}${toolSection}${agentSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
 }

@@ -65,7 +65,16 @@ agent/subagent-runs/
 # Derived from each project's manifests and rebuildable on demand — deleting them
 # costs one image build.
 agent/verify-images/
-agent/pi-blackhole/
+
+# pi-blackhole's state directory is machine-written EXCEPT for its config file,
+# which is hand-tuned configuration and belongs in git like settings.json does.
+# Note the `/*` — a bare `agent/pi-blackhole/` excludes the DIRECTORY, and git
+# never descends into an excluded directory, so a `!…/pi-blackhole-config.json`
+# negation under it would be silently dead. Ignoring the directory's *contents*
+# keeps the negation reachable. Everything else here stays ignored: per-session
+# `<id>-pending.json` / `-pending.stale.json` run state and `debug.ndjson`.
+agent/pi-blackhole/*
+!agent/pi-blackhole/pi-blackhole-config.json
 # Trading profile (~/.pi/agent-trading): symlinks share the default profile's
 # tree, so only its own machine state is ignored here. Its .env and mcp-auth
 # are symlinks into agent/ and track as (relative) symlinks, not secrets.
@@ -73,7 +82,8 @@ agent-trading/sessions/
 agent-trading/subagent-sessions/
 agent-trading/subagent-runs/
 agent-trading/verify-images/
-agent-trading/pi-blackhole/
+agent-trading/pi-blackhole/*
+!agent-trading/pi-blackhole/pi-blackhole-config.json
 agent-trading/auth.json
 agent-trading/models-store.json
 # Plans are per-session working state keyed by session id, and the archive grows

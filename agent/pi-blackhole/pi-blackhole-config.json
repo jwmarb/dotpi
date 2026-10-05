@@ -1,0 +1,61 @@
+{
+  "compaction": "auto",
+  "compactionEngine": "blackhole",
+  "tailBehavior": "minimal",
+  "showPreCompactionMessage": true,
+  "compactionSummaryMode": "default",
+  "midRunCompaction": "resume",
+  "compactAfterRatio": 0.65,
+  "compactAfterPreset": "default",
+  "retainedToolOutputMaxTokens": 32000,
+  "recallResponseMaxChars": 48000,
+  "skipForProviders": [],
+
+  "memory": true,
+  "sessionFallback": true,
+  "fullFoldAlways": true,
+  "statusBar": true,
+  "showWorkerNotifications": false,
+  "observeAfterTokens": 20000,
+  "reflectAfterTokens": 35000,
+  "observationsPoolMaxTokens": 24000,
+  "reflectionsPoolMaxTokens": 8000,
+  "observationsPoolTargetTokens": 12000,
+  "reflectorInputMaxTokens": 120000,
+  "dropperInputMaxTokens": 120000,
+  "observerChunkMaxTokens": 60000,
+  "observerPreambleMaxTokens": 0,
+  "dropperPressureThreshold": 0.7,
+  "dropperPoolFullnessThreshold": 0.1,
+  "agentMaxTurns": 16,
+  "workerAttemptTimeoutMs": 600000,
+  "providerIdleTimeoutMs": 120000,
+
+  "model": {
+    "provider": "litellm",
+    "id": "qwen/qwen3.8-27b",
+    "thinking": "low",
+    "contextWindow": 262144
+  },
+  "observerModel": {
+    "provider": "litellm",
+    "id": "qwen/qwen3.8-27b",
+    "thinking": "low",
+    "contextWindow": 262144
+  },
+  "reflectorModel": {
+    "provider": "litellm",
+    "id": "qwen/qwen3.8-27b",
+    "thinking": "xhigh",
+    "contextWindow": 262144
+  },
+  "dropperModel": {
+    "provider": "litellm",
+    "id": "qwen/qwen3.8-27b",
+    "thinking": "low",
+    "contextWindow": 262144
+  },
+
+  "debug": false,
+  "debugLog": false
+}

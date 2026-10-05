@@ -85,7 +85,13 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
   removed in `7a54a3b`; "dead but harmless" was the wrong reading, because the branch still
   *described* a tool with ops (add/status/revise/seed/attach/archive/show) that no longer
   exists, and any future tool named `plan` would have silently inherited that stale
-  contract. It is gone — a new planning tool brings its own prompt section.
+  contract. It is gone — a new planning tool brings its own prompt section. The same rule now
+  covers *agents*: the `## Quality Pass` section (which tells the orchestrator to have its own
+  implementation work graded by `reviewer`/`verifier`, the gate a `worker` already ends its run
+  with) is built from the agents actually in `agentInventory`, so an install missing one names
+  only the other, and one missing both omits the section entirely. The verifier-only
+  image-tag caveat is nested inside that same gate, because container guidance for an absent
+  agent is the identical bug one level down.
 - **`todo.ts` is not the old `plan` extension and must not grow into it.** `todo` is a
   different tool, and now that the stale `plan` prompt branch is deleted nothing re-arms it.
   What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a

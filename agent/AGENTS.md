@@ -34,6 +34,15 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   `reviewer`, `explorer`, `verifier` have no `write`/`edit` by construction. Widening one
   to unblock a task destroys the independence that makes its verdict worth anything — add
   a new definition instead.
+- **Whoever implements, grades afterwards — and never grades itself.** `worker` ends every
+  run by delegating a quality pass to `reviewer` (always) and `verifier` (when the change is
+  runtime-testable), then fixes every Critical and in-scope Warning before reporting; the
+  orchestrator does the same for code *it* edited directly, via the `## Quality Pass` section
+  `extensions/dynamic-prompt.ts` gates on those agents existing. Only `worker` and `spiker`
+  can write at all, so no other definition needs this. `spiker` is deliberately excluded: it
+  may not touch the user's project, so there is nothing of the project's to grade. The
+  ancestry guard is what keeps this from recursing — `lineageRejection` refuses an agent
+  already in its own chain, so neither a `worker` nor a grader can spawn a second `worker`.
 - **A subagent sees no skills unless its `skills:` key names them.** `dynamic-prompt.ts`
   builds `## Available Skills` for the *orchestrator* only, so a child's prompt is
   otherwise its body and nothing else — a skill is invisible to it, including one the
@@ -127,6 +136,9 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   `npm/`, `git/`, `pi-blackhole/`, or the loose state files beside them (`auth.json`,
   `models-store.json`, `mcp-auth.json`, `run-history.jsonl`, `settings.json.bak`, the
   `*.log`s). All gitignored, rewritten without warning — configuration never lives there.
+  **Sole exception:** `pi-blackhole/pi-blackhole-config.json` *is* hand-edited tracked
+  configuration (the only non-ignored file in `pi-blackhole/`). Edit it directly or via
+  `/blackhole settings`; note that a modal save rewrites the file, so keep it valid JSON.
 - Following `git/github.com/obra/superpowers/AGENTS.md`. That is the vendored package's
   own contributor guide; its rules govern *its* repo, not this one.
 - Editing `docker/verify-base.Dockerfile` without building and running it. Every line
