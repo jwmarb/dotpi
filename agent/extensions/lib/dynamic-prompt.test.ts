@@ -111,6 +111,57 @@ describe("the questionnaire sections are gated on the tool existing", () => {
   });
 });
 
+describe("the quality pass is gated on the grading agents existing", () => {
+  // Same failure mode as the questionnaire gate: a prompt ordering a delegation
+  // to an agent this install does not have is an instruction the model cannot
+  // obey. The orchestrator is the one agent with no parent to grade it, so this
+  // section is what makes its own edits subject to the same gate a `worker`'s
+  // diff already passes through.
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+
+  test("absent when neither grader is in the inventory", () => {
+    const p = build({ agentInventory: [agent("worker"), agent("explorer")] });
+    expect(p).not.toContain("## Quality Pass");
+  });
+
+  test("absent on an empty inventory, which a fresh install hits", () => {
+    expect(build()).not.toContain("## Quality Pass");
+  });
+
+  test("names both graders when both exist", () => {
+    const p = build({ agentInventory: [agent("reviewer"), agent("verifier")] });
+    expect(p).toContain("## Quality Pass");
+    expect(p).toContain('subagent(agent: "reviewer"');
+    expect(p).toContain('subagent(agent: "verifier"');
+  });
+
+  test("names only the grader that exists, and drops the verifier-only guidance", () => {
+    // The image-tag caveat is meaningless without the verifier, and advertising
+    // a container workflow for an agent that is absent is the same bug again.
+    const p = build({ agentInventory: [agent("reviewer")] });
+    expect(p).toContain("## Quality Pass");
+    expect(p).toContain('subagent(agent: "reviewer"');
+    expect(p).not.toContain('subagent(agent: "verifier"');
+    expect(p).not.toContain("ralph-verify/*");
+  });
+
+  test("sits after the agent inventory it refers to", () => {
+    // It names agents by name, so the table that introduces them must come first.
+    const p = build({ agentInventory: [agent("reviewer"), agent("verifier")] });
+    expect(p.indexOf("## Available Agents")).toBeLessThan(p.indexOf("## Quality Pass"));
+    expect(p.indexOf("## Quality Pass")).toBeLessThan(p.indexOf("Current date:"));
+  });
+
+  test("leaves no unexpanded template expression", () => {
+    // The section interpolates a mapped list and a nested conditional; an
+    // escaping slip would ship literal `${...}` into every request.
+    const p = build({ agentInventory: [agent("reviewer"), agent("verifier")] });
+    const section = p.slice(p.indexOf("## Quality Pass"), p.indexOf("Current date:"));
+    expect(section).not.toContain("${");
+  });
+});
+
 describe("the retired plan tool leaves no trace", () => {
   // The `plan` extension was deleted in 7a54a3b, but this builder kept a
   // 44-line Planning Discipline section gated on a tool that could no longer
