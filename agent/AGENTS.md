@@ -118,6 +118,9 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   `npm/`, `git/`, `pi-blackhole/`, or the loose state files beside them (`auth.json`,
   `models-store.json`, `mcp-auth.json`, `run-history.jsonl`, `settings.json.bak`, the
   `*.log`s). All gitignored, rewritten without warning — configuration never lives there.
+  **Sole exception:** `pi-blackhole/pi-blackhole-config.json` *is* hand-edited tracked
+  configuration (the only non-ignored file in `pi-blackhole/`). Edit it directly or via
+  `/blackhole settings`; note that a modal save rewrites the file, so keep it valid JSON.
 - Following `git/github.com/obra/superpowers/AGENTS.md`. That is the vendored package's
   own contributor guide; its rules govern *its* repo, not this one.
 - Editing `docker/verify-base.Dockerfile` without building and running it. Every line
