@@ -1,9 +1,10 @@
 {
-  "lastChangelogVersion": "1.0.2",
+  "lastChangelogVersion": "1.0.4",
   "defaultProvider": "fallback",
   "defaultModel": "auto",
   "defaultThinkingLevel": "xhigh",
   "hideThinkingBlock": false,
+  "steeringMode": "all",
   "extensions": [
     "+builtin:mcp",
     "+builtin:codemode",

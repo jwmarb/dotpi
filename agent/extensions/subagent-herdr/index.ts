@@ -54,9 +54,13 @@
  * *input* — which is why this extension hooks `input`: it recognises the notice
  * grammar (`rundir.ts` owns it), swallows the raw text, and re-injects a
  * composed briefing carrying the run's state and, for a finished run, its
- * answer. Near-simultaneous notices are coalesced into one turn, so three
- * children finishing together wake the orchestrator once rather than three
- * times.
+ * answer. Near-simultaneous notices are coalesced into one turn via a sliding
+ * window, and a flush-time registry sweep folds in any sibling that has already
+ * finished (sidecar on disk, pane gone) even if its notice has not arrived yet —
+ * so a fan-out that finishes together wakes the orchestrator once, not once
+ * per child. A later notice for an already-briefed completion is swallowed.
+ * `steeringMode: "all"` in settings.json ensures that if two briefings ever
+ * queue simultaneously they drain into one response.
  *
  * The briefing is delivered as **steering**, not as a follow-up. An idle
  * orchestrator is woken either way, but a *busy* one — still chaining tool calls
@@ -710,8 +714,71 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Sweep: find runs that finished since the last wake
+// ---------------------------------------------------------------------------
+
+/**
+ * Finds runs in the registry that have finished since the last wake.
+ *
+ * This is the sweep that makes "multiple subagents finishing at once" produce
+ * one response: a notice is a prompt to look, not the evidence. When any notice
+ * triggers a flush, every other run that has also finished (sidecar on disk,
+ * pane gone) is folded into the same briefing, so a fan-out that finishes
+ * together wakes the orchestrator once, not once per child.
+ *
+ * @param recs - Snapshot of all registry records.
+ * @param exclude - Run ids already covered by the current batch or previously briefed.
+ * @param reconcileOne - Classifies one running record; resolves false when the
+ *   record is no longer running. Injected for testability.
+ * @returns Records that finished, in registry order.
+ */
+export async function collectFinished(
+  recs: readonly RunRecord[],
+  exclude: ReadonlySet<string>,
+  reconcileOne: (rec: RunRecord) => Promise<boolean>,
+): Promise<RunRecord[]> {
+  const candidates = recs.filter(
+    (rec) => rec.status === "running" && !exclude.has(rec.runId),
+  );
+  const finished: RunRecord[] = [];
+  const CONCURRENCY = 8;
+  for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+    const slice = candidates.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(
+      slice.map(async (rec) => {
+        try {
+          return !(await reconcileOne(rec));
+        } catch {
+          return false; // one bad record must not abort the sweep
+        }
+      }),
+    );
+    for (let j = 0; j < slice.length; j++) {
+      if (results[j]) finished.push(slice[j]);
+    }
+  }
+  return finished;
+}
+
+// ---------------------------------------------------------------------------
 // Briefings (the text a notice becomes)
 // ---------------------------------------------------------------------------
+
+/**
+ * Renders one completed run's block: header, answer, diagnostics, reports.
+ * The caller must have already called `reconcile` on the record.
+ */
+async function doneBlock(rec: RunRecord): Promise<string> {
+  const out: string[] = [formatResultHeader(rec)];
+  const result = await extractRunResult(dirFor(rec.runId), rec.runId);
+  out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
+  if (rec.status === "failed" && !result.answered) {
+    const diag = await paneDiagnostic(rec);
+    if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
+  }
+  await pushReports(rec, out);
+  return out.join("\n");
+}
 
 /**
  * The user message a batch of notices becomes.
@@ -724,13 +791,21 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
  * longer exists.
  *
  * A `done` notice inlines the child's answer, so the common case costs no
- * follow-up tool call. A `report` does not classify the run — the child is still
- * working and must not be reaped.
+ * follow-up tool call. A `report` is reconciled first: if the child has
+ * finished by flush time, it renders as a full result block rather than a
+ * stale "still working" line.
  *
  * @param batch - Notices from the closed coalesce window, in arrival order.
+ * @param swept - Registry records that finished since the last wake, found by
+ *   the flush-time sweep. Rendered after the batch blocks.
  */
-async function composeBriefing(batch: readonly Notice[]): Promise<string> {
+async function composeBriefing(
+  batch: readonly Notice[],
+  swept: readonly RunRecord[] = [],
+): Promise<string> {
   const blocks: string[] = [];
+  const briefed = new Set<string>();
+
   for (const notice of batch) {
     const rec = runs.get(notice.runId);
     if (!rec) {
@@ -744,25 +819,32 @@ async function composeBriefing(batch: readonly Notice[]): Promise<string> {
       continue;
     }
 
-    if (notice.kind === "report") {
-      blocks.push(
-        `--- ${rec.runId} (${rec.agent}) sent a mid-run report ---\n${notice.text || "(no message)"}\n` +
-          `It is still working. Reply with subagent_tasks (action "message", ids ["${rec.runId}"]) if it needs an answer or a correction.`,
-      );
+    // Reconcile before deciding: a report notice may have arrived while the
+    // child was still working, but by flush time the child may have finished.
+    await reconcile(rec);
+
+    if (rec.status !== "running") {
+      // Finished (done or failed): render the full result block.
+      if (!briefed.has(rec.runId)) {
+        blocks.push(await doneBlock(rec));
+        briefed.add(rec.runId);
+      }
       continue;
     }
 
-    // A `done` notice: classify now and inline the answer.
-    await reconcile(rec);
-    const out: string[] = [formatResultHeader(rec)];
-    const result = await extractRunResult(dirFor(rec.runId), rec.runId);
-    out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
-    if (rec.status === "failed" && !result.answered) {
-      const diag = await paneDiagnostic(rec);
-      if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
+    // Still running: render as a report-style block.
+    blocks.push(
+      `--- ${rec.runId} (${rec.agent}) ${notice.kind === "report" ? "sent a mid-run report" : "sent a notice"} ---\n${notice.text || "(no message)"}\n` +
+      `It is still working. Reply with subagent_tasks (action "message", ids ["${rec.runId}"]) if it needs an answer or a correction.`,
+    );
+  }
+
+  // Append swept runs (finished since last wake, not in the batch).
+  for (const rec of swept) {
+    if (!briefed.has(rec.runId)) {
+      blocks.push(await doneBlock(rec));
+      briefed.add(rec.runId);
     }
-    await pushReports(rec, out);
-    blocks.push(out.join("\n"));
   }
 
   const stillRunning = [...runs.values()].filter((r) => r.status === "running");
@@ -783,10 +865,24 @@ async function composeBriefing(batch: readonly Notice[]): Promise<string> {
  * wake that says only "something happened, go and look" still beats an
  * orchestrator that sleeps through a finished child.
  */
-function fallbackBriefing(batch: readonly Notice[]): string {
-  const lines = batch.map(
-    (n) => `- ${n.runId} (${n.agent}) ${n.kind}${n.text ? `: ${n.text}` : ""}`,
-  );
+function fallbackBriefing(
+  batch: readonly Notice[],
+  swept: readonly RunRecord[] = [],
+): string {
+  const ids = new Set<string>();
+  const lines: string[] = [];
+  for (const n of batch) {
+    if (!ids.has(n.runId)) {
+      ids.add(n.runId);
+      lines.push(`- ${n.runId} (${n.agent}) ${n.kind}${n.text ? `: ${n.text}` : ""}`);
+    }
+  }
+  for (const r of swept) {
+    if (!ids.has(r.runId)) {
+      ids.add(r.runId);
+      lines.push(`- ${r.runId} (${r.agent}) ${r.status}`);
+    }
+  }
   return (
     `[subagent update — delivered automatically, not typed by the user]\n\n${lines.join("\n")}\n\n` +
     `I could not read the run details. Use subagent_tasks (action "result") on the ids above to collect them.`
@@ -915,6 +1011,10 @@ export default function (pi: ExtensionAPI) {
   /** Notices seen since the last briefing was dispatched. */
   let pending: Notice[] = [];
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Run ids already delivered in a completed briefing, so a later duplicate notice is swallowed. */
+  const briefedFinishedRunIds = new Set<string>();
+  /** Serializes flush bodies so overlapping timers cannot race the dedup set. */
+  let flushChain: Promise<void> = Promise.resolve();
 
   /**
    * Turns the buffered notices into one user message and sends it.
@@ -935,62 +1035,97 @@ export default function (pi: ExtensionAPI) {
    * (`/reload`, a new session, a session switch). An uncaught throw from a timer
    * callback reaches pi's `uncaughtException` handler and exits the process — a
    * subagent finishing must never be able to kill the orchestrator.
+   *
+   * Before composing, the flush sweeps the registry for other runs that have
+   * finished since the last wake (sidecar on disk, pane gone) and folds them
+   * into the same briefing, so a fan-out that finishes together produces one
+   * response rather than one per child.
    */
-  const flushNotices = async (): Promise<void> => {
+  const flushNotices = (): void => {
     coalesceTimer = undefined;
     const batch = pending;
     pending = [];
     if (batch.length === 0) return;
-    let briefing: string;
-    try {
-      briefing = await composeBriefing(batch);
-    } catch {
-      // Composing reads run dirs and probes herdr; if that fails the orchestrator
-      // must still be told something, or the event is silently lost.
-      briefing = fallbackBriefing(batch);
-    }
-    try {
-      // deliverAs "steer", not "followUp" — and the distinction is the whole
-      // reason a finished child used to be invisible until the orchestrator was
-      // completely done. pi's agent loop drains the two queues from
-      // structurally different places (`agent-loop.js`, measured against
-      // pi-agent-core 0.99.2):
-      //
-      //   inner loop, every turn:  pendingMessages = getSteeringMessages()
-      //   outer loop, after the inner `while` exits:  getFollowUpMessages()
-      //
-      // The inner loop runs `while (hasMoreToolCalls || pendingMessages.length)`.
-      // So a follow-up is only collected once the orchestrator has stopped
-      // calling tools altogether — i.e. when its turn is already over. An
-      // orchestrator that delegates and then keeps working (reads a file, greps,
-      // spawns a sibling) pauses for each tool result *inside* that inner loop,
-      // where the follow-up queue is never consulted, so the briefing sat there
-      // until the turn ended on its own. That is the bug: not a late wake, a
-      // structurally unreachable one.
-      //
-      // Steering is drained after the current assistant message's tool results
-      // are already in context and before the next LLM call, so it cuts into the
-      // tool-call chain at the first safe boundary without ever splitting a
-      // tool_call/tool_result pair. Cutting in is the point — a subagent's result
-      // is new information that should redirect the loop, not wait politely
-      // behind the work it invalidates.
-      //
-      // This does not change the idle path at all: `deliverAs` is only consulted
-      // when `isStreaming` is true (`agent-session.js` `prompt()`), and when the
-      // session is idle this still starts a fresh turn exactly as before.
-      //
-      // Steering mode defaults to "one-at-a-time", so two briefings landing in
-      // separate coalesce windows arrive on consecutive turns rather than merged.
-      // Both still arrive mid-turn; none is dropped.
-      //
-      // `expandPromptTemplates` is deliberately omitted rather than passed as
-      // false: false is already the default. The briefing always starts with "[",
-      // so it could never be taken for a slash command anyway.
-      pi.sendUserMessage(briefing, { deliverAs: "steer" });
-    } catch {
-      // The runtime went away under us. The run's state is on disk either way,
-      // so the next `status`/`result` still reports it correctly.
-    }
+
+    flushChain = flushChain.then(async () => {
+      // Suppress delayed duplicate notices for runs already briefed.
+      const fresh = batch.filter((n) => {
+        const rec = runs.get(n.runId);
+        return !(rec && rec.status !== "running" && briefedFinishedRunIds.has(n.runId));
+      });
+      if (fresh.length === 0) return;
+
+      // Sweep: find other runs that finished since the last wake.
+      const swept: RunRecord[] = [];
+      try {
+        const exclude = new Set([...fresh.map((n) => n.runId), ...briefedFinishedRunIds]);
+        swept.push(...(await collectFinished([...runs.values()], exclude, reconcile)));
+      } catch {
+        // Best effort: the notice-driven briefing still goes out below.
+      }
+
+      let briefing: string;
+      try {
+        briefing = await composeBriefing(fresh, swept);
+      } catch {
+        // Composing reads run dirs and probes herdr; if that fails the orchestrator
+        // must still be told something, or the event is silently lost.
+        briefing = fallbackBriefing(fresh, swept);
+      }
+
+      // Record what we just briefed so later duplicate notices are swallowed.
+      for (const n of fresh) {
+        const rec = runs.get(n.runId);
+        if (rec && rec.status !== "running") briefedFinishedRunIds.add(n.runId);
+      }
+      for (const r of swept) {
+        briefedFinishedRunIds.add(r.runId);
+      }
+
+      try {
+        // deliverAs "steer", not "followUp" — and the distinction is the whole
+        // reason a finished child used to be invisible until the orchestrator was
+        // completely done. pi's agent loop drains the two queues from
+        // structurally different places (`agent-loop.js`, measured against
+        // pi-agent-core 0.99.2):
+        //
+        //   inner loop, every turn:  pendingMessages = getSteeringMessages()
+        //   outer loop, after the inner `while` exits:  getFollowUpMessages()
+        //
+        // The inner loop runs `while (hasMoreToolCalls || pendingMessages.length)`.
+        // So a follow-up is only collected once the orchestrator has stopped
+        // calling tools altogether — i.e. when its turn is already over. An
+        // orchestrator that delegates and then keeps working (reads a file, greps,
+        // spawns a sibling) pauses for each tool result *inside* that inner loop,
+        // where the follow-up queue is never consulted, so the briefing sat there
+        // until the turn ended on its own. That is the bug: not a late wake, a
+        // structurally unreachable one.
+        //
+        // Steering is drained after the current assistant message's tool results
+        // are already in context and before the next LLM call, so it cuts into the
+        // tool-call chain at the first safe boundary without ever splitting a
+        // tool_call/tool_result pair. Cutting in is the point — a subagent's result
+        // is new information that should redirect the loop, not wait politely
+        // behind the work it invalidates.
+        //
+        // This does not change the idle path at all: `deliverAs` is only consulted
+        // when `isStreaming` is true (`agent-session.js` `prompt()`), and when the
+        // session is idle this still starts a fresh turn exactly as before.
+        //
+        // `steeringMode` is set to "all" in agent/settings.json, so if two
+        // briefings ever land in the steering queue simultaneously (e.g. the
+        // second flush fires while the orchestrator is still responding to the
+        // first), both drain into the same next turn as one consolidated response.
+        //
+        // `expandPromptTemplates` is deliberately omitted rather than passed as
+        // false: false is already the default. The briefing always starts with "[",
+        // so it could never be taken for a slash command anyway.
+        pi.sendUserMessage(briefing, { deliverAs: "steer" });
+      } catch {
+        // The runtime went away under us. The run's state is on disk either way,
+        // so the next `status`/`result` still reports it correctly.
+      }
+    });
   };
 
   /**
@@ -1012,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
     pending.push(notice);
     if (coalesceTimer) clearTimeout(coalesceTimer);
     coalesceTimer = setTimeout(() => {
-      void flushNotices();
+      flushNotices();
     }, NOTICE_COALESCE_MS);
 
     return { action: "handled" as const };
