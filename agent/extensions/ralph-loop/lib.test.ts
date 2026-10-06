@@ -6,7 +6,11 @@
  * agent that quotes its own instructions, a goal that starts with a slash, and
  * flag values that are not numbers.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	COMPLETION_TAIL_CHARS,
 	DEFAULT_MAX_ITERATIONS,
@@ -30,9 +34,15 @@ import {
 	renderOpening,
 	statusLine,
 	stopMessage,
+	decideVerificationTransition,
+	nextVerificationRound,
+	renderExtensionQuestion,
+	type VerificationSource,
+	type VerificationTransition,
 } from "./lib.js";
 import { parseRuntimeVerdict, renderRuntimePrompt } from "./runtime-gate.js";
 import { withChainEnv } from "./gate.js";
+import { resolveGateAgent } from "./gate-agent.js";
 import { CHAIN_ENV } from "../model-fallback/lib.js";
 import {
 	REFERENCE_IMAGE,
@@ -1198,5 +1208,247 @@ describe("withChainEnv", () => {
 	test("passes the spawn's result through", async () => {
 		expect(await withChainEnv(["a/1", "b/2"], true, async () => 42)).toBe(42);
 		expect(await withChainEnv(undefined, false, async () => "x")).toBe("x");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// resolveGateAgent — the shared gate resolution seam (gate-agent.ts)
+// ---------------------------------------------------------------------------
+
+describe("resolveGateAgent", () => {
+	let agentRoot: string;
+	let originalAgentDir: string | undefined;
+
+	beforeEach(async () => {
+		agentRoot = await mkdtemp(join(tmpdir(), "gate-agent-test-"));
+		originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentRoot;
+	});
+
+	afterEach(async () => {
+		if (originalAgentDir === undefined) {
+			delete process.env.PI_CODING_AGENT_DIR;
+		} else {
+			process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		}
+		await rm(agentRoot, { recursive: true, force: true });
+	});
+
+	function writeAgent(name: string, body: string) {
+		mkdirSync(join(agentRoot, "agents"), { recursive: true });
+		writeFileSync(join(agentRoot, "agents", `${name}.md`), body, "utf8");
+	}
+
+	test("resolves model, chain, tools and prompt body from the definition", async () => {
+		writeAgent("gate-x", [
+			"---",
+			"name: gate-x",
+			"description: test agent",
+			"tools: read, bash",
+			"model: openai/gpt-test",
+			"fallback_models: anthropic/claude-test",
+			"---",
+			"",
+			"You are a test gate.",
+			"",
+		].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-x", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r.model).toBe("openai/gpt-test");
+		expect(r.chain).toEqual(["openai/gpt-test", "anthropic/claude-test"]);
+		expect(r.tools).toEqual(["read", "bash"]);
+		expect(r.promptBody).toBe("You are a test gate.");
+	});
+
+	test("falls back to the caller's model when the definition declares none", async () => {
+		writeAgent("gate-y", ["---", "name: gate-y", "description: d", "---", "body"].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-y", fallbackModel: "fb/model", defaultTools: ["read", "grep"] });
+		expect(r.model).toBe("fb/model");
+		expect(r.chain).toBeUndefined();
+		expect(r.tools).toEqual(["read", "grep"]);
+		expect(r.promptBody).toBe("body");
+	});
+
+	test("falls back to the caller's default tools when the definition declares none", async () => {
+		writeAgent("gate-z", ["---", "name: gate-z", "description: d", "model: p/m", "---", ""].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-z", fallbackModel: "fb/model", defaultTools: ["find", "ls"] });
+		expect(r.tools).toEqual(["find", "ls"]);
+	});
+
+	test("returns all defaults when the file is missing", async () => {
+		const r = await resolveGateAgent({ name: "missing-agent", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r).toEqual({ model: "fb/model", tools: ["read"], promptBody: "" });
+	});
+
+	test("returns all defaults for a definition with no frontmatter", async () => {
+		writeAgent("gate-bad", "no frontmatter here\n");
+		const r = await resolveGateAgent({ name: "gate-bad", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r).toEqual({ model: "fb/model", tools: ["read"], promptBody: "" });
+	});
+
+	test("chain is undefined when the declaration yields a single model", async () => {
+		writeAgent("gate-one", ["---", "name: gate-one", "description: d", "model: p/m", "fallback_models: p/m", "---", ""].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-one", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r.model).toBe("p/m");
+		expect(r.chain).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Verification transition policy (decideVerificationTransition, etc.)
+// ---------------------------------------------------------------------------
+
+describe("decideVerificationTransition", () => {
+	function makeState(overrides: Partial<LoopState> = {}): LoopState {
+		return {
+			task: "do the thing",
+			maxIterations: 10,
+			promise: "DONE",
+			ultrawork: false,
+			verify: "static",
+			iteration: 0,
+			stallCount: 0,
+			lastFingerprint: undefined,
+			stopping: false,
+			awaitingDecision: false,
+			dispatchedAt: undefined,
+			nudged: false,
+			verifying: false,
+			verifyPhase: undefined,
+			verifications: 1,
+			maxVerifications: DEFAULT_MAX_VERIFICATIONS,
+			...overrides,
+		};
+	}
+
+	test("approve → stop complete", () => {
+		const t = decideVerificationTransition(makeState(), { verdict: "approve", findings: "" }, "static");
+		expect(t).toEqual({ kind: "stop", reason: "complete" });
+	});
+
+	test("inconclusive with reason → stop verification-inconclusive + notice", () => {
+		const t = decideVerificationTransition(makeState(), { verdict: "inconclusive", findings: "", reason: "timeout" }, "static");
+		expect(t).toEqual({ kind: "stop", reason: "verification-inconclusive", notice: "Audit inconclusive: timeout" });
+	});
+
+	test("inconclusive without reason → stop verification-inconclusive, no notice", () => {
+		const t = decideVerificationTransition(makeState(), { verdict: "inconclusive", findings: "" }, "runtime");
+		expect(t).toEqual({ kind: "stop", reason: "verification-inconclusive", notice: undefined });
+	});
+
+	test("inconclusive notice uses 'Runtime check' for runtime source", () => {
+		const t = decideVerificationTransition(makeState(), { verdict: "inconclusive", findings: "", reason: "no image" }, "runtime");
+		expect(t).toEqual({ kind: "stop", reason: "verification-inconclusive", notice: "Runtime check inconclusive: no image" });
+	});
+
+	test("reject + stall ceiling → stop stalled", () => {
+		const t = decideVerificationTransition(makeState({ stallCount: STALL_LIMIT }), { verdict: "reject", findings: "x" }, "static");
+		expect(t).toEqual({ kind: "stop", reason: "stalled" });
+	});
+
+	test("reject + verification ceiling → stop verification-limit + notice", () => {
+		const t = decideVerificationTransition(
+			makeState({ verifications: 3, maxVerifications: 3 }),
+			{ verdict: "reject", findings: "x" },
+			"static",
+		);
+		expect(t).toEqual({ kind: "stop", reason: "verification-limit", notice: "The final completion claim was rejected." });
+	});
+
+	test("reject + iteration ceiling → ask-extension", () => {
+		const t = decideVerificationTransition(makeState({ iteration: 10, maxIterations: 10 }), { verdict: "reject", findings: "x" }, "static");
+		expect(t).toEqual({ kind: "ask-extension", cause: "rejected" });
+	});
+
+	test("reject + all budgets remaining → continue-after-rejection", () => {
+		const t = decideVerificationTransition(makeState({ iteration: 2 }), { verdict: "reject", findings: "the bug" }, "static");
+		expect(t.kind).toBe("continue-after-rejection");
+		if (t.kind === "continue-after-rejection") {
+			expect(t.nextIteration).toBe(3);
+			expect(t.notice).toBe("Audit rejected the claim — sending findings back.");
+			expect(t.prompt).toContain("[RALPH AUDIT REJECTED 1/3]");
+			expect(t.prompt).toContain("the bug");
+		}
+	});
+
+	test("reject + runtime source → runtime notice and prompt framing", () => {
+		const t = decideVerificationTransition(makeState({ iteration: 1 }), { verdict: "reject", findings: "exit 1" }, "runtime");
+		expect(t.kind).toBe("continue-after-rejection");
+		if (t.kind === "continue-after-rejection") {
+			expect(t.notice).toBe("The project's checks failed — sending the output back.");
+			expect(t.prompt).toContain("[RALPH RUNTIME CHECK FAILED 1/3]");
+			expect(t.prompt).toContain("exit 1");
+		}
+	});
+
+	test("precedence: stall ceiling wins over verification ceiling", () => {
+		const t = decideVerificationTransition(
+			makeState({ stallCount: STALL_LIMIT, verifications: 5, maxVerifications: 5 }),
+			{ verdict: "reject", findings: "x" },
+			"static",
+		);
+		expect(t).toEqual({ kind: "stop", reason: "stalled" });
+	});
+
+	test("precedence: verification ceiling wins over iteration ceiling", () => {
+		const t = decideVerificationTransition(
+			makeState({ verifications: 3, maxVerifications: 3, iteration: 10, maxIterations: 10 }),
+			{ verdict: "reject", findings: "x" },
+			"static",
+		);
+		expect(t).toEqual({ kind: "stop", reason: "verification-limit", notice: "The final completion claim was rejected." });
+	});
+});
+
+describe("nextVerificationRound", () => {
+	test("returns next count and budget label", () => {
+		const state = {
+			verifications: 2,
+			maxVerifications: 5,
+		} as LoopState;
+		const r = nextVerificationRound(state);
+		expect(r.verifications).toBe(3);
+		expect(r.budgetLabel).toBe("3/5");
+	});
+
+	test("does not mutate state", () => {
+		const state = { verifications: 0, maxVerifications: 5 } as LoopState;
+		nextVerificationRound(state);
+		expect(state.verifications).toBe(0);
+	});
+});
+
+describe("renderExtensionQuestion", () => {
+	function makeState(overrides: Partial<LoopState> = {}): LoopState {
+		return {
+			task: "do the thing",
+			maxIterations: 10,
+			promise: "DONE",
+			ultrawork: false,
+			verify: "static",
+			iteration: 10,
+			stallCount: 0,
+			lastFingerprint: undefined,
+			stopping: false,
+			awaitingDecision: false,
+			dispatchedAt: undefined,
+			nudged: false,
+			verifying: false,
+			verifyPhase: undefined,
+			verifications: 1,
+			maxVerifications: 5,
+			...overrides,
+		};
+	}
+
+	test("no-claim cause mentions missing tag", () => {
+		const msg = renderExtensionQuestion(makeState({ iteration: 10 }), "no-claim");
+		expect(msg).toContain("10 iterations without <promise>DONE</promise>");
+		expect(msg).toContain(`Run another ${DEFAULT_MAX_ITERATIONS}?`);
+	});
+
+	test("rejected cause mentions the audit rejection", () => {
+		const msg = renderExtensionQuestion(makeState({ iteration: 7 }), "rejected");
+		expect(msg).toContain("7 iterations; the audit rejected the last completion claim.");
+		expect(msg).toContain(`Run another ${DEFAULT_MAX_ITERATIONS}?`);
 	});
 });

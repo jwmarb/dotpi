@@ -26,16 +26,11 @@
  *
  * @module ralph-loop/gate
  */
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeFile, mkdtemp } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { parseAgentFile } from "../lib/agents.js";
-import { agentsDir } from "../lib/layout.js";
-// The chain rule and the router id are owned by the modules that define them:
-// one parser per format, so the gate cannot drift from the launcher.
-import { childFallbackChain } from "../subagent-herdr/lib.js";
+import { resolveGateAgent } from "./gate-agent.js";
 import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
 	VERIFY_TIMEOUT_MS,
@@ -91,50 +86,9 @@ export async function withChainEnv<T>(
 /** Tools the gate child is allowed, when the agent definition declares none. */
 const DEFAULT_GATE_TOOLS = ["read", "grep", "find", "ls", "bash"];
 
-/**
- * Resolve the gate's model, chain and tools from its agent definition.
- *
- * Read from `agent/agents/<name>.md` so the gate tracks the fleet definition
- * rather than duplicating a model id. Falls back rather than throwing: a
- * missing or malformed definition must not take the loop down.
- *
- * ## Why a chain and not just a model
- *
- * The gate is an agent like any other, and the goal is that *any* agent which
- * errors moves to its next fallback. This resolver read `info.model` alone, so
- * the oracle's two declared `fallback_models` were inert here: a gate audit on
- * an erroring provider burned pi's retry budget against one dead model and
- * returned `inconclusive`, which stops the loop. The chain is handed to the
- * child the same way a subagent gets one (`PI_FALLBACK_CHAIN` plus
- * `--model fallback/auto`), so one declaration covers the launcher, a running
- * subagent, and now the gate.
- *
- * @param name Agent name, e.g. `oracle`.
- * @param fallbackModel Model to use when the definition yields none.
- */
-export async function resolveGateAgent(
-	name: string,
-	fallbackModel: string,
-): Promise<{ model: string; chain?: string[]; tools: string[]; promptBody: string }> {
-	try {
-		const file = join(agentsDir(), `${name}.md`);
-		const content = await readFile(file, "utf8");
-		const info = parseAgentFile(content, `${name}.md`);
-		if (info) {
-			return {
-				model: info.model ?? fallbackModel,
-				// `undefined` when the definition declares no usable chain, which
-				// leaves the launch byte-identical to pre-feature.
-				chain: childFallbackChain(undefined, info),
-				tools: info.tools?.length ? info.tools : DEFAULT_GATE_TOOLS,
-				promptBody: info.promptBody,
-			};
-		}
-	} catch {
-		// Fall through to defaults.
-	}
-	return { model: fallbackModel, tools: DEFAULT_GATE_TOOLS, promptBody: "" };
-}
+// The gate's model/chain/tools/prompt resolution lives in `gate-agent.ts`,
+// shared with the runtime gate; `DEFAULT_GATE_TOOLS` above stays here because
+// it is gate-specific policy, not shared knowledge.
 
 /** Capture of the repository state a loop started from. */
 export interface Baseline {
@@ -205,10 +159,11 @@ export async function runGate(
 	pi: ExtensionAPI,
 	req: GateRequest,
 ): Promise<VerificationResult> {
-	const { model, chain, tools, promptBody } = await resolveGateAgent(
-		req.agent,
-		req.fallbackModel,
-	);
+	const { model, chain, tools, promptBody } = await resolveGateAgent({
+		name: req.agent,
+		fallbackModel: req.fallbackModel,
+		defaultTools: DEFAULT_GATE_TOOLS,
+	});
 
 	let dir: string;
 	try {

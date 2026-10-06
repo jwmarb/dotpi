@@ -28,13 +28,11 @@
  *
  * @module ralph-loop/runtime-gate
  */
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { parseAgentFile } from "../lib/agents.js";
-import { agentsDir } from "../lib/layout.js";
-import { childFallbackChain } from "../subagent-herdr/lib.js";
+import { resolveGateAgent } from "./gate-agent.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { withChainEnv } from "./gate.js";
 import {
@@ -241,26 +239,11 @@ export async function runRuntimeGate(
 	pi: ExtensionAPI,
 	req: RuntimeGateRequest,
 ): Promise<VerificationResult> {
-	let model = RUNTIME_FALLBACK_MODEL;
-	let chain: string[] | undefined;
-	let tools = DEFAULT_RUNTIME_TOOLS;
-	let promptBody = "";
-	try {
-		const content = await readFile(join(agentsDir(), `${RUNTIME_AGENT}.md`), "utf8");
-		const info = parseAgentFile(content, `${RUNTIME_AGENT}.md`);
-		if (info) {
-			model = info.model ?? RUNTIME_FALLBACK_MODEL;
-			// The verifier's own `fallback_models`, in the same second role the
-			// launcher and the static gate give it: a provider error mid-audit hops
-			// instead of burning the retry budget on one dead model and returning
-			// `inconclusive`, which stops the loop.
-			chain = childFallbackChain(undefined, info);
-			tools = info.tools?.length ? info.tools : DEFAULT_RUNTIME_TOOLS;
-			promptBody = info.promptBody;
-		}
-	} catch {
-		// Defaults stand.
-	}
+	const { model, chain, tools, promptBody } = await resolveGateAgent({
+		name: RUNTIME_AGENT,
+		fallbackModel: RUNTIME_FALLBACK_MODEL,
+		defaultTools: DEFAULT_RUNTIME_TOOLS,
+	});
 
 	let dir: string;
 	let promptPath: string;

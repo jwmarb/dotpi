@@ -589,6 +589,110 @@ export function renderRejection(
 	return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Verification transition policy
+// ---------------------------------------------------------------------------
+
+/** Which gate produced the verdict. */
+export type VerificationSource = "static" | "runtime";
+
+/**
+ * The pure decision of what to do after a gate verdict.
+ *
+ * The orchestration (stop, notify, dispatchPrompt, askToContinue) stays in
+ * `index.ts`; this type is the contract between the policy and the side effects.
+ */
+export type VerificationTransition =
+	| { kind: "stop"; reason: StopReason; notice?: string }
+	| { kind: "ask-extension"; cause: "rejected" }
+	| {
+		  kind: "continue-after-rejection";
+		  notice: string;
+		  prompt: string;
+		  nextIteration: number;
+		};
+
+/**
+ * Decide what happens after a gate verdict, given the current loop state.
+ *
+ * Ordering is load-bearing:
+ *  1. approve → stop complete
+ *  2. inconclusive → stop verification-inconclusive (fail-stop, not fail-open)
+ *  3. reject + stall ceiling → stop stalled
+ *  4. reject + verification ceiling → stop verification-limit
+ *  5. reject + iteration ceiling → ask for extension
+ *  6. otherwise → continue with rendered rejection prompt
+ *
+ * `state.verifications` is assumed to already include the current audit.
+ */
+export function decideVerificationTransition(
+	state: LoopState,
+	result: VerificationResult,
+	source: VerificationSource,
+): VerificationTransition {
+	if (result.verdict === "approve") {
+		return { kind: "stop", reason: "complete" };
+	}
+
+	if (result.verdict === "inconclusive") {
+		const notice = result.reason
+		  ? `${source === "runtime" ? "Runtime check" : "Audit"} inconclusive: ${result.reason}`
+		  : undefined;
+		return { kind: "stop", reason: "verification-inconclusive", notice };
+	}
+
+	// Reject
+	if (state.stallCount >= STALL_LIMIT) {
+		return { kind: "stop", reason: "stalled" };
+	}
+
+	if (state.verifications >= state.maxVerifications) {
+		return { kind: "stop", reason: "verification-limit", notice: "The final completion claim was rejected." };
+	}
+
+	if (state.iteration >= state.maxIterations) {
+		return { kind: "ask-extension", cause: "rejected" };
+	}
+
+	const notice = source === "runtime"
+		? "The project's checks failed — sending the output back."
+		: "Audit rejected the claim — sending findings back.";
+	const prompt = renderRejection(state, result.findings, source);
+	return {
+		kind: "continue-after-rejection",
+		notice,
+		prompt,
+		nextIteration: state.iteration + 1,
+	};
+}
+
+/**
+ * Compute the next verification count and budget label without mutating state.
+ * `index.ts` assigns the result before running the gates.
+ */
+export function nextVerificationRound(
+	state: LoopState,
+): { verifications: number; budgetLabel: string } {
+	const next = state.verifications + 1;
+	return { verifications: next, budgetLabel: `${next}/${state.maxVerifications}` };
+}
+
+/**
+ * Render the cap-extension question.
+ *
+ * The two causes are genuinely different situations: a rejected claim had the
+ * tag but the audit said no; a no-claim turn never had the tag at all.
+ */
+export function renderExtensionQuestion(
+	state: LoopState,
+	cause: "no-claim" | "rejected",
+): string {
+	const prefix = cause === "rejected"
+		? `${state.iteration} iterations; the audit rejected the last completion claim.\n\n`
+		: `${state.iteration} iterations without ${completionTag(state.promise)}.\n\n`;
+	return prefix + `Run another ${DEFAULT_MAX_ITERATIONS}?`;
+}
+
 /** The ultrawork intensity directive, prepended when ultrawork is on. */
 export const ULTRAWORK_DIRECTIVE = `ultrawork — MAXIMUM INTENSITY MODE
 

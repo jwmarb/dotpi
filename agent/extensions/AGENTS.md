@@ -180,13 +180,13 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
-There are now **three** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
+There are now **four** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
 reached transitively for a while but not *declared*, which left the module owning a
 cross-process grammar outside the stated scope),
-`model-fallback`'s three, and `ralph-loop`'s five (added when the gates gained a fallback
-chain — a change to a spawn argv deserves a typecheck). What matters here is what they do **not** cover: `lib/` and every
-top-level `*.ts` are in no typecheck scope at all — nothing type-checks `dynamic-prompt.ts`,
-`litellm.ts` or `firecrawl-cli.ts` but pi loading them. Beware the skew when you check one by
+`model-fallback`'s three, `ralph-loop`'s six, and the top-level `agent/extensions` scope
+(all top-level `*.ts` plus `lib/*.ts`, excluding tests). What matters here is what they do **not** cover: the
+subdirectory extensions' internal modules are each in their own scope; `auto-update/` and
+`trade-journal/` remain untyped. Beware the skew when you check one by
 hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.2,
 so typechecking against it reports phantom errors for APIs that exist only in the live
 bundle (for example `registerMcpServer`, from `core/mcp-servers.js`). 0.75.4 has

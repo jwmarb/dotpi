@@ -14,5 +14,5 @@
       "@earendil-works/*": ["../../../../../.bun/install/global/node_modules/@earendil-works/*"]
     }
   },
-  "include": ["lib.ts", "gate.ts", "image.ts", "runtime-gate.ts", "index.ts"]
+  "include": ["gate-agent.ts", "lib.ts", "gate.ts", "image.ts", "runtime-gate.ts", "index.ts"]
 }

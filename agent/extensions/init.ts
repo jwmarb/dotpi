@@ -27,6 +27,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -407,7 +408,7 @@ export default function (pi: ExtensionAPI) {
     description: "Generate a hierarchical AGENTS.md knowledge base (root + scored nested tiers)",
     getArgumentCompletions: (prefix) =>
       prefix.startsWith("--")
-        ? ["--create-new", "--max-depth="].filter((f) => f.startsWith(prefix))
+        ? ["--create-new", "--max-depth="].filter((f) => f.startsWith(prefix)).map((value): AutocompleteItem => ({ value, label: value }))
         : [],
     handler: async (args, ctx) => {
       const parsed = parseInitArgs(args);

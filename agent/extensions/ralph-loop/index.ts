@@ -40,7 +40,6 @@ import {
 	STALL_LIMIT,
 	type LoopState,
 	type StopReason,
-	completionTag,
 	detectCompletion,
 	fingerprint,
 	isProgress,
@@ -52,6 +51,10 @@ import {
 	DEFAULT_MAX_VERIFICATIONS,
 	renderRejection,
 	type VerificationResult,
+	decideVerificationTransition,
+	nextVerificationRound,
+	renderExtensionQuestion,
+	type VerificationSource,
 } from "./lib.js";
 import { type Baseline, captureBaseline, runGate } from "./gate.js";
 import { ensureImage } from "./image.js";
@@ -424,13 +427,12 @@ export default function activate(pi: ExtensionAPI): void {
 		if (!snapshot || snapshot.stopping) return;
 
 		snapshot.verifying = true;
-		snapshot.verifications += 1;
-		const budget = `${snapshot.verifications}/${snapshot.maxVerifications}`;
+		const round = nextVerificationRound(snapshot);
+		snapshot.verifications = round.verifications;
+		const budget = round.budgetLabel;
 
-		/** Act on the decisive verdict. */
-		const finish = (decided: VerificationResult, from: "static" | "runtime"): void => {
-			// `finally` above has not run yet when this is called from inside `try`,
-			// so release the latch here too; both are idempotent.
+		/** Act on the decisive verdict via the pure transition policy. */
+		const finish = (decided: VerificationResult, from: VerificationSource): void => {
 			snapshot.verifying = false;
 			snapshot.verifyPhase = undefined;
 
@@ -438,54 +440,30 @@ export default function activate(pi: ExtensionAPI): void {
 			// verdict must never stop or steer its successor.
 			if (state !== snapshot || snapshot.stopping) return;
 
-			if (decided.verdict === "approve") {
-				stop(ctx, "complete");
+			const transition = decideVerificationTransition(snapshot, decided, from);
+
+			// Remember findings for any future cap-extension re-send.
+			if (decided.verdict === "reject") {
+				lastRejection = decided.findings;
+				lastRejectionKind = from;
+			}
+
+			if (transition.kind === "stop") {
+				if (transition.notice) ctx.ui.notify(transition.notice, "warning");
+				stop(ctx, transition.reason);
 				return;
 			}
 
-			if (decided.verdict === "inconclusive") {
-				// Fail-stop, not fail-open and not fail-closed-by-looping. A broken or
-				// undecided gate must not be read as approval, and must not feed
-				// infrastructure errors back to the agent as code defects.
-				if (decided.reason) {
-					ctx.ui.notify(
-						`${from === "runtime" ? "Runtime check" : "Audit"} inconclusive: ${decided.reason}`,
-						"warning",
-					);
-				}
-				stop(ctx, "verification-inconclusive");
-				return;
-			}
-
-			// Rejected. Remember the findings so a cap-extension can re-send them.
-			lastRejection = decided.findings;
-			lastRejectionKind = from;
-
-			// The claiming turn has already been through progress accounting, so apply
-			// the normal rails before spending another iteration on it.
-			if (snapshot.stallCount >= STALL_LIMIT) {
-				stop(ctx, "stalled");
-				return;
-			}
-			if (snapshot.verifications >= snapshot.maxVerifications) {
-				ctx.ui.notify("The final completion claim was rejected.", "warning");
-				stop(ctx, "verification-limit");
-				return;
-			}
-			if (snapshot.iteration >= snapshot.maxIterations) {
+			if (transition.kind === "ask-extension") {
 				void askToContinue(ctx, "rejected");
 				return;
 			}
 
-			ctx.ui.notify(
-				from === "runtime"
-					? "The project's checks failed — sending the output back."
-					: "Audit rejected the claim — sending findings back.",
-				"warning",
-			);
-			snapshot.iteration += 1;
+			// continue-after-rejection
+			ctx.ui.notify(transition.notice, "warning");
+			snapshot.iteration = transition.nextIteration;
 			showStatus(ctx);
-			dispatchPrompt(renderRejection(snapshot, decided.findings, from));
+			dispatchPrompt(transition.prompt);
 		};
 
 		const evidence = {
@@ -630,13 +608,7 @@ export default function activate(pi: ExtensionAPI): void {
 		try {
 			extend = await ctx.ui.confirm(
 				"Ralph loop — iteration cap reached",
-				// The two causes are genuinely different situations, and saying
-				// "without <promise>DONE</promise>" when the tag WAS present but the
-				// audit rejected it would simply be false.
-				(cause === "rejected"
-					? `${snapshot.iteration} iterations; the audit rejected the last completion claim.\n\n`
-					: `${snapshot.iteration} iterations without ${completionTag(snapshot.promise)}.\n\n`) +
-					`Run another ${DEFAULT_MAX_ITERATIONS}?`,
+				renderExtensionQuestion(snapshot, cause),
 			);
 		} finally {
 			// Always released, so the flag's lifetime is bounded by this call even if

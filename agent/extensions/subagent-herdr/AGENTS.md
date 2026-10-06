@@ -44,7 +44,7 @@ bun test agent/extensions/subagent-herdr/lib.test.ts   # 137 tests
 ```
 
 Its `tsconfig.json` includes `lib.ts`, `herdr.ts`,
-`child-done.ts`, `index.ts`, `rundir.ts`; this is the only dir with a `package.json` (the other two typecheck scopes — `model-fallback/`, `ralph-loop/` — borrow this `tsc`) — dev-only
+`child-done.ts`, `index.ts`, `rundir.ts`; this is the only dir with a `package.json` (the other three typecheck scopes — `model-fallback/`, `ralph-loop/`, and the top-level `agent/extensions` scope — borrow this `tsc`) — dev-only
 (`typescript`, `@types/node`); pi loads `index.ts` directly and needs none of it at
 runtime. Run it from here with the local binary:
 

@@ -216,7 +216,15 @@ export function parseAgentFile(content: string, fileName: string): AgentInfo | n
   };
 }
 
-/** Single scalar frontmatter value (`key: value`, first match). */
+/**
+ * Single scalar frontmatter value (`key: value`, first match).
+ *
+ * Deliberately does NOT strip surrounding quotes or fold block scalars: agent
+ * files (`agents/*.md`) never quote scalar values, and adding those rules here
+ * would silently widen the grammar the spawn path parses. The SKILL.md-specific
+ * reader — `extractSkillString` in `subagent-herdr/lib.ts`, which does strip
+ * quotes and fold `|`/`>` blocks — owns the wider format; do not merge the two.
+ */
 function extractString(yaml: string, key: string): string {
   const match = yaml.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
   return match ? match[1].trim() : "";

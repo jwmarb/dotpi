@@ -765,11 +765,12 @@ export async function collectFinished(
 // ---------------------------------------------------------------------------
 
 /**
- * Renders one completed run's block: header, answer, diagnostics, reports.
- * The caller must have already called `reconcile` on the record.
+ * Pushes one completed run's block (header, answer, diagnostics, reports)
+ * onto the caller's output array. The caller must have already called
+ * `reconcile` on the record.
  */
-async function doneBlock(rec: RunRecord): Promise<string> {
-  const out: string[] = [formatResultHeader(rec)];
+async function renderResultBlock(rec: RunRecord, out: string[]): Promise<void> {
+  out.push(formatResultHeader(rec));
   const result = await extractRunResult(dirFor(rec.runId), rec.runId);
   out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
   if (rec.status === "failed" && !result.answered) {
@@ -777,6 +778,15 @@ async function doneBlock(rec: RunRecord): Promise<string> {
     if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
   }
   await pushReports(rec, out);
+}
+
+/**
+ * Renders one completed run's block as a single string (joined with "\n").
+ * Used by the wake briefing where each block is an independent paragraph.
+ */
+async function doneBlock(rec: RunRecord): Promise<string> {
+  const out: string[] = [];
+  await renderResultBlock(rec, out);
   return out.join("\n");
 }
 
@@ -1240,14 +1250,7 @@ async function dispatchTasks(
           details[rec.runId] = { status: "running" };
           continue;
         }
-        const result = await extractRunResult(dirFor(rec.runId), rec.runId);
-        out.push(formatResultHeader(rec));
-        out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
-        if (rec.status === "failed" && !result.answered) {
-          const diag = await paneDiagnostic(rec);
-          if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
-        }
-        await pushReports(rec, out);
+        await renderResultBlock(rec, out);
         details[rec.runId] = { status: rec.status };
       }
       return { content: [{ type: "text", text: unknownNote + out.join("\n\n") }], details };

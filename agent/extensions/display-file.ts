@@ -144,6 +144,7 @@ export default function (pi: ExtensionAPI) {
 			const abs = path.isAbsolute(params.path)
 				? params.path
 				: path.resolve(ctx.cwd, params.path);
+			const opener = getOpener();
 
 			let stat: fs.Stats | null;
 			try {
@@ -154,15 +155,16 @@ export default function (pi: ExtensionAPI) {
 			if (!stat) {
 				return {
 					content: [{ type: "text", text: `Error: file not found: ${abs}` }],
+					details: { path: abs, opener: opener.command, success: false, error: "file not found" },
 				};
 			}
 			if (!stat.isFile()) {
 				return {
 					content: [{ type: "text", text: `Error: ${abs} is not a regular file` }],
+					details: { path: abs, opener: opener.command, success: false, error: "not a regular file" },
 				};
 			}
 
-			const opener = getOpener();
 			const error = await launchOpener(opener, abs);
 
 			if (error) {

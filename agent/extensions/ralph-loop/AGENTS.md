@@ -70,14 +70,16 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 
 ## CONVENTIONS (local)
 
-- **Both gates run on a fallback chain, not one model.** `resolveGateAgent` (static) and
-  the inline resolve in `runtime-gate.ts` now read the agent's `fallback_models` through
-  `childFallbackChain` and launch the headless child on `fallback/auto` with the chain in
-  `PI_FALLBACK_CHAIN`. Before this they read `info.model` alone, so the oracle's and
+- **Both gates run on a fallback chain, not one model.** `resolveGateAgent` in
+  `gate-agent.ts` — the single resolution seam shared by the static gate and the
+  runtime gate — reads the agent's `fallback_models` through
+  `childFallbackChain` and launches the headless child on `fallback/auto` with the chain in
+  `PI_FALLBACK_CHAIN`. Before the chain existed they read `info.model` alone, so the oracle's and
   verifier's declared fallbacks were inert here: a gate audit against an erroring provider
   burned pi's retry budget on one dead model and returned `inconclusive`, which **stops the
   loop**. A gate is an agent like any other, so "any agent that errors moves to its next
-  fallback" has to include it.
+  fallback" has to include it. Each gate passes its own `defaultTools` so the seam does not
+  couple the two gates' tool policy.
 - **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
   calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
   `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the

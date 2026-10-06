@@ -492,10 +492,11 @@ export interface RunResult {
  */
 export async function extractRunResult(runDir: string, runId: string): Promise<RunResult> {
   let entries: string[];
+  let sessionFile: string | undefined;
   try {
-    const file = await findSessionFile(runDir, runId);
-    if (!file) return { found: false, answered: false, text: "" };
-    const content = await readFile(file, "utf-8");
+    sessionFile = await findSessionFile(runDir, runId);
+    if (!sessionFile) return { found: false, answered: false, text: "" };
+    const content = await readFile(sessionFile, "utf-8");
     entries = content.split("\n");
   } catch {
     return { found: false, answered: false, text: "" };
@@ -548,12 +549,10 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
       .join("\n")
       .trim();
     if (text) {
-      const sessionFile = await findSessionFile(runDir, runId);
       return { found: true, answered: true, text, stopReason: m.stopReason, sessionFile };
     }
   }
 
-  const sessionFile = await findSessionFile(runDir, runId);
   return { found: true, answered: false, text: "", sessionFile };
 }
 async function findSessionFile(runDir: string, runId: string): Promise<string | undefined> {

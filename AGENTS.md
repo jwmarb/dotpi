@@ -97,12 +97,13 @@ docker build -f agent/docker/verify-base.Dockerfile \
   -t ralph-verify/base:latest agent/docker/    # the tracked verifier base image (also built on demand)
 ```
 
-Typecheck (`noEmit`) has three scopes; there is no root `tsconfig.json`:
+Typecheck (`noEmit`) has four scopes; there is no root `tsconfig.json`:
 
 ```sh
 cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions/model-fallback && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions                && subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
 
 `model-fallback` resolves `@earendil-works/*` through a `paths` entry pointing at the

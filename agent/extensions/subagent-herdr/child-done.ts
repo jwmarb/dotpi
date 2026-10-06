@@ -41,6 +41,16 @@
  * until herdr's post-exit cleanup. The parent still closes the pane as a
  * backstop when it classifies the run — a close that didn't land there must
  * not leave a ghost pane behind.
+ *
+ * ## Testability
+ *
+ * The handshake logic is factored into `createChildDoneHandshake`, which takes
+ * an effects interface. The real Node adapter (filesystem writes, detached
+ * spawn, herdr pane close) is constructed by the default export; tests supply
+ * a recording stub to verify ordering and deduplication without a live
+ * process.
+ *
+ * @module subagent-herdr/child-done
  */
 import { execFile, spawn } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
@@ -50,12 +60,57 @@ import {
   formatExitSidecar,
   formatNotice,
   formatReportLine,
-  type NoticeKind,
   reportsPath,
 } from "./rundir.js";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A minimal message shape sufficient for `endedCleanly`. */
+export type MessageLike = { role: string; stopReason?: string };
+
+/** The side effects the handshake can perform. */
+export interface ChildDoneEffects {
+  /**
+   * Write the `.exit` sidecar. Must remain synchronous: an `await` between the
+   * write and `ctx.shutdown()` is a window in which the process can exit with
+   * the sidecar unwritten.
+   */
+  writeExitSidecar(path: string, content: string): boolean;
+
+  /** Append a report line to the run's report log. */
+  appendReport(path: string, line: string): void;
+
+  /**
+   * Send a notice to the parent's pane. Must preserve detached + ignored-stdio
+   * + unref behavior so the delivery survives the child's own process-group kill.
+   */
+  sendNotice(parentPane: string, notice: string): void;
+
+  /** Fire-and-forget pane close. Never throws. */
+  closePane(paneId: string): void;
+}
+
+/** Outcome of the `complete` operation. */
+export type ChildDoneOutcome =
+  | { kind: "no-session-file" }
+  | { kind: "write-failed"; sessionFile: string }
+  | { kind: "completed"; sessionFile: string };
+
+/** Outcome of the `report` operation. */
+export type ChildReportOutcome =
+  | { kind: "no-run-dir" }
+  | { kind: "recorded-no-parent" }
+  | { kind: "delivered" };
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
 /**
  * Did this turn end cleanly enough to count as completion?
  *
@@ -65,7 +120,7 @@ import { Type } from "typebox";
  *
  * @param messages - The turn's messages, oldest first.
  */
-export function endedCleanly(messages: readonly { role: string; stopReason?: string }[]): boolean {
+export function endedCleanly(messages: readonly MessageLike[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "assistant") return false;
@@ -74,84 +129,189 @@ export function endedCleanly(messages: readonly { role: string; stopReason?: str
   return false;
 }
 
-/**
- * Closes this child's own herdr pane, fire-and-forget.
- *
- * herdr injects `HERDR_PANE_ID` into every agent it launches, so a child can
- * dismiss its own pane the instant it finishes instead of lingering until
- * herdr's post-exit cleanup. Closing the pane kills the process group, which
- * also makes `ctx.shutdown()` below a redundant safety net. Never throws:
- * a cosmetic cleanup must not be able to fail the completion handshake, and
- * the parent closes the pane again as a backstop when it classifies the run.
- */
-function closeOwnPane(): void {
-  const paneId = process.env.HERDR_PANE_ID;
-  if (process.env.HERDR_ENV !== "1" || !paneId) return;
-  execFile("herdr", ["pane", "close", paneId], { timeout: 5000 }, () => {});
-}
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
 
 /**
- * Wakes the orchestrator by typing a notice into its pane.
+ * Create the child-done handshake with injected effects.
  *
- * This is the whole child → orchestrator channel. The orchestrator no longer
- * sits in a blocking wait, so it is *idle* when this lands — and an idle pi
- * treats an incoming prompt as a new turn. That is the point: a sleeping
- * orchestrator is woken by the notice rather than discovering it whenever a
- * blocking call happened to return.
+ * Holds the `signalled` deduplication flag. The three methods encode the
+ * exact ordering: sidecar write → notice → pane close → shutdown.
  *
- * Fire-and-forget on purpose. A report must never wedge the child's turn on a
- * slow delivery, and a `done` notice must never delay the shutdown that
- * follows it: the `.exit` sidecar is the durable record of completion, so a
- * notice that fails to land costs the orchestrator promptness, never the
- * result.
- *
- * @param kind - `report` for a mid-run message, `done` for completion.
- * @param message - Body text; omitted for a bare `done`.
- * @returns Whether a parent pane was known to deliver to.
+ * @param effects The side effects to perform.
+ * @param env The process environment (for `HERDR_PANE_ID`, `HERDR_ENV`,
+ *   `PI_SUBAGENT_PARENT_PANE`, `PI_SUBAGENT_RUN_ID`, `PI_SUBAGENT_AGENT`).
  */
-function notifyParent(kind: NoticeKind, message = ""): boolean {
-  const parentPane = process.env.PI_SUBAGENT_PARENT_PANE;
-  if (!parentPane) return false;
-  const runId = process.env.PI_SUBAGENT_RUN_ID ?? "unknown";
-  const agent = process.env.PI_SUBAGENT_AGENT ?? "subagent";
-  // `spawn` rather than `execFile`, detached and unref'd, because the `done`
-  // notice races its own sender's death: `closeOwnPane()` kills this child's
-  // *process group*, and a delivery still in flight would go with it — the
-  // orchestrator would then sleep until a human poked it, which is the bug this
-  // channel exists to fix. `detached` puts the delivery in its own process group
-  // so it survives that kill; `unref` plus ignored stdio means it holds neither
-  // the event loop nor a pipe to a process that is about to exit. (`detached` is
-  // a spawn option; `execFile` does not accept it.)
-  const child = spawn(
-    "herdr",
-    ["agent", "prompt", parentPane, formatNotice(runId, agent, kind, message)],
-    { detached: true, stdio: "ignore" },
-  );
-  // A missing `herdr` binary emits 'error' asynchronously; unhandled, that is an
-  // uncaught exception that would take the child down on its way out.
-  child.on("error", () => {});
-  child.unref();
-  return true;
-}
-
-export default function (pi: ExtensionAPI) {
+export function createChildDoneHandshake(
+  effects: ChildDoneEffects,
+  env: NodeJS.ProcessEnv,
+): {
+  complete(
+    sessionFile: string | undefined,
+    shutdown: () => void,
+  ): ChildDoneOutcome;
+  report(
+    message: string,
+    runDir: string | undefined,
+  ): ChildReportOutcome;
+  onAgentEnd(
+    messages: readonly MessageLike[],
+    sessionFile: string | undefined,
+    shutdown: () => void,
+  ): void;
+} {
   /** Written at most once: a second sidecar would tell the parent nothing new. */
   let signalled = false;
 
-  /**
-   * Synchronous on purpose: the tool path calls this immediately before
-   * `ctx.shutdown()`, and an `await` between the write and the shutdown is a
-   * window in which the process can exit with the sidecar unwritten — which
-   * the parent would read as a run that died without finishing.
-   */
-  const writeSidecar = (sessionFile: string): boolean => {
-    try {
-      writeFileSync(exitPath(sessionFile), formatExitSidecar());
-      return true;
-    } catch {
-      return false;
+  function complete(
+    sessionFile: string | undefined,
+    shutdown: () => void,
+  ): ChildDoneOutcome {
+    if (!sessionFile) return { kind: "no-session-file" };
+
+    const written = signalled || effects.writeExitSidecar(
+      exitPath(sessionFile),
+      formatExitSidecar(),
+    );
+    signalled = true;
+
+    if (!written) return { kind: "write-failed", sessionFile };
+
+    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
+    if (parentPane) {
+      effects.sendNotice(
+        parentPane,
+        formatNotice(
+          env.PI_SUBAGENT_RUN_ID ?? "unknown",
+          env.PI_SUBAGENT_AGENT ?? "subagent",
+          "done",
+          "",
+        ),
+      );
     }
+    closePane();
+    shutdown();
+    return { kind: "completed", sessionFile };
+  }
+
+  function report(
+    message: string,
+    runDir: string | undefined,
+  ): ChildReportOutcome {
+    if (!runDir) return { kind: "no-run-dir" };
+
+    try {
+      effects.appendReport(reportsPath(runDir), formatReportLine(message));
+    } catch {
+      // fall through: delivery still happens
+    }
+
+    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
+    if (!parentPane) return { kind: "recorded-no-parent" };
+
+    effects.sendNotice(
+      parentPane,
+      formatNotice(
+        env.PI_SUBAGENT_RUN_ID ?? "unknown",
+        env.PI_SUBAGENT_AGENT ?? "subagent",
+        "report",
+        message,
+      ),
+    );
+    return { kind: "delivered" };
+  }
+
+  function onAgentEnd(
+    messages: readonly MessageLike[],
+    sessionFile: string | undefined,
+    shutdown: () => void,
+  ): void {
+    if (signalled) return;
+    if (!endedCleanly(messages)) return;
+    if (!sessionFile) return;
+
+    signalled = effects.writeExitSidecar(
+      exitPath(sessionFile),
+      formatExitSidecar(),
+    );
+    if (signalled) {
+      const parentPane = env.PI_SUBAGENT_PARENT_PANE;
+      if (parentPane) {
+        effects.sendNotice(
+          parentPane,
+          formatNotice(
+            env.PI_SUBAGENT_RUN_ID ?? "unknown",
+            env.PI_SUBAGENT_AGENT ?? "subagent",
+            "done",
+            "",
+          ),
+        );
+      }
+      closePane();
+      shutdown();
+    }
+  }
+
+  function closePane(): void {
+    const paneId = env.HERDR_PANE_ID;
+    if (env.HERDR_ENV !== "1" || !paneId) return;
+    effects.closePane(paneId);
+  }
+
+  return { complete, report, onAgentEnd };
+}
+
+// ---------------------------------------------------------------------------
+// Real Node adapter
+// ---------------------------------------------------------------------------
+
+function createNodeEffects(): ChildDoneEffects {
+  return {
+    writeExitSidecar(path, content) {
+      try {
+        writeFileSync(path, content);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    appendReport(path, line) {
+      appendFileSync(path, line);
+    },
+
+    sendNotice(parentPane, notice) {
+      // `spawn` rather than `execFile`, detached and unref'd, because the `done`
+      // notice races its own sender's death: `closePane()` kills this child's
+      // *process group*, and a delivery still in flight would go with it — the
+      // orchestrator would then sleep until a human poked it, which is the bug
+      // this channel exists to fix. `detached` puts the delivery in its own
+      // process group so it survives that kill; `unref` plus ignored stdio
+      // means it holds neither the event loop nor a pipe to a process that is
+      // about to exit.
+      const child = spawn(
+        "herdr",
+        ["agent", "prompt", parentPane, notice],
+        { detached: true, stdio: "ignore" },
+      );
+      child.on("error", () => {});
+      child.unref();
+    },
+
+    closePane(paneId) {
+      execFile("herdr", ["pane", "close", paneId], { timeout: 5000 }, () => {});
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pi extension wiring
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  const effects = createNodeEffects();
+  const handshake = createChildDoneHandshake(effects, process.env);
 
   pi.registerTool({
     name: "subagent_done",
@@ -169,53 +329,37 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile) {
-        // No session means no sidecar path and no transcript to read an answer
-        // from. Refuse rather than shut down: an error keeps the run alive and
-        // explains itself, whereas a vanished child tells the parent nothing.
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: this session has no session file, so completion cannot be reported. The run was probably started without --session-dir/--session-id.",
-            },
-          ],
-          details: {},
-        };
-      }
+      const outcome = handshake.complete(sessionFile, () => ctx.shutdown());
 
-      const written = signalled || writeSidecar(sessionFile);
-      signalled = true;
-      if (!written) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: could not write the completion marker beside ${sessionFile}. Not shutting down, because the orchestrator would read that as a run that died mid-task. Report your answer in a final message instead.`,
-            },
-          ],
-          details: {},
-        };
+      switch (outcome.kind) {
+        case "no-session-file":
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: this session has no session file, so completion cannot be reported. The run was probably started without --session-dir/--session-id.",
+              },
+            ],
+            details: {},
+          };
+        case "write-failed":
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: could not write the completion marker beside ${outcome.sessionFile}. Not shutting down, because the orchestrator would read that as a run that died mid-task. Report your answer in a final message instead.`,
+              },
+            ],
+            details: {},
+          };
+        case "completed":
+          return {
+            content: [{ type: "text", text: "Reported completion; closing this session." }],
+            details: {},
+          };
       }
-
-      // Wake the orchestrator, *then* tear down. The notice is what turns a
-      // finished child into a live orchestrator turn; the sidecar it already
-      // wrote is the durable fallback if the notice never lands.
-      notifyParent("done");
-      // Sidecar on disk, parent notified, pane dismissed, *then* shut down (the
-      // pane close already kills the process group; this covers a close that
-      // didn't land).
-      closeOwnPane();
-      ctx.shutdown();
-      return {
-        content: [{ type: "text", text: "Reported completion; closing this session." }],
-        details: {},
-      };
     },
   });
-  // -------------------------------------------------------------------------
-  // subagent_report — the child → orchestrator leg of mid-run communication
-  // -------------------------------------------------------------------------
 
   pi.registerTool({
     name: "subagent_report",
@@ -225,7 +369,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet:
       "Send a mid-run message (status, blocker, finding) to the orchestrator while you keep working.",
     promptGuidelines: [
-      "Use subagent_report for mid-run communication only: a status checkpoint, a blocker you cannot resolve, a decision the orchestrator should make, or a finding it should know about before your run ends.",
+      "Use subagent_report for mid-run communication only: a status checkpoint, a blocker you cannot resolve, a decision you need the orchestrator to make, or a finding it should know about before your run ends.",
       "A report does not block your run — keep working after sending one; the orchestrator may reply, and the reply arrives here as a normal message in this session.",
       "Your final answer is your final message, not a report. Never restate your answer in a report.",
     ],
@@ -235,48 +379,35 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const runDir = process.env.PI_SUBAGENT_RUN_DIR;
-      if (!runDir) {
-        return {
-          content: [{ type: "text", text: "Error: PI_SUBAGENT_RUN_DIR is not set; the report cannot be recorded." }],
-          details: {},
-        };
-      }
+      const outcome = handshake.report(params.message, runDir);
 
-      // Record first: the log is durable even when delivery is not (the
-      // orchestrator's pane may be in a dialog, or gone).
-      try {
-        appendFileSync(reportsPath(runDir), formatReportLine(params.message));
-      } catch {
-        // fall through: delivery still happens
+      switch (outcome.kind) {
+        case "no-run-dir":
+          return {
+            content: [{ type: "text", text: "Error: PI_SUBAGENT_RUN_DIR is not set; the report cannot be recorded." }],
+            details: {},
+          };
+        case "recorded-no-parent":
+          return {
+            content: [
+              { type: "text", text: "Report recorded; no parent pane is known, so the orchestrator will pick it up on its next task check." },
+            ],
+            details: {},
+          };
+        case "delivered":
+          return {
+            content: [{ type: "text", text: "Report sent to the orchestrator." }],
+            details: {},
+          };
       }
-
-      if (!notifyParent("report", params.message)) {
-        return {
-          content: [
-            { type: "text", text: "Report recorded; no parent pane is known, so the orchestrator will pick it up on its next task check." },
-          ],
-          details: {},
-        };
-      }
-      return {
-        content: [{ type: "text", text: "Report sent to the orchestrator." }],
-        details: {},
-      };
     },
   });
 
-  // The second signal: a child that finished talking is finished, whether or
-  // not it remembered the tool.
   pi.on("agent_end", (event, ctx) => {
-    if (signalled) return;
-    if (!endedCleanly(event.messages as { role: string; stopReason?: string }[])) return;
-    const sessionFile = ctx.sessionManager.getSessionFile();
-    if (!sessionFile) return;
-    signalled = writeSidecar(sessionFile);
-    if (signalled) {
-      notifyParent("done");
-      closeOwnPane();
-      ctx.shutdown();
-    }
+    handshake.onAgentEnd(
+      event.messages as MessageLike[],
+      ctx.sessionManager.getSessionFile(),
+      () => ctx.shutdown(),
+    );
   });
 }
