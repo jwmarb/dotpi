@@ -73,7 +73,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   running child as well as a launching one. An explicit `model` on the delegation call
   suppresses both: the caller pinned it. See `extensions/model-fallback/AGENTS.md`. Recon
   agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
-  `librarian` on `qwen3.8-27b`, `summarizer` on `deepseek-v4-flash`. A model reference here
+  `librarian` on `occamy-1.0`, `summarizer` on `deepseek-v4-flash`. A model reference here
   must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
   unreachable *tail* degrades a running child, so verify against
   `/model_group/info` rather than by eye.

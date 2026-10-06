@@ -3,7 +3,7 @@ name: librarian
 description: Read-only external research. Looks up library/API documentation on the web, and when the docs are thin or wrong, reads the dependency's own source or proves its behaviour by running it. Returns verified signatures and caveats.
 tools: bash, read_skill, subagent, subagent_tasks
 skills: scrape-web-as-markdown
-model: qwen/qwen3.8-27b
+model: accio-lab/occamy-1.0
 fallback_models: deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
 ---
 

@@ -33,25 +33,25 @@
 
   "model": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-27b",
+    "id": "accio-lab/occamy-1.0",
     "thinking": "low",
     "contextWindow": 262144
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-27b",
+    "id": "accio-lab/occamy-1.0",
     "thinking": "low",
     "contextWindow": 262144
   },
   "reflectorModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-27b",
+    "id": "accio-lab/occamy-1.0",
     "thinking": "xhigh",
     "contextWindow": 262144
   },
   "dropperModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-27b",
+    "id": "accio-lab/occamy-1.0",
     "thinking": "low",
     "contextWindow": 262144
   },
