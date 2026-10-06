@@ -91,7 +91,44 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
   with) is built from the agents actually in `agentInventory`, so an install missing one names
   only the other, and one missing both omits the section entirely. The verifier-only
   image-tag caveat is nested inside that same gate, because container guidance for an absent
-  agent is the identical bug one level down.
+  agent is the identical bug one level down. `## Plan Before You Implement` is gated the
+  same way on `planner`, and its grading paragraph is nested one level further inside the
+  grader gate — a section promising a review that no present agent can perform is the same
+  unobeyable instruction. When the planner is absent the two numbered planning steps (Core
+  Responsibilities 2, Decision Framework 3) fall back to their generic wording, because a
+  step pointing at a section that was never emitted is a dangling reference. All three agent
+  sections carry a **second** conjunct: `hasSubagent`. `agentInventory` is read off
+  `agents/*.md` on disk and says nothing about whether `subagent-herdr` loaded (it imports
+  `../model-fallback/lib.js` and typebox; the documented signature when that resolution
+  breaks is a silent load failure), so without it a session with no spawn tool still got a
+  prompt mandating delegation. A roster is not a capability unless the tool that spawns it
+  exists.
+- **The planner and the graders are one rule, stated in two places on purpose.**
+  `## Plan Before You Implement` pushes multi-file/multi-step work through `planner` (a skip
+  is allowed but must be *named*, the same stance the skill catalogue takes) and declares
+  that a `planner` plan obliges a `reviewer`+`verifier` pass over the implementation;
+  `## Quality Pass` owns how to write those two tasks, and the planning section defers to it
+  rather than restating it. Both carve out the **same** exception — a `worker` has already
+  passed its own diff through those graders, so neither section may order a re-grade. They
+  must also agree on *conditionality*: the verifier is qualified on the change being
+  runtime-testable in Quality Pass and in `agents/worker.md`, so the planning section states
+  it as conditional too rather than absolute, or the model launches a container run for a
+  prose edit. If you change either the exemption or that condition, change it in both: the
+  contradiction is invisible at a glance because the two sections sit ~50 lines apart in the
+  builder.
+- **Every grader phrase is derived from the `graders` roster, including the number.** The
+  prose around the list ("launch them", "those two tasks", "these graders"/"these agents")
+  was hardcoded plural while the list itself was computed, so a reviewer-only or
+  verifier-only install was told to launch two agents concurrently beside a code block
+  holding one call. **Both** sections had it; the planning one was fixed first and its
+  comment then claimed the module was safe, which left the identical live bug next door
+  looking deliberate. Anything number-sensitive branches on `graders.length` (`plural`), and
+  the `ROLE` table holds each role *without* the agent's name so the name is printed exactly
+  once per sentence. `Grader` is a closed union (`'reviewer' | 'verifier'`) rather than
+  `string`, so the table must cover every member and a third grader fails to compile at the
+  one place that must be updated — the earlier `?? fallback` was unreachable and only looked
+  like safety. Note `dynamic-prompt.ts` is in **no `tsc -p` scope**, so that typing is only
+  enforced when pi loads the file or you point a hand-rolled tsconfig at it.
 - **`todo.ts` is not the old `plan` extension and must not grow into it.** `todo` is a
   different tool, and now that the stale `plan` prompt branch is deleted nothing re-arms it.
   What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a

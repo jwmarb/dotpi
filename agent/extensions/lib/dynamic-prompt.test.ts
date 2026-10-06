@@ -11,7 +11,7 @@
  * all along.
  *
  * So these assertions cross the module's real seam: the single exported
- * `buildOrchestratorPrompt`. The nine section builders stay private, and that is
+ * `buildOrchestratorPrompt`. Its section builders stay private, and that is
  * deliberate — a test that reached them would pin the implementation and would
  * not be able to pin section *ordering*, which is the thing most likely to break
  * silently when a section is added.
@@ -35,6 +35,9 @@ function build(overrides: Partial<Parameters<typeof buildOrchestratorPrompt>[0]>
     contextInventory: [],
     guidelines: [],
     hasQuestionnaire: false,
+    // True by default: the agent sections are what most of these tests are about,
+    // and a session without the spawn tool is the exception, not the baseline.
+    hasSubagent: true,
     cwd: "/work/repo",
     skillsLibrary: "/home/u/.pi/agent/skills",
     // Fixed so the footer is assertable without freezing time globally.
@@ -159,6 +162,286 @@ describe("the quality pass is gated on the grading agents existing", () => {
     const p = build({ agentInventory: [agent("reviewer"), agent("verifier")] });
     const section = p.slice(p.indexOf("## Quality Pass"), p.indexOf("Current date:"));
     expect(section).not.toContain("${");
+  });
+});
+
+describe("the planning section is gated on the planner agent existing", () => {
+  // Same gate as the questionnaire and the quality pass: a prompt that orders a
+  // delegation to an agent this install does not have is an instruction the
+  // model cannot obey. The orchestrator's weakest moment is starting to edit
+  // from a plan it holds only in its own head, so when `planner` *is* present
+  // the prompt has to push toward it rather than merely mention it.
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+
+  test("absent when the planner is not in the inventory", () => {
+    const p = build({ agentInventory: [agent("reviewer"), agent("verifier")] });
+    expect(p).not.toContain("## Plan Before You Implement");
+  });
+
+  test("absent on an empty inventory, which a fresh install hits", () => {
+    expect(build()).not.toContain("## Plan Before You Implement");
+  });
+
+  test("leaves the two generic planning steps untouched when the planner is absent", () => {
+    // Without the agent, step 3 must still read as a plain instruction rather
+    // than a dangling reference to a section that was never emitted.
+    const p = build();
+    expect(p).toContain("3. Design a step-by-step plan");
+    expect(p).toContain(
+      "2. **Plan** \u2014 Consult the skills catalogue first, then determine",
+    );
+    expect(p).not.toContain("planner");
+  });
+
+  test("present, and pushed as the default, when the planner exists", () => {
+    // "Encouraged" is the whole point: an advisory mention reads as a licence to
+    // skip, which is the failure the skills catalogue already learned once.
+    const p = build({ agentInventory: [agent("planner")] });
+    expect(p).toContain("## Plan Before You Implement");
+    expect(p).toContain("delegate the plan to `planner` before you");
+    expect(p).toContain("Name any skip");
+  });
+
+  test("rewires both numbered planning steps to route through the planner", () => {
+    // The section alone is not enough: Core Responsibilities and the Decision
+    // Framework are what the model reads first, and a step 3 still saying
+    // "design a plan" would contradict the section further down.
+    const p = build({ agentInventory: [agent("planner")] });
+    expect(p).toContain("delegate the plan to `planner` for anything beyond a trivial edit");
+    expect(p).toContain("3. Delegate the plan to `planner`");
+    expect(p).not.toContain("3. Design a step-by-step plan");
+  });
+
+  test("states the trigger scope as multi-file or multi-step, and exempts trivia", () => {
+    // The scope is a deliberate choice: routing a typo through three agents is
+    // as wrong as improvising a refactor.
+    const p = build({ agentInventory: [agent("planner")] });
+    expect(p).toContain("spans two or more files, or needs three or more steps");
+    expect(p).toContain("a typo, a one-line fix");
+  });
+
+  test("binds the planner to both graders when they exist", () => {
+    // The user-facing rule being pinned: calling `planner` obliges a review of
+    // the implementation and a runtime check that it works.
+    const p = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(p).toContain("grading obligation");
+    expect(p).toContain("graded by `reviewer` and `verifier`");
+    expect(p).toContain("`reviewer` reads the implementation for correctness");
+    expect(p).toContain("`verifier` proves it actually runs");
+  });
+
+  test("keeps the worker exemption, so a self-graded diff is not graded twice", () => {
+    // A `worker` ends its own run by handing its diff to these same two agents.
+    // Re-grading it buys a duplicate pass and nothing else, and the Quality Pass
+    // section already says so — the two must not contradict each other.
+    const p = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(p).toContain("a `worker` has passed its own diff through these graders");
+    expect(p).toContain("Grade what **you** implemented");
+  });
+
+  test("drops the grading obligation when no grader can be spawned", () => {
+    // Naming a grader this install lacks is the bug the gate exists to prevent,
+    // and here it would also promise a pass that can never run.
+    const p = build({ agentInventory: [agent("planner")] });
+    expect(p).toContain("## Plan Before You Implement");
+    expect(p).not.toContain("grading obligation");
+    expect(p).not.toContain("## Quality Pass");
+  });
+
+  test("agrees in number with a single grader, in both single-grader installs", () => {
+    // Regression: the "Launch them in one turn so they run concurrently ... those
+    // two tasks" wording was hardcoded outside the conditional, so a one-grader
+    // install was told to launch two agents concurrently when only one existed.
+    // `planner`+`verifier` is the combination that had no coverage at all.
+    for (const other of ["reviewer", "verifier"]) {
+      const p = build({ agentInventory: [agent("planner"), agent(other)] });
+      const section = p.slice(
+        p.indexOf("## Plan Before You Implement"),
+        p.indexOf("## Quality Pass"),
+      );
+      expect(section).toContain("Launch it, then end your turn");
+      expect(section).toContain("how to write that task");
+      expect(section).toContain("through this grader");
+      // The plural forms must be absent, not merely outnumbered.
+      expect(section).not.toContain("Launch them");
+      expect(section).not.toContain("they run concurrently");
+      expect(section).not.toContain("those two tasks");
+      expect(section).not.toContain("these graders");
+    }
+  });
+
+  test("uses the plural only when both graders are present", () => {
+    const p = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    const section = p.slice(
+      p.indexOf("## Plan Before You Implement"),
+      p.indexOf("## Quality Pass"),
+    );
+    expect(section).toContain("Launch them");
+    expect(section).toContain("they run concurrently");
+    expect(section).toContain("those two tasks");
+    expect(section).toContain("these graders");
+    expect(section).not.toContain("Launch it,");
+    expect(section).not.toContain("this grader");
+  });
+
+  test("pairs each grader with its own role, never the other's", () => {
+    // The roles are keyed off the roster; a mix-up would describe the verifier as
+    // reading code, or the reviewer as proving it runs. Singular omits the
+    // redundant second mention of the name — the list just named it — so the
+    // assertion is on the role text, not on a repeated backticked name.
+    const rev = build({ agentInventory: [agent("planner"), agent("reviewer")] });
+    expect(rev).toContain("graded by `reviewer` before");
+    expect(rev).toContain("it reads the implementation for correctness");
+    expect(rev).not.toContain("proves it actually runs");
+
+    const ver = build({ agentInventory: [agent("planner"), agent("verifier")] });
+    expect(ver).toContain("graded by `verifier` before");
+    expect(ver).toContain("it proves it actually runs");
+    expect(ver).not.toContain("reads the implementation for correctness");
+
+    // Only the both-graders case repeats the names, because there the roles
+    // would otherwise be ambiguous about which agent does which.
+    const both = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(both).toContain("`reviewer` reads the implementation for correctness");
+    expect(both).toContain("`verifier` proves it actually runs");
+  });
+
+  test("states the verifier's obligation as conditional, not absolute", () => {
+    // Quality Pass and `agents/worker.md` both qualify the verifier on the change
+    // being runtime-testable. The section that *introduces* the obligation must
+    // agree, or the model launches a container run for a prose edit.
+    const both = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(both).toContain("`verifier` applies only when execution can settle the change");
+    expect(both).toContain("`reviewer` always applies");
+
+    // Verifier-only still carries the caveat; reviewer-only must not, since the
+    // condition is the verifier's alone.
+    const ver = build({ agentInventory: [agent("planner"), agent("verifier")] });
+    expect(ver).toContain("`verifier` applies only when execution can settle the change");
+    expect(ver).not.toContain("always applies");
+
+    const rev = build({ agentInventory: [agent("planner"), agent("reviewer")] });
+    expect(rev).not.toContain("applies when the change");
+  });
+
+  test("leaves no dangling comma or empty clause in the role list", () => {
+    // The role list used to be two conditionals joined by a separate conditional
+    // comma — three expressions that had to agree, and the shape most likely to
+    // emit " — , and …" or a sentence starting with a comma.
+    for (const inv of [
+      [agent("planner"), agent("reviewer")],
+      [agent("planner"), agent("verifier")],
+      [agent("planner"), agent("reviewer"), agent("verifier")],
+    ]) {
+      const p = build({ agentInventory: inv });
+      const section = p.slice(
+        p.indexOf("## Plan Before You Implement"),
+        p.indexOf("## Quality Pass"),
+      );
+      expect(section).not.toContain("\u2014 ,");
+      expect(section).not.toContain(", and .");
+      expect(section).not.toContain("done \u2014 .");
+      expect(section).not.toMatch(/\n\n\n/);
+    }
+  });
+
+  test("sits between the agent table and the quality pass it defers to", () => {
+    // It names agents, so the table must precede it; it points at Quality Pass
+    // for how to write the two tasks, so that section must follow it.
+    const p = build({
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(p.indexOf("## Available Agents")).toBeLessThan(
+      p.indexOf("## Plan Before You Implement"),
+    );
+    expect(p.indexOf("## Plan Before You Implement")).toBeLessThan(p.indexOf("## Quality Pass"));
+  });
+
+  test("leaves no unexpanded template expression", () => {
+    // The section nests a conditional inside a conditional and interpolates the
+    // grader list; an escaping slip would ship literal `${...}` into every request.
+    for (const inv of [
+      [agent("planner")],
+      [agent("planner"), agent("reviewer")],
+      [agent("planner"), agent("verifier")],
+      [agent("planner"), agent("reviewer"), agent("verifier")],
+    ]) {
+      const p = build({ agentInventory: inv });
+      const section = p.slice(p.indexOf("## Plan Before You Implement"), p.indexOf("Current date:"));
+      expect(section).not.toContain("${");
+    }
+  });
+
+  test("is withheld entirely when the subagent tool is absent", () => {
+    // `agentInventory` is read off disk and says nothing about whether the
+    // extension that can *spawn* those agents loaded. A strong default ordering a
+    // delegation, with no tool to delegate with, is the house rule's exact
+    // failure mode — one level up from a missing tool to a missing spawner.
+    const p = build({
+      hasSubagent: false,
+      agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
+    });
+    expect(p).not.toContain("## Plan Before You Implement");
+    expect(p).not.toContain("## Quality Pass");
+    expect(p).not.toContain("## Available Agents");
+    expect(p).not.toContain("planner");
+    // The generic fallbacks must be what is left behind.
+    expect(p).toContain("3. Design a step-by-step plan");
+  });
+});
+
+describe("the quality pass agrees in number with its own roster", () => {
+  // The planning section was fixed for this and the comment then claimed the
+  // whole module was safe — but `## Quality Pass` consumes the same roster and
+  // had the identical hardcoded plural, so a single-grader install was told to
+  // launch "the graders" "concurrently" beside a code block holding one call.
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+
+  const qualityPass = (names: string[]) => {
+    const p = build({ agentInventory: names.map(agent) });
+    return p.slice(p.indexOf("## Quality Pass"), p.indexOf("Current date:"));
+  };
+
+  test("uses the singular for a one-grader install, in both directions", () => {
+    for (const only of ["reviewer", "verifier"]) {
+      const section = qualityPass([only]);
+      expect(section).toContain("- Launch it, then end your turn.");
+      expect(section).toContain("passed through this agent");
+      expect(section).not.toContain("Launch the graders");
+      expect(section).not.toContain("they run concurrently");
+      expect(section).not.toContain("through these agents");
+    }
+  });
+
+  test("uses the plural only when both graders exist", () => {
+    const section = qualityPass(["reviewer", "verifier"]);
+    expect(section).toContain("Launch the graders in one turn so they run concurrently");
+    expect(section).toContain("passed through these agents");
+    expect(section).not.toContain("Launch it, then end your turn.");
+    expect(section).not.toContain("through this agent");
+  });
+
+  test("emits one subagent call per grader, matching the number it describes", () => {
+    // The code block and the prose around it are built from the same roster;
+    // they must not disagree on how many calls the model should make.
+    for (const names of [["reviewer"], ["verifier"], ["reviewer", "verifier"]]) {
+      const section = qualityPass(names);
+      const calls = section.split("subagent(agent:").length - 1;
+      expect(calls).toBe(names.length);
+      expect(section.includes("Launch the graders")).toBe(names.length > 1);
+    }
   });
 });
 

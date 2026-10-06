@@ -35,6 +35,22 @@ import {
  */
 const QUESTIONNAIRE_TOOL = 'questionnaire';
 
+/**
+ * Name of the tool registered by the `subagent-herdr` extension. The agent
+ * sections are gated on it: a roster discovered on disk is not a capability
+ * unless the tool that spawns those agents is actually offered this run.
+ */
+const SUBAGENT_TOOL = 'subagent';
+
+/**
+ * The two agents that grade an implementation: `reviewer` reads it, `verifier`
+ * runs it. A closed union rather than `string`, so the role table below has to
+ * cover every member and a third grader fails to compile at the one place that
+ * must be updated — the alternative was an unreachable `??` fallback that only
+ * looked like safety.
+ */
+type Grader = 'reviewer' | 'verifier';
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -164,6 +180,18 @@ export default function (pi: ExtensionAPI) {
       (opts.selectedTools ?? []).includes(QUESTIONNAIRE_TOOL) ||
       toolInventory.some((t) => t.name === QUESTIONNAIRE_TOOL);
 
+    // --- Detect the subagent-herdr extension ---
+    // `agentInventory` is read off `agents/*.md` on disk, which says nothing about
+    // whether the extension that can *spawn* them loaded. subagent-herdr imports
+    // `../model-fallback/lib.js` and typebox, and the documented failure mode when
+    // that resolution breaks is a silent load failure — leaving a prompt that
+    // mandates delegation while offering no tool to delegate with. Same rule as the
+    // questionnaire gate, one level up: an agent roster is only actionable if the
+    // tool that spawns it exists.
+    const hasSubagent =
+      (opts.selectedTools ?? []).includes(SUBAGENT_TOOL) ||
+      toolInventory.some((t) => t.name === SUBAGENT_TOOL);
+
     // --- Build the orchestrator system prompt ---
     const orchestratorPrompt = buildOrchestratorPrompt({
       agentInventory,
@@ -172,6 +200,7 @@ export default function (pi: ExtensionAPI) {
       contextInventory,
       guidelines,
       hasQuestionnaire,
+      hasSubagent,
       customPrompt: opts.customPrompt,
       appendSystemPrompt: opts.appendSystemPrompt,
       cwd: opts.cwd,
@@ -276,7 +305,7 @@ function renderSkillCategories(
  *
  * Exported as the **one** seam for this module: callers and tests cross the same
  * interface, so a test asserts on the prompt the model actually receives rather
- * than on nine private section builders. The nine sections stay private on
+ * than on its private section builders. Those sections stay private on
  * purpose — exporting them would widen the interface without adding leverage,
  * and section *ordering* is part of what a test should be able to pin.
  *
@@ -306,6 +335,12 @@ export function buildOrchestratorPrompt(opts: {
   guidelines: string[];
   /** True when the `ask-user` extension's questionnaire tool is available. */
   hasQuestionnaire: boolean;
+  /**
+   * True when the `subagent-herdr` extension's spawn tool is available. The agent
+   * roster is discovered from disk independently, so without this a prompt could
+   * order a delegation the session has no tool to perform.
+   */
+  hasSubagent: boolean;
   customPrompt?: string;
   appendSystemPrompt?: string;
   cwd: string;
@@ -347,7 +382,7 @@ ${opts.toolInventory.map((t) => `| ${t.name} | ${t.description} |`).join('\n')}
 
   // --- Agent inventory section ---
   const agentSection =
-    opts.agentInventory.length > 0
+    opts.hasSubagent && opts.agentInventory.length > 0
       ? `
 ## Available Agents
 
@@ -396,19 +431,112 @@ The loop works like this:
 `
       : '';
 
-  // --- Quality pass section ---
-  // Gated on the grading agents actually being spawnable, like askUserSection is
-  // gated on the questionnaire tool: a prompt that orders a delegation to an
-  // agent this install does not have is an instruction the model cannot obey.
+  // --- Grading roster ---
+  // Shared by the two sections below, both of which name these agents directly.
+  // Gated on them actually being spawnable, like askUserSection is gated on the
+  // questionnaire tool: a prompt that orders a delegation to an agent this
+  // install does not have is an instruction the model cannot obey.
+  // The `subagent` conjunct is what makes a roster actionable: without the spawn
+  // tool these sections would order a delegation the session cannot perform.
+  const graders = (opts.hasSubagent ? (['reviewer', 'verifier'] as const) : []).filter((g) =>
+    opts.agentInventory.some((a) => a.name === g),
+  );
+  // Every phrase that mentions a grader is derived from this one filtered roster,
+  // so a single-grader install cannot end up with a list of one described in the
+  // plural. That is a bug both sections below have actually shipped: the prose
+  // around the list ("launch them", "those two tasks", "these graders") was
+  // hardcoded while the list itself was computed, and the two silently
+  // disagreed. Anything number-sensitive therefore branches on `graders.length`
+  // — and `ROLE` holds the role *without* the agent's name, so the name is
+  // printed exactly once per sentence by the caller that needs it.
+  const ROLE: Record<Grader, string> = {
+    reviewer: 'reads the implementation for correctness',
+    verifier: 'proves it actually runs',
+  };
+  const plural = graders.length > 1;
+  const graderList = graders.map((g) => `\`${g}\``).join(' and ');
+  // Singular drops the redundant second mention: the list already named it.
+  const graderRoles = plural
+    ? graders.map((g) => `\`${g}\` ${ROLE[g]}`).join(', and ')
+    : `it ${graders[0] ? ROLE[graders[0]] : ''}`;
+  // The verifier's obligation is conditional wherever else it is stated — Quality
+  // Pass below and `agents/worker.md` both qualify it on the change being
+  // runtime-testable — so the sentence that *introduces* it must not read as
+  // absolute, or the model launches a container run for a prose edit. It is its
+  // own trailing sentence rather than an inline aside, because inlining it
+  // collided with the clause that follows the list in the single-grader case.
+  const verifierCaveat = graders.includes('verifier')
+    ? ` \`verifier\` applies only when execution can settle the change${
+        plural ? '; `reviewer` always applies' : ''
+      }.`
+    : '';
+
+  // --- Planning delegation section ---
+  // The orchestrator's weakest moment is the one where it starts editing from a
+  // plan it holds only in its own head: `planner` reads the actual files and
+  // returns an ordered, file-specific plan, and improvising that order instead is
+  // how a half-finished refactor gets left behind.
   //
+  // The grading obligation is stated *here* rather than left to the Quality Pass
+  // section alone, because a plan nobody checked against the result is a
+  // document and not an engineering step. The one carve-out is the same one
+  // Quality Pass already makes — a `worker` ends its own run by handing its diff
+  // to these graders, so re-grading it would buy a duplicate pass and nothing
+  // else.
+  const hasPlanner =
+    opts.hasSubagent && opts.agentInventory.some((a) => a.name === 'planner');
+  const planningSection = hasPlanner
+    ? `
+## Plan Before You Implement
+
+For any change beyond a trivial edit, **delegate the plan to \`planner\` before you
+touch code.** It reads the real files and returns an ordered, file-specific,
+verifiable plan. Designing that order in your head instead is how a change lands
+half-finished.
+
+**Delegate to \`planner\` when:**
+- The work spans two or more files, or needs three or more steps
+- It is a feature, a refactor, or a migration — however small it looks
+- You are about to invent an approach you have not written down anywhere
+
+**Go direct when:**
+- It is a typo, a one-line fix, a single string or constant
+- You are only reading, researching, or explaining — nothing is being changed
+- You already have a written, file-specific plan — from the user, or from a skill that produced one
+
+**Name any skip.** If a change clears that bar and you still plan it yourself,
+say which and why, in one line. Silently skipping is the failure this section
+exists to prevent.
+${
+  graders.length > 0
+    ? `
+**A \`planner\` plan carries a grading obligation.** Whenever you call
+\`planner\`, the implementation that follows it gets graded by ${graderList} before
+you report it done — ${graderRoles}.${verifierCaveat} ${
+  plural
+    ? `Launch them
+in one turn so they run concurrently, then end your turn. See **Quality Pass**
+below for how to write those two tasks.`
+    : `Launch it, then end your turn. See **Quality Pass**
+below for how to write that task.`
+}
+
+The pairing is the point: a plan nobody checked against the result is a document,
+not an engineering step. The single exception is the one Quality Pass already
+names — a \`worker\` has passed its own diff through ${plural ? 'these graders' : 'this grader'}, so do not
+re-grade it. Grade what **you** implemented.
+`
+    : ''
+}`
+    : '';
+
+  // --- Quality pass section ---
   // The orchestrator is the one agent with no parent to grade it. A `worker`
   // ends its run by handing the diff to `reviewer`/`verifier`, so work routed
   // through delegation is graded by construction — but the orchestrator edits
   // files directly too, and that path had no gate at all. This closes it, so
-  // "who checks the implementation" has the same answer either way.
-  const graders = ['reviewer', 'verifier'].filter((g) =>
-    opts.agentInventory.some((a) => a.name === g),
-  );
+  // "who checks the implementation" has the same answer either way. The planning
+  // section above makes the same obligation explicit for plan-driven work.
   const qualityPassSection =
     graders.length > 0
       ? `
@@ -431,14 +559,14 @@ for any remaining bugs, issues, or quality-of-life improvements.**
 **When it applies:** you changed code, config, or anything executable, and the
 change is more than a typo or a one-line string. It does **not** apply to work you
 only read, planned, or researched, nor to a change a subagent already had graded —
-do not re-grade a \`worker\`'s diff it has itself passed through these agents.
+do not re-grade a \`worker\`'s diff it has itself passed through ${plural ? 'these agents' : 'this agent'}.
 
 **How to delegate it well:**
 - Write the task self-contained: the child cannot see this conversation. Name the
   goal, the absolute paths, and the command that checks it.
 - **List the files explicitly rather than saying \`git diff\`** — an uncommitted new
   file is untracked, and a diff alone will not show it.
-- Launch the graders in one turn so they run concurrently, then end your turn.
+- ${plural ? 'Launch the graders in one turn so they run concurrently, then end your turn.' : 'Launch it, then end your turn.'}
 ${graders.includes('verifier') ? `- \`verifier\` expects a container image tag that already exists. Check
   \`docker image ls 'ralph-verify/*'\` and pass a fitting tag, or say plainly that
   none was prebuilt — an honest INCONCLUSIVE beats a verdict from a container that
@@ -590,7 +718,7 @@ skill invocations in the right order.
 ## Core Responsibilities
 
 1. **Decompose** — Break complex user requests into discrete, verifiable steps. If a request has gaps or is unclear, ask${opts.hasQuestionnaire ? ` using the \`${QUESTIONNAIRE_TOOL}\` tool` : ''} before planning.
-2. **Plan** — Consult the skills catalogue first, then determine the optimal sequence of tool calls and skill invocations
+2. **Plan** — Consult the skills catalogue first, then${hasPlanner ? ` delegate the plan to \`planner\` for anything beyond a trivial edit (see **Plan Before You Implement**) and` : ''} determine the optimal sequence of tool calls and skill invocations
 3. **Execute** — Call tools and skills in the correct order, handling errors gracefully
 4. **Verify** — Confirm each step's result before proceeding to the next
 5. **Adapt** — If something fails, diagnose and try a different approach
@@ -600,7 +728,7 @@ skill invocations in the right order.
 When given a task:
 1. Identify the goal and any constraints
 2. Check which tools are available, and scan the skills catalogue for a match — open any plausible skill before designing the plan
-3. Design a step-by-step plan
+3. ${hasPlanner ? `Delegate the plan to \`planner\` for two or more files or three or more steps — and name any skip (see **Plan Before You Implement**)` : 'Design a step-by-step plan'}
 4. Execute the plan, verifying each step
 5. Report back with results and any issues
 
@@ -611,5 +739,5 @@ When given a task:
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 
-${askUserSection}${toolSection}${agentSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
+${askUserSection}${toolSection}${agentSection}${planningSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
 }
