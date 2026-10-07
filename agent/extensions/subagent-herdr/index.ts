@@ -38,10 +38,16 @@
  * notice to this pane, and then shuts the child down. The parent classifies a
  * run from the sidecar when a notice arrives (or when asked directly):
  *
- * - sidecar present → **done**; the answer is the last assistant message at
- *   or before the `subagent_done` call in the child's transcript. The child
- *   closes its own pane the moment it finishes; the parent closes it again as
- *   a backstop.
+ * - sidecar present → **done**; the answer is the last *visible* assistant
+ *   text at or before the `subagent_done` call, with `qualifiesAsAnswer`
+ *   (`rundir.ts`) deciding whether it is an answer at all, and two salvage
+ *   paths behind that (the done call's arguments, then an earlier message).
+ *   The child closes its own pane the moment it finishes; the parent closes it
+ *   again as a backstop.
+ *   The child will not *reach* completion without a visible answer: the
+ *   `subagent_done` gate refuses a bounded number of such calls, and a clean
+ *   turn end with nothing visible is nudged once for one. Both halves judge
+ *   this with the same shared predicate, against the run's `system-prompt.md`.
  * - sidecar absent  → **failed**; the pane is kept open with its scrollback
  *   as evidence (herdr destroys scrollback when a pane is closed).
  *
@@ -772,6 +778,21 @@ export async function collectFinished(
 async function renderResultBlock(rec: RunRecord, out: string[]): Promise<void> {
   out.push(formatResultHeader(rec));
   const result = await extractRunResult(dirFor(rec.runId), rec.runId);
+  // A salvaged answer is labelled rather than passed off as a clean report: the
+  // orchestrator should know it is reading something the child stranded in the
+  // wrong place, because it may be truncated and the delegation may be worth
+  // re-running. A clean answer in the right place gets no label at all.
+  const salvageNote: Record<string, string> = {
+    "done-arguments":
+      "(recovered from this run's subagent_done arguments — the child passed its answer to the tool instead of writing it as a message, so it is very likely truncated)",
+    "truncated-answer":
+      "(this is the child's final answer, but it does not close its `<result>` element — most likely cut off by the output limit, so treat it as incomplete)",
+    "earlier-message":
+      "(recovered from an earlier message — the child answered and then kept working, so its final message was not the answer)",
+    "non-conforming":
+      "(NOT AN ANSWER — this run produced no report, only this line. Everything it concluded is lost; re-delegate the task rather than relying on this.)",
+  };
+  if (result.salvagedFrom) out.push(salvageNote[result.salvagedFrom]);
   out.push(result.answered ? truncate(result.text) : "(no final answer in transcript)");
   if (rec.status === "failed" && !result.answered) {
     const diag = await paneDiagnostic(rec);

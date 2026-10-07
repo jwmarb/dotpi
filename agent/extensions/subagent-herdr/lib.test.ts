@@ -49,6 +49,12 @@ import {
   reportsPath,
   runDir,
   runsDir,
+  hasResultBlock,
+  qualifiesAsAnswer,
+  SUBSTANTIAL_ANSWER_CHARS,
+  visibleTextOf,
+  qualifiesAsSalvage,
+  requiresResultBlock,
   systemPromptPath,
 } from "./rundir.js";
 
@@ -219,6 +225,439 @@ describe("extractRunResult", () => {
     expect(r.answered).toBe(true);
     expect(r.text).toBe("Here is my answer");
   });
+
+  // -------------------------------------------------------------------------
+  // Salvage: the three ways a real run has stranded its answer.
+  // Fixtures are modelled on recorded transcripts in agent/subagent-runs/.
+  // -------------------------------------------------------------------------
+
+  /** A run dir carrying a `<result>`-contract system prompt, like every fleet agent. */
+  function runDirWithResultPrompt(): string {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    writeFileSync(systemPromptPath(dir), "You map codebases.\n\nOnly what is inside `<result>` reaches the orchestrator.");
+    return dir;
+  }
+
+  test("salvages the report from a fabricated argument on the done call (sub-c459, sub-e987)", async () => {
+    const dir = runDirWithResultPrompt();
+    const report = "<result>\n## Map\n- `index.ts:826` — tool registration\n</result>";
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0101" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I have all the evidence I need. Compiling the recon report now." },
+            // `subagent_done` takes no parameters, but typebox accepts extra
+            // properties, so this call validated and the run was marked done.
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: { message: report } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0101.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0101");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(report);
+    expect(r.salvagedFrom).toBe("done-arguments");
+  });
+
+  test("prefers a qualifying visible answer over a tool argument that also has one", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0102" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "<result>the visible one</result>" },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: { message: "<result>the argument one</result>" } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0102.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0102");
+    expect(r.text).toBe("<result>the visible one</result>");
+    expect(r.salvagedFrom).toBeUndefined();
+  });
+
+  test("ignores a non-qualifying tool argument rather than reporting metadata as the answer", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0103" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Writing the report." },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: { reason: "finished", ok: true } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0103.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0103");
+    // Not the metadata argument: the only thing left is the short visible line,
+    // which is forwarded as explicitly non-conforming rather than as an answer.
+    expect(r.text).toBe("Writing the report.");
+    expect(r.salvagedFrom).toBe("non-conforming");
+  });
+
+  test("recovers an earlier qualifying answer when the done message is only filler (sub-835d, sub-e0fe)", async () => {
+    const dir = runDirWithResultPrompt();
+    const report = "<result>\n## Map\n- `lib.ts:493` — extractRunResult\n</result>";
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0104" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: report }], stopReason: "stop" },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: "anything else?" }] },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "<result>a second, better report</result>" },
+            { type: "text", text: "All questions are answered. Compiling the final report." },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: {} },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0104.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0104");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(report);
+    expect(r.salvagedFrom).toBe("earlier-message");
+  });
+
+  test("never surfaces a <result> that exists only in thinking (sub-835d)", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0105" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "<result>\n## Map\n- only in reasoning\n</result>" },
+            { type: "text", text: "All questions are answered with verified line numbers." },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: {} },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0105.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0105");
+    // The <result> in thinking is never surfaced. The visible filler is
+    // forwarded only under the `non-conforming` label (see the dedicated test).
+    expect(r.text).not.toContain("only in reasoning");
+    expect(r.salvagedFrom).toBe("non-conforming");
+  });
+
+  test("a thinking-only clean turn end stays unanswered (sub-9bad)", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0106" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "Deletion test: delete → raw execFile resurfaces…" }],
+          stopReason: "stop",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0106.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0106");
+    expect(r.answered).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // No `subagent_done` call at all: the dominant real shape, and the one an
+  // earlier draft of this function lost 47678 chars across 20 runs by missing.
+  // Every fixture above happens to have a done call, which is exactly why the
+  // suite stayed green through that regression.
+  // -------------------------------------------------------------------------
+
+  test("a clean turn end with a truncated report keeps it (sub-1a09, sub-c62b, sub-db10)", async () => {
+    const dir = runDirWithResultPrompt();
+    // Real shape: no done call, final assistant message holds 8-15 KB of report
+    // whose closing tag never arrived. Measured: sub-c62b 14838, sub-1a09 10122.
+    const report = `<result>\n## Map\n${"- `a.ts:1` — a mapped file, described at length.\n".repeat(30)}`;
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0109" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: report }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0109.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0109");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(report.trim());
+    expect(r.salvagedFrom).toBe("truncated-answer");
+  });
+
+  test("a trailing toolResult does not hide the final answer (sub-9ecd)", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0110" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "<result>\nthe report\n</result>" }], stopReason: "stop" },
+      }),
+      // The last *entry* is not the last assistant message. Keying the search on
+      // the final entry excluded the answer from every step.
+      JSON.stringify({
+        type: "message",
+        message: { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "file bytes" }] },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0110.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0110");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe("<result>\nthe report\n</result>");
+    // A complete answer in the right place is not salvage, and must not be
+    // labelled as suspect in the briefing.
+    expect(r.salvagedFrom).toBeUndefined();
+  });
+
+  test("a complete later answer beats an earlier interim note (sub-7864)", async () => {
+    const dir = runDirWithResultPrompt();
+    const note = "Interim: ".padEnd(565, "x");
+    const answer = `<result>\n## Findings\n${"- a verified fact.\n".repeat(40)}</result>`;
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0111" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: note }], stopReason: "stop" },
+      }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "continue" }] } }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0111.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0111");
+    expect(r.answered).toBe(true);
+    // The real answer, not the 565-char note that precedes it.
+    expect(r.text).toBe(answer);
+    expect(r.text.length).toBeGreaterThan(note.length);
+  });
+
+  test("a strict answer anywhere beats a merely-substantial one nearer the end", async () => {
+    const dir = runDirWithResultPrompt();
+    const complete = "<result>\nthe real report\n</result>";
+    const substantial = "y".repeat(900);
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0112" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: complete }], stopReason: "stop" },
+      }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "and?" }] } }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: substantial }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0112.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0112");
+    expect(r.text).toBe(complete);
+    expect(r.salvagedFrom).toBe("earlier-message");
+  });
+
+  test("a truncated visible report alongside a done call is still recovered", async () => {
+    // The gate refuses this run twice and then lets it through, so the parent
+    // must not then throw away the report the child did write.
+    const dir = runDirWithResultPrompt();
+    const report = `<result>\n## Map\n${"- `b.ts:2` — described at length.\n".repeat(30)}`;
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0113" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: report },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: {} },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0113.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0113");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(report.trim());
+    expect(r.salvagedFrom).toBe("truncated-answer");
+  });
+
+  test("salvage prefers a qualifying argument over the filler that carried it", async () => {
+    // Thickens the done-arguments path, which a mutation audit found was held
+    // by a single test.
+    const dir = runDirWithResultPrompt();
+    const report = `## 1. OVERVIEW\n${"Something substantial and specific.\n".repeat(20)}`;
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0114" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Writing it up." },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: { report, note: "short" } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0114.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0114");
+    expect(r.answered).toBe(true);
+    // Not `message`, and not the short `note`: the substantial string wins.
+    expect(r.text).toBe(report.trim());
+    expect(r.salvagedFrom).toBe("done-arguments");
+  });
+
+  test("an unrelated tool call's arguments are never read as the answer", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0115" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Reading." },
+            // A big string argument on a DIFFERENT tool must not be salvaged.
+            { type: "toolCall", id: "c1", name: "write", arguments: { content: "z".repeat(900) } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "toolResult", toolCallId: "c1", toolName: "write", content: [{ type: "text", text: "ok" }] },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0115.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0115");
+    expect(r.text).not.toContain("z".repeat(900));
+    expect(r.salvagedFrom).toBe("non-conforming");
+  });
+
+  test("a filler-only run is forwarded but labelled NOT AN ANSWER, never dropped", async () => {
+    // 13 of the 164 recorded runs produced only a progress line (20-294 chars).
+    // The old code showed those *as the answer*, which is the bug; refusing them
+    // outright would lose the three that carry partial findings. So: forwarded
+    // with an honest label, which index.ts renders as "NOT AN ANSWER".
+    const dir = runDirWithResultPrompt();
+    const filler = "All questions are answered with verified line numbers. Compiling the final report.";
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0116" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "<result>the report, invisible to the orchestrator</result>" },
+            { type: "text", text: filler },
+          ],
+          stopReason: "stop",
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0116.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0116");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(filler);
+    expect(r.salvagedFrom).toBe("non-conforming");
+    // The thinking content is still never surfaced.
+    expect(r.text).not.toContain("invisible to the orchestrator");
+  });
+
+  test("a run with no visible text at all remains unanswered", async () => {
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0117" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "thinking", thinking: "only reasoning" }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0117.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0117");
+    expect(r.answered).toBe(false);
+    expect(r.text).toBe("");
+    expect(r.salvagedFrom).toBeUndefined();
+  });
+
+  test("an agent with no <result> contract is still answered by plain prose", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    writeFileSync(systemPromptPath(dir), "Record one journal observation and reply with its id.");
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0107" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "Recorded obs-0007." }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0107.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0107");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe("Recorded obs-0007.");
+  });
+
+  test("a run with no system-prompt.md keeps the pre-fix behaviour", async () => {
+    // Historical runs predate the prompt file being required for extraction;
+    // they must not regress to unanswered.
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0108" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "plain answer" }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "x_sub-0108.jsonl"), lines.join("\n"));
+
+    const r = await extractRunResult(dir, "sub-0108");
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe("plain answer");
+  });
+
 });
 
 describe("buildChildEnv", () => {
@@ -1476,5 +1915,128 @@ describe("parseAgentFile callable_by key", () => {
   test("a camelCase key does not match, as the frontmatter contract warns", () => {
     const a = parseAgentFile(`---\nname: a\ncallableBy: librarian\n---\nbody`, "a.md");
     expect(a?.callableBy).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The answer contract (rundir.ts) — shared by both halves of the handshake
+// ---------------------------------------------------------------------------
+
+describe("qualifiesAsAnswer", () => {
+  // Every agent in agent/agents/ ends its prompt with this sentence.
+  const RESULT_PROMPT = "You map codebases.\n\nOnly what is inside `<result>` reaches the orchestrator.";
+  const PLAIN_PROMPT = "Record one journal observation. Reply with the id you wrote.";
+
+  test("a complete <result> element qualifies under a <result> prompt", () => {
+    expect(qualifiesAsAnswer("<result>\n## Map\n- a.ts:1 — here\n</result>", RESULT_PROMPT)).toBe(true);
+  });
+
+  test("filler prose does not qualify under a <result> prompt", () => {
+    // The exact text sub-c459 and sub-e987 left behind as their "answer".
+    expect(qualifiesAsAnswer("I have all the evidence I need. Compiling the recon report now.", RESULT_PROMPT)).toBe(false);
+  });
+
+  test("an unclosed <result> does not qualify: a truncated report is not a report", () => {
+    expect(qualifiesAsAnswer("<result>\n## Map\n- a.ts:1", RESULT_PROMPT)).toBe(false);
+    expect(qualifiesAsAnswer("</result> first, then <result>", RESULT_PROMPT)).toBe(false);
+  });
+
+  test("an agent whose prompt never mentions <result> may answer in plain prose", () => {
+    expect(qualifiesAsAnswer("Recorded observation obs-0007.", PLAIN_PROMPT)).toBe(true);
+    expect(qualifiesAsAnswer("<result>also fine</result>", PLAIN_PROMPT)).toBe(true);
+  });
+
+  test("whitespace is never an answer, under either contract", () => {
+    expect(qualifiesAsAnswer("   \n\t ", RESULT_PROMPT)).toBe(false);
+    expect(qualifiesAsAnswer("   \n\t ", PLAIN_PROMPT)).toBe(false);
+    expect(qualifiesAsAnswer("", undefined)).toBe(false);
+  });
+
+  test("an unreadable prompt falls back to the weaker rule rather than trapping the child", () => {
+    // A historical or corrupt run has no system-prompt.md. Refusing every answer
+    // there would make such a run unfinishable; accepting visible text still
+    // beats the filler-line status quo.
+    expect(qualifiesAsAnswer("some answer", undefined)).toBe(true);
+  });
+
+  test("requiresResultBlock reads the contract off the prompt, not off a hardcoded roster", () => {
+    expect(requiresResultBlock(RESULT_PROMPT)).toBe(true);
+    expect(requiresResultBlock(PLAIN_PROMPT)).toBe(false);
+    expect(requiresResultBlock(undefined)).toBe(false);
+  });
+
+  test("qualifiesAsSalvage keeps a truncated report that the gate would reject", () => {
+    // Every real done-arguments case was cut off mid-document: the model spent
+    // its output budget on an argument it should not have been writing. Lengths
+    // measured from sub-2ea3 (17419), sub-e987 (9199) and sub-c459 (7496).
+    const truncated = `<result>\n## Map\n${"- `a.ts:1` — a mapped file, described at length.\n".repeat(20)}`;
+    expect(truncated.length).toBeGreaterThan(400);
+    // The gate refuses it, so the child is still told to write a real answer...
+    expect(qualifiesAsAnswer(truncated, RESULT_PROMPT)).toBe(false);
+    // ...but once the run is over, 17 KB of map beats "(no final answer)".
+    expect(qualifiesAsSalvage(truncated, RESULT_PROMPT)).toBe(true);
+  });
+
+  test("qualifiesAsSalvage keeps a substantial untagged report", () => {
+    // sub-c459 and sub-e987 passed 7.5 KB and 9.2 KB with no tags at all.
+    const untagged = "## 1. OVERVIEW\n".padEnd(500, "x");
+    expect(qualifiesAsSalvage(untagged, RESULT_PROMPT)).toBe(true);
+  });
+
+  test("qualifiesAsSalvage still rejects the filler lines this fix exists to stop", () => {
+    // The actual visible "answers" of the three cases: 62, 63 and 48 chars.
+    for (const filler of [
+      "I have all the evidence I need. Here is the recon report.",
+      "I have all the evidence I need. Compiling the recon report now.",
+      "All evidence gathered. Writing the recon report.",
+    ]) {
+      expect(filler.length).toBeLessThan(400);
+      expect(qualifiesAsSalvage(filler, RESULT_PROMPT)).toBe(false);
+    }
+  });
+
+  test("qualifiesAsSalvage uses length alone, because the real cases had no tags", () => {
+    // Requiring even an opening <result> was tried and would have discarded
+    // sub-c459 (7.5 KB) and sub-e987 (9.2 KB), which carried no tags at all.
+    expect(qualifiesAsSalvage("x".repeat(500), RESULT_PROMPT)).toBe(true);
+    expect(qualifiesAsSalvage("short", RESULT_PROMPT)).toBe(false);
+    expect(qualifiesAsSalvage("", RESULT_PROMPT)).toBe(false);
+    // The boundary is pinned so a future tweak has to come past these tests.
+    expect(qualifiesAsSalvage("y".repeat(399), RESULT_PROMPT)).toBe(false);
+    expect(qualifiesAsSalvage("y".repeat(400), RESULT_PROMPT)).toBe(true);
+  });
+
+  test("both halves of the handshake share ONE visible-text extractor", async () => {
+    // The gate and the parent must agree on what text they are judging, or a
+    // child can pass its own gate on a message the parent reads as unanswered.
+    // These two were briefly separate implementations that had already diverged
+    // on string `content`; this pins them to the same function.
+    const { visibleTextOf: childSide } = await import("./child-done.js");
+    expect(childSide).toBe(visibleTextOf);
+
+    const msg = {
+      content: [
+        { type: "thinking", thinking: "hidden" },
+        { type: "text", text: "visible" },
+      ],
+    };
+    expect(visibleTextOf(msg)).toBe("visible");
+    // String content: the shape the two copies disagreed about.
+    expect(visibleTextOf({ content: "  plain  " })).toBe("plain");
+    expect(visibleTextOf({ content: undefined })).toBe("");
+    expect(visibleTextOf({ content: 42 })).toBe("");
+    expect(visibleTextOf({ content: [{ type: "text" }] })).toBe("");
+  });
+
+  test("the documented salvage bar is the exported constant", () => {
+    // subagent-herdr/AGENTS.md cites SUBSTANTIAL_ANSWER_CHARS by name.
+    expect(SUBSTANTIAL_ANSWER_CHARS).toBe(400);
+    expect(qualifiesAsSalvage("z".repeat(SUBSTANTIAL_ANSWER_CHARS), RESULT_PROMPT)).toBe(true);
+    expect(qualifiesAsSalvage("z".repeat(SUBSTANTIAL_ANSWER_CHARS - 1), RESULT_PROMPT)).toBe(false);
+  });
+
+  test("hasResultBlock accepts a multi-line body and a trailing remark", () => {
+    expect(hasResultBlock("noise\n<result>\nbody\nmore\n</result>\ntrailing")).toBe(true);
+    expect(hasResultBlock("no tags at all")).toBe(false);
   });
 });

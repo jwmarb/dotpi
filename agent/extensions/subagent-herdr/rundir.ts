@@ -315,3 +315,148 @@ export function parseNotice(text: string): Notice | undefined {
 	if (!m) return undefined;
 	return { runId: m[1], agent: m[2], kind: m[3] as NoticeKind, text: m[4].trim() };
 }
+
+// ---------------------------------------------------------------------------
+// The answer contract: what counts as a finished subagent's answer
+// ---------------------------------------------------------------------------
+
+/**
+ * Does this agent's own system prompt put its answer under a `<result>`
+ * contract?
+ *
+ * Every agent in `agent/agents/` ends its prompt with "Only what is inside
+ * `<result>` reaches the orchestrator", but an agent shipped by a skill
+ * (`skills/*​/agents/*.md`) need not, and a future one need not either. So the
+ * requirement is *read off the prompt the child was actually launched with*
+ * rather than hardcoded here or declared twice in frontmatter: an agent that
+ * never mentions the tag is held to the weaker rule, and one that does is held
+ * to its own stated contract.
+ *
+ * @param systemPrompt - The child's composed prompt (`systemPromptPath`), or
+ *   `undefined` when it cannot be read.
+ */
+export function requiresResultBlock(systemPrompt: string | undefined): boolean {
+	return !!systemPrompt && systemPrompt.includes("<result>");
+}
+
+/**
+ * One content part of an assistant message, as little as these rules need.
+ *
+ * Deliberately structural rather than imported from pi: this module is the
+ * parent/child seam and the child reads its own live session while the parent
+ * reads JSONL off disk, so the shape has to be described once, here, for both.
+ */
+export interface VisiblePart {
+	type?: string;
+	text?: string;
+}
+
+/**
+ * The visible text of an assistant message: `text` parts only, joined.
+ *
+ * Lives here, with the predicate that consumes it, because *what text is fed
+ * to the rule* is as much of the contract as the rule itself. It was briefly
+ * implemented twice — once in `child-done.ts` for the live session, once in
+ * `lib.ts` for the transcript — and the two had already diverged on string
+ * `content` before they were merged, which is precisely the drift the
+ * "one parser per format" convention exists to stop: the child could have
+ * passed its gate on a message the parent then read as unanswered.
+ *
+ * Thinking is excluded, and that exclusion is the point. A report composed
+ * inside reasoning is invisible to the orchestrator, however complete it looks
+ * in the child's own pane.
+ */
+export function visibleTextOf(message: { content?: unknown }): string {
+	const content = message.content;
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(part): part is VisiblePart =>
+				!!part &&
+				typeof part === "object" &&
+				(part as VisiblePart).type === "text" &&
+				typeof (part as VisiblePart).text === "string",
+		)
+		.map((part) => part.text as string)
+		.join("\n")
+		.trim();
+}
+
+/**
+ * Does this text carry a complete `<result>` element?
+ *
+ * The pair is what matters, in order. A model that opened the tag and ran out
+ * of output has not delivered a report, and neither has one that wrote the
+ * closing tag first — both looked like success to a bare `includes("<result>")`.
+ */
+export function hasResultBlock(text: string): boolean {
+	return /<result>[\s\S]*?<\/result>/.test(text);
+}
+
+/**
+ * Is this text an answer the orchestrator can actually use?
+ *
+ * This is the single rule both halves of the handshake apply: the child gates
+ * its own completion on it (`child-done.ts`) and the parent decides what to
+ * surface with it (`lib.ts`). It lives here, beside the paths and the notice
+ * grammar, because it spans the same process seam — and because the two halves
+ * disagreeing about what "finished" means is exactly how an answer goes
+ * missing. Nine of thirty-seven recorded `explorer` runs ended with the report
+ * stranded in a tool argument, in the model's thinking, or nowhere at all,
+ * while both ends believed the run had succeeded.
+ *
+ * Thinking is never passed in: reasoning is not visible to the orchestrator, so
+ * a `<result>` composed there is not an answer no matter how complete it is.
+ *
+ * @param text - Candidate answer text, already extracted from visible content.
+ * @param systemPrompt - The child's composed prompt, for {@link requiresResultBlock}.
+ */
+export function qualifiesAsAnswer(text: string, systemPrompt: string | undefined): boolean {
+	if (!text.trim()) return false;
+	return requiresResultBlock(systemPrompt) ? hasResultBlock(text) : true;
+}
+
+/**
+ * Minimum length for a stranded payload to be worth surfacing as a report.
+ *
+ * Set from the real cases: the three recorded runs that handed their write-up
+ * to the tool passed 7.5 KB, 9.2 KB and 17.4 KB, while the filler lines they
+ * left as their visible "answer" were 48, 62 and 63 characters. Anything in
+ * between is not a judgement this function can make well, so the bar sits far
+ * above the filler and far below the reports.
+ */
+export const SUBSTANTIAL_ANSWER_CHARS = 400;
+
+/**
+ * Is this *salvaged* text worth showing the orchestrator?
+ *
+ * Deliberately weaker than {@link qualifiesAsAnswer}, and only ever applied
+ * after the fact, to text the child already committed somewhere unintended.
+ * The distinction matters because the two questions are different:
+ *
+ * - The **gate** asks "may this run finish?", while the child can still fix it.
+ *   There it must be strict, or the contract is not a contract.
+ * - **Salvage** asks "is there anything here worth forwarding?", once the run
+ *   is over and the alternative is `(no final answer in transcript)`.
+ *
+ * Measured against the real failures, strictness here would discard every one:
+ * all three reports handed to `subagent_done` were truncated mid-document (the
+ * model spent its output budget on an argument it should not have been writing)
+ * or carried no tags at all, so none has a closing `</result>`. A 17 KB map
+ * with a missing tag is still the recon the orchestrator asked for.
+ *
+ * So: a complete `<result>` always qualifies, and so does any substantial
+ * text. A short line never does — that is the filler this whole fix exists to
+ * stop being mistaken for an answer.
+ *
+ * Length is the only extra signal, deliberately. Requiring even an *opening*
+ * `<result>` was tried and measured against the real runs: it would have thrown
+ * away sub-c459 (7.5 KB) and sub-e987 (9.2 KB), which carried no tags at all.
+ * The tag tells you the model remembered the format; it does not tell you
+ * whether there is a report, and the report is what the orchestrator needs.
+ */
+export function qualifiesAsSalvage(text: string, systemPrompt: string | undefined): boolean {
+	if (qualifiesAsAnswer(text, systemPrompt)) return true;
+	return text.trim().length >= SUBSTANTIAL_ANSWER_CHARS;
+}

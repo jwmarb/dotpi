@@ -18,6 +18,9 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
 | Which builtins are on/off | `settings.json` `extensions` — one `+builtin:`/`-builtin:` entry each; currently `mcp` and `codemode` enabled, `llama.cpp` and `tool-search` disabled |
+| Why a skill's `agents/` yields nothing | It holds `openai.yaml` alone — which is why discovery gates on `agents/*.md`, not on the directory existing. `technical-analysis` is currently the only skill whose `agents/` holds real `*.md` definitions (and the only one with no `openai.yaml`); derive it with `find agent/skills -path '*/agents/*.md'` rather than trusting a count |
+| This tier's own build/test commands | There are none — it is data, not code. Every command lives at the repo root (`scripts/check.sh`); the suites that assert *this* tier's grammars live in `extensions/lib/` — `agents.test.ts` for the frontmatter, and `skill-catalogue.test.ts`, which walks the **live** `skills/` tree rather than a fixture |
+
 ## CONVENTIONS
 
 - **`agents/*.md` frontmatter draws on a seven-key vocabulary**, parsed only by
@@ -89,6 +92,18 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   *different* tree: the librarian that clones into `.firecrawl/src/<repo>` and then spawns
   the explorer without `cwd` gets a confident, well-formatted map of the user's project
   instead of the dependency — a wrong answer that looks right.
+- **An agent's final answer must be visible assistant text, and saying `<result>` in its
+  prompt makes that a contract the runtime enforces.** `subagent-herdr` reads each run's
+  own `system-prompt.md`: mention `<result>` and the child may not complete until it has
+  written a complete `<result>…</result>` element as a normal message, while an agent whose
+  prompt never mentions it (the three `technical-analysis` journal agents) completes on any
+  non-empty visible text. Both ends use the one predicate in
+  `extensions/subagent-herdr/rundir.ts`. Two consequences when writing an agent: **an answer
+  composed only in reasoning does not count** (the orchestrator never sees thinking), and
+  **an answer passed to `subagent_done` as an argument does not count** (the tool takes
+  none and discards them) — those two mistakes cost 9 of the 37 recorded `explorer` runs,
+  and 5 of the 64 `librarian` ones, their entire report. Writing a `<result>` *example* in a prompt is enough
+  to switch the strict rule on, so put illustrative tags in prose or fences deliberately.
 - **`skills/<category>/<skill>/agents/openai.yaml` is optional presentation**
   (`display_name`, `short_description`); most skills have one and its absence changes nothing
   functional. An `agents/` directory holding only this file defines **no agents** — which is

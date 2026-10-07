@@ -22,7 +22,11 @@ import {
   type FailedAttempt,
   isSessionFileFor,
   parseReportLine,
+  qualifiesAsAnswer,
+  qualifiesAsSalvage,
   reportsPath,
+  systemPromptPath,
+  visibleTextOf,
 } from "./rundir.js";
 
 export type { ChildReport };
@@ -468,27 +472,94 @@ export function lineageRejection(
 }
 
 /**
+ * Where an answer was found, when it was not where it should have been.
+ *
+ * Absent means the normal path: visible text in the message that called
+ * `subagent_done` (or the last visible text of a clean turn). The other two are
+ * salvage, and worth naming because they are evidence of a child that did not
+ * honour the handshake — a pattern worth seeing in the briefing rather than
+ * silently repairing.
+ */
+export type AnswerSource =
+  /** Recovered from a string argument on the `subagent_done` call. */
+  | "done-arguments"
+  /** The final answer itself, but below the strict bar — typically truncated. */
+  | "truncated-answer"
+  /** The model answered, then carried on; the answer is an earlier message. */
+  | "earlier-message"
+  /**
+   * Nothing resembling a report: all that exists is a short line, usually the
+   * model narrating ("Compiling the report now."). Forwarded anyway, because
+   * it is strictly more than nothing and the orchestrator can judge it, but
+   * labelled so it is never mistaken for the answer.
+   */
+  | "non-conforming";
+
+/**
  * What the parent can recover from a finished (or dead) run's session file.
  */
 export interface RunResult {
   /** A `*_<runId>.jsonl` session file exists in the run directory. */
   found: boolean;
-  /** The last assistant message carries text. */
+  /** A qualifying answer was recovered (see `qualifiesAsAnswer`). */
   answered: boolean;
-  /** The last assistant message's text (the answer). */
+  /** The answer text. */
   text: string;
-  /** Stop reason of that last assistant message, when the session records one. */
+  /** Stop reason of the assistant message the answer came from, when recorded. */
   stopReason?: string;
   /** The session file the answer came from, when found. */
   sessionFile?: string;
+  /** Set only when the answer had to be salvaged from somewhere unintended. */
+  salvagedFrom?: AnswerSource;
 }
 
 /**
- * Reads the child's transcript and returns its last assistant message.
+ * Reads the child's transcript and recovers the answer the orchestrator should
+ * see.
  *
  * The session file is `*_<runId>.jsonl` inside `runDir` (pi mints the
  * timestamp prefix itself), so ownership by runId is unambiguous and a
  * resumed session cannot be mistaken for a different run.
+ *
+ * ## What counts as an answer
+ *
+ * `qualifiesAsAnswer` (in `rundir.ts`, shared with the child's completion gate)
+ * decides, against the run's own `system-prompt.md`: an agent whose prompt puts
+ * its output under a `<result>` contract must have produced a complete
+ * `<result>` element, and any other agent needs only non-empty visible text.
+ * **Thinking is never considered** — reasoning does not reach the orchestrator,
+ * so a report composed there is not an answer, however complete it looks in the
+ * child's pane.
+ *
+ * ## Where it looks, in order
+ *
+ * 1. The newest strictly-qualifying visible text at or before the completion
+ *    boundary (the `subagent_done` call, or the last assistant message when
+ *    there is none). A strict answer wins over anything merely salvageable,
+ *    wherever each sits, so an interim note cannot shadow the real report.
+ * 2. String values in that call's own `arguments`, preferring `message`. The
+ *    tool declares no parameters, but typebox accepts extra properties, so a
+ *    model that "passed" its report to the tool produced a *valid* call whose
+ *    payload would otherwise be dropped on the floor. Restricted to the
+ *    matching call so an unrelated tool's argument can never be read as an
+ *    answer.
+ * 3. The newest *salvageable* visible text at or before the boundary — a real
+ *    report the strict rule turned down, usually truncated mid-document.
+ * 4. Failing all that, any visible text at all, labelled `non-conforming`, so
+ *    that nothing the previous implementation surfaced is silently dropped.
+ *
+ * Steps 2 and 3 use `qualifiesAsSalvage`, which is deliberately looser than the
+ * gate: all three recorded runs that handed their write-up to the tool had
+ * spent their output budget on it and were cut off without a closing tag, so
+ * requiring a complete element here would discard 7-17 KB reports in favour of
+ * "(no final answer in transcript)". Short filler still never qualifies.
+ *
+ * Text *after* the done call is still excluded: the model frequently emits one
+ * short closing remark ("Done.") that would otherwise shadow the real answer.
+ * When the child finished by ending its turn cleanly there is no tool call, and
+ * the search simply starts at the final message.
+ *
+ * Salvage (2 and 3) sets `salvagedFrom`; the normal path leaves it unset.
  */
 export async function extractRunResult(runDir: string, runId: string): Promise<RunResult> {
   let entries: string[];
@@ -502,6 +573,12 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
     return { found: false, answered: false, text: "" };
   }
 
+  interface ContentPart {
+    type?: string;
+    text?: string;
+    name?: string;
+    arguments?: unknown;
+  }
   interface Entry {
     type?: string;
     message?: { role?: string; content?: unknown; stopReason?: string };
@@ -517,44 +594,148 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
     }
   }
 
-  /**
-   * The answer is the last assistant text at or before the `subagent_done`
-   * call — not the transcript's final assistant message. After the tool result
-   * the model frequently emits one short closing remark ("Done."), which would
-   * otherwise shadow the real answer. The call rides in the same assistant
-   * message as the answer, so that message is included. When the child
-   * finished via a clean turn without the tool, there is no tool call and the
-   * final assistant text is the answer.
-   */
-  let doneIdx = parsed.length - 1;
+  // The contract the child was launched under. Unreadable (a historical run, a
+  // corrupt dir) degrades to the weaker rule rather than declaring every such
+  // run unanswered.
+  let systemPrompt: string | undefined;
+  try {
+    systemPrompt = await readFile(systemPromptPath(runDir), "utf-8");
+  } catch {
+    systemPrompt = undefined;
+  }
+
+  const partsOf = (m: { content?: unknown }): ContentPart[] =>
+    (Array.isArray(m.content) ? m.content : []).filter(
+      (c): c is ContentPart => !!c && typeof c === "object",
+    );
+
+  const doneCallIn = (m: { content?: unknown }): ContentPart | undefined =>
+    partsOf(m).find((c) => c.type === "toolCall" && c.name === DONE_TOOL_NAME);
+
+  // The message that declared completion, and the boundary for every search
+  // below. With no `subagent_done` call, that boundary is the last *assistant*
+  // message — not the last entry, which is frequently a `toolResult` and would
+  // exclude the real final answer from every step.
+  let doneIdx = -1;
+  let doneCall: ContentPart | undefined;
   for (let i = parsed.length - 1; i >= 0; i--) {
     const m = parsed[i].message;
-    if (m?.role === "assistant" && Array.isArray(m.content)) {
-      const called = (m.content as Array<{ type?: string; name?: string }>).some(
-        (c) => c?.type === "toolCall" && c?.name === DONE_TOOL_NAME,
-      );
-      if (called) {
+    if (m?.role !== "assistant") continue;
+    const call = doneCallIn(m);
+    if (call) {
+      doneIdx = i;
+      doneCall = call;
+      break;
+    }
+  }
+  if (doneIdx < 0) {
+    for (let i = parsed.length - 1; i >= 0; i--) {
+      if (parsed[i].message?.role === "assistant") {
         doneIdx = i;
         break;
       }
     }
   }
 
+  // 1. The contract: a qualifying visible answer at or before the completion
+  //    boundary, newest first. A strictly-qualifying answer wins over anything
+  //    salvageable, wherever each sits, so an interim note cannot shadow the
+  //    real report that came after it (sub-7864: a 565-char note at entry 97
+  //    and the genuine 15,430-char answer at 101).
+  const doneMessage = doneIdx >= 0 ? parsed[doneIdx].message : undefined;
   for (let i = doneIdx; i >= 0; i--) {
     const m = parsed[i].message;
     if (m?.role !== "assistant") continue;
-    const text = (Array.isArray(m.content) ? m.content : [])
-      .filter((c): c is { type: string; text: string } => !!c && c.type === "text")
-      .map((c) => c.text)
-      .join("\n")
-      .trim();
+    const text = visibleTextOf(m);
+    if (qualifiesAsAnswer(text, systemPrompt)) {
+      return {
+        found: true,
+        answered: true,
+        text,
+        stopReason: m.stopReason,
+        sessionFile,
+        // Only the boundary message is "where the answer belongs"; anything
+        // earlier is the model having answered and then carried on.
+        ...(i === doneIdx ? {} : { salvagedFrom: "earlier-message" as const }),
+      };
+    }
+  }
+
+  // 2. Salvage: the report handed to the tool as a fabricated argument.
+  if (doneCall && typeof doneCall.arguments === "object" && doneCall.arguments !== null) {
+    const args = doneCall.arguments as Record<string, unknown>;
+    // `message` first (the name every observed case invented), then insertion
+    // order, so a model that picked a different key is still recovered.
+    const keys = ["message", ...Object.keys(args).filter((k) => k !== "message")];
+    for (const key of keys) {
+      const value = args[key];
+      if (typeof value !== "string") continue;
+      const text = value.trim();
+      if (qualifiesAsSalvage(text, systemPrompt)) {
+        return {
+          found: true,
+          answered: true,
+          text,
+          stopReason: doneMessage?.stopReason,
+          sessionFile,
+          salvagedFrom: "done-arguments",
+        };
+      }
+    }
+  }
+
+  // 3. Salvage: a substantial report the strict rule turned down, newest first.
+  //
+  // Starts **at** `doneIdx`, not below it. The done-calling message's own
+  // visible text gets a second, looser look here — a 15 KB `<result>` truncated
+  // by the output budget is still the report, and excluding it is what made an
+  // earlier draft of this function lose 47 KB across seven recorded runs while
+  // every test passed. A `<result>` contract agent that merely ran out of room
+  // is the single most common real shape, and it has no done call at all.
+  for (let i = doneIdx; i >= 0; i--) {
+    const m = parsed[i].message;
+    if (m?.role !== "assistant") continue;
+    const text = visibleTextOf(m);
+    if (qualifiesAsSalvage(text, systemPrompt)) {
+      return {
+        found: true,
+        answered: true,
+        text,
+        stopReason: m.stopReason,
+        sessionFile,
+        salvagedFrom: i === doneIdx ? "truncated-answer" : "earlier-message",
+      };
+    }
+  }
+
+  // 4. Last resort: any visible text at all, labelled as not an answer.
+  //
+  // This exists so the fix cannot lose information the old code surfaced. The
+  // old behaviour presented whatever text it found *as the answer*, which is
+  // how a filler line came to stand in for a report; the rule above refuses
+  // that, and this step forwards the same bytes with an honest label instead.
+  // Measured over the 164 recorded runs, this is the difference between losing
+  // 13 short texts (three of which carry real partial findings) and losing
+  // none.
+  for (let i = doneIdx; i >= 0; i--) {
+    const m = parsed[i].message;
+    if (m?.role !== "assistant") continue;
+    const text = visibleTextOf(m);
     if (text) {
-      return { found: true, answered: true, text, stopReason: m.stopReason, sessionFile };
+      return {
+        found: true,
+        answered: true,
+        text,
+        stopReason: m.stopReason,
+        sessionFile,
+        salvagedFrom: "non-conforming",
+      };
     }
   }
 
   return { found: true, answered: false, text: "", sessionFile };
 }
+
 async function findSessionFile(runDir: string, runId: string): Promise<string | undefined> {
   let dirEntries: string[];
   try {
