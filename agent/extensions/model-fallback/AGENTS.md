@@ -6,7 +6,7 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 | File | Owns |
 |---|---|
-| `lib.ts` | The state machine and every message. Pure, pi-free, 155 tests |
+| `lib.ts` | The state machine and every message. Pure, pi-free, and the one suite here covers it |
 | `index.ts` | Session wiring: `registerVirtualModel`, `/fallback-chain`, the footer notice |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
 
@@ -87,9 +87,11 @@ answered, the next request went back to the primary, task completed.
 
 ## MEASURED BEHAVIOUR
 
-Everything below was produced by running pi 1.0.2, not inferred. The harness used
-a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection refused on every
-request), so the primary fails deterministically.
+Everything below was produced by running pi 1.0.2 (the running pi is now **1.0.4**), not
+inferred. The harness used a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection
+refused on every request), so the primary fails deterministically. The chains quoted below
+(`deadend/void`, `deadend/void2`, `claude-haiku-4.5`) are that harness's, **not** the live
+`modelFallback.chain` in `agent/settings.json` — read the setting for what is configured now.
 
 A session transcript (`agent/sessions/*/*.jsonl`) with chain
 `[deadend/void, anthropic/claude-haiku-4.5]`:
@@ -251,7 +253,7 @@ This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At th
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/model-fallback/lib.test.ts   # 155 tests
+bun test agent/extensions/model-fallback/lib.test.ts   # the whole suite
 cd agent/extensions/model-fallback && \
   ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```

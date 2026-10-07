@@ -2,8 +2,11 @@
 
 Every top-level `*.ts` here is one independent extension (the inventory below is the list —
 the count is whatever `ls agent/extensions/*.ts` says, not a number restated in prose);
-`lib/` is the shared, pi-free helper layer. `ralph-loop/`, `subagent-herdr/` and
-`model-fallback/` have their own AGENTS.md.
+`lib/` is the shared, pi-free helper layer, inventoried below rather than in its own
+AGENTS.md — a second file there is the duplication this hierarchy exists to avoid.
+`ralph-loop/`, `subagent-herdr/` and `model-fallback/` have their own AGENTS.md; this tier's
+only config file is `tsconfig.json` (the top-level typecheck scope — no `package.json`, no
+scripts, so every command below comes from the repo root).
 
 ## WHERE TO LOOK
 
@@ -43,7 +46,7 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
   `promptGuidelines`: pi folds those into the prompt only while the tool is in the active
   set, so gating the tool and gating its advice are the same act.
 - **Skill activation is inferred, not reported, and the inference is load-bearing.**
-  Re-probed against the installed pi (1.0.0): there is still **no `skill_invoke` event**,
+  Re-probed against the installed pi (1.0.x; the running pi is now 1.0.4): there is still **no `skill_invoke` event**,
   and `systemPromptOptions.skills` is the **catalogue** (every discovered skill, every
   turn), *not* the loaded set — reading it as "loaded" silently ungates everything. The two
   real signals are a `/skill:x` invocation, which pi expands into `before_agent_start`'s
@@ -127,8 +130,7 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
   once per sentence. `Grader` is a closed union (`'reviewer' | 'verifier'`) rather than
   `string`, so the table must cover every member and a third grader fails to compile at the
   one place that must be updated — the earlier `?? fallback` was unreachable and only looked
-  like safety. Note `dynamic-prompt.ts` is in **no `tsc -p` scope**, so that typing is only
-  enforced when pi loads the file or you point a hand-rolled tsconfig at it.
+  like safety.
 - **`todo.ts` is not the old `plan` extension and must not grow into it.** `todo` is a
   different tool, and now that the stale `plan` prompt branch is deleted nothing re-arms it.
   What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a
@@ -180,20 +182,28 @@ the count is whatever `ls agent/extensions/*.ts` says, not a number restated in 
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
-There are now **four** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
+There are **four** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
 reached transitively for a while but not *declared*, which left the module owning a
 cross-process grammar outside the stated scope),
 `model-fallback`'s three, `ralph-loop`'s six, and the top-level `agent/extensions` scope
-(all top-level `*.ts` plus `lib/*.ts`, excluding tests). What matters here is what they do **not** cover: the
-subdirectory extensions' internal modules are each in their own scope; `auto-update/` and
-`trade-journal/` remain untyped. Beware the skew when you check one by
-hand: the `@earendil-works/*` in `~/node_modules` is 0.75.4 against a running pi of 1.0.2,
-so typechecking against it reports phantom errors for APIs that exist only in the live
-bundle (for example `registerMcpServer`, from `core/mcp-servers.js`). 0.75.4 has
-no virtual-model API at all, so `model-fallback` cannot typecheck against it even nominally.
-Point `types`/aliases at the running pi's `dist/` instead, as `model-fallback/tsconfig.json`
-does with a `paths` entry — that is the pattern to copy, and `Model<Api>` comes from
-`@earendil-works/pi-ai`, not from `pi-coding-agent`.
+(all top-level `*.ts` plus `lib/*.ts`, excluding tests — so `dynamic-prompt.ts` **is** covered;
+this file claimed the opposite for several revisions). What matters here is what they do
+**not** cover: the subdirectory extensions' internal modules are each in their own scope, and
+`auto-update/` and `trade-journal/` have no `tsconfig.json` at all, so they remain untyped —
+though they still resolve the live bundle at runtime, since with no tsconfig of their own they
+inherit this directory's `paths`.
+
+Three of the four scopes carry a `paths` entry aiming `@earendil-works/*` at the running pi's
+bundle; `subagent-herdr` is the lone holdout, and because the **nearest** tsconfig wins
+outright its paths-less config shadows this directory's mapping rather than inheriting it — so
+it resolves the stale `~/node_modules` (0.75.4) instead. It survives that because it imports
+`ExtensionAPI` as a **type** only. The skew is real for anything newer: 0.75.4 reports phantom
+errors for APIs that exist only in the live bundle (`registerMcpServer`, from
+`core/mcp-servers.js` — plausible but not re-measured) and has no virtual-model API at all, so
+`model-fallback` could not typecheck against it even nominally. Copy its `paths` entry rather
+than re-deriving one, and note `Model<Api>` comes from `@earendil-works/pi-ai`, not from
+`pi-coding-agent`. The root AGENTS.md COMMANDS section has the per-scope table and the probe
+that measures it — `paths` governs **bun's runtime resolution too**, not just tsc.
 
 ## ANTI-PATTERNS
 

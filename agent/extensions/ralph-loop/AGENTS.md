@@ -15,7 +15,7 @@ cap is reached, it stalls, or the user stops it. A port of oh-my-openagent's
 | `gate.ts` | The **static** gate — resolves the oracle definition, captures the git baseline, runs the headless audit child |
 | `runtime-gate.ts` | The **runtime** gate — runs the `verifier` agent, which executes the project's checks in Docker |
 | `image.ts` | Container image provisioning: prefers the project's Dockerfile, else synthesises one extending the reference base; keyed by manifest hash |
-| `lib.test.ts` | The pure parts, both gate protocols, image + web detection (140 tests) |
+| `lib.test.ts` | The pure parts, both gate protocols, image + web detection (the one suite here; count it rather than trusting a number) |
 
 The loop edge is `agent_settled` — the only event that fires *after* auto-retry and
 auto-compaction, so it means "the agent genuinely stopped", not "the agent paused". Per
@@ -145,7 +145,7 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/ralph-loop/lib.test.ts   # 140 tests
+bun test agent/extensions/ralph-loop/lib.test.ts   # the whole suite (no local config declares this; it is a repo-root command)
 ```
 
 ```
