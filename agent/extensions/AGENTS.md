@@ -23,7 +23,8 @@ scripts, so every command below comes from the repo root).
 | `model-fallback/` | `registerVirtualModel("fallback/auto")` + `/fallback-chain` — on an error, route the retry to the **next** model in a chain, then hand the following request back to the original. One full lap of the chain is one logical retry. Consumed by the orchestrator (settings), delegated children (`PI_FALLBACK_CHAIN`) and both ralph-loop gates. Own AGENTS.md |
 | `sessions.ts` | `/sessions` — resumable session list from pi's own `SessionManager.list()`; no JSONL re-parsing |
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
-| `todo.ts` | `todo` tool + `/todos` — in-session checklist as a `belowEditor` widget. State replays from tool-result `details` on the current branch, so no file and no lock. Also holds the turn open on `agent_before_settle` while items are still pending/in-progress, injecting a `custom_message` nudge — once per distinct list state, and only on `outcome: "completed"` |
+| `todo.ts` | `todo` tool + `/todos` — **a spawned subagent's** checklist as a `belowEditor` widget; the factory returns unless `PI_SUBAGENT_RUN_ID` is set, and `subagent-herdr` appends `todo` to every child's `--tools`. State is in memory, rebuilt from tool-result `details` on `session_start`/`session_tree` only (replaying per op lost parallel updates). No settle guard: a child's completion handshake fires on `agent_end`, before `agent_before_settle` could continue it |
+| `kanban/` | `kanban` tool + `/kanban` — **the orchestrator's** board, replacing `todo` for it. Columns backlog → in_progress → blocked → review → done; cards link subagent runs (advisory badges, never auto-moved). `index.ts` is the single writer (snapshots in tool-result `details` or `kanban-state` custom entries, in-memory authoritative, digest repair at `turn_end`/`agent_settled`) and holds the settle guard; `board.ts` (shebang, bun) is the read-only side-pane viewer of a projection in `$XDG_RUNTIME_DIR/pi-kanban/`; `lib.ts` is pure; `runs.ts` reads `meta.json` through `rundir.ts`. Opens a side pane on every non-reload session start inside herdr's TUI, widget fallback otherwise |
 | `auto-update/` | `/update` + `pi_update` tool — version check on `session_start`, at most every 4h |
 | `trade-journal/` | `trade_journal` tool — journal in `~/.agentic-trading/journal/` (`AGENTIC_TRADING_JOURNAL` overrides). Modes `record`/`read`/`stats`/`dupes`. Mechanics only — judgment belongs to the `technical-analysis` skill's agents, and the tool is gated on that skill being active |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
@@ -32,7 +33,7 @@ scripts, so every command below comes from the repo root).
 | `lib/skill-tree.ts` | Where skills live on disk (`findSkills`, `categoryFromPath`, `SkillLocation`) — the single walker of `skills/<category>/<skill>/`, mirroring pi's rule that a dir holding `SKILL.md` is a skill root. The three readers below it each did their own one-level `readdir` once, and nesting broke all three *silently* |
 | `lib/skill-categories.ts` | Which category a skill belongs to (`groupByCategory`, `categoryFor`, `CATEGORY_ORDER`, `PACKAGE_SKILL_CATEGORIES`) — path wins for a local skill, a name-keyed map covers the vendored package skills, and an unmapped one degrades to `other` rather than vanishing |
 | `lib/skill-activation.ts` | Which skills are live this session (`SkillActivation`, `skillsInPrompt`, `isSkillLoad`, `gateTools`, `parseOwnedTools`, `skillDirFromPath`, `loadSkillToolOwners`) — the inference behind skill-gated tools and agents |
-| `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot. Also owns the forgetting guards: `unfinished`, `nudgeFor`, `progressSignature` (settle-time reminder + its dedupe key) and `demotedBy` (the item a `start` silently knocked back to pending) |
+| `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot. Also owns `demotedBy` (the item a `start` silently knocked back to pending), and `unfinished`/`nudgeFor`/`progressSignature`, a settle-time reminder and its dedupe key that `todo.ts` no longer installs (subagent-only now; the orchestrator's guard is `kanban/lib.ts`) |
 | `lib/trade-journal-store.ts` | The single journal markdown grammar (`parseDay`, `renderDay`, `recordObservations`, `mergeObservations`, `findDuplicates`, `summarize`) — same format the journal agents hand-edit |
 | `lib/widget.ts` | `fitLines`, `fittedWidget`, `row`, `frame`, `cachedByWidth` — the measuring seam |
 
@@ -131,22 +132,26 @@ scripts, so every command below comes from the repo root).
   `string`, so the table must cover every member and a third grader fails to compile at the
   one place that must be updated — the earlier `?? fallback` was unreachable and only looked
   like safety.
-- **`todo.ts` is not the old `plan` extension and must not grow into it.** `todo` is a
-  different tool, and now that the stale `plan` prompt branch is deleted nothing re-arms it.
-  What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a
+- **Neither `todo.ts` nor `kanban/` is the old `plan` extension, and neither may grow into
+  it.** What `plan` was is worth knowing first: a plan file (`agent/plans/<key>.jsonl`) plus a
   live kanban Board in its own pane, which needed a *second* writer and then a cross-process
   lock that could still lose updates, and whose last commits before deletion were all
-  stale-card fixes. `todo` avoids all of it by having no file — state replays from
-  tool-result `details` on the current branch, so there is exactly one writer and a rewind
-  cannot leave a stale list describing work the agent no longer remembers doing.
-- **A boundary handler must not gate on the `canContinue` it was handed.** `todo.ts`'s
+  stale-card fixes. Both successors avoid all of it by keeping canonical state in the session
+  branch — one writer, and a rewind cannot leave a stale board describing work the agent no
+  longer remembers doing. `kanban/board.ts` is a *viewer*: it reads a disposable projection
+  and writes nothing. **Do not give it an inbox, a marker file or any other write path** —
+  that is the second writer again; user edits go through `/kanban`, which runs in the
+  extension. And do not rebuild either list from the branch inside `execute`: pi persists a
+  parallel tool batch only after the whole batch, so every call replays the same stale
+  branch and the last snapshot erases the rest (measured on `todo`).
+- **A boundary handler must not gate on the `canContinue` it was handed.** `kanban/`'s
   `agent_before_settle` guard returns `{ continue: true }` with a `custom_message` draft to
-  stop the agent abandoning an unfinished list. At handler time `event.context.canContinue`
+  stop the agent abandoning an unfinished board. At handler time `event.context.canContinue`
   is `false` — the last message is still the assistant's — and pi only recomputes it *after*
   committing the drafts (`_runBeforeSettleBoundary`), where the committed message is what
   makes the continuation legal. Reading that flag as a precondition is a silent no-op that
   looks like a safety check. Pair any such continuation with a cap keyed on real progress
-  (`progressSignature`): an unconditional one re-asks forever and wedges the session.
+  (`settleSignature`): an unconditional one re-asks forever and wedges the session.
 - **A test may import a top-level extension; only the test *file* is barred from this
   directory.** The constraint is where the file sits, not what it may reach: pi auto-loads
   every top-level `*.ts`, so a `*.test.ts` here imports `bun:test` and kills startup. A test
@@ -182,10 +187,10 @@ scripts, so every command below comes from the repo root).
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
-There are **four** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
+There are **five** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
 reached transitively for a while but not *declared*, which left the module owning a
 cross-process grammar outside the stated scope),
-`model-fallback`'s three, `ralph-loop`'s six, and the top-level `agent/extensions` scope
+`model-fallback`'s three, `ralph-loop`'s six, `kanban`'s four (`board.ts` included), and the top-level `agent/extensions` scope
 (all top-level `*.ts` plus `lib/*.ts`, excluding tests — so `dynamic-prompt.ts` **is** covered;
 this file claimed the opposite for several revisions). What matters here is what they do
 **not** cover: the subdirectory extensions' internal modules are each in their own scope, and
@@ -193,7 +198,7 @@ this file claimed the opposite for several revisions). What matters here is what
 though they still resolve the live bundle at runtime, since with no tsconfig of their own they
 inherit this directory's `paths`.
 
-Three of the four scopes carry a `paths` entry aiming `@earendil-works/*` at the running pi's
+Four of the five scopes carry a `paths` entry aiming `@earendil-works/*` at the running pi's
 bundle; `subagent-herdr` is the lone holdout, and because the **nearest** tsconfig wins
 outright its paths-less config shadows this directory's mapping rather than inheriting it — so
 it resolves the stale `~/node_modules` (0.75.4) instead. It survives that because it imports

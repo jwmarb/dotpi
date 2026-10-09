@@ -1,44 +1,45 @@
 /**
- * todo extension — an in-session todo list the agent maintains, rendered as a
- * live widget below the editor.
+ * todo extension — the simple checklist a SPAWNED SUBAGENT keeps, rendered as a
+ * live widget below the editor of its own herdr pane.
+ *
+ * Subagent-only: the factory returns at once unless `PI_SUBAGENT_RUN_ID` is set
+ * (subagent-herdr stamps it into every child, and auto-appends `todo` to every
+ * child's `--tools` allowlist). The human's orchestrator gets the kanban board
+ * instead (`kanban/`), which replaced this list for it.
  *
  * Use case: multi-step work drifts. The agent writes the steps down, marks one
- * in progress, and the user can see at a glance what it thinks it is doing
- * without asking.
+ * in progress, and whoever watches the child's pane sees what it thinks it is
+ * doing.
  *
  * Behavior:
  * - Registers a `todo` tool (add / start / complete / block / drop / clear).
  * - Renders the list below the editor whenever it is non-empty; hides itself
  *   when empty, so a session that never plans anything costs no screen space.
  * - Registers `/todos` to print the list into the transcript on demand.
- * - Holds the turn open on `agent_before_settle` when items are still open, so
- *   an abandoned list is corrected rather than silently left behind.
  *
- * WHY A SETTLE-TIME GUARD AND NOT JUST A STRONGER PROMPT
+ * WHY THERE IS NO SETTLE-TIME GUARD ANY MORE
  *
- * `promptGuidelines` already say to complete each item as it lands. Guidelines
- * are read once, at the top of a long run, and the forgetting happens at the
- * end — the model finishes the work, writes its summary and stops, with the list
- * still claiming nothing finished. Prose cannot fix a recency problem, so the
- * reminder is moved to the moment it is about to be wrong: `agent_before_settle`
- * fires when the agent would stop, and returning `{ continue: true }` with a
- * `custom_message` draft puts the open items back in front of the model as a
- * user-role turn (pi maps `role: "custom"` to `user` in `convertToLlm`).
+ * This extension used to hold the turn open on `agent_before_settle` while
+ * items were still open. That guard now lives in the kanban extension, for the
+ * orchestrator. In a subagent it cannot work and would be harmful: pi runs
+ * `agent_before_settle` only after `agent_end` (`agent-session.js`
+ * `_runAgentPrompt`), and the child's completion handshake
+ * (`subagent-herdr/child-done.ts`) acts *on* `agent_end` — it writes the
+ * `.exit` sidecar, tells the parent the run is done, closes its own pane and
+ * shuts down. A continuation after that is either killed with the pane or,
+ * worse, a child still editing files after its parent was told it finished
+ * (decided with the oracle). Completion gating belongs to `child-done`.
  *
- * Two things keep that from becoming a trap:
+ * WHY THE STATE IS IN MEMORY, REBUILT FROM THE BRANCH
  *
- *  - **One reminder per distinct list state** (`nudgedSignatures`). The nudge is
- *    keyed on every item's status, so completing an item re-arms it but an
- *    ignored reminder is never repeated. Without that cap a model declining to
- *    update its list would be asked forever and the session would wedge.
- *  - **Only on `outcome: "completed"`.** An aborted or errored run is not a
- *    forgotten checklist; injecting work there would fight the user's Esc.
+ * Rebuilding the list from the branch before every op loses updates: pi runs a
+ * message's tool calls in parallel and persists their results only after the
+ * whole batch, so parallel `todo` calls all replayed the same branch and the
+ * last one's snapshot erased the others' (observed: seven `block` calls left
+ * one blocked item). Ops therefore apply to the in-memory list, synchronously,
+ * and the branch rebuilds it only where the branch can actually change under
+ * it — `session_start` (every reason) and `session_tree`.
  *
- * `context.canContinue` is deliberately *not* consulted: at handler time the
- * last message is the assistant's, so it reads `false`. pi recomputes it after
- * committing the draft, and the committed `custom_message` is what makes the
- * continuation legal. Gating on the value seen here would disable the guard
- * entirely while looking correct.
  *
  * WHY BELOW THE EDITOR AND NOT IN THE FOOTER
  *
@@ -50,8 +51,8 @@
  * WHY THE STATE IS NOT IN A FILE
  *
  * The list is rebuilt by replaying `todo` tool results on the *current* branch
- * (`reconstruct`). Fork or rewind, and the list is correct for that point in
- * history for free. The `plan` extension removed in `7a54a3b` kept
+ * (`reconstruct`) at those two events. Fork or rewind, and the list is correct
+ * for that point in history for free. The `plan` extension removed in `7a54a3b` kept
  * `agent/plans/<key>.jsonl` instead, which had no notion of branches: a rewind
  * left the file describing work the agent no longer remembered doing. Worse,
  * its Board wrote the same file (ADR 0015), which required a cross-process lock
@@ -72,7 +73,6 @@ import {
 	counts,
 	demotedBy,
 	emptyState,
-	nudgeFor,
 	STATUS_GLYPH,
 	summarize,
 	TodoError,
@@ -162,16 +162,10 @@ function toOp(params: TodoParamsType): TodoOp {
 }
 
 export default function (pi: ExtensionAPI) {
-	let state: TodoState = emptyState();
+	// The orchestrator has the kanban board; only spawned subagents keep this list.
+	if (!process.env.PI_SUBAGENT_RUN_ID) return;
 
-	/**
-	 * List states already reminded about, so each is raised at most once.
-	 *
-	 * In memory rather than derived from the branch: it is a property of this
-	 * conversation's nagging, not of the todo list, and a reminder the model
-	 * ignored must not come back on every subsequent settle.
-	 */
-	const nudgedSignatures = new Set<string>();
+	let state: TodoState = emptyState();
 
 	/**
 	 * Rebuild the list from the current branch's `todo` tool results.
@@ -241,7 +235,7 @@ export default function (pi: ExtensionAPI) {
 		name: TOOL_NAME,
 		label: "Todo",
 		description:
-			"Maintain a todo list for the current task, shown to the user below the editor. " +
+			"Maintain a todo list for your current task, shown below the editor in your pane. " +
 			"Ops: add (texts), start (id), complete (id, note?), block (id, note), drop (id), clear. " +
 			"Items are addressed by id, so you never resend the whole list.",
 		promptSnippet: "Track multi-step work in a visible todo list (add/start/complete/block).",
@@ -249,14 +243,13 @@ export default function (pi: ExtensionAPI) {
 			"For work of three or more non-trivial steps, call todo with op 'add' to write the steps down before starting. Skip it for single-step or trivial requests — a plan for trivial work is noise.",
 			"Mark exactly one item in progress with op 'start' before working on it, and op 'complete' immediately after finishing it, not batched at the end. Starting an item automatically demotes the previous one, so complete or block the current item before starting the next.",
 			"Only complete an item when it is genuinely finished. If tests fail, the implementation is partial, or you hit an unresolved error, use op 'block' with a note saying what is wrong instead.",
-			"Before you finish your reply, every item must be resolved: complete, blocked with a note, or dropped. Leaving items pending or in progress holds the turn open and asks you to account for them, so settle the list as you go rather than being reminded.",
+			"Before you finish your reply, every item must be resolved: complete, blocked with a note, or dropped. Settle the list as you go — nothing reminds you at the end.",
 			"Do not restate the todo list in your replies after calling the tool — the user already sees it below the editor.",
 		],
 		parameters: TodoParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			// Re-derive before mutating: a fork or rewind between calls means the
-			// in-memory copy may describe a branch the session has left.
-			reconstruct(ctx);
+			// No reconstruct here: the in-memory list is authoritative between branch
+			// changes, and replaying the branch per op loses parallel updates (header).
 
 			const before = state;
 			try {
@@ -325,46 +318,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => {
 		reconstruct(ctx);
 		refreshWidget(ctx);
-		// A rewind can land on a state that was already nudged. Keeping those
-		// signatures would suppress the reminder for work now unfinished again, so
-		// a branch change forgets them and the guard re-arms.
-		nudgedSignatures.clear();
 	});
 
-	/**
-	 * The guard: refuse to let the agent stop while items are still open.
-	 *
-	 * Returns a `custom_message` draft plus `continue: true`, which pi commits
-	 * and then re-runs the agent against — see the header note on why
-	 * `context.canContinue` is not consulted here.
-	 */
-	pi.on("agent_before_settle", async (event, ctx) => {
-		// Esc or a crash is not a forgotten checklist. Leave those alone.
-		if (event.outcome !== "completed") return;
-
-		reconstruct(ctx);
-		refreshWidget(ctx);
-
-		const nudge = nudgeFor(state);
-		if (!nudge) return;
-		// Already asked about exactly this list, and nothing moved since. Asking
-		// again would loop a model that has decided not to update it.
-		if (nudgedSignatures.has(nudge.signature)) return;
-		nudgedSignatures.add(nudge.signature);
-
-		return {
-			entries: [
-				...event.entries,
-				{
-					type: "custom_message" as const,
-					customType: "todo-reminder",
-					content: nudge.text,
-					// Visible: the user should see why the turn did not end, and the
-					// widget alone does not explain the extra round trip.
-					display: true,
-				},
-			],
-			continue: true,
-		};
-	});
 }

@@ -26,11 +26,13 @@
  * 3. **An unfinished list is not allowed to settle quietly.**
  *    Forgetting to mark an item done is the dominant failure mode: the work
  *    happens, the list keeps claiming it did not. `nudgeFor` and
- *    `progressSignature` are the pure half of the guard the extension installs
- *    on `agent_before_settle` — one reminder per distinct list state, so real
- *    progress re-arms it while an ignored reminder cannot wedge the session.
- *    `demotedBy` catches the same mistake one step earlier, at the `start` that
- *    silently knocked the previous item back to pending.
+ *    `progressSignature` are a settle-time reminder and its dedupe key — one
+ *    reminder per distinct list state. `todo.ts` no longer installs that guard:
+ *    it is subagent-only now, and a child's completion handshake fires on
+ *    `agent_end`, before `agent_before_settle` could continue it (see its
+ *    header). The orchestrator's equivalent is `kanban/lib.ts` `nudgeFor`.
+ *    `demotedBy` still catches the mistake one step earlier, at the `start`
+ *    that silently knocked the previous item back to pending.
  */
 
 /** Lifecycle of a single item. `blocked` needs no WIP rule, so it is uncapped. */

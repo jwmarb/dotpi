@@ -47,7 +47,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Loop the agent on a goal until it declares completion | `agent/extensions/ralph-loop/` (`/ralph-loop`, `/ulw-loop`, `/loop-stop`; `--verify[=static\|runtime\|both]`) |
 | Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools; event-driven — no blocking wait, the child wakes the parent) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
-| Track multi-step work in a visible checklist | `agent/extensions/todo.ts` (`todo` tool, `/todos`; widget below the editor, state lives in tool-result `details` — no plan file) |
+| Track the orchestrator's work on a board | `agent/extensions/kanban/` (`kanban` tool, `/kanban`; a read-only herdr side pane opened on every session start except `/reload` (which adopts the open pane, or respects that you closed it), widget fallback. State lives in the session branch — the board only reads a projection. Orchestrator only) |
+| A subagent's private checklist | `agent/extensions/todo.ts` (`todo` tool, `/todos`; registered **only** in a spawned child, which gets it appended to its `--tools` by `subagent-herdr`) |
 | Record/read trading-journal observations | `agent/extensions/trade-journal/` (`trade_journal` tool; modes record/read/stats/dupes. Gated on the `technical-analysis` skill being active; grammar in `lib/trade-journal-store.ts`) |
 | Regenerate this knowledge base | `agent/extensions/init.ts` (`/init`) |
 | Shared extension helpers | `agent/extensions/lib/` (dotenv loader, widget measuring/fitting, repo layout, agent parsing) |
@@ -59,7 +60,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 
 ## CONVENTIONS
 
-- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests therefore live in subdirectories, which pi enters only via `index.ts` — `agent/extensions/lib/*.test.ts` plus one `lib.test.ts` per subdirectory extension (`trade-journal/`, `subagent-herdr/`, `ralph-loop/`, `model-fallback/`); `bun test agent/extensions/lib/` and the COMMANDS block below are the live list. **This bars the test file's location, not its imports:** a test in `lib/` may import `../<extension>.js` and exercise a top-level extension's pure logic directly, which `lib/sessions.test.ts` already does. Needing a test is not by itself a reason to make an extension a directory.
+- **Parse errors are startup-fatal.** Pi auto-loads every top-level `agent/extensions/*.ts`; a test file placed there (it imports `bun:test`) breaks pi startup. Tests therefore live in subdirectories, which pi enters only via `index.ts` — `agent/extensions/lib/*.test.ts` plus one `lib.test.ts` per subdirectory extension (`trade-journal/`, `subagent-herdr/`, `ralph-loop/`, `model-fallback/`, `kanban/`); `bun test agent/extensions/lib/` and the COMMANDS block below are the live list. **This bars the test file's location, not its imports:** a test in `lib/` may import `../<extension>.js` and exercise a top-level extension's pure logic directly, which `lib/sessions.test.ts` already does. Needing a test is not by itself a reason to make an extension a directory.
 - **One parser per format.** `lib/dotenv.ts` owns `agent/.env`, `lib/agents.ts` owns the `agents/*.md` frontmatter *and* the frontmatter list grammar every `SKILL.md` shares (`extractStringList`, `frontmatterOf`), `lib/skill-tree.ts` owns the **shape of `agent/skills/`** (where a skill is, and what category it is in), `lib/trade-journal-store.ts` owns the journal markdown, `subagent-herdr/rundir.ts` owns the run-directory shapes *and the child→parent wake-notice grammar*, `model-fallback/lib.ts` owns the model-reference grammar and the `PI_FALLBACK_CHAIN` handoff (`subagent-herdr` imports `CHAIN_ENV`/`FALLBACK_MODEL_REF` from it rather than restating either). Do not add a second reader of any of them — two parsers drift, and drift is how credentials and spawn arguments get out of sync. This has already happened twice here: `skill-activation.ts` shipped a second copy of the list grammar that had *already* diverged on whether to `.trim()` before testing for `-`, and three separate readers each hardcoded a flat `skills/` layout, so categorizing the library silently cost every nested skill its tools and agents until `skill-tree.ts` became the one walker.
 - **Widgets must measure.** Hand-built widget lines render through `fitLines`/`fittedWidget` (`lib/widget.ts`): a line wider than the terminal throws in pi's TUI host and kills the `pi` process (measured with `visibleWidth`, never `String.length`).
 - **Secrets live only in `agent/.env`.** `litellm.ts` reads `LITELLM_API_KEY` lazily and `firecrawl-cli.ts` loads `FIRECRAWL_API_URL` into the real `process.env` so the `firecrawl` CLI can see it; a literal key in a tracked file defeats both.
@@ -75,6 +76,7 @@ bun test agent/extensions/lib/                          # widget/agents/layout/s
 bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic
 bun test agent/extensions/subagent-herdr/               # herdr: lib + child-done + wake (3 suites, not 1)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop
+bun test agent/extensions/kanban/                       # kanban: reducer, replay, guard, layout, board args, runs + the role gate
 bun test agent/extensions/model-fallback/lib.test.ts    # fallback-chain state machine
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name
@@ -86,6 +88,7 @@ In-session slash commands (typed into pi's TUI, not a shell):
 /update      check for + install a pi update (checks at most every 4h)
 /mcp         builtin MCP manager: sign in, reconnect, enable/disable, change exposure
 /reload      hot-reload extensions after editing them
+/kanban      reopen the orchestrator's board pane after closing it; add/move/note/link/drop/…, show/close/restart (/kanban help)
 ```
 
 ```sh
@@ -97,12 +100,13 @@ docker build -f agent/docker/verify-base.Dockerfile \
   -t ralph-verify/base:latest agent/docker/    # the tracked verifier base image (also built on demand)
 ```
 
-Typecheck (`noEmit`) has four scopes; there is no root `tsconfig.json`:
+Typecheck (`noEmit`) has five scopes; there is no root `tsconfig.json`:
 
 ```sh
 cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions/model-fallback && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/kanban         && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 cd agent/extensions                && subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
 
@@ -123,6 +127,7 @@ which is the mechanism behind the table below:
 | `agent/extensions` (top-level `*.ts` + `lib/*.ts`) | own, has `paths` | global, **1.0.4** |
 | `agent/extensions/ralph-loop` | own, has `paths` | global, **1.0.4** |
 | `agent/extensions/model-fallback` | own, has `paths` | global, **1.0.4** |
+| `agent/extensions/kanban` (incl. the `board.ts` pane process, run by bun) | own, has `paths` | global, **1.0.4** |
 | `agent/extensions/subagent-herdr` | own, **no `paths`** | ancestor, **0.75.4** |
 | `agent/extensions/auto-update`, `trade-journal`, any new dir with no tsconfig | inherits `agent/extensions` | global, **1.0.4** |
 
