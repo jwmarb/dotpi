@@ -38,6 +38,12 @@ export const DONE_TOOL_NAME = "subagent_done";
 export const REPORT_TOOL_NAME = "subagent_report";
 
 /**
+ * The simple checklist every subagent gets (`todo.ts`, registered only when
+ * `PI_SUBAGENT_RUN_ID` is set). The orchestrator has the kanban board instead.
+ */
+export const TODO_TOOL_NAME = "todo";
+
+/**
  * A run id in the `sub-a3f1` shape that the orchestrator prompt advertises.
  * Four hex chars: plenty for a handful of concurrent runs, short enough to
  * read aloud.
@@ -145,7 +151,10 @@ export async function readReports(runDir: string): Promise<ChildReport[]> {
  * `subagent_done` and `subagent_report` are always appended to the tool
  * allowlist: a child that cannot report completion cannot finish, and a
  * child that cannot message the orchestrator is a subagent that can only
- * shout from a pane nobody is watching.
+ * shout from a pane nobody is watching. `todo` is appended too: every
+ * subagent gets its private checklist, which is launch policy rather than a
+ * capability to copy into each agent's frontmatter (it writes no files, so a
+ * read-only agent stays read-only).
  */
 export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   const argv: string[] = [
@@ -158,7 +167,7 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   ];
   if (opts.model) argv.push("--model", opts.model);
   if (opts.tools && opts.tools.length > 0) {
-    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME])];
+    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME, TODO_TOOL_NAME])];
     argv.push("--tools", tools.join(","));
   }
   if (opts.systemPromptPath) argv.push("--append-system-prompt", opts.systemPromptPath);

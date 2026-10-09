@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { discoverAgents, parseAgentFile } from "../lib/agents.js";
+import { agentsDir } from "../lib/layout.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   appendSkillCatalogue,
@@ -32,9 +33,10 @@ import {
   selectSkills,
   skillEntriesFromPi,
   SKILLS_WILDCARD,
+  TODO_TOOL_NAME,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
-import { classifyExecFailure, errorPayload } from "./herdr.js";
+import { classifyExecFailure, errorPayload, paneRectFrom, splitArgs } from "./herdr.js";
 import { launchAttempt, type Launcher } from "./index.js";
 import {
   exitPath,
@@ -89,16 +91,24 @@ describe("buildChildArgv", () => {
     expect(argv.slice(0, 6)).toEqual(["-e", base.childDonePath, "--session-dir", base.runDir, "--session-id", base.runId]);
   });
 
-  test("appends the done and report tools to a declared tool allowlist", () => {
+  test("appends the done, report and todo tools to a declared tool allowlist", () => {
     const argv = buildChildArgv({ ...base, tools: ["read", "grep"] });
     expect(argv).toContain("--tools");
     const tools = argv[argv.indexOf("--tools") + 1];
-    expect(tools).toBe(`read,grep,${DONE_TOOL_NAME},${REPORT_TOOL_NAME}`);
+    expect(tools).toBe(`read,grep,${DONE_TOOL_NAME},${REPORT_TOOL_NAME},${TODO_TOOL_NAME}`);
   });
 
-  test("does not duplicate the handshake tools if an agent file already declares them", () => {
-    const argv = buildChildArgv({ ...base, tools: [DONE_TOOL_NAME, REPORT_TOOL_NAME] });
-    expect(argv[argv.indexOf("--tools") + 1]).toBe(`${DONE_TOOL_NAME},${REPORT_TOOL_NAME}`);
+  test("does not duplicate the handshake or todo tools if an agent file already declares them", () => {
+    const argv = buildChildArgv({ ...base, tools: [TODO_TOOL_NAME, DONE_TOOL_NAME, REPORT_TOOL_NAME] });
+    expect(argv[argv.indexOf("--tools") + 1]).toBe(`${TODO_TOOL_NAME},${DONE_TOOL_NAME},${REPORT_TOOL_NAME}`);
+  });
+
+  test("every repository agent with an explicit allowlist gets todo", async () => {
+    for (const agent of await discoverAgents(agentsDir())) {
+      if (!agent.tools || agent.tools.length === 0) continue;
+      const argv = buildChildArgv({ ...base, tools: agent.tools });
+      expect(argv[argv.indexOf("--tools") + 1]!.split(",")).toContain(TODO_TOOL_NAME);
+    }
   });
 
   test("omits --tools for an all-tools agent", () => {
@@ -2038,5 +2048,46 @@ describe("qualifiesAsAnswer", () => {
   test("hasResultBlock accepts a multi-line body and a trailing remark", () => {
     expect(hasResultBlock("noise\n<result>\nbody\nmore\n</result>\ntrailing")).toBe(true);
     expect(hasResultBlock("no tags at all")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// herdr pane primitives (kanban side pane)
+// ---------------------------------------------------------------------------
+
+describe("splitArgs", () => {
+  test("anchors an explicit pane, never --current, and never steals focus", () => {
+    const args = splitArgs("w9:p1", "right", 0.7, "/repo");
+    expect(args).toEqual(["pane", "split", "--pane", "w9:p1", "--direction", "right", "--ratio", "0.7", "--cwd", "/repo", "--no-focus"]);
+    expect(args).not.toContain("--current");
+  });
+});
+
+describe("paneRectFrom", () => {
+  // The reply shape measured from `herdr pane layout --pane w9:p1` (herdr 0.9.0).
+  const reply = {
+    id: "cli:pane:layout",
+    result: {
+      layout: {
+        area: { height: 69, width: 251, x: 0, y: 0 },
+        panes: [
+          { focused: true, pane_id: "w9:p2B", rect: { height: 69, width: 75, x: 0, y: 0 } },
+          { focused: false, pane_id: "w9:p2C", rect: { height: 69, width: 176, x: 75, y: 0 } },
+        ],
+      },
+      type: "pane_layout",
+    },
+  };
+
+  test("selects the rect of the named pane", () => {
+    expect(paneRectFrom(reply, "w9:p2C")).toEqual({ width: 176, height: 69 });
+    expect(paneRectFrom(reply, "w9:p2B")).toEqual({ width: 75, height: 69 });
+  });
+
+  test("an absent pane or a malformed reply is null", () => {
+    expect(paneRectFrom(reply, "w9:p9")).toBeNull();
+    expect(paneRectFrom({ result: {} }, "w9:p2C")).toBeNull();
+    expect(paneRectFrom(null, "w9:p2C")).toBeNull();
+    expect(paneRectFrom({ result: { layout: { panes: [{ pane_id: "w9:p1", rect: { width: "x", height: 3 } }] } } }, "w9:p1")).toBeNull();
   });
 });

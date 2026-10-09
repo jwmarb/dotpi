@@ -363,8 +363,103 @@ export async function readAgent(paneId: string, lines = 40): Promise<string | nu
   return stdout.trim() ? stdout : null;
 }
 
-/** Closes a pane (killing its process). Idempotent enough: a second close just fails cleanly. */
-export async function closePane(paneId: string): Promise<boolean> {
-  const r = await herdr(["pane", "close", paneId]);
+/**
+ * Closes a pane (killing its process). Idempotent enough: a second close just fails cleanly.
+ *
+ * @param timeoutMs - Patience for the CLI round-trip. A shutdown path passes a
+ *        short one, so a wedged herdr cannot hold pi's exit for 30 s.
+ */
+export async function closePane(paneId: string, timeoutMs = HERDR_TIMEOUT_MS): Promise<boolean> {
+  const r = await herdr(["pane", "close", paneId], timeoutMs);
   return r.ok;
+}
+
+// ---------------------------------------------------------------------------
+// Generic pane primitives (used by the kanban extension's side pane)
+// ---------------------------------------------------------------------------
+
+export type PaneDirection = "right" | "down";
+
+/**
+ * argv for splitting an EXPLICIT pane — never `--current`, which resolves to
+ * whatever pane herdr thinks is calling and is wrong from a detached process.
+ * `ratio` is the fraction the ORIGINAL pane keeps (measured, herdr 0.9.0:
+ * `--ratio 0.3` on a 251-col pane left it 75 cols).
+ */
+export function splitArgs(ownerPaneId: string, direction: PaneDirection, ratio: number, cwd: string): string[] {
+  return [
+    "pane", "split", "--pane", ownerPaneId,
+    "--direction", direction,
+    "--ratio", String(ratio),
+    "--cwd", cwd,
+    "--no-focus",
+  ];
+}
+
+/** Splits `ownerPaneId` without stealing focus; resolves the new pane id, or null. */
+export async function splitPaneOf(
+  ownerPaneId: string,
+  direction: PaneDirection,
+  ratio: number,
+  cwd: string,
+): Promise<string | null> {
+  const r = await herdr(splitArgs(ownerPaneId, direction, ratio, cwd));
+  if (!r.ok || !r.data) return null;
+  return pick(r.data, ["result", "pane", "pane_id"]) ?? null;
+}
+
+/**
+ * Whether a pane exists: true, false (herdr answered `pane_not_found`), or null
+ * (herdr could not be asked). The three-way answer is load-bearing — treating a
+ * hiccup as "gone" would split a second pane beside a live one.
+ */
+export async function paneExists(paneId: string): Promise<boolean | null> {
+  const r = await herdr(["pane", "get", paneId]);
+  if (r.ok && r.data) return pick(r.data, ["result", "pane", "pane_id"]) === paneId ? true : null;
+  return r.error === "pane_not_found" ? false : null;
+}
+
+/**
+ * A pane's label (`pane rename`), or undefined when it has none, is gone, or
+ * herdr could not be asked. Pane ids are workspace-local counters, so before
+ * closing a pane remembered from earlier, check it still carries the label we gave it.
+ */
+export async function paneLabel(paneId: string, timeoutMs = HERDR_TIMEOUT_MS): Promise<string | undefined> {
+  const r = await herdr(["pane", "get", paneId], timeoutMs);
+  if (!r.ok || !r.data || pick(r.data, ["result", "pane", "pane_id"]) !== paneId) return undefined;
+  return pick(r.data, ["result", "pane", "label"]);
+}
+
+export interface PaneRect {
+  width: number;
+  height: number;
+}
+
+/**
+ * The size of `paneId` from a `pane layout` reply. Pure, so the reply shape is
+ * pinned by a test rather than by a live herdr.
+ */
+export function paneRectFrom(reply: unknown, paneId: string): PaneRect | null {
+  const panes = (reply as { result?: { layout?: { panes?: unknown } } } | null)?.result?.layout?.panes;
+  if (!Array.isArray(panes)) return null;
+  for (const p of panes) {
+    const entry = p as { pane_id?: unknown; rect?: { width?: unknown; height?: unknown } };
+    if (entry.pane_id !== paneId) continue;
+    const { width, height } = entry.rect ?? {};
+    if (typeof width === "number" && typeof height === "number" && width > 0 && height > 0) return { width, height };
+    return null;
+  }
+  return null;
+}
+
+/** The current size of a pane, or null when herdr refuses or the reply is unexpected. */
+export async function paneRect(paneId: string): Promise<PaneRect | null> {
+  const r = await herdr(["pane", "layout", "--pane", paneId]);
+  return r.ok && r.data ? paneRectFrom(r.data, paneId) : null;
+}
+
+/** Types `command` + Enter into the pane's shell (`herdr pane run`). */
+export async function runInPane(paneId: string, command: string): Promise<{ ok: boolean; error: string | null }> {
+  const r = await herdr(["pane", "run", paneId, command]);
+  return { ok: r.ok, error: r.error };
 }
