@@ -28,6 +28,9 @@ agent/mcp-auth.json
 agent/mcp-auth/
 # Connection log written by the built-in MCP extension.
 agent/mcp.log
+# pi's project-trust decisions (absolute paths of folders you trusted). Written
+# by pi's trust prompt, per machine; a cloned copy must ask again, not inherit.
+agent/trust.json
 # Never commit a backup of a config that may contain a key.
 *.bak
 *.orig-backup
