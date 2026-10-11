@@ -10,7 +10,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 
 | Question | Answer |
 |---|---|
-| Which agents exist, on what model | `agents/*.md` frontmatter — the directory is the list: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker |
+| Which agents exist, on what model | `agents/*.md` frontmatter — the directory is the list: explorer, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker, healthcheck |
 | Which skills the model may auto-invoke | `skills/<category>/<skill>/SKILL.md`, minus the slash-only ones (`disable-model-invocation: true`), plus whatever the `superpowers` package contributes. Derive it — `find agent/skills -name SKILL.md` for the local set, `grep -rl 'disable-model-invocation: true' agent/skills` for the slash-only ones — rather than trusting a count written here |
 | Why a skill dir has extra `.md` files | Progressive disclosure: `SKILL.md` is the entry point, siblings (`tests.md`, `REPORT.md`) load on demand |
 | Which skill ships its own tool / agents | `technical-analysis` alone declares `tools:` (`trade_journal`); `automate-browser` declares the unrelated `allowed-tools:` (a Bash allowlist) plus `hidden: true`; many skills have an `agents/` dir but only `technical-analysis` defines real agents there — the rest hold `openai.yaml` alone. The live answer: `find agent/skills -path '*/agents/*.md'` |
@@ -65,7 +65,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   orchestrator is always allowed, which is how you debug one by hand. Unspawnable agents
   are filtered out of the "Available agents" error list too, so a caller is never
   advertised what it cannot use.
-- **Every agent declares `fallback_models`** (all 9 do), and the list now has **two jobs**.
+- **Every agent declares `fallback_models`** (all 10 do), and the list now has **two jobs**.
   It still covers a failure to *launch* — unknown model, provider down or rate-limiting —
   which is `candidateModels` in `extensions/subagent-herdr/lib.ts`: one spawn attempt per
   model until one accepts the task. It is now **also** the child's runtime chain: the same
@@ -92,6 +92,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   *different* tree: the librarian that clones into `.firecrawl/src/<repo>` and then spawns
   the explorer without `cwd` gets a confident, well-formatted map of the user's project
   instead of the dependency — a wrong answer that looks right.
+- **`healthcheck` is the only agent that is not model-delegated.** It is spawned programmatically by `subagent-herdr` (via `spawnHealthCheck`) when a child stalls or ends without a readable answer. Its `tools` allowlist is read-only (`read bash ffgrep fffind grep find ls`) and it deliberately omits `subagent` and `subagent_tasks`, which is what prevents recursive health checks at the schema level in addition to the `target.agent === "healthcheck"` guard in `spawnHealthCheck`. Its absence from the orchestrator's `Available Agents` table when `hasSubagent` is false is the same gate as every other agent.
 - **An agent's final answer must be visible assistant text, and saying `<result>` in its
   prompt makes that a contract the runtime enforces.** `subagent-herdr` reads each run's
   own `system-prompt.md`: mention `<result>` and the child may not complete until it has

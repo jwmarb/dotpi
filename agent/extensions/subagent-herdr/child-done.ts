@@ -454,6 +454,309 @@ export function createChildDoneHandshake(
 }
 
 // ---------------------------------------------------------------------------
+// Child watchdog: one-shot stall detection, independent of the handshake
+// ---------------------------------------------------------------------------
+
+/**
+ * How long an assistant stream may go without a `message_update` before the
+ * child reports it as stalled.
+ *
+ * Measured from the LAST update, not from the stream's start: a live stream
+ * emits `message_update` continuously, and xhigh thinking is routine here — a
+ * thinking-heavy stream can go minutes with no visible text — so a phase that
+ * reaches this age since its last update has stopped producing output rather
+ * than merely moved slowly.
+ *
+ * Known limitation: the idle phase — the stretch between a stream's end and
+ * the next stream's or tool's start — is unwatched, so a child wedged there
+ * (e.g. inside a provider call that emits no events) is not detected.
+ *
+ * pi emits `message_update` for assistant streaming only; a non-assistant
+ * `message_update` is ignored by the watchdog.
+ */
+export const STREAMING_STALL_MS = 5 * 60_000;
+
+/**
+ * How long one top-level tool call may go without activity before the child
+ * reports it as stalled.
+ *
+ * Activity is the tool's own start/end/update events; a nested (codemode)
+ * sub-call's start, end, or update refreshes the PARENT's entry, because work
+ * inside the child is work of the outer tool.
+ *
+ * Known limitation: a tool that hangs before its first event (a start that
+ * never arrives) never opens an entry, so it is unwatched.
+ */
+export const TOOL_STALL_MS = 10 * 60_000;
+
+/** The watchdog's tick cadence: how often it re-examines the active phases. */
+export const WATCHDOG_TICK_MS = 30_000;
+
+/**
+ * The child's active activity phase. The streaming half is a single slot —
+ * assistant messages are sequential — but the tool half is a map keyed by
+ * toolCallId (see {@link ToolEntry}), because pi runs tool calls in parallel
+ * batches and codemode nests sub-calls inside them: a single slot would let
+ * any sibling's or nested child's end clear a hung tool's phase, and the hung
+ * tool would run unwatched.
+ */
+type WatchdogPhase =
+  | { kind: "idle" }
+  | { kind: "streaming"; startedAt: number; lastActivityAt: number; warned: boolean };
+
+/** One top-level tool call under watch. */
+interface ToolEntry {
+  toolCallId: string;
+  toolName: string;
+  startedAt: number;
+  lastActivityAt: number;
+  /** One-shot: at most one stall notice per tool call. */
+  warned: boolean;
+}
+
+/**
+ * The watchdog's character count of a message: `text` + `thinking` +
+ * JSON-stringified tool-call `arguments`.
+ *
+ * Deliberately wider than the handshake's `visibleTextOf` (text parts only —
+ * thinking is excluded there because reasoning never reaches the orchestrator,
+ * which is the point of the gate). A stall notice, by contrast, should read as
+ * "produced N" when the child was in fact producing: a silently reasoning
+ * model's thinking is production, and partial tool-call arguments are
+ * production. The two counters answer different questions, so they must not
+ * be merged. The count is untrimmed by design (diverges deliberately from
+ * `visibleTextOf`, which trims): a stall notice should reflect raw production.
+ */
+function watchdogCharsOf(message: MessageLike): number {
+  const content = message.content;
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as { type?: unknown; text?: unknown; thinking?: unknown; arguments?: unknown };
+    if (p.type === "text" && typeof p.text === "string") {
+      chars += p.text.length;
+    } else if (p.type === "thinking" && typeof p.thinking === "string") {
+      chars += p.thinking.length;
+    } else if (p.type === "toolCall" && p.arguments != null) {
+      // Partial while streaming: the args object is built up across
+      // `toolcall_delta` frames, so the latest snapshot's args are the
+      // production so far.
+      chars += JSON.stringify(p.arguments).length;
+    }
+  }
+  return chars;
+}
+
+/** The side effects the watchdog can perform. */
+export interface ChildWatchdogEffects {
+  /** The current time in ms, injected so tests drive the clock. */
+  now(): number;
+  /**
+   * Deliver a notice to the parent pane. Must preserve detached + ignored-stdio
+   * + unref behavior so the delivery survives the child's own process-group kill.
+   */
+  sendNotice(parentPane: string, notice: string): void;
+}
+
+/**
+ * Create the child-side stall watchdog with injected effects.
+ *
+ * Independent of {@link createChildDoneHandshake}: it observes streaming and
+ * tool phases and, once a phase overruns its threshold, sends exactly one
+ * `stalled` notice to the parent. The parent is the one that spawns the
+ * health-check; the child only signals. Each fresh phase gets a fresh one-shot
+ * allowance, so a phase that is restarted is re-warnable, but a phase that
+ * merely continues does not re-warn.
+ *
+ * The character count in a streaming stall notice is computed lazily, inside
+ * `check()`, from the LATEST `message_update` snapshot (pi emits a fresh
+ * shallow copy per update, reusing the content array): text, thinking, and
+ * JSON-stringified tool-call arguments, so a silently reasoning stream does
+ * not read as "produced nothing". Storing the reference — not a running
+ * count — keeps each update O(1); the count is read once per tick, not once
+ * per token delta.
+ *
+ * @param effects The side effects to perform (clock + detached notice).
+ * @param env The process environment (for `PI_SUBAGENT_RUN_ID`,
+ *   `PI_SUBAGENT_AGENT`, `PI_SUBAGENT_PARENT_PANE`).
+ */
+export function createChildWatchdog(
+  effects: ChildWatchdogEffects,
+  env: NodeJS.ProcessEnv,
+): {
+  onMessageStart(message: MessageLike): void;
+  onMessageUpdate(message: MessageLike): void;
+  onMessageEnd(message: MessageLike): void;
+  onToolExecutionStart(toolCallId: string, toolName: string, parentToolCallId?: string): void;
+  onToolExecutionEnd(toolCallId?: string, parentToolCallId?: string): void;
+  onToolExecutionUpdate(toolCallId?: string, parentToolCallId?: string): void;
+  onAgentEnd(): void;
+  check(): void;
+} {
+  let phase: WatchdogPhase = { kind: "idle" };
+  /** Every top-level tool call in flight, keyed by toolCallId. */
+  const toolEntries = new Map<string, ToolEntry>();
+  /** Latest `message_update` snapshot of the active stream; the char count is derived from it, lazily, at check time. */
+  let latestMessage: MessageLike | null = null;
+
+  /**
+   * Resolve a tool entry by walking ancestors: trim at the last `/` repeatedly
+   * until a key hits the map. Top-level ids have no `/`; nested (codemode) ids
+   * are `<parentId>/<n>` chains, and the walk is unbounded: it trims to any depth.
+   */
+  function resolveEntry(id: string): ToolEntry | undefined {
+    let key = id;
+    for (;;) {
+      const entry = toolEntries.get(key);
+      if (entry) return entry;
+      const slash = key.lastIndexOf("/");
+      if (slash === -1) return undefined;
+      key = key.slice(0, slash);
+    }
+  }
+
+  function onMessageStart(message: MessageLike): void {
+    // Only an assistant message starts a fresh streaming phase; a user or
+    // toolResult message_start is not the child talking.
+    if (message.role !== "assistant") return;
+    const at = effects.now();
+    phase = { kind: "streaming", startedAt: at, lastActivityAt: at, warned: false };
+    latestMessage = message;
+  }
+
+  function onMessageUpdate(message: MessageLike): void {
+    if (phase.kind !== "streaming") return;
+    // Each update carries the current full message (pi's agent-loop.js emits
+    // `{...partialMessage}` per update, a fresh shallow copy reusing the content
+    // array), so the latest one is everything the stream has produced so far.
+    // Store the reference, not a count: pi updates on every token delta, and
+    // scanning the content on each one would be O(n) per delta, quadratic over
+    // a stream — the count is read once per tick, inside check().
+    phase.lastActivityAt = effects.now();
+    latestMessage = message;
+  }
+
+  function onMessageEnd(message: MessageLike): void {
+    // Symmetry with onMessageStart: only the assistant's own message end
+    // closes its phase; a user or toolResult end says nothing about it.
+    if (message.role !== "assistant") return;
+    if (phase.kind !== "streaming") return;
+    phase = { kind: "idle" };
+    latestMessage = null;
+  }
+
+  function onToolExecutionStart(toolCallId: string, toolName: string, parentToolCallId?: string): void {
+    if (parentToolCallId !== undefined) {
+      // A nested (codemode) sub-call's start is activity of the outer tool:
+      // refresh the parent's clock so a busy codemode (e.g. 40 sequential reads
+      // over 20 min) does not false-stall the parent entry.
+      const entry = resolveEntry(parentToolCallId);
+      if (entry) entry.lastActivityAt = effects.now();
+      return;
+    }
+    // Only a TOP-LEVEL tool call gets an entry.
+    // Upsert: a start for an id already in the map restarts its clock.
+    const at = effects.now();
+    toolEntries.set(toolCallId, {
+      toolCallId,
+      toolName,
+      startedAt: at,
+      lastActivityAt: at,
+      warned: false,
+    });
+  }
+
+  function onToolExecutionEnd(toolCallId?: string, parentToolCallId?: string): void {
+    if (parentToolCallId !== undefined) {
+      // A nested (codemode) sub-call's end is activity of the outer tool:
+      // refresh the parent's clock. Identity-blind clearing is exactly what
+      // let a sibling's end clear a hung tool's entry, so a nested end must
+      // not delete the parent.
+      const entry = resolveEntry(parentToolCallId);
+      if (entry) entry.lastActivityAt = effects.now();
+      return;
+    }
+    if (toolCallId === undefined) return;
+    toolEntries.delete(toolCallId);
+  }
+
+  function onToolExecutionUpdate(toolCallId?: string, parentToolCallId?: string): void {
+    // Activity inside a nested child is activity of the outer tool, so a
+    // nested update (parentToolCallId = P) refreshes the ancestor entry P;
+    // a top-level update refreshes its own entry. An update whose entry is
+    // already gone (its end arrived first) is a no-op.
+    const id = parentToolCallId ?? toolCallId;
+    if (id === undefined) return;
+    const entry = resolveEntry(id);
+    if (!entry) return;
+    entry.lastActivityAt = effects.now();
+  }
+
+  function onAgentEnd(): void {
+    // A turn boundary: clear whatever the previous turn left behind. A
+    // non-truncation throw mid-batch can leave an orphaned start with no
+    // matching end, which would otherwise wedge an entry and false-stall the
+    // next turn; a stream that ends without message_end is the same shape on
+    // the streaming half. agent_end is the one ending path every outcome
+    // (clean, aborted, error) emits, so it is the place to reset both.
+    phase = { kind: "idle" };
+    toolEntries.clear();
+    latestMessage = null;
+  }
+
+  function check(): void {
+    const now = effects.now();
+    if (phase.kind === "streaming" && !phase.warned) {
+      if (now - phase.lastActivityAt >= STREAMING_STALL_MS) {
+        phase.warned = true;
+        const chars = latestMessage ? watchdogCharsOf(latestMessage) : 0;
+        sendStalled(`phase=streaming elapsedMs=${now - phase.startedAt} charsGenerated=${chars}`);
+      }
+    }
+    // One notice per tool call, and the OLDEST stalled one first: a batch
+    // with several wedged siblings warns them in start order, one per tick.
+    let stalled: ToolEntry | undefined;
+    for (const entry of toolEntries.values()) {
+      if (entry.warned || now - entry.lastActivityAt < TOOL_STALL_MS) continue;
+      if (!stalled || entry.startedAt < stalled.startedAt) stalled = entry;
+    }
+    if (stalled) {
+      stalled.warned = true;
+      sendStalled(`phase=tool elapsedMs=${now - stalled.startedAt} tool=${stalled.toolName}`);
+    }
+  }
+
+  function sendStalled(text: string): void {
+    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
+    // No parent pane: the notice has nowhere to go. A stall signal that cannot
+    // be delivered is a no-op, not a reason to throw from the watchdog tick.
+    if (!parentPane) return;
+    effects.sendNotice(
+      parentPane,
+      formatNotice(
+        env.PI_SUBAGENT_RUN_ID ?? "unknown",
+        env.PI_SUBAGENT_AGENT ?? "subagent",
+        "stalled",
+        text,
+      ),
+    );
+  }
+
+  return {
+    onMessageStart,
+    onMessageUpdate,
+    onMessageEnd,
+    onToolExecutionStart,
+    onToolExecutionEnd,
+    onToolExecutionUpdate,
+    onAgentEnd,
+    check,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Real Node adapter
 // ---------------------------------------------------------------------------
 
@@ -686,5 +989,67 @@ export default function (pi: ExtensionAPI) {
       () => ctx.shutdown(),
       readSystemPrompt(),
     );
+  });
+  // Child-side stall watchdog: independent of the handshake. It observes
+  // streaming/tool phases and sends one `stalled` notice when a phase overruns
+  // its threshold; the parent then decides whether to spawn a health check.
+  const watchdog = createChildWatchdog(
+    {
+      now: () => Date.now(),
+      sendNotice: effects.sendNotice,
+    },
+    process.env,
+  );
+
+  pi.on("message_start", (event) => {
+    watchdog.onMessageStart(event.message as MessageLike);
+  });
+  pi.on("message_update", (event) => {
+    watchdog.onMessageUpdate(event.message as MessageLike);
+  });
+  pi.on("message_end", (event) => {
+    watchdog.onMessageEnd(event.message as MessageLike);
+  });
+  pi.on("tool_execution_start", (event) => {
+    // 0.75.4's ToolExecution*Event predates `parentToolCallId`; the running
+    // pi carries it, so read it off the event structurally. A nested (codemode)
+    // sub-call sets it and must not touch the map of top-level entries.
+    const parentToolCallId = (event as { parentToolCallId?: string }).parentToolCallId;
+    watchdog.onToolExecutionStart(event.toolCallId, event.toolName, parentToolCallId);
+  });
+  pi.on("tool_execution_update", (event) => {
+    // A nested sub-call's update carries its parent's id; activity inside the
+    // child is activity of the outer tool, so it refreshes the parent's entry.
+    const parentToolCallId = (event as { parentToolCallId?: string }).parentToolCallId;
+    watchdog.onToolExecutionUpdate(event.toolCallId, parentToolCallId);
+  });
+  pi.on("tool_execution_end", (event) => {
+    // A nested sub-call's end carries its parent's id and must not delete the
+    // parent's entry; only a top-level end deletes its own.
+    const parentToolCallId = (event as { parentToolCallId?: string }).parentToolCallId;
+    watchdog.onToolExecutionEnd(event.toolCallId, parentToolCallId);
+  });
+  pi.on("agent_end", () => {
+    // A turn boundary clears whatever the previous turn left behind: an
+    // orphaned start (a throw mid-batch) would otherwise wedge an entry and
+    // false-stall the next turn.
+    watchdog.onAgentEnd();
+  });
+
+  // One tick, unref'd so it never holds the child's event loop open, and cleared
+  // on shutdown. A tick is a bounded phase re-check, not a wait. The body is
+  // wrapped because a synchronous throw in a timer callback is uncaught and
+  // would kill the child; a lost tick costs one 30-second delay, not the run.
+  const watchdogTimer = setInterval(() => {
+    try {
+      watchdog.check();
+    } catch {
+      // The next tick re-examines the same phases; nothing is lost by dropping
+      // one.
+    }
+  }, WATCHDOG_TICK_MS);
+  watchdogTimer.unref();
+  pi.on("session_shutdown", () => {
+    clearInterval(watchdogTimer);
   });
 }

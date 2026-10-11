@@ -30,10 +30,22 @@
  *    scrollback intact, until something closes it. That is what keeps `agent read`
  *    usable as failure evidence after a run has ended, and it is why a *missing*
  *    pane is read as "the child is gone" rather than "herdr hiccuped".
+ * 5. `agent send-keys <pane> esc` accepts the canonical key name `esc` and
+ *    sends an Escape keypress (measured, herdr 0.9.0); the *consequence* of
+ *    that Escape is a pi measurement, not herdr's: pi's bash tool kills its
+ *    process tree on abort, so one Escape interrupts both a streaming
+ *    response and a running tool call. `agent wait <pane> --until idle
+ *    --timeout <MS>` resolves once the agent reports `idle`; the agent states
+ *    herdr reports are `idle`, `working`, `blocked`, `done`, and `unknown`.
+ *    Note `idle` and `done` both mean "ready for input" — herdr
+ *    distinguishes them by server-side seen-state, so a pane that finished
+ *    just before the Escape may answer `done` to `--until idle` (callers that
+ *    need to tell the two apart reconcile afterwards).
  *
  * (`agent wait --until done` was used until the parent stopped blocking on
  * children; `waitAgentWorking` keeps the `--until working` form, which is still
- * needed to prove a task prompt was actually accepted.)
+ * needed to prove a task prompt was actually accepted, and `waitAgentIdle`
+ * uses the `--until idle` form for the interrupt handshake.)
  *
  * `agent read` is the one oddity: it prints raw terminal text, not a JSON
  * document, so `readAgent` passes stdout through un-parsed.
@@ -313,14 +325,42 @@ export async function sendKeys(paneId: string, ...keys: string[]): Promise<boole
   return r.ok;
 }
 
-/** True once the agent reaches `working`; false on timeout or missing pane. */
-export async function waitAgentWorking(paneId: string, timeoutMs: number): Promise<boolean> {
+/**
+ * Waits until herdr reports a given agent state. The shared heart of
+ * {@link waitAgentWorking} and {@link waitAgentIdle}: one command, one result
+ * parse, and the module-wide "never throw; a false is the failure" contract.
+ *
+ * @returns true only when the reply's `agent_status` is exactly `state`; false
+ *          on timeout, missing pane, malformed reply, any other state, or any
+ *          CLI error.
+ */
+/**
+ * argv for a state wait. Pure and exported so the `--until <state>` form both
+ * state-waits share is pinned by a test rather than by a live herdr — the same
+ * precedent as `splitArgs`: a regression in the argv would otherwise break the
+ * launch recovery path with every test still green.
+ */
+export function waitArgs(paneId: string, state: "working" | "idle", timeoutMs: number): string[] {
+  return ["agent", "wait", paneId, "--until", state, "--timeout", String(timeoutMs)];
+}
+
+async function waitForAgentState(paneId: string, state: "working" | "idle", timeoutMs: number): Promise<boolean> {
   const r = await herdr(
-    ["agent", "wait", paneId, "--until", "working", "--timeout", String(timeoutMs)],
+    waitArgs(paneId, state, timeoutMs),
     timeoutMs + EXEC_SLACK_MS,
   );
   if (!r.ok || !r.data) return false;
-  return pick(r.data, ["result", "agent", "agent_status"]) === "working";
+  return pick(r.data, ["result", "agent", "agent_status"]) === state;
+}
+
+/** True once the agent reaches `working`; false on timeout, missing pane, or any other state. */
+export async function waitAgentWorking(paneId: string, timeoutMs: number): Promise<boolean> {
+  return waitForAgentState(paneId, "working", timeoutMs);
+}
+
+/** True once the agent reaches `idle`; false on timeout, missing pane, `done`, or any CLI error. */
+export async function waitAgentIdle(paneId: string, timeoutMs: number): Promise<boolean> {
+  return waitForAgentState(paneId, "idle", timeoutMs);
 }
 
 /** The agent states herdr reports for a pane. */

@@ -20,6 +20,7 @@ import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   type ChildReport,
   type FailedAttempt,
+  type RunRecord,
   isSessionFileFor,
   parseReportLine,
   qualifiesAsAnswer,
@@ -754,6 +755,68 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   }
   const file = dirEntries.find((e) => isSessionFileFor(e, runId));
   return file ? join(runDir, file) : undefined;
+}
+
+/**
+ * What asked for a health check.
+ *
+ * - `stalled` — the child's watchdog noticed its child stopped making
+ *   progress while the pane is still alive. `detail` is the watchdog's full
+ *   notice text (`phase=… elapsedMs=…` plus the chars/tool detail), passed
+ *   through verbatim so the health check sees exactly what the watchdog saw.
+ * - `ended-without-result` — the run ended, but `extractRunResult` returned
+ *   `answered: false`: the transcript carries no answer the orchestrator can
+ *   read.
+ */
+export type HealthCheckTrigger =
+  | { kind: "stalled"; detail: string }
+  | { kind: "ended-without-result" };
+
+/**
+ * The task text for a programmatically spawned health-check run.
+ *
+ * Self-contained by contract — the health-check child sees no conversation,
+ * so this names the target run id, the target's run directory (absolute), the
+ * target agent, the target's complete original task, and what triggered the
+ * check. It also states the inspection method (incremental, bounded reads of
+ * the JSONL — never the whole transcript) and the four sections the child
+ * must return.
+ *
+ * It is a formatter, not a policy: it says what to look at and what to
+ * report, never what the orchestrator should do about the answer — that
+ * choice stays with the orchestrator, which reads the report.
+ */
+export function buildHealthCheckTask(
+  target: Pick<RunRecord, "runId" | "agent" | "task">,
+  targetRunDir: string,
+  trigger: HealthCheckTrigger,
+): string {
+  const triggerText =
+    trigger.kind === "stalled"
+      ? `The child's watchdog signalled that the run is stalled: ${trigger.detail}`
+      : "The run ended, but extractRunResult returned answered: false — the transcript carries no answer the orchestrator can read.";
+
+  return [
+    `You are diagnosing a delegated subagent run. The target run is ${target.runId} (agent: ${target.agent}).`,
+    "",
+    `Its run directory is ${targetRunDir}. It is the source of truth: read its meta.json, system-prompt.md, reports.jsonl if present, and its session transcript (<timestamp>_${target.runId}.jsonl, plus the .exit sidecar when present).`,
+    "",
+    "The target's original task, verbatim:",
+    "",
+    "```",
+    target.task,
+    "```",
+    "",
+    `Trigger: ${triggerText}`,
+    "",
+    "The transcript may be several megabytes. Do not read it wholesale. Inspect it incrementally: file names and sizes first, then bounded ranges around the newest messages, the current tool call, errors, and any visible findings (wc, tail, and bounded greps are for this). Never write, edit, or delete anything in the run directory.",
+    "",
+    "Report exactly these four sections, in a single <result> element:",
+    "1. Target status — still streaming, stuck in which tool, idle, done, failed, or indeterminate.",
+    "2. What happened — the sequence that led to this check, including the trigger and any relevant errors.",
+    "3. Findings/work so far — conclusions, partial output, files, and decisions recoverable from the run; \"none recovered\" if there are none.",
+    "4. Recommendation — wait, interrupt with a corrective prompt, cancel, continue from the recovered work, or spawn a fresh subagent carrying it.",
+  ].join("\n");
 }
 
 /**

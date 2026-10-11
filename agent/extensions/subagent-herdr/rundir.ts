@@ -168,6 +168,27 @@ export interface RunRecord {
 	fallbackChain?: string[];
 	/** Launch attempts that failed before this run started, in order. */
 	failedAttempts?: FailedAttempt[];
+	/**
+	 * The target run id for a programmatically spawned health-check run. Absent
+	 * for ordinary runs (the common case); when present it must be a string, and
+	 * a health-check record points back at the run it is diagnosing. A present
+	 * non-string value is ignored (treated as absent) by {@link isRunRecord};
+	 * the reading sites guard with `typeof === "string"` checks.
+	 */
+	healthCheckOf?: string;
+	/**
+	 * The herdr pane id of the spawning parent process (from its
+	 * `HERDR_PANE_ID`), stamped at spawn. The run dir is global across all pi
+	 * processes, so this is what lets a process tell its own records apart from
+	 * every other session's: only the owning pane's process may *autonomously*
+	 * sweep the run (flush sweep, liveness tick, stranded-release scan).
+	 * Absent on legacy records (pre-ownership), which are loadable but
+	 * unsweepable — they stay globally queryable, they are just never swept.
+	 * `runId` remains the only record-fatal validation: a present non-string
+	 * `ownerPane` is accepted and treated as absent at the guarded read sites
+	 * (string equality only), so a corrupted value cannot make a run invisible.
+	 */
+	ownerPane?: string;
 }
 
 /**
@@ -175,8 +196,10 @@ export interface RunRecord {
  *
  * The registry is rebuilt by reading every `meta.json` on disk, where a record
  * can be truncated (the parent crashed mid-spawn) or predate a field. Only
- * `runId` is load-bearing for keying the registry, so that is what this
- * insists on.
+ * `runId` is load-bearing for keying the registry. A present non-string
+ * `healthCheckOf` is ignored (treated as absent) rather than record-fatal:
+ * the reading sites in index.ts guard with `typeof rec.healthCheckOf ===
+ * "string"` checks, so a corrupted value cannot key a bogus registry entry.
  */
 export function isRunRecord(value: unknown): value is RunRecord {
 	return (
@@ -258,8 +281,12 @@ export function formatExitSidecar(at: number = Date.now()): string {
  *
  * - `report` — a mid-run message; the child keeps working.
  * - `done` — the child finished and is shutting down.
+ * - `stalled` — a one-shot phase-overrun signal (a stream, or one tool call,
+ *   that has gone quiet past its threshold). It is *not* a direct orchestrator
+ *   briefing: the parent consumes it and spawns a health check, and that health
+ *   check is what actually briefs the orchestrator.
  */
-export type NoticeKind = "report" | "done";
+export type NoticeKind = "report" | "done" | "stalled";
 
 /** A parsed wake notice. */
 export interface Notice {
@@ -300,7 +327,7 @@ export function formatNotice(
  * would silently eat a human's message that happened to start with a bracket.
  */
 const NOTICE_RE =
-	/^\[subagent (sub-[0-9a-f]{4}) \(([a-z][a-z0-9_-]{0,31})\) (report|done)\][ \t]?([\s\S]*)$/;
+	/^\[subagent (sub-[0-9a-f]{4}) \(([a-z][a-z0-9_-]{0,31})\) (report|done|stalled)\][ \t]?([\s\S]*)$/;
 
 /**
  * Parse one wake notice, or `undefined` when the text is not one.

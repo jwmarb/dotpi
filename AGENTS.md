@@ -45,7 +45,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
 | List/resume previous sessions | `agent/extensions/sessions.ts` (`/sessions` modal) |
 | Loop the agent on a goal until it declares completion | `agent/extensions/ralph-loop/` (`/ralph-loop`, `/ulw-loop`, `/loop-stop`; `--verify[=static\|runtime\|both]`) |
-| Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools; event-driven — no blocking wait, the child wakes the parent) |
+| Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools incl. `interrupt`; event-driven — no blocking wait, the child wakes the parent; stalled or unanswered runs are auto-diagnosed by a read-only `healthcheck` child whose `healthCheckOf` tags the target, and the target's no-answer briefing is held until the health check completes) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |
 | Track the orchestrator's work on a board | `agent/extensions/kanban/` (`kanban` tool, `/kanban`; a read-only herdr side pane opened on every session start except `/reload` (which adopts the open pane, or respects that you closed it), widget fallback. State lives in the session branch — the board only reads a projection. Orchestrator only) |
 | A subagent's private checklist | `agent/extensions/todo.ts` (`todo` tool, `/todos`; registered **only** in a spawned child, which gets it appended to its `--tools` by `subagent-herdr`) |
@@ -157,7 +157,7 @@ The absence of a resolvable tree is a loud failure, not a silent degradation: `t
 and `model-fallback` import `@earendil-works/pi-ai` and simply fail to load. On the machine
 whose links went missing that took `scripts/check.sh` from 749 passing tests to 594 plus two
 load failures — treat the *two load failures* as the signature rather than any total. This tree
-passes **874** as of this revision; count it rather than comparing against that figure.
+passes its tests as of this revision; count it with `scripts/check.sh` rather than comparing against a fixed figure.
 
 ## NOTES
 

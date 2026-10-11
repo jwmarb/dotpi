@@ -1,17 +1,27 @@
 /**
- * Tests for the child-done handshake factory (`createChildDoneHandshake`).
+ * Tests for the child-done handshake factory (`createChildDoneHandshake`) and
+ * the child-side stall watchdog (`createChildWatchdog`).
  *
- * Uses a recording effects stub to verify the exact ordering of side effects:
- * sidecar write → notice → pane close → shutdown, and the deduplication
- * invariant that the sidecar is written at most once.
+ * Uses recording effects stubs to verify the exact ordering of side effects:
+ * sidecar write → notice → pane close → shutdown, the deduplication
+ * invariant that the sidecar is written at most once, the answer gate and
+ * one-shot nudge, and the watchdog's one-shot stall notices — streaming and
+ * tool phases, nested/parallel tool-call isolation, and the tick wiring.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 
-import {
+import childDone, {
   type ChildDoneEffects,
+  type ChildWatchdogEffects,
+  type MessageLike,
   createChildDoneHandshake,
+  createChildWatchdog,
+  STREAMING_STALL_MS,
+  TOOL_STALL_MS,
+  WATCHDOG_TICK_MS,
 } from "./child-done.js";
 import { formatNotice } from "./rundir.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
 // Recording stub
@@ -458,5 +468,621 @@ describe("agent_end answer nudge", () => {
 
     const notice = calls.find((c) => c.name === "sendNotice");
     expect(notice?.args[1]).toBe(formatNotice("run-789", "worker", "done", ""));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createChildWatchdog: one-shot stall detection
+// ---------------------------------------------------------------------------
+
+/** An assistant message carrying a given amount of visible text. */
+function assistantText(text: string): MessageLike {
+  return { role: "assistant", content: [{ type: "text", text }] };
+}
+
+describe("createChildWatchdog", () => {
+  const ENV: NodeJS.ProcessEnv = {
+    PI_SUBAGENT_RUN_ID: "sub-a3f1",
+    PI_SUBAGENT_AGENT: "worker",
+    PI_SUBAGENT_PARENT_PANE: "parent-pane-456",
+  };
+
+  /** A recording watchdog with a driven clock; `set` moves the clock to an absolute time. */
+  function harness(env: NodeJS.ProcessEnv = ENV) {
+    let time = 0;
+    const notices: string[] = [];
+    const effects: ChildWatchdogEffects = {
+      now: () => time,
+      sendNotice(_parentPane: string, notice: string) {
+        notices.push(notice);
+      },
+    };
+    return {
+      notices,
+      set: (t: number) => {
+        time = t;
+      },
+      watchdog: createChildWatchdog(effects, env),
+    };
+  }
+
+  test("streaming emits nothing below the threshold", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    set(STREAMING_STALL_MS - 1); // 5 minutes minus 1 ms — the real boundary, one tick under
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("streaming emits exactly one notice at the threshold, with elapsedMs and charsGenerated", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    watchdog.onMessageUpdate(assistantText("hello world")); // 11 visible chars
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(
+      formatNotice("sub-a3f1", "worker", "stalled", "phase=streaming elapsedMs=300000 charsGenerated=11"),
+    );
+  });
+
+  test("a start with content seeds the char count when no update ever arrives", () => {
+    const { watchdog, set, notices } = harness();
+    // The start snapshot alone must carry the chars: without the
+    // `latestMessage = message` assignment in onMessageStart the notice
+    // would read charsGenerated=0.
+    watchdog.onMessageStart({ role: "assistant", content: [{ type: "text", text: "hello world" }] });
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("charsGenerated=11");
+  });
+  test("a continued stream does not re-warn after the one-shot notice", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    set(STREAMING_STALL_MS + 10 * 60_000);
+    watchdog.check();
+    set(2 * STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+  });
+
+  test("charsGenerated is computed lazily at check time, from the latest snapshot", () => {
+    const { watchdog, set, notices } = harness();
+    const body = "a longer visible body";
+    const msg = assistantText("abc");
+    watchdog.onMessageStart(assistantText(""));
+    watchdog.onMessageUpdate(msg);
+    // pi reuses the content array and emits a fresh shallow copy per update,
+    // so a count frozen at update time would read "abc". Mutate the message
+    // after the update: the notice must carry the mutated length, proving the
+    // count is derived from the stored reference at check time.
+    msg.content = [{ type: "text", text: body }];
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices[0]).toBe(
+      formatNotice(
+        "sub-a3f1",
+        "worker",
+        "stalled",
+        `phase=streaming elapsedMs=${STREAMING_STALL_MS} charsGenerated=${body.length}`,
+      ),
+    );
+  });
+
+  test("a new assistant message_start resets the one-shot allowance", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    // A brand-new assistant stream starts over: fresh phase, fresh allowance.
+    set(STREAMING_STALL_MS + 10_000);
+    watchdog.onMessageStart(assistantText(""));
+    set(2 * STREAMING_STALL_MS + 10_000);
+    watchdog.check();
+    expect(notices).toHaveLength(2);
+  });
+
+  test("message_end prevents later notices", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText("hello"));
+    set(60_000);
+    watchdog.onMessageEnd(assistantText("hello"));
+    set(STREAMING_STALL_MS + 10 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("a cleared phase does not count a stale start snapshot", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText("hello world")); // 11 chars
+    set(60_000);
+    watchdog.onMessageEnd(assistantText("hello world")); // clears phase + snapshot
+    set(120_000);
+    watchdog.onMessageStart(assistantText("")); // fresh start, no content
+    set(120_000 + STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    // Without the `latestMessage = null` clear in onMessageEnd the stale
+    // 11-char snapshot would still be counted.
+    expect(notices[0]).toContain("charsGenerated=0");
+  });
+
+  test("tool execution emits nothing below the threshold, then one notice with the tool name", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-1", "bash");
+    set(9 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(TOOL_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(
+      formatNotice("sub-a3f1", "worker", "stalled", "phase=tool elapsedMs=600000 tool=bash"),
+    );
+  });
+
+  test("a nested tool start (parentToolCallId set) does not open its own entry and refreshes the parent", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-outer", "bash");
+    set(5 * 60_000);
+    // A codemode sub-call starts: it must NOT get an entry of its own, so the
+    // outer bash remains the only warnable entry. Its start refreshes the
+    // outer clock, because nested activity is outer activity.
+    watchdog.onToolExecutionStart("call-inner", "bash", "call-outer");
+    set(10 * 60_000); // 5 min after the refresh: not stalled
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(15 * 60_000); // 10 min after the refresh: the outer stalls
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+    expect(notices[0]).toContain("elapsedMs=900000");
+    // Extend to 20 min and tick again: exactly ONE notice total — the nested
+    // entry (had one been opened) must never become warnable, and the outer
+    // is one-shot.
+    set(20 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+  });
+
+  test("tool_execution_end clears the matching entry; a later tool starts a separately warnable entry", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-1", "read");
+    set(TOOL_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    // The first tool ends; its entry is deleted.
+    watchdog.onToolExecutionEnd("call-1");
+    set(TOOL_STALL_MS + 60_000);
+    watchdog.check(); // idle now: nothing
+    expect(notices).toHaveLength(1);
+    // A new tool starts its own, independently warnable entry.
+    watchdog.onToolExecutionStart("call-2", "grep");
+    set(2 * TOOL_STALL_MS + 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(2);
+    expect(notices[1]).toContain("tool=grep");
+  });
+
+  test("a non-assistant message_start is ignored", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart({ role: "user", content: [{ type: "text", text: "hi" }] });
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("a missing parent pane makes a stall a no-op, not a throw", () => {
+    const env: NodeJS.ProcessEnv = {
+      PI_SUBAGENT_RUN_ID: "sub-a3f1",
+      PI_SUBAGENT_AGENT: "worker",
+      // PI_SUBAGENT_PARENT_PANE absent
+    };
+    const { watchdog, set, notices } = harness(env);
+    watchdog.onMessageStart(assistantText(""));
+    set(STREAMING_STALL_MS);
+    expect(() => watchdog.check()).not.toThrow();
+    expect(notices).toHaveLength(0);
+  });
+
+  // Pins the unparseable env shape: launcher-spawned children never reach it,
+  // because buildChildEnv always sets PI_SUBAGENT_RUN_ID and PI_SUBAGENT_AGENT
+  // — the fallback exists for a hand-launched child with no run identity.
+  test("a missing run id and agent fall back to the defaults in the notice", () => {
+    const env: NodeJS.ProcessEnv = { PI_SUBAGENT_PARENT_PANE: "parent-pane-456" };
+    const { watchdog, set, notices } = harness(env);
+    watchdog.onToolExecutionStart("call-1", "bash");
+    set(TOOL_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(
+      formatNotice("unknown", "subagent", "stalled", "phase=tool elapsedMs=600000 tool=bash"),
+    );
+  });
+
+  test("a slow-but-alive stream is not flagged: every update resets the stall clock", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    // Updates 4 minutes apart: well under the 5-minute threshold between
+    // updates, 17 minutes of stream age in total. xhigh thinking does this.
+    for (let i = 1; i <= 4; i++) {
+      set(i * 4 * 60_000);
+      watchdog.onMessageUpdate(assistantText(`chunk ${i}`));
+    }
+    set(17 * 60_000); // 3 minutes after the last update
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(17 * 60_000 + STREAMING_STALL_MS + 1); // now past the threshold from the last update
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("phase=streaming");
+  });
+
+  test("charsGenerated counts thinking and partial tool-call arguments, not visible text only", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    watchdog.onMessageUpdate({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "pondering" }, // 9
+        { type: "text", text: "abc" }, // 3
+        { type: "toolCall", id: "tc1", name: "bash", arguments: { command: "ls" } }, // 16
+      ],
+    });
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    // 9 + 3 + JSON.stringify({ command: "ls" }).length (16) = 28 — a
+    // thinking-heavy stall notice must not read as "produced nothing".
+    expect(notices[0]).toBe(
+      formatNotice("sub-a3f1", "worker", "stalled", "phase=streaming elapsedMs=300000 charsGenerated=28"),
+    );
+  });
+
+  test("a nested tool end (parentToolCallId set) does not clear the outer entry and refreshes its clock", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-outer", "bash");
+    set(5 * 60_000);
+    // A codemode sub-call finishes; its end carries the OUTER call's id. The
+    // outer entry must survive (not be deleted) and its clock refreshes —
+    // nested activity is outer activity.
+    watchdog.onToolExecutionEnd("call-outer/1", "call-outer");
+    set(10 * 60_000); // 5 min after the refresh: not stalled
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(15 * 60_000); // 10 min after the refresh: the outer stalls
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+    expect(notices[0]).toContain("elapsedMs=900000");
+  });
+
+  test("in a parallel batch, one sibling's end leaves the wedged sibling warnable", () => {
+    const { watchdog, set, notices } = harness();
+    // pi emits every start of a parallel batch before any of them executes.
+    watchdog.onToolExecutionStart("call-a", "read");
+    watchdog.onToolExecutionStart("call-b", "bash");
+    watchdog.onToolExecutionEnd("call-a"); // first sibling finishes
+    set(TOOL_STALL_MS);
+    watchdog.check();
+    // The wedged sibling still warns — its entry survived call-a's end.
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+    expect(notices[0]).toContain("elapsedMs=600000");
+    // One notice per tool call: no re-warn.
+    set(2 * TOOL_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+  });
+
+  test("a top-level tool start while a stream is active keeps both tracked", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText("")); // t=0
+    set(60_000);
+    watchdog.onToolExecutionStart("call-1", "bash"); // t=60s
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    // The stream owns its one-shot notice; the tool (4 min in) is not stalled.
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("phase=streaming");
+    watchdog.onMessageEnd(assistantText(""));
+    set(11 * 60_000); // t=660s: 10 min past the tool's start
+    watchdog.check();
+    expect(notices).toHaveLength(2);
+    expect(notices[1]).toBe(
+      formatNotice("sub-a3f1", "worker", "stalled", "phase=tool elapsedMs=600000 tool=bash"),
+    );
+  });
+
+  test("a tool update refreshes its own entry; a nested update refreshes the parent's", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-outer", "bash");
+    set(9 * 60_000);
+    // A nested sub-call reports progress: its update carries the outer id.
+    watchdog.onToolExecutionUpdate("call-inner", "call-outer");
+    set(9 * 60_000 + 60_000); // 1 min after the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(0); // 9 min since the outer start, but only 1 min since activity
+    set(9 * 60_000 + 11 * 60_000 + 1); // 10 min + 1 ms past the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+  });
+
+  test("a depth-2 nested update walks ancestors to refresh the top-level entry", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-outer", "bash");
+    set(9 * 60_000);
+    // The sub-call's id and its parent are both below the top-level entry, so
+    // only an unbounded ancestor walk reaches `call-outer`; a direct lookup or
+    // a single trim misses it, and the outer entry would false-stall.
+    watchdog.onToolExecutionUpdate("call-outer/1/2", "call-outer/1");
+    set(9 * 60_000 + 60_000); // 1 min after the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(9 * 60_000 + 11 * 60_000 + 1); // 10 min + 1 ms past the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+  });
+
+  test("a depth-3 nested update walks ancestors to the top-level entry", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("a", "bash");
+    set(9 * 60_000);
+    watchdog.onToolExecutionUpdate("a/1/2/3", "a/1/2");
+    set(9 * 60_000 + 60_000); // 1 min after the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(9 * 60_000 + 11 * 60_000 + 1); // 10 min + 1 ms past the refresh
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+  });
+
+  test("a top-level tool update refreshes its own entry", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-1", "bash");
+    set(9 * 60_000);
+    watchdog.onToolExecutionUpdate("call-1");
+    set(19 * 60_000 - 1); // 9 min 59.999 s since the update
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+    set(19 * 60_000 + 1);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+  });
+
+  test("a message_update while idle is ignored", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageUpdate(assistantText("hello"));
+    set(STREAMING_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("check while idle emits nothing, even long after the thresholds", () => {
+    const { watchdog, set, notices } = harness();
+    set(10 * 60_000);
+    watchdog.check();
+    set(20 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("a message_end during a tool phase does not clear the tool entry", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onToolExecutionStart("call-1", "bash");
+    set(60_000);
+    watchdog.onMessageEnd(assistantText(""));
+    set(11 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=bash");
+  });
+
+  test("agent_end clears an orphaned tool entry and the streaming phase", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText(""));
+    watchdog.onToolExecutionStart("call-1", "bash"); // a start whose end never came
+    watchdog.onAgentEnd();
+    set(30 * 60_000);
+    watchdog.check();
+    expect(notices).toHaveLength(0);
+  });
+
+  test("the tick runs on WATCHDOG_TICK_MS, is unref'd, and is cleared on session_shutdown", () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    let unrefCalled = false;
+    let intervalMs: number | undefined;
+    let cleared = false;
+    (globalThis as Record<string, unknown>).setInterval = (cb: () => void, ms: number) => {
+      intervalMs = ms;
+      return { unref: () => { unrefCalled = true; } };
+    };
+    (globalThis as Record<string, unknown>).clearInterval = () => {
+      cleared = true;
+    };
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const pi = {
+      registerTool: () => {},
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+      },
+    } as unknown as ExtensionAPI;
+    try {
+      childDone(pi);
+      expect(intervalMs).toBe(WATCHDOG_TICK_MS);
+      expect(unrefCalled).toBe(true);
+      expect(handlers.has("session_shutdown")).toBe(true);
+      handlers.get("session_shutdown")![0]({});
+      expect(cleared).toBe(true);
+    } finally {
+      (globalThis as Record<string, unknown>).setInterval = realSetInterval;
+      (globalThis as Record<string, unknown>).clearInterval = realClearInterval;
+    }
+  });
+  test("oldest-first selection: two wedged siblings warn in start order, one per tick", () => {
+    const { watchdog, set, notices } = harness();
+    // pi emits every start of a parallel batch before any of them executes.
+    watchdog.onToolExecutionStart("call-a", "read");
+    set(1000); // +1 s
+    watchdog.onToolExecutionStart("call-b", "grep");
+    set(TOOL_STALL_MS + 1000); // both siblings past the threshold
+    watchdog.check();
+    // The first notice names the OLDEST sibling (a), not the newest.
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("tool=read");
+    expect(notices[0]).not.toContain("tool=grep");
+    // The next tick names the other wedged sibling (b), and only it.
+    set(TOOL_STALL_MS + 2000);
+    watchdog.check();
+    expect(notices).toHaveLength(2);
+    expect(notices[1]).toContain("tool=grep");
+  });
+
+  test("a non-assistant message_end does not close an active assistant streaming phase", () => {
+    const { watchdog, set, notices } = harness();
+    watchdog.onMessageStart(assistantText("hello"));
+    set(60_000);
+    // A toolResult message_end arrives while the assistant stream is active:
+    // it says nothing about the assistant's phase, which must survive and
+    // still stall on its own threshold.
+    watchdog.onMessageEnd({ role: "toolResult", content: [{ type: "text", text: "ok" }] });
+    set(STREAMING_STALL_MS + 10_000);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("phase=streaming");
+  });
+
+  test("a throw inside the tick callback is swallowed (the 30 s tick is throw-safe)", () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realNow = Date.now;
+    let capturedCb: (() => void) | undefined;
+    (globalThis as Record<string, unknown>).setInterval = (cb: () => void, _ms: number) => {
+      capturedCb = cb;
+      return { unref: () => {} };
+    };
+    (globalThis as Record<string, unknown>).clearInterval = () => {};
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const pi = {
+      registerTool: () => {},
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+      },
+    } as unknown as ExtensionAPI;
+    try {
+      childDone(pi);
+      expect(capturedCb).toBeDefined();
+      // Point the watchdog's clock at a throwing now(): check() reads
+      // effects.now() first, so without the try/catch the timer callback
+      // would throw, and a synchronous throw in a timer callback is uncaught
+      // and would kill the child.
+      Date.now = () => {
+        throw new Error("clock on fire");
+      };
+      expect(() => capturedCb!()).not.toThrow();
+    } finally {
+      (globalThis as Record<string, unknown>).setInterval = realSetInterval;
+      (globalThis as Record<string, unknown>).clearInterval = realClearInterval;
+      Date.now = realNow;
+    }
+  });
+
+  test("default-export wiring: all events registered; nested tool_execution_end forwards parentToolCallId", () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realNow = Date.now;
+    let currentTime = 0;
+    let tickCb: (() => void) | undefined;
+    (globalThis as Record<string, unknown>).setInterval = (cb: () => void, _ms: number) => {
+      tickCb = cb;
+      return { unref: () => {} };
+    };
+    (globalThis as Record<string, unknown>).clearInterval = () => {};
+    Date.now = () => currentTime;
+
+    // Record every spawn so stall notices sent through the real node effects
+    // are observable. mock.module is retroactive: child-done.js's `spawn`
+    // binding picks this up even though the module is already imported.
+    const spawnedArgs: unknown[][] = [];
+    mock.module("node:child_process", () => ({
+      spawn: (...args: unknown[]) => {
+        spawnedArgs.push(args);
+        return { on: () => {}, unref: () => {} };
+      },
+      execFile: (..._args: unknown[]) => {},
+    }));
+
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const pi = {
+      registerTool: () => {},
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+      },
+    } as unknown as ExtensionAPI;
+
+    const savedPane = process.env.PI_SUBAGENT_PARENT_PANE;
+    process.env.PI_SUBAGENT_PARENT_PANE = "test-parent-pane";
+    try {
+      childDone(pi);
+
+      // Every registered event must be present: dropping any registration
+      // (message_update, agent_end, ...) leaves the watchdog blind to that
+      // phase.
+      for (const evt of [
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "tool_execution_update",
+        "agent_end",
+        "session_shutdown",
+      ]) {
+        expect(handlers.has(evt), `pi.on("${evt}") not registered`).toBe(true);
+      }
+      // agent_end is registered twice (handshake + watchdog); deleting either
+      // one leaves the other, so check the count specifically.
+      expect(handlers.get("agent_end")!.length).toBe(2);
+
+      // Drive one nested tool_execution_end through the captured handler.
+      // If the wiring forwards parentToolCallId, the nested end refreshes the
+      // parent's clock and nothing stalls at t=10 min; if the argument is
+      // dropped, the nested end becomes a no-op top-level delete of an id that
+      // was never in the map, and the parent false-stalls.
+      const startHandler = handlers.get("tool_execution_start")![0];
+      const endHandler = handlers.get("tool_execution_end")![0];
+      currentTime = 0;
+      startHandler({ toolCallId: "call-outer", toolName: "bash" });
+      currentTime = 5 * 60_000;
+      endHandler({ toolCallId: "call-outer/1", parentToolCallId: "call-outer" });
+      currentTime = 10 * 60_000;
+      tickCb!();
+
+      const stalled = spawnedArgs.filter((args) => {
+        const argv = args[1] as unknown[] | undefined;
+        return typeof argv?.[3] === "string" && argv[3].includes("stalled");
+      });
+      expect(stalled).toHaveLength(0);
+    } finally {
+      mock.restore();
+      (globalThis as Record<string, unknown>).setInterval = realSetInterval;
+      (globalThis as Record<string, unknown>).clearInterval = realClearInterval;
+      Date.now = realNow;
+      if (savedPane === undefined) delete process.env.PI_SUBAGENT_PARENT_PANE;
+      else process.env.PI_SUBAGENT_PARENT_PANE = savedPane;
+    }
   });
 });

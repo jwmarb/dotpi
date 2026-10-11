@@ -4,9 +4,10 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { discoverAgents, parseAgentFile } from "../lib/agents.js";
 import { agentsDir } from "../lib/layout.js";
@@ -15,6 +16,7 @@ import {
   appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
+  buildHealthCheckTask,
   agentNameRejection,
   childNameRejection,
   candidateModels,
@@ -36,8 +38,8 @@ import {
   TODO_TOOL_NAME,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
-import { classifyExecFailure, errorPayload, paneRectFrom, splitArgs } from "./herdr.js";
-import { launchAttempt, type Launcher } from "./index.js";
+import { classifyExecFailure, errorPayload, paneRectFrom, splitArgs, waitArgs } from "./herdr.js";
+import { interruptRun, launchAttempt, type Launcher } from "./index.js";
 import {
   exitPath,
   formatExitSidecar,
@@ -58,6 +60,7 @@ import {
   qualifiesAsSalvage,
   requiresResultBlock,
   systemPromptPath,
+  type RunRecord,
 } from "./rundir.js";
 
 // ---------------------------------------------------------------------------
@@ -670,6 +673,49 @@ describe("extractRunResult", () => {
 
 });
 
+// ---------------------------------------------------------------------------
+// buildHealthCheckTask
+// ---------------------------------------------------------------------------
+
+describe("buildHealthCheckTask", () => {
+  const target = { runId: "sub-aaaa", agent: "librarian", task: "Research the X API" };
+  const dir = "/home/u/.pi/agent/subagent-runs/sub-aaaa";
+
+  test("a stalled task carries the target's identity, the original task, and the watchdog detail", () => {
+    const task = buildHealthCheckTask(target, dir, {
+      kind: "stalled",
+      detail: "phase=tool elapsedMs=600000 tool=bash",
+    });
+    expect(task).toContain("sub-aaaa");
+    expect(task).toContain(dir);
+    expect(task).toContain("librarian");
+    expect(task).toContain("Research the X API");
+    expect(task).toContain("stalled");
+    expect(task).toContain("phase=tool elapsedMs=600000 tool=bash");
+  });
+
+  test("an ended-without-result task names the completion predicate and its verdict", () => {
+    const task = buildHealthCheckTask(target, dir, { kind: "ended-without-result" });
+    expect(task).toContain("sub-aaaa");
+    expect(task).toContain(dir);
+    expect(task).toContain("librarian");
+    expect(task).toContain("Research the X API");
+    expect(task).toContain("extractRunResult");
+    expect(task).toContain("answered: false");
+  });
+
+  test("a multiline original task stays fully present, untruncated and un-reencoded", () => {
+    const multi = "Line one\nLine two with a \"quoted\" word\n\tTabbed line";
+    const task = buildHealthCheckTask({ ...target, task: multi }, dir, {
+      kind: "stalled",
+      detail: "phase=streaming elapsedMs=300000 charsGenerated=412",
+    });
+    expect(task).toContain(multi);
+    expect(task).not.toContain("\\n");
+    expect(task).toContain("phase=streaming elapsedMs=300000 charsGenerated=412");
+  });
+});
+
 describe("buildChildEnv", () => {
   test("carries the run identity and the parent pane when known", () => {
     const env = buildChildEnv({ runId: "sub-0008", agent: "worker" }, "w5:p1", "/runs/sub-0008");
@@ -887,6 +933,62 @@ describe("rundir record shapes", () => {
     expect(isRunRecord(rec)).toBe(true);
     expect(Object.keys(rec)).not.toContain("runDir");
   });
+
+  test("a present non-string healthCheckOf is accepted and treated as absent", () => {
+    // Historical records carry no healthCheckOf and must stay valid.
+    expect(isRunRecord({ runId: "sub-1" })).toBe(true);
+    // A health-check record points back at the run it is diagnosing.
+    const rec = {
+      runId: "sub-aaaa",
+      agent: "healthcheck",
+      task: "t",
+      cwd: "/",
+      status: "running" as const,
+      startedAt: 1,
+      healthCheckOf: "sub-abcd",
+    };
+    expect(isRunRecord(rec)).toBe(true);
+    // A present non-string healthCheckOf is now ACCEPTED (treated as absent):
+    // runId is the only load-bearing requirement, and the reading sites guard
+    // with typeof === "string" checks, so a corrupted value cannot key a bogus
+    // registry entry — it must not make a live run invisible either.
+    expect(isRunRecord({ ...rec, healthCheckOf: 42 })).toBe(true);
+    expect(isRunRecord({ ...rec, healthCheckOf: { runId: "sub-abcd" } })).toBe(true);
+    // A present null is a non-string too: JSON keeps the key, and it is treated
+    // as absent, not record-fatal.
+    expect(isRunRecord({ ...rec, healthCheckOf: null })).toBe(true);
+    // runId remains the only load-bearing requirement.
+    expect(isRunRecord({ runId: 42 })).toBe(false);
+    expect(isRunRecord(null)).toBe(false);
+  });
+
+  test("a present non-string ownerPane is accepted and treated as absent", () => {
+    // The run dir is global across pi processes; ownerPane names the spawning
+    // parent's herdr pane. runId remains the only record-fatal requirement,
+    // so ownership is loadable but not sweepable when missing or corrupted.
+    const rec = {
+      runId: "sub-aaaa",
+      agent: "worker",
+      task: "t",
+      cwd: "/",
+      status: "running" as const,
+      startedAt: 1,
+    };
+    // Missing ownerPane (legacy) stays valid.
+    expect(isRunRecord(rec)).toBe(true);
+    // A string ownerPane is the stamped, sweepable case.
+    expect(isRunRecord({ ...rec, ownerPane: "w9:p1" })).toBe(true);
+    // A present non-string ownerPane is accepted (treated as absent at the
+    // guarded read sites), not record-fatal.
+    expect(isRunRecord({ ...rec, ownerPane: 42 })).toBe(true);
+    expect(isRunRecord({ ...rec, ownerPane: { pane: "w9:p1" } })).toBe(true);
+    // A present null is a non-string too: JSON keeps the key, and it is
+    // treated as absent, not record-fatal.
+    expect(isRunRecord({ ...rec, ownerPane: null })).toBe(true);
+    // runId remains the only load-bearing requirement.
+    expect(isRunRecord({ runId: 42, ownerPane: "w9:p1" })).toBe(false);
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -1202,6 +1304,55 @@ describe("formatNotice / parseNotice", () => {
     const runId = makeRunId();
     expect(parseNotice(formatNotice(runId, "worker", "done"))?.runId).toBe(runId);
   });
+  test("round-trips a stalled notice for a streaming overrun", () => {
+    // The watchdog's exact text shape: phase, elapsed ms, and the visible
+    // character count it had accumulated when the stream went quiet.
+    const line = formatNotice("sub-a3f1", "worker", "stalled", "phase=streaming elapsedMs=300000 charsGenerated=1287");
+    expect(parseNotice(line)).toEqual({
+      runId: "sub-a3f1",
+      agent: "worker",
+      kind: "stalled",
+      text: "phase=streaming elapsedMs=300000 charsGenerated=1287",
+    });
+  });
+
+  test("round-trips a stalled notice for a tool overrun", () => {
+    const line = formatNotice("sub-0b2c", "librarian", "stalled", "phase=tool elapsedMs=600000 tool=bash");
+    expect(parseNotice(line)).toEqual({
+      runId: "sub-0b2c",
+      agent: "librarian",
+      kind: "stalled",
+      text: "phase=tool elapsedMs=600000 tool=bash",
+    });
+  });
+
+  test("a stalled notice keeps the strict id/agent grammar it shares with report and done", () => {
+    // The kind is the only thing that widened; the run-id and agent constraints
+    // are untouched, so a malformed stalled notice is still swallowed-safe.
+    expect(
+      parseNotice("[subagent sub-a3f1 (explorer) stalled] phase=tool elapsedMs=600000 tool=bash"),
+    ).toEqual({
+      runId: "sub-a3f1",
+      agent: "explorer",
+      kind: "stalled",
+      text: "phase=tool elapsedMs=600000 tool=bash",
+    });
+    // Non-hex run id.
+    expect(
+      parseNotice("[subagent sub-zzzz (explorer) stalled] phase=tool elapsedMs=600000 tool=bash"),
+    ).toBeUndefined();
+    // Capitalised agent name.
+    expect(
+      parseNotice("[subagent sub-a3f1 (Explorer) stalled] phase=tool elapsedMs=600000 tool=bash"),
+    ).toBeUndefined();
+    // An unknown kind next to the new one is still rejected.
+    expect(
+      parseNotice("[subagent sub-a3f1 (explorer) chatter] phase=tool elapsedMs=600000 tool=bash"),
+    ).toBeUndefined();
+    // A human's bracketed line that merely mentions the run is not a notice.
+    expect(parseNotice("the run is [subagent sub-a3f1 (explorer) stalled]")).toBeUndefined();
+  });
+
 });
 
 
@@ -2089,5 +2240,198 @@ describe("paneRectFrom", () => {
     expect(paneRectFrom({ result: {} }, "w9:p2C")).toBeNull();
     expect(paneRectFrom(null, "w9:p2C")).toBeNull();
     expect(paneRectFrom({ result: { layout: { panes: [{ pane_id: "w9:p1", rect: { width: "x", height: 3 } }] } } }, "w9:p1")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// interruptRun — the subagent_tasks "interrupt" seam
+// ---------------------------------------------------------------------------
+
+describe("interruptRun", () => {
+  const runningRec = (): RunRecord => ({
+    runId: "sub-ab12",
+    agent: "explorer",
+    task: "map the repo",
+    cwd: "/repo",
+    paneId: "w9:p1",
+    status: "running",
+    startedAt: 1_000,
+  });
+
+  /** Recording effects: every herdr call is logged as [name, ...args]. */
+  function makeEffects(opts?: {
+    sendKeysOk?: boolean;
+    idle?: boolean;
+    promptOk?: boolean;
+    promptError?: string | null;
+    onReconcile?: (rec: RunRecord, callNumber: number) => void;
+  }) {
+    const calls: Array<[string, ...unknown[]]> = [];
+    let reconcileCalls = 0;
+    const effects = {
+      sendKeys: async (paneId: string, ...keys: string[]) => {
+        calls.push(["sendKeys", paneId, ...keys]);
+        return opts?.sendKeysOk ?? true;
+      },
+      waitAgentIdle: async (paneId: string, timeoutMs: number) => {
+        calls.push(["waitAgentIdle", paneId, timeoutMs]);
+        return opts?.idle ?? true;
+      },
+      sendPrompt: async (paneId: string, text: string) => {
+        calls.push(["sendPrompt", paneId, text]);
+        const ok = opts?.promptOk ?? true;
+        return { ok, error: ok ? null : (opts?.promptError ?? "agent_blocked") };
+      },
+      reconcile: async (rec: RunRecord) => {
+        reconcileCalls += 1;
+        calls.push(["reconcile", rec.runId, reconcileCalls]);
+        opts?.onReconcile?.(rec, reconcileCalls);
+        return true;
+      },
+    };
+    return { calls, effects };
+  }
+
+  const names = (calls: Array<[string, ...unknown[]]>) => calls.map((c) => c[0]);
+
+  test("a running run gets reconcile → esc → bounded idle wait → replacement prompt → post-prompt reconcile, in that exact order", async () => {
+    const { calls, effects } = makeEffects();
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt", "reconcile"]);
+    expect(calls[1]).toEqual(["sendKeys", "w9:p1", "esc"]);
+    expect(calls[2]).toEqual(["waitAgentIdle", "w9:p1", 30_000]);
+    expect(calls[3]).toEqual(["sendPrompt", "w9:p1", "new direction"]);
+    expect(r).toEqual({ interrupted: true, delivered: true, status: "running" });
+  });
+
+  test("a run that finishes between the idle wait and the prompt is reported done, not running", async () => {
+    const { calls, effects } = makeEffects({
+      // The second reconcile is the post-prompt one: the child finished while
+      // the prompt was in flight, so the reported status must be the fresh one.
+      onReconcile: (rec, n) => {
+        if (n === 2) rec.status = "done";
+      },
+    });
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt", "reconcile"]);
+    expect(r).toEqual({ interrupted: true, delivered: true, status: "done" });
+  });
+
+  test("a post-prompt reconcile that throws keeps the pre-prompt status", async () => {
+    const { effects } = makeEffects();
+    const originalReconcile = effects.reconcile;
+    let n = 0;
+    effects.reconcile = async (rec) => {
+      n += 1;
+      if (n === 2) throw new Error("probe failed");
+      return originalReconcile(rec);
+    };
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(r).toEqual({ interrupted: true, delivered: true, status: "running" });
+  });
+
+  test("a non-running run is rejected after reconcile, with no key delivery and no prompt", async () => {
+    const rec: RunRecord = { ...runningRec(), status: "done" };
+    const { calls, effects } = makeEffects();
+    const r = await interruptRun(rec, "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile"]);
+    expect(r).toEqual({ interrupted: false, delivered: false, status: "done" });
+  });
+
+  test("a running run with no pane is rejected after reconcile, with no key delivery", async () => {
+    const rec: RunRecord = { ...runningRec(), paneId: undefined };
+    const { calls, effects } = makeEffects();
+    const r = await interruptRun(rec, "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile"]);
+    expect(r).toEqual({ interrupted: false, delivered: false, status: "running" });
+  });
+
+  test("a failed Escape is an interrupt failure and never prompts", async () => {
+    const { calls, effects } = makeEffects({ sendKeysOk: false });
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys"]);
+    expect(r.interrupted).toBe(false);
+    expect(r.delivered).toBe(false);
+    expect(r.status).toBe("running");
+    expect(r.error).toBeDefined();
+  });
+
+  test("an idle timeout never sends the replacement prompt, and reconciles once more", async () => {
+    const { calls, effects } = makeEffects({ idle: false });
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "reconcile"]);
+    expect(r.interrupted).toBe(true);
+    expect(r.delivered).toBe(false);
+    expect(r.status).toBe("running");
+    expect(r.error).toContain("idle");
+  });
+
+  test("a run that transitions to done while waiting reports done, with no prompt", async () => {
+    const rec = runningRec();
+    const { calls, effects } = makeEffects({
+      idle: false,
+      onReconcile: (r, n) => {
+        if (n === 2) r.status = "done";
+      },
+    });
+    const out = await interruptRun(rec, "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "reconcile"]);
+    expect(out).toEqual({ interrupted: true, delivered: false, status: "done" });
+  });
+
+  test("a failed replacement prompt reports interrupted but not delivered, with the herdr error", async () => {
+    const { calls, effects } = makeEffects({ promptOk: false, promptError: "agent_blocked" });
+    const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
+    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt"]);
+    expect(r).toEqual({ interrupted: true, delivered: false, status: "running", error: "agent_blocked" });
+  });
+
+  test("an empty replacement prompt is rejected before any effect", async () => {
+    const { calls, effects } = makeEffects();
+    const r = await interruptRun(runningRec(), "   ", 30_000, effects);
+    expect(calls).toHaveLength(0);
+    expect(r.interrupted).toBe(false);
+    expect(r.delivered).toBe(false);
+    expect(r.status).toBe("running");
+    expect(r.error).toBeDefined();
+  });
+
+  // Regression pin: the cancel branch must keep doing exactly what it has always
+  // done — close the pane, stamp `cancelled`, stamp `finishedAt`, persist.
+  // There is no dispatchTasks-level seam to inject a record through, so the
+  // branch is pinned in source: byte-identical effect, not a paraphrase.
+  test("the cancel branch still closes the pane and stamps cancelled + finishedAt metadata (regression)", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf-8");
+    const start = src.indexOf('case "cancel":');
+    expect(start).toBeGreaterThan(-1);
+    // `cancel` is the case right before `interrupt`; bound the branch at
+    // `interrupt`'s start, so this pin only ever sees the cancel branch.
+    const end = src.indexOf('case "interrupt":', start);
+    expect(end).toBeGreaterThan(start);
+    const branch = src.slice(start, end);
+    const close = branch.indexOf("closePane(rec.paneId)");
+    const cancelled = branch.indexOf('rec.status = "cancelled"');
+    const stamped = branch.indexOf("rec.finishedAt = Date.now()");
+    const saved = branch.indexOf("saveMeta(rec)");
+    for (const [needle, i] of [
+      ["closePane", close],
+      ["cancelled", cancelled],
+      ["finishedAt", stamped],
+      ["saveMeta", saved],
+    ]) {
+      expect(i, `cancel branch must contain ${needle}`).toBeGreaterThan(-1);
+    }
+    // And in that order, inside the running-status guard.
+    expect(close < cancelled && cancelled < stamped && stamped < saved).toBe(true);
+    expect(branch.indexOf('rec.status === "running"')).toBeLessThan(close);
+  });
+});
+
+describe("waitArgs", () => {
+  // The `--until <state>` argv is what both state-waits share; a regression
+  // here would break the launch recovery path with every test still green.
+  test("pins the argv for the idle and working forms", () => {
+    expect(waitArgs("w9:p1", "idle", 30_000)).toEqual(["agent", "wait", "w9:p1", "--until", "idle", "--timeout", "30000"]);
+    expect(waitArgs("w9:p1", "working", 15_000)).toEqual(["agent", "wait", "w9:p1", "--until", "working", "--timeout", "15000"]);
   });
 });

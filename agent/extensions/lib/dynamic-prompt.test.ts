@@ -22,10 +22,12 @@
  *
  * Run: `bun test agent/extensions/lib/dynamic-prompt.test.ts`
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll, beforeAll } from "bun:test";
 
 import { buildOrchestratorPrompt } from "../dynamic-prompt.js";
-
+import { agentsDir } from "./layout.js";
+import { discoverAgents } from "./agents.js";
+import { fileURLToPath } from "node:url";
 /** A minimal valid call; each test overrides only what it is about. */
 function build(overrides: Partial<Parameters<typeof buildOrchestratorPrompt>[0]> = {}) {
   return buildOrchestratorPrompt({
@@ -700,5 +702,41 @@ describe("the context inventory", () => {
     expect(p).toContain("## Project Context");
     expect(p).toContain("/work/repo/AGENTS.md");
     expect(p).toContain("/work/repo/sub/AGENTS.md");
+  });
+});
+
+
+describe("healthcheck agent visibility in the inventory", () => {
+  // The agent dir is the repo's own `agent/` directory, derived from this
+  // test file's location. Setting PI_CODING_AGENT_DIR makes the test hermetic:
+  // it works in a container where HOME points at an empty dir.
+  const agentDirPath = fileURLToPath(new URL("../..", import.meta.url));
+  // Assigned in beforeAll, not the describe body: the body runs at collection
+  // time, which would put the override in force for every earlier test in the
+  // file.
+  let originalEnv: string | undefined;
+  beforeAll(() => {
+    originalEnv = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDirPath;
+  });
+  test("the Available Agents table includes healthcheck when hasSubagent is true", async () => {
+    const inventory = await discoverAgents(agentsDir());
+    const p = build({ agentInventory: inventory as never[], hasSubagent: true });
+    expect(p).toContain("## Available Agents");
+    expect(p).toContain("| healthcheck |");
+  });
+
+  test("the agent section is absent when hasSubagent is false", async () => {
+    const inventory = await discoverAgents(agentsDir());
+    const p = build({ agentInventory: inventory as never[], hasSubagent: false });
+    expect(p).not.toContain("## Available Agents");
+    expect(p).not.toContain("| healthcheck |");
+  });
+
+  // Restore the original env once the tests have run, so other test files in
+  // the same process are unaffected.
+  afterAll(() => {
+    if (originalEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalEnv;
   });
 });
