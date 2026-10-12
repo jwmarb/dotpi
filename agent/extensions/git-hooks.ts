@@ -46,10 +46,37 @@ export default function (pi: ExtensionAPI) {
 			// Dependency repair, independent of the hooksPath outcome: a fresh
 			// clone is missing node_modules (git-ignored), and the initial clone
 			// is the one state no git hook observes. No-op when installed.
-			const setup = await pi.exec("bash", [path.join(repoRoot, "scripts/setup-deps.sh")]);
+			//
+			// The script is platform-specific: bash on Linux/macOS, PowerShell on
+			// Windows. On Windows prefer the native scripts/setup-deps.ps1, and
+			// fall back to the bash twin through Git Bash (present wherever git
+			// is) when PowerShell is unavailable. Both are no-ops when the trees
+			// are already installed, so the fallback is cheap.
+			const isWin = process.platform === "win32";
+			const shScript = path.join(repoRoot, "scripts/setup-deps.sh");
+			const psScript = path.join(repoRoot, "scripts/setup-deps.ps1");
+
+			let setup = { code: 0, stdout: "", stderr: "" } as { code: number; stdout: string; stderr: string };
+			if (isWin) {
+				try {
+					setup = await pi.exec("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psScript]);
+				} catch {
+					setup = { code: 1, stdout: "", stderr: "powershell unavailable" };
+				}
+				if (setup.code !== 0) {
+					try {
+						setup = await pi.exec("bash", [shScript]);
+					} catch {
+						setup = { code: 1, stdout: "", stderr: "neither powershell nor bash could run setup-deps" };
+					}
+				}
+			} else {
+				setup = await pi.exec("bash", [shScript]);
+			}
 			if (setup.code !== 0 && ctx.hasUI) {
+				const hint = isWin ? "powershell scripts/setup-deps.ps1" : "bash scripts/setup-deps.sh";
 				ctx.ui.notify(
-					`Extension dependency setup reported a problem:\n${(setup.stderr || setup.stdout).trim()}\nRun it manually with: bash scripts/setup-deps.sh`,
+					`Extension dependency setup reported a problem:\n${(setup.stderr || setup.stdout).trim()}\nRun it manually with: ${hint}`,
 					"warning",
 				);
 			}

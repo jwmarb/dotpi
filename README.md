@@ -79,6 +79,27 @@ backup up front, or download and run it directly.
 
 Flags go after `--` when piping: `... | bash -s -- --dir ~/src/dotpi`
 
+#### Windows 🪟
+
+The Windows installer is [install.ps1](install.ps1) — the same steps in PowerShell. It writes the `~/.bun/bin` PATH entry to the user registry (no `.bashrc`/`.zshrc` on Windows) and points `~/.pi` at the clone with a directory **junction** (`mklink /J`, no elevation) instead of a symlink. It uses [setup-deps.ps1](scripts/setup-deps.ps1) for the dependency install, with a Git Bash fallback.
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/jwmarb/dotpi/master/install.ps1 | iex"
+```
+
+Or read it first, then run it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/jwmarb/dotpi/master/install.ps1 -OutFile install.ps1"
+.\install.ps1
+```
+
+The same flags work: `--dir`, `--ref`, `--yes`, `--no-pi`. When piping, flags go through `-Args`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/jwmarb/dotpi/master/install.ps1 | iex -Args '--dir C:\src\dotpi'"
+```
+
 ### Manual steps
 
 1. Clone the repository into `~/.pi` — the directory pi resolves its agent tree from:
@@ -104,6 +125,8 @@ Flags go after `--` when piping: `... | bash -s -- --dir ~/src/dotpi`
    ```sh
    bash scripts/setup-deps.sh
    ```
+
+   (On Windows: `powershell scripts\setup-deps.ps1`.)
 
 5. Start pi:
 
@@ -262,7 +285,15 @@ cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p
 
 ## OS Compatibility
 
-Linux and macOS — the setup scripts are bash, the `~/.pi` pointer is a symlink, and the `--verify` runtime gate needs a Docker daemon. The configuration itself is plain JSON/TypeScript/Markdown and platform-agnostic.
+Linux, macOS, and Windows. The configuration itself is plain JSON/TypeScript/Markdown and platform-agnostic; the installer is the only OS-specific piece, and it comes in two twins — `install.sh` (bash, for Linux/macOS) and [install.ps1](install.ps1) (PowerShell, for Windows) — that do the same job in each OS's idiom:
+
+| | Linux / macOS (`install.sh`) | Windows (`install.ps1`) |
+| --- | --- | --- |
+| `~/.pi` pointer | symlink (`ln -s`) | directory junction (`mklink /J`) |
+| PATH | appends to `.bashrc`/`.zshrc` | user-registry `PATH` |
+| dependency install | `scripts/setup-deps.sh` | `scripts/setup-deps.ps1` (Git Bash fallback) |
+
+Two things are genuinely Linux/macOS-only and degrade on Windows: the `--verify` runtime gate needs a Docker daemon (the loop reports `inconclusive` without one, it never assumes success), and the git `pre-commit` hook runs through Git Bash. Everything pi *loads* — extensions, subagents, skills, provider wiring — is identical across platforms; `display-file` and the subagent tool both branch on `process.platform` for the parts that touch the OS.
 
 ## Known Limitations ⚠️
 
