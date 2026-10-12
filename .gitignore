@@ -51,6 +51,9 @@ agent/skills/other/uarizona-hpc/
 
 # ---- Dependencies -----------------------------------------------------------
 node_modules/
+# The root one is a symlink to pi's global install (scripts/setup-deps.sh);
+# `node_modules/` matches directories only, not a link.
+/node_modules
 # bun's lockfile is binary; the text lockfile is committed instead if present.
 bun.lockb
 

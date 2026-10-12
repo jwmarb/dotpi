@@ -80,6 +80,32 @@ for pkg in $manifests; do
 	fi
 done
 
+# pi's own packages (@earendil-works/*, typebox) are NOT npm dependencies of
+# this repo: at run time pi supplies them from its global install. Outside pi --
+# `bun test`, scripts/check.sh, the pre-commit hook -- a bare import resolves by
+# walking up from the importing file, so without a node_modules above the
+# extensions every suite importing them dies with "Cannot find package
+# 'typebox'". (This used to work by accident via a stray ~/node_modules; when it
+# went away, 53 tests and the commit hook failed on a clean HEAD.) Link the
+# running pi's global node_modules at the repo root -- the same copy pi uses, so
+# tests see the exact version that loads the extensions. NODE_PATH is not an
+# alternative: `bun test` ignores it. Repaired when the link is missing or stale.
+pi_cli=$(command -v pi 2>/dev/null) && pi_cli=$(readlink -f "$pi_cli")
+pi_mods=${pi_cli%%/@earendil-works/pi-coding-agent/*}
+if [ -n "$pi_cli" ] && [ "$pi_mods" != "$pi_cli" ] && [ -d "$pi_mods/typebox" ]; then
+	if [ -L node_modules ] && [ "$(readlink node_modules)" != "$pi_mods" ]; then
+		rm node_modules
+	fi
+	if [ ! -e node_modules ]; then
+		ln -s "$pi_mods" node_modules && echo "setup-deps: linked node_modules -> $pi_mods"
+	elif [ ! -L node_modules ]; then
+		echo "setup-deps: ./node_modules exists and is not a link; leaving it" >&2
+	fi
+else
+	echo "setup-deps: could not locate pi's global node_modules; tests importing pi packages will fail" >&2
+	status=1
+fi
+
 # A run that discovered nothing means the globs stopped matching the tree -- the
 # exact silent failure this script had when it looked at extensions only. Report
 # it instead of exiting 0 on an empty loop.
