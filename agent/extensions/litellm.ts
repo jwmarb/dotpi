@@ -134,6 +134,19 @@ const QWEN_THINKING_LEVEL_MAP = {
   max: 'xhigh',
 } as const;
 /**
+ * Claude thinking levels. `off` must be sent explicitly: Claude 5.x thinks
+ * adaptively by default at the genai gateway, so omitting reasoning_effort
+ * leaves thinking ON. For Claude <= 5.0 (and haiku) the genai proxy translates
+ * `none` into thinking={type:"disabled"}, which really turns it off.
+ *
+ * LIMITATION: Claude 5.5 rejects thinking.type="disabled" upstream (400), so
+ * on 5.5 `none` passes through and the model still thinks adaptively (hidden).
+ * There is no request shape that disables 5.5 thinking at this gateway. On
+ * `:adaptive` groups the variant's thinking wins; `none` only disables it on
+ * 4.6. Verified 2026-10-12.
+ */
+const CLAUDE_THINKING_LEVEL_MAP = { off: 'none', xhigh: 'xhigh' } as const;
+/**
  * LiteLLM proxy extension. Fetches model metadata from a LiteLLM proxy and
  * registers it as a provider, including per-token costs and cache read/write rates.
  *
@@ -188,7 +201,9 @@ export default async function (pi: ExtensionAPI) {
         thinkingLevelMap: m.supports_reasoning
           ? m.model_group.startsWith('qwen/')
             ? QWEN_THINKING_LEVEL_MAP
-            : { xhigh: 'xhigh' }
+            : m.model_group.startsWith('anthropic/')
+              ? CLAUDE_THINKING_LEVEL_MAP
+              : { xhigh: 'xhigh' }
           : undefined,
         input: m.supports_vision ? (['text', 'image'] as const) : (['text'] as const),
         cost: {
