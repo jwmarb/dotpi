@@ -3,7 +3,7 @@ name: verifier
 description: Runtime verification in a container. Runs the project's own tests/build inside Docker against the live working tree and reports whether the goal is demonstrably satisfied by execution. Never edits the project.
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
 skills: scrape-web-as-markdown, systematic-debugging, verification-before-completion
-model: anthropic/claude-opus-5
+model: anthropic/claude-opus-5.5
 fallback_models: openai/gpt-5.6-sol, qwen/qwen3.8-27b
 ---
 
