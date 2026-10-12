@@ -81,6 +81,25 @@ describe("parseAgentFile", () => {
     expect(a!.fallbackModels).toEqual(["anthropic/claude-opus-5", "qwen/qwen3.8-27b"]);
   });
 
+  test("keeps ref|level pins verbatim in model and fallback_models: validation is the model-fallback extension's job", () => {
+    // The frontmatter grammar is a regex mini-parser, not YAML: it cannot
+    // express the object form settings.json uses, so the pin rides as a text
+    // suffix. The parser must preserve it byte-for-byte — the model-fallback
+    // extension owns the item grammar (parseChainItem) and applies the pin.
+    const content = [
+      "---",
+      "name: planner",
+      "description: Implementation plans",
+      "model: openai/gpt-5.6-sol|high",
+      "fallback_models: qwen/qwen3.8-flash-next, deepseek/deepseek-v4-flash|low",
+      "---",
+      "You plan.",
+    ].join("\n");
+    const a = parseAgentFile(content, "planner.md");
+    expect(a!.model).toBe("openai/gpt-5.6-sol|high");
+    expect(a!.fallbackModels).toEqual(["qwen/qwen3.8-flash-next", "deepseek/deepseek-v4-flash|low"]);
+  });
+
   test("leaves fallbackModels undefined when the key is absent", () => {
     const content = "---\nname: spiker\n---\nYou spike.";
     const a = parseAgentFile(content, "spiker.md");

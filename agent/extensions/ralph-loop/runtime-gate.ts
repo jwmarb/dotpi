@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolveGateAgent } from "./gate-agent.js";
-import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import { FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
 import { withChainEnv } from "./gate.js";
 import {
 	type LoopState,
@@ -266,8 +266,10 @@ export async function runRuntimeGate(
 	}
 
 	// --no-extensions is deliberately absent: the provider serving the model is
-	// itself a local extension.
-	const useChain = !!chain && chain.length > 1;
+	// itself a local extension — which is also what makes the fallback router
+	// available to the child. `isRoutable` (the shared definition: two entries
+	// to hop, or one pinned entry) decides whether the router gets used.
+	const useChain = !!chain && isRoutable(parseChainEnv(chain.join(",")));
 	const args = [
 		"-p",
 		"--no-session",

@@ -24,16 +24,24 @@ import {
 	describeExhaustion,
 	describeHop,
 	describeNoneAvailable,
+	formatChainItem,
+	formatEntry,
 	formatModelRef,
 	initialState,
 	isDisabled,
 	isOwnError,
+	isRoutable,
+	isThinkingLevel,
+	levelFor,
 	parseChain,
 	parseChainEnv,
+	parseChainItem,
+	parseModelEntry,
 	parseModelRef,
 	readChain,
 	readConfig,
 	readLimits,
+	THINKING_LEVELS,
 	VIRTUAL_MODEL_API,
 	requiredPhysicalRetries,
 	sanitizeModelRef,
@@ -92,9 +100,119 @@ describe("parseModelRef", () => {
 	});
 
 	test("rejects a trailing thinking level rather than stripping it", () => {
-		// The level comes from the selection; a chain entry carrying one is a
-		// misunderstanding that should be visible, not silently half-honoured.
+		// A `:level` suffix on a string has no home — the object form is where a
+		// pinned level lives — so a string carrying one is a misunderstanding.
 		expect(parseModelRef("litellm/qwen:high")).toBeUndefined();
+	});
+
+	test("rejects the transport separators — comma and internal whitespace", () => {
+		// A comma is the list/env separator and a space the env token separator,
+		// so a ref carrying either would be split by `parseChainEnv` and the
+		// `join(",")` round-trip would be lossy. Both are rejected up front.
+		expect(parseModelRef("vendor/model,variant")).toBeUndefined();
+		expect(parseModelRef("vendor/model variant")).toBeUndefined();
+	});
+});
+
+describe("parseModelEntry", () => {
+	test("a string is parsed with the bare-reference grammar", () => {
+		expect(parseModelEntry("qwen/qwen3.8-27b")).toEqual({ ref: "qwen/qwen3.8-27b" });
+		// A ref with a `:level` suffix is rejected in both forms.
+		expect(parseModelEntry("litellm/qwen:high")).toBeUndefined();
+	});
+
+	test("an object pins a valid thinking level, trimming the model like a string", () => {
+		expect(parseModelEntry({ model: "  anthropic/claude-opus-5  ", thinking: "low" })).toEqual({
+			ref: "anthropic/claude-opus-5",
+			thinking: "low",
+		});
+	});
+
+	test("accepts each of the seven levels exactly", () => {
+		for (const level of THINKING_LEVELS) {
+			expect(parseModelEntry({ model: "a/1", thinking: level })).toEqual({
+				ref: "a/1",
+				thinking: level,
+			});
+		}
+	});
+
+	test("an object without thinking pins nothing, so the selection passes through", () => {
+		const entry = parseModelEntry({ model: "a/1" });
+		expect(entry).toEqual({ ref: "a/1" });
+		expect("thinking" in (entry ?? {})).toBe(false);
+	});
+
+	test("an invalid level is dropped, keeping the clearly intended model", () => {
+		// The reference is the intent; the selection's level is the honest
+		// fallback, which is what the bare-string form already does.
+		for (const thinking of ["ultra", "HIGH", "Low", "low ", "", 7, true, null, ["low"], { low: 1 }]) {
+			expect(parseModelEntry({ model: "a/1", thinking })).toEqual({ ref: "a/1" });
+		}
+	});
+
+	test("rejects an object whose model is missing or not a usable reference", () => {
+		expect(parseModelEntry({})).toBeUndefined();
+		expect(parseModelEntry({ thinking: "low" })).toBeUndefined();
+		expect(parseModelEntry({ model: 7 })).toBeUndefined();
+		expect(parseModelEntry({ model: "" })).toBeUndefined();
+		expect(parseModelEntry({ model: "/leading" })).toBeUndefined();
+		expect(parseModelEntry({ model: "a/1:high" })).toBeUndefined();
+	});
+
+	test("ignores properties other than model and thinking", () => {
+		expect(parseModelEntry({ model: "a/1", thinking: "high", whatever: 1 })).toEqual({
+			ref: "a/1",
+			thinking: "high",
+		});
+	});
+
+	test("rejects values that are neither strings nor objects", () => {
+		expect(parseModelEntry(7)).toBeUndefined();
+		expect(parseModelEntry(null)).toBeUndefined();
+		expect(parseModelEntry(["a/1"])).toBeUndefined();
+	});
+});
+describe("parseChainItem", () => {
+	test("a bare item is parsed with the bare-reference grammar", () => {
+		expect(parseChainItem("qwen/qwen3.8-27b")).toEqual({ ref: "qwen/qwen3.8-27b" });
+	});
+
+	test("trims surrounding whitespace", () => {
+		expect(parseChainItem("  a/1  ")).toEqual({ ref: "a/1" });
+	});
+
+	test("pins each of the seven valid levels exactly", () => {
+		for (const level of THINKING_LEVELS) {
+			expect(parseChainItem(`a/1|${level}`)).toEqual({ ref: "a/1", thinking: level });
+		}
+	});
+
+	test("splits at the first | only: a later | makes the suffix invalid", () => {
+		// `low|high` is not a level, so the pin is dropped and the model kept.
+		expect(parseChainItem("a/1|low|high")).toEqual({ ref: "a/1" });
+	});
+
+	test("an invalid level drops the pin but keeps the model", () => {
+		for (const bad of ["ultra", "HIGH", "Low", "", " 7", "true"]) {
+			expect(parseChainItem(`a/1|${bad}`)).toEqual({ ref: "a/1" });
+		}
+	});
+
+	test("a level with internal whitespace pins nothing: the compact form is the grammar", () => {
+		expect(parseChainItem("a/1| high")).toEqual({ ref: "a/1" });
+	});
+
+	test("a :level suffix in the ref part is rejected, because the ref grammar owns it", () => {
+		expect(parseChainItem("a/1:low|high")).toBeUndefined();
+	});
+
+	test("rejects items whose ref part names nothing", () => {
+		expect(parseChainItem("")).toBeUndefined();
+		expect(parseChainItem("   ")).toBeUndefined();
+		expect(parseChainItem("|high")).toBeUndefined();
+		expect(parseChainItem("/|high")).toBeUndefined();
+		expect(parseChainItem("provider/|high")).toBeUndefined();
 	});
 });
 
@@ -115,6 +233,36 @@ describe("parseChain", () => {
 	test("yields an empty chain when nothing parses", () => {
 		expect(parseChain(["x:high", "", "/leading", "trailing/"])).toEqual([]);
 	});
+	test("parses a mix of strings and objects, keeping declaration order", () => {
+		expect(parseChain(["a/1", { model: "b/2", thinking: "low" }, "c/3"])).toEqual([
+			{ ref: "a/1" },
+			{ ref: "b/2", thinking: "low" },
+			{ ref: "c/3" },
+		]);
+	});
+
+	test("dedupes by model reference, so two levels on one model are one entry", () => {
+		const first = parseChain(["a/1", { model: "a/1", thinking: "high" }]);
+		expect(first).toEqual([{ ref: "a/1" }]);
+		// First occurrence wins in either order.
+		const flipped = parseChain([{ model: "a/1", thinking: "high" }, "a/1"]);
+		expect(flipped).toEqual([{ ref: "a/1", thinking: "high" }]);
+	});
+
+	test("dedup is case-insensitive, because resolution matches case-insensitively", () => {
+		// `a/1` and `A/1` resolve to the same physical model, so they are one
+		// entry — and the level on the dropped copy does not survive.
+		expect(parseChain(["a/1", { model: "A/1", thinking: "high" }])).toEqual([
+			{ ref: "a/1" },
+		]);
+	});
+
+	test("drops malformed objects without discarding their neighbours", () => {
+		expect(
+			parseChain([7, { thinking: "low" }, null, "a/1", ["b/2"]]).map(formatModelRef),
+		).toEqual(["a/1"]);
+	});
+
 });
 
 describe("parseChainEnv", () => {
@@ -129,6 +277,44 @@ describe("parseChainEnv", () => {
 	test("an unset value is an empty chain, not an error", () => {
 		expect(parseChainEnv(undefined)).toEqual([]);
 		expect(parseChainEnv("")).toEqual([]);
+	});
+
+	test("entries may pin a level with the ref|level item form", () => {
+		// The same item syntax an agent file's model:/fallback_models: uses —
+		// that is what keeps the two surfaces interchangeable.
+		expect(parseChainEnv("a/1,b/2|low")).toEqual([
+			{ ref: "a/1" },
+			{ ref: "b/2", thinking: "low" },
+		]);
+	});
+
+	test("dedup is by ref, case-insensitively, first occurrence winning — pin or no pin", () => {
+		expect(parseChainEnv("a/1,A/1|high")).toEqual([{ ref: "a/1" }]);
+		expect(parseChainEnv("A/1|high,a/1")).toEqual([{ ref: "A/1", thinking: "high" }]);
+	});
+
+	test("an invalid pin degrades to the bare model, matching the object form", () => {
+		expect(parseChainEnv("a/1|ultra")).toEqual([{ ref: "a/1" }]);
+	});
+});
+
+describe("isRoutable", () => {
+	test("an empty chain is not routable", () => {
+		expect(isRoutable([])).toBe(false);
+	});
+
+	test("one unpinned entry is not routable: nothing to hop to, no pin to apply", () => {
+		expect(isRoutable([{ ref: "a/1" }])).toBe(false);
+	});
+
+	test("one pinned entry IS routable: only the router applies a pin", () => {
+		expect(isRoutable([{ ref: "a/1", thinking: "high" }])).toBe(true);
+		expect(isRoutable([{ ref: "a/1", thinking: "off" }])).toBe(true);
+	});
+
+	test("two or more entries are routable, pin or no pin", () => {
+		expect(isRoutable([{ ref: "a/1" }, { ref: "b/2" }])).toBe(true);
+		expect(isRoutable([{ ref: "a/1", thinking: "low" }, { ref: "b/2" }])).toBe(true);
 	});
 });
 
@@ -459,6 +645,13 @@ describe("describeExhaustion", () => {
 		expect(text).toContain("failed on its own side");
 	});
 
+	test("shows a pinned level beside its model", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1", thinking: "high" }, { ref: "b/2" }];
+		const text = describeExhaustion(chain, 2, "Flurble");
+		expect(text).toContain("a/1 (thinking: high)");
+		expect(text).toContain("  - b/2");
+	});
+
 	test("says 1 cycle rather than 1 cycles", () => {
 		expect(describeExhaustion([{ ref: "a/b" }], 1, "x")).toContain("1 cycle");
 	});
@@ -555,6 +748,24 @@ describe("exhaustion messages are never themselves retryable", () => {
 			).toBe(false);
 		}
 	});
+
+	test("a pinned level cannot make a terminal message retryable", () => {
+		// The seven level words are appended to the entry lists in BOTH terminal
+		// messages; prove none of them trips pi's real classifier, for every level.
+		const pinned: ChainEntry[] = [{ ref: "a/1", thinking: "high" }, { ref: "b/2" }];
+		for (const level of THINKING_LEVELS) {
+			pinned[0]!.thinking = level;
+			for (const message of [describeExhaustion(pinned, 2, "Flurble"), describeNoneAvailable(pinned)]) {
+				expect(
+					isRetryableAssistantError({
+						role: "assistant",
+						stopReason: "error",
+						errorMessage: message,
+					} as never),
+				).toBe(false);
+			}
+		}
+	});
 });
 
 describe("sanitizeProviderError", () => {
@@ -621,6 +832,75 @@ describe("describeHop", () => {
 	test("omits the failed model when there is none", () => {
 		expect(describeHop(undefined, { ref: "b/2" }, 0)).toContain("routing to b/2");
 	});
+
+	test("shows a pinned level for both entries it names", () => {
+		const text = describeHop({ ref: "a/1", thinking: "xhigh" }, { ref: "b/2", thinking: "low" }, 0);
+		expect(text).toContain("a/1 (thinking: xhigh) failed");
+		expect(text).toContain("b/2 (thinking: low)");
+	});
+});
+
+describe("formatEntry", () => {
+	test("renders an unpinned entry as the bare reference", () => {
+		expect(formatEntry({ ref: "a/1" })).toBe("a/1");
+	});
+
+	test("renders a pinned entry with its level", () => {
+		expect(formatEntry({ ref: "a/1", thinking: "high" })).toBe("a/1 (thinking: high)");
+	});
+
+	test("formatModelRef stays the identity: the annotation never leaks into the ref", () => {
+		// Dedup and resolution key on the ref; a level is display, not identity.
+		expect(formatModelRef({ ref: "a/1", thinking: "high" })).toBe("a/1");
+	});
+});
+
+describe("formatChainItem", () => {
+	test("renders an unpinned entry as the bare reference", () => {
+		expect(formatChainItem({ ref: "a/1" })).toBe("a/1");
+	});
+
+	test("renders a pinned entry in the ref|level transport form", () => {
+		expect(formatChainItem({ ref: "a/1", thinking: "high" })).toBe("a/1|high");
+	});
+
+	test("round-trips through parseChainItem", () => {
+		// The transport contract covers every level, not a sample of them.
+		const entries = [
+			{ ref: "a/1" },
+			...THINKING_LEVELS.map((level) => ({ ref: "a/1", thinking: level })),
+		];
+		for (const entry of entries) {
+			expect(parseChainItem(formatChainItem(entry))).toEqual(entry);
+		}
+	});
+});
+
+describe("levelFor", () => {
+	test("a pinned level overrides the selection", () => {
+		const chain = parseChain(["a/1", { model: "b/2", thinking: "low" }]);
+		expect(levelFor(chain, 1, "xhigh")).toBe("low");
+	});
+
+	test("an unpinned entry passes the selection through", () => {
+		const chain = parseChain(["a/1", "b/2"]);
+		expect(levelFor(chain, 1, "xhigh")).toBe("xhigh");
+		expect(levelFor(chain, 0, "medium")).toBe("medium");
+	});
+
+	test("a pinned off is honoured, because the lookup is nullish, not truthy", () => {
+		const chain = parseChain([{ model: "a/1", thinking: "off" }]);
+		expect(levelFor(chain, 0, "high")).toBe("off");
+	});
+
+	test("the caller supplies the post-walk index: a skipped entry's level does not travel with it", () => {
+		// The whole reason this helper exists. `route()` walks forward past
+		// unreachable entries, so the index it passes is the model that actually
+		// answers — not the one `advance` aimed at.
+		const chain = parseChain([{ model: "a/1", thinking: "max" }, "b/2"]);
+		expect(levelFor(chain, 0, "high")).toBe("max");
+		expect(levelFor(chain, 1, "high")).toBe("high");
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -646,11 +926,19 @@ describe("readChain", () => {
 		expect(readChain({ chain: ["a/1", "b/2"] }).map(formatModelRef)).toEqual(["a/1", "b/2"]);
 	});
 
+	test("reads mixed string and object entries in both forms", () => {
+		const nested = readChain({ chain: ["a/1", { model: "b/2", thinking: "max" }] });
+		expect(nested.map((e) => e.ref)).toEqual(["a/1", "b/2"]);
+		expect(nested[1]!.thinking).toBe("max");
+		expect("thinking" in nested[0]!).toBe(false);
+		expect(readChain(["a/1", { model: "b/2" }]).map(formatModelRef)).toEqual(["a/1", "b/2"]);
+	});
+
 	test("reads a bare array at the key", () => {
 		expect(readChain(["a/1", "b/2"]).map(formatModelRef)).toEqual(["a/1", "b/2"]);
 	});
 
-	test("ignores non-string entries", () => {
+	test("ignores entries that are neither strings nor objects", () => {
 		expect(readChain({ chain: ["a/1", 7, null] }).map(formatModelRef)).toEqual(["a/1"]);
 	});
 
@@ -857,6 +1145,22 @@ describe("a hostile chain cannot make exhaustion retryable", () => {
 			).toBe(false);
 		}
 	});
+
+	test("a hostile ref with a pinned level is still terminal", () => {
+		// The hostile-ref loop and the pinned-level loop each cover one half of
+		// `sanitizeModelRef(formatEntry(e))`; this covers the composition, where a
+		// keyword could in principle straddle the ref → annotation boundary.
+		const chain = parseChain([{ model: "timeout/model", thinking: "high" }, "ok/model"]);
+		expect(chain.length).toBe(2);
+		const errorMessage = describeExhaustion(chain, 2, "Connection error.");
+		expect(
+			isRetryableAssistantError({
+				role: "assistant",
+				stopReason: "error",
+				errorMessage,
+			} as never),
+		).toBe(false);
+	});
 });
 
 describe("describeNoneAvailable", () => {
@@ -867,6 +1171,12 @@ describe("describeNoneAvailable", () => {
 		expect(text).toContain("settings.modelFallback.chain");
 		// Distinct from exhaustion: nothing was tried, so waiting will not help.
 		expect(text).not.toContain("cycle");
+	});
+
+	test("shows a pinned level beside its model", () => {
+		const text = describeNoneAvailable([{ ref: "a/1", thinking: "max" }, { ref: "nope/b" }]);
+		expect(text).toContain("a/1 (thinking: max)");
+		expect(text).toContain("nope/b");
 	});
 
 	test("is never retryable, even for a hostile model name", () => {

@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import { writeFile, mkdtemp } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolveGateAgent } from "./gate-agent.js";
-import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import { CHAIN_ENV, FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
 import {
 	VERIFY_TIMEOUT_MS,
 	type LoopState,
@@ -72,7 +72,7 @@ export async function withChainEnv<T>(
 	active: boolean,
 	spawn: () => Promise<T>,
 ): Promise<T> {
-	if (!active || !chain || chain.length < 2) return spawn();
+	if (!active || !chain || !isRoutable(parseChainEnv(chain.join(",")))) return spawn();
 	const previous = process.env[CHAIN_ENV];
 	process.env[CHAIN_ENV] = chain.join(",");
 	try {
@@ -196,10 +196,12 @@ export async function runGate(
 	// extension discovery would make the model unresolvable. That is also what
 	// makes the fallback router available to the child.
 	//
-	// With a chain, the child launches on `fallback/auto` instead of one model, so
-	// a provider error during the audit hops rather than burning pi's retry budget
-	// against a dead model and returning `inconclusive` (which stops the loop).
-	const useChain = !!chain && chain.length > 1;
+	// With a routable chain, the child launches on `fallback/auto` instead of one
+	// model, so a provider error during the audit hops rather than burning pi's
+	// retry budget against a dead model and returning `inconclusive` (which stops
+	// the loop). `isRoutable` is the shared definition: two entries to hop,
+	// or a single pinned entry whose thinking level only the router applies.
+	const useChain = !!chain && isRoutable(parseChainEnv(chain.join(",")));
 	const args = [
 		"-p",
 		"--no-session",

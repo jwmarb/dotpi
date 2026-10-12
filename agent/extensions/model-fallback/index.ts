@@ -52,13 +52,17 @@ import {
 	FALLBACK_MODEL_ID,
 	FALLBACK_MODEL_REF,
 	FALLBACK_PROVIDER,
+	THINKING_LEVELS,
 	advance,
 	describeBudgetShortfall,
 	describeExhaustion,
 	describeHop,
 	describeNoneAvailable,
+	formatEntry,
 	formatModelRef,
 	isDisabled,
+	isRoutable,
+	levelFor,
 	parseChainEnv,
 	readChain,
 	readConfig,
@@ -159,18 +163,20 @@ export default function (pi: ExtensionAPI) {
 	const envChain = parseChainEnv(process.env[CHAIN_ENV]);
 	const chain = envChain.length > 0 ? envChain : readChain(raw);
 
-	// Fewer than two models is not a chain: there is nothing to fall back *to*.
-	// Registering anyway would publish a selectable `fallback/auto` that spends a
-	// logical cycle per failure with nowhere to hop — strictly worse than its
-	// absence, because pi's own retry already does that and does it honestly.
+	// A chain the router cannot serve is not a chain: `isRoutable` is the one
+	// definition of "worth registering", shared with the launcher and the
+	// Ralph-loop gates. Two entries (or more) need the router to hop between
+	// models on failure; a **single pinned entry** needs it too, because the
+	// route-time override is the only place a pin is applied. What it rules
+	// out is one unpinned model: registering anyway would publish a selectable
+	// `fallback/auto` that spends a logical cycle per failure with nowhere to
+	// hop — strictly worse than its absence, because pi's own retry already
+	// does that and does it honestly.
 	//
-	// `> 1` is deliberately the same threshold the launcher uses
-	// (`subagent-herdr/lib.ts` `childFallbackChain`, `buildChildEnv`, and the
-	// `--model` choice in `launchAttempt`). They disagreed at first — `=== 0` here
-	// against `> 1` there — which meant a one-entry chain registered a router the
-	// launcher would never route a child to. One definition of "a chain", in both
-	// halves.
-	if (chain.length < 2) return;
+	// The threshold lives in `lib.ts` rather than being re-derived here: it
+	// used to be `length < 2` in every consumer, and the pinned one-entry case
+	// is exactly the kind of rule that drifts when five copies disagree.
+	if (!isRoutable(chain)) return;
 
 	/** The last error text seen, for {@link describeExhaustion}. */
 	let lastError: string | undefined;
@@ -240,11 +246,17 @@ export default function (pi: ExtensionAPI) {
 	pi.registerVirtualModel<FallbackState>({
 		provider: FALLBACK_PROVIDER,
 		id: FALLBACK_MODEL_ID,
+		// The bare ref, deliberately not `formatEntry`: `name` is a fuzzy-match
+		// surface in pi's resolver (`model-resolver.js` `m.name.includes(pattern)`),
+		// so a level word like `high`/`max` in the name would let `--model high`
+		// silently select this router. The level stays on `/fallback-chain`.
 		name: `Fallback chain (${chain.map(formatModelRef).join(" → ")})`,
 		// Every level the chain's members might accept. pi clamps to the routed
 		// model, so offering a level a given member lacks costs nothing, while
 		// omitting one would make it unselectable on the members that have it.
-		thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+		// Entries that pin a level apply it at route time, below; the selection
+		// still needs to stay selectable, so the full list is offered either way.
+		thinkingLevels: THINKING_LEVELS,
 		// Shown only until the first response; after that pi uses the limits of the
 		// physical model that answered. See the `chainLimits` note above for why
 		// leaving these unset does not disturb compaction.
@@ -291,7 +303,11 @@ export default function (pi: ExtensionAPI) {
 			// `advance` aimed, or the next hop would step from a model that never
 			// ran and silently skip the one that did.
 			const state = result.state ? { ...result.state, index } : undefined;
-			return { model, thinkingLevel: request.thinkingLevel, state };
+			// A level pinned on the routed entry overrides the selection; an
+			// unpinned entry passes it through. `levelFor` takes the final `index`,
+			// after the reachability walk, so a skipped entry's level cannot leak
+			// onto the model that actually answers.
+			return { model, thinkingLevel: levelFor(chain, index, request.thinkingLevel), state };
 		},
 	});
 
@@ -304,7 +320,7 @@ export default function (pi: ExtensionAPI) {
 				...chain.map((entry, i) => {
 					const model = resolve(ctx, entry);
 					const mark = model ? "ok" : "UNAVAILABLE";
-					return `  ${i}. ${formatModelRef(entry)} [${mark}]`;
+					return `  ${i}. ${formatEntry(entry)} [${mark}]`;
 				}),
 				"",
 				`Cycles allowed: ${config.maxCycles} (one cycle = one full lap of the chain = one retry)`,

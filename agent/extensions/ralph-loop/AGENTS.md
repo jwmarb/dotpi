@@ -72,7 +72,7 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 
 - **Both gates run on a fallback chain, not one model.** `resolveGateAgent` in
   `gate-agent.ts` — the single resolution seam shared by the static gate and the
-  runtime gate — reads the agent's `fallback_models` through
+  runtime gate — reads the agent's `model` and `fallback_models` through
   `childFallbackChain` and launches the headless child on `fallback/auto` with the chain in
   `PI_FALLBACK_CHAIN`. Before the chain existed they read `info.model` alone, so the oracle's and
   verifier's declared fallbacks were inert here: a gate audit against an erroring provider
@@ -80,6 +80,13 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
   loop**. A gate is an agent like any other, so "any agent that errors moves to its next
   fallback" has to include it. Each gate passes its own `defaultTools` so the seam does not
   couple the two gates' tool policy.
+- **Chain items may pin a thinking level (`ref|level`), and the routability test is shared.**
+  `withChainEnv` (gate.ts) and both `useChain` decisions (gate.ts, runtime-gate.ts) no longer
+  re-derive `length > 1`: they parse the serialized items with `parseChainEnv` and ask
+  `isRoutable` — the one definition in `../model-fallback/lib.ts`. Consequence: a gate agent
+  whose declaration collapses to a **single pinned model** now takes the router path too
+  (`--provider` omitted, `PI_FALLBACK_CHAIN` set), because only the router applies the pin;
+  a single *unpinned* model still launches directly with its provider.
 - **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
   calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
   `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the

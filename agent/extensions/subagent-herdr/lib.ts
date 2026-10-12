@@ -16,7 +16,15 @@ import { frontmatterOf } from "../lib/agents.js";
 import { findSkills } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
-import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import {
+  type ChainEntry,
+  CHAIN_ENV,
+  FALLBACK_MODEL_REF,
+  formatChainItem,
+  isRoutable,
+  parseChainEnv,
+  parseChainItem,
+} from "../model-fallback/lib.js";
 import {
   type ChildReport,
   type FailedAttempt,
@@ -109,9 +117,11 @@ export function buildChildEnv(
     PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
-  // Only when there is something to hop between: an absent var leaves the
-  // child's model selection exactly as it was before this feature.
-  if (fallbackChain && fallbackChain.length > 1) {
+  // Only when the child's router will actually register: `isRoutable` is the
+  // shared definition (two entries to hop, or one pinned entry whose level
+  // only the router can apply). An absent var leaves the child's model
+  // selection exactly as it was before this feature.
+  if (fallbackChain && isRoutable(parseChainEnv(fallbackChain.join(",")))) {
     env[CHAIN_ENV] = fallbackChain.join(",");
   }
   return env;
@@ -826,7 +836,16 @@ export function buildHealthCheckTask(
  * An explicit `model` on the delegation call suppresses the fallbacks: the
  * caller named a model, and silently running a different one would be a
  * surprise rather than a recovery. Duplicates are dropped so a fallback that
- * repeats the primary does not buy a second identical attempt.
+ * repeats the primary does not buy a second identical attempt — by **ref**,
+ * case-insensitively, first occurrence winning: a `model: a/1` and a
+ * `fallback_models: A/1|low` name the same model, and the pin is routing
+ * metadata the launcher does not apply.
+ *
+ * The `--model` argv takes bare references, so a `ref|level` item is parsed
+ * down to its ref here; the pin crosses to the child in {@link CHAIN_ENV}
+ * instead, where the router applies it. An item that parses to nothing is
+ * passed through unchanged — a bad model name is a launch failure pi reports,
+ * not a parse problem this module should fix.
  *
  * @param requested - The model named on the delegation call, if any.
  * @param agent - The agent definition, for its model and fallbacks.
@@ -837,9 +856,19 @@ export function candidateModels(
   agent: { model?: string; fallbackModels?: string[] },
 ): (string | undefined)[] {
   if (requested) return [requested];
-  const out: (string | undefined)[] = [agent.model];
-  for (const m of agent.fallbackModels ?? []) {
-    if (!out.includes(m)) out.push(m);
+  const out: (string | undefined)[] = [];
+  const seen = new Set<string>();
+  for (const raw of [agent.model, ...(agent.fallbackModels ?? [])]) {
+    if (raw === undefined) {
+      // No declared model: pi's default takes the first slot.
+      if (out.length === 0) out.push(undefined);
+      continue;
+    }
+    const ref = parseChainItem(raw)?.ref ?? raw;
+    const key = ref.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
   }
   return out;
 }
@@ -857,28 +886,42 @@ export function candidateModels(
  * `model-fallback` extension turns it into `fallback/auto` and hops on error.
  * One declaration, two jobs: the launcher's and the running child's.
  *
- * Returns `undefined` when there is nothing to hop *between* — an explicit
- * `model` on the delegation call (the caller pinned it, so a silent switch would
- * be a surprise, the same rule {@link candidateModels} applies), or an agent
- * with no declared fallbacks. In both cases the child launches exactly as it
- * did before this feature existed.
+ * Items are canonicalised through the child's own item grammar
+ * ({@link parseChainItem} → {@link formatChainItem}), so a `ref|level` pin in
+ * the agent file survives the handoff verbatim. An entry the grammar rejects
+ * is dropped here too: keeping it would advertise a chain the child's router
+ * does not serve, and the two halves of the handoff disagreeing is the drift
+ * this module exists to prevent. Dedup is by ref, case-insensitively, first
+ * occurrence winning — the same rule {@link candidateModels} applies.
+ *
+ * Returns `undefined` when the child's router will not register — an explicit
+ * `model` on the delegation call (the caller pinned it, so a silent switch
+ * would be a surprise, the same rule {@link candidateModels} applies), or a
+ * declaration that is one unpinned model. In those cases the child launches
+ * exactly as it did before this feature existed. A **single pinned model is
+ * routable**: the pin is applied at route time, which only the router does.
  *
  * @param requested - The model named on the delegation call, if any.
  * @param agent - The agent definition, for its model and fallbacks.
- * @returns Model references in priority order, or `undefined`.
+ * @returns Chain items in priority order, or `undefined`.
  */
 export function childFallbackChain(
   requested: string | undefined,
   agent: { model?: string; fallbackModels?: string[] },
 ): string[] | undefined {
   if (requested) return undefined;
-  if (!agent.model || !agent.fallbackModels || agent.fallbackModels.length === 0) return undefined;
-  const chain = [agent.model];
-  for (const m of agent.fallbackModels) {
-    if (!chain.includes(m)) chain.push(m);
+  const chain: ChainEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of [agent.model, ...(agent.fallbackModels ?? [])]) {
+    if (raw === undefined) continue;
+    const entry = parseChainItem(raw);
+    if (!entry) continue;
+    const key = entry.ref.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    chain.push(entry);
   }
-  // A chain of one is the no-fallback case: nothing to hop to.
-  return chain.length > 1 ? chain : undefined;
+  return isRoutable(chain) ? chain.map(formatChainItem) : undefined;
 }
 
 /**

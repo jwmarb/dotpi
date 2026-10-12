@@ -1205,6 +1205,18 @@ describe("withChainEnv", () => {
 		}
 	});
 
+	test("installs a one-entry pinned chain, because the router must apply the pin", async () => {
+		// The contrast with the unpinned single entry above: the pin is the
+		// reason the router exists, so the var must cross.
+		delete process.env[KEY];
+		let seen: string | undefined = "unset-marker";
+		await withChainEnv(["a/1|high"], true, async () => {
+			seen = process.env[KEY];
+		});
+		expect(seen).toBe("a/1|high");
+		expect(process.env[KEY]).toBeUndefined();
+	});
+
 	test("passes the spawn's result through", async () => {
 		expect(await withChainEnv(["a/1", "b/2"], true, async () => 42)).toBe(42);
 		expect(await withChainEnv(undefined, false, async () => "x")).toBe("x");
@@ -1289,6 +1301,21 @@ describe("resolveGateAgent", () => {
 		writeAgent("gate-one", ["---", "name: gate-one", "description: d", "model: p/m", "fallback_models: p/m", "---", ""].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-one", fallbackModel: "fb/model", defaultTools: ["read"] });
 		expect(r.model).toBe("p/m");
+		expect(r.chain).toBeUndefined();
+	});
+
+	test("a single pinned model yields a chain: the pin needs the router", async () => {
+		writeAgent("gate-pinned", ["---", "name: gate-pinned", "description: d", "model: p/m|high", "---", ""].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-pinned", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r.model).toBe("p/m|high");
+		expect(r.chain).toEqual(["p/m|high"]);
+	});
+
+	test("a pinned primary and an unpinned duplicate of it collapse to the first, unpinned", async () => {
+		// Dedup is by ref, case-insensitively, first occurrence winning — the
+		// same rule the launcher applies, so the gate and the launch agree.
+		writeAgent("gate-dup", ["---", "name: gate-dup", "description: d", "model: p/m", "fallback_models: P/m|high", "---", ""].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-dup", fallbackModel: "fb/model", defaultTools: ["read"] });
 		expect(r.chain).toBeUndefined();
 	});
 });

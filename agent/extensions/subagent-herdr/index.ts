@@ -146,7 +146,7 @@ import {
   skillEntriesFromPi,
 } from "./lib.js";
 // The router model id, owned by the extension that registers it.
-import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import { FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
 import {
   type AgentInfo,
   discoverAgents,
@@ -466,15 +466,17 @@ export async function launchAttempt(
   }
   await launcher.renamePane(pane.paneId, label);
 
-  // A child with a chain launches on the router, not on one model: that is
-  // what lets it hop mid-task instead of re-asking a model that just failed.
-  // Without a chain the model passes through unchanged, so a pinned or
+  // A child whose chain is routable launches on the router, not on one model:
+  // that is what lets it hop mid-task instead of re-asking a model that just
+  // failed — and, since `childFallbackChain` only returns a chain the router
+  // will serve, it is also what applies a pinned thinking level. Without a
+  // routable chain the model passes through unchanged, so a pinned or
   // fallback-less agent launches exactly as it did before.
   const argv = buildChildArgv({
     childDonePath: join(SELF_DIR, "child-done.ts"),
     runDir: dir,
     runId: rec.runId,
-    model: fallbackChain && fallbackChain.length > 1 ? FALLBACK_MODEL_REF : model,
+    model: fallbackChain && isRoutable(parseChainEnv(fallbackChain.join(","))) ? FALLBACK_MODEL_REF : model,
     tools: agent.tools,
     systemPromptPath: promptPath,
   });

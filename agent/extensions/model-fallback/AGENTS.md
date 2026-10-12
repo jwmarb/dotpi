@@ -19,7 +19,7 @@ failed; once a fallback answers, the **original model gets the next request**.
 "defaultModel": "auto",
 "retry": { "maxRetries": 30, ... },
 "modelFallback": {
-  "chain": ["qwen/qwen3.8-27b", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"],
+  "chain": ["qwen/qwen3.8-27b", { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
   "contextWindow": 262144, "maxTokens": 32768
 }
@@ -38,6 +38,29 @@ changing either.
 retries, and 10 cycles therefore needs 30 (see THE TWO BUDGETS). With 10 only 3 cycles were
 reachable and `/fallback-chain` warned about it.
 
+**A chain entry may pin a thinking level.** An entry is either a bare reference
+string or an object `{ "model": "provider/id", "thinking": "level" }` — both forms
+mix freely in one array, and `PI_FALLBACK_CHAIN` carries the same `ref|level`
+item syntax (e.g. `a/1,b/2|low`) so agent-file and env chains stay
+level (one of `off/minimal/low/medium/high/xhigh/max`, case-sensitive)
+**overrides the user's selected level** for the requests that entry answers;
+an entry without one passes the selection through. The override is applied
+at route time on the *final* index — after the
+reachability walk — so a skipped entry's level cannot land on the model that
+actually answers, and pi clamps it to the routed model's capabilities. The pin
+follows the model: `direct` requests routed to a pinned entry — compaction
+summaries and cache warming, which `advance()` sends to `home` — also run at the
+pinned level, an unbudgeted token cost a `thinking` key can create. The virtual
+model still offers all seven levels, so the selection always stays selectable.
+An invalid `thinking` value drops the level but keeps the model; dedup is by
+model reference, case-insensitive, first occurrence winning — the level is
+display, not identity. The level is visible in `/fallback-chain`, hop notices,
+and the exhaustion/unreachable messages (the seven level words are proven
+non-retryable against pi's real classifier in the suite). It is deliberately
+**not** in the virtual model's `name`, because that is a fuzzy-match surface in
+pi's resolver and a bare level word there would let `--model high` select the
+router.
+
 ## WHERE TO LOOK
 
 | Question | Answer |
@@ -45,7 +68,7 @@ reachable and `/fallback-chain` warned about it.
 | What model answers the next request | `lib.ts` `advance()` — the whole decision, by `reason` |
 | Why a lap costs one retry and not L | `lib.ts` module docstring, "The two budgets" |
 | Why the exhaustion message reads oddly flat | `lib.ts` `sanitizeProviderError` — pi retries on a *regex over the error text* |
-| How a subagent gets a chain | `subagent-herdr/lib.ts` `childFallbackChain` → `PI_FALLBACK_CHAIN` → here |
+| How a subagent gets a chain | `subagent-herdr/lib.ts` `childFallbackChain` → `PI_FALLBACK_CHAIN` (items as `ref` or `ref|level`) → here |
 | How a ralph-loop gate gets one | `ralph-loop/gate.ts` `resolveGateAgent` + `withChainEnv` (same env var; `pi.exec()` has no `env` option) |
 | How to configure it | `settings.json` `modelFallback.chain`, then select `fallback/auto` |
 | Whether it is on | `/fallback-chain` — lists the chain, marks unavailable entries, prints the budget |
@@ -67,8 +90,9 @@ fires once per run, not per request, and there is no retry event at all.
 ## SUBAGENTS, AND THE TRAP WHEN TESTING THEM
 
 A child gets its chain from `PI_FALLBACK_CHAIN`, which `subagent-herdr` sets from the
-agent's `fallback_models`; it then launches on `--model fallback/auto` instead of one
-model. All 9 agent files declare fallbacks, so all 9 compose a chain — verified by
+agent's `model:` and `fallback_models:` (each entry may be a bare ref or `ref|level`
+with a pinned thinking level); it then launches on `--model fallback/auto` instead of one
+model. All 10 agent files declare fallbacks, so all 10 compose a chain — verified by
 composing the real spawn inputs from the real files and asserting that the chain starts at
 each agent's declared `model`, that the `--model` flag and the env agree, that the
 handshake vars survive, and that a pinned `model` suppresses the chain for every one.
@@ -141,6 +165,15 @@ is what made the formula wrong rather than merely conservative.
   an unambiguous bare id. Fuzzy substring matching is deliberately **not** copied
   from `resolveCliModel` — a chain names specific models, and answering with a
   near-miss is how a cheap fallback silently becomes an expensive one.
+- **A pinned thinking level is display, not identity.** An object entry
+  `{ "model": "...", "thinking": "..." }` applies its level at route time, for the
+  requests it answers; an entry without one passes the selection through. Dedup
+  and resolution key on `entry.ref` alone — case-insensitively, the way
+  `resolve()` matches the catalogue — so a model that appears twice with
+  different levels is one entry, and `formatModelRef` never carries the
+  annotation; the level never enters the virtual model's `name` either, because
+  that is a fuzzy-match surface in pi's resolver. The moment a level became part
+  of identity, the catalogue lookup would stop finding the model.
 - **The exhaustion message must not contain a word pi retries on.** pi classifies
   retryability with a **regex over the error text** (`pi-ai/utils/retry.js`
   `RETRYABLE_PROVIDER_ERROR_PATTERN`: `connection.?error`, `timeout`, `503`, …),
@@ -171,15 +204,7 @@ is what made the formula wrong rather than merely conservative.
   that is when the virtual model is registered. `settings.ts` owns that read;
   `retry.maxRetries` still goes through `pi.getSettings()` at call time, where it
   is live and `/reload` can change it.
-- **A chain of fewer than two models registers nothing** (`index.ts` guards
-  `chain.length < 2`). A `fallback/auto` over one model would be a selectable
-  model that spends a logical cycle per failure with nowhere to hop — worse than
-  its absence, since pi's own retry already does that and does it honestly. The
-  threshold is deliberately the same `> 1` the launcher uses
-  (`subagent-herdr/lib.ts` `childFallbackChain`/`buildChildEnv`, and the `--model`
-  choice in `launchAttempt`). They disagreed at first — `=== 0` here against `> 1`
-  there — so a one-entry chain registered a router the launcher would never route
-  a child to. One definition of "a chain", in both halves.
+- **`isRoutable` is the one definition of "worth registering the router"** (`index.ts` guards `!isRoutable(chain)`). Two entries (or more) need it to hop; a **single pinned entry** needs it too, because the route-time override is the only place a pin is applied. What it rules out is one *unpinned* model: a `fallback/auto` over one unpinned model would be a selectable model that spends a logical cycle per failure with nowhere to hop — worse than its absence, since pi's own retry already does that and does it honestly. The threshold lives in `lib.ts` rather than being re-derived in each consumer (`subagent-herdr/lib.ts` `childFallbackChain`/`buildChildEnv`, `subagent-herdr/index.ts` `launchAttempt`, `ralph-loop/gate.ts` `withChainEnv`/`runGate`, `ralph-loop/runtime-gate.ts` `runRuntimeGate`), so a future change to the rule cannot drift across six call sites.
 - **A virtual model is never a valid route, so `resolve()` filters it out.**
   `getAvailable()` *includes* virtual entries (`virtual-models.js`
   `withVirtualModels` adds them to the provider's `getModels()`) and a keyless
@@ -238,9 +263,11 @@ This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At th
   A copy drifts, and drift here is an infinite loop rather than a wrong answer.
 - Quoting a provider error into any message this module produces as an error.
 - Calling `pi.getSettings()`, `setActiveTools()` or `getCommands()` at load time.
-- Giving the router a chain whose entries carry `:level` — the thinking level
-  comes from the selection and passes through — or one that names `fallback/auto`
-  itself.
+- Giving the router a chain entry that carries a `:level` suffix — the legacy
+  separator the ref grammar rejects. Pins live in the object form (`{ "model":
+  "...", "thinking": "..." }`) in `settings.json`, or in the `ref|level` item
+  form in agent files and `PI_FALLBACK_CHAIN` — or in a chain that names
+  `fallback/auto` itself.
 - Asserting a sanitised string is safe with a **word-boundary** regex. pi matches
   its status atoms as raw substrings, so `/\b503\b/` passes on text that pi still
   retries. That false assurance is exactly why the dated-model-id leak survived

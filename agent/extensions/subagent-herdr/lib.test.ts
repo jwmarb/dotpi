@@ -760,6 +760,19 @@ describe("buildChildEnv", () => {
     ], []);
     expect(empty.PI_FALLBACK_CHAIN).toBeUndefined();
   });
+
+  test("a one-entry pinned chain emits the var, because the router must apply the pin", () => {
+    // The contrast with the unpinned case above: the pin is the reason the
+    // router exists here, so the var must cross.
+    const pinned = buildChildEnv(
+      { runId: "sub-0014", agent: "worker" },
+      "w5:p1",
+      "/runs",
+      ["worker"],
+      ["qwen/qwen3.8-27b|high"],
+    );
+    expect(pinned.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b|high");
+  });
 });
 
 describe("childFallbackChain", () => {
@@ -822,6 +835,84 @@ describe("childFallbackChain", () => {
       fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
     };
     expect(childFallbackChain(undefined, agent)).toEqual(candidateModels(undefined, agent));
+  });
+
+  test("a grammar-rejected item: lenient launcher, strict chain, one runtime consequence — together", () => {
+    // `bad:ref` carries the legacy `:` separator, so the item grammar rejects it.
+    // The two halves intentionally disagree on it: `candidateModels` passes it
+    // through (a bad name is a launch failure pi reports), `childFallbackChain`
+    // drops it (the router must not advertise a model it cannot resolve). With
+    // two valid entries left the chain is routable, so at runtime the malformed
+    // item never reaches `--model`: the child launches on `fallback/auto` with
+    // the strict chain in the env var. Pinning all three together keeps the
+    // asymmetry from drifting back into silent agreement.
+    const agent = {
+      model: "openai/gpt-5.6-sol",
+      fallbackModels: ["bad:ref", "qwen/qwen3.8-27b|low"],
+    };
+    expect(candidateModels(undefined, agent)).toEqual([
+      "openai/gpt-5.6-sol",
+      "bad:ref",
+      "qwen/qwen3.8-27b",
+    ]);
+    const chain = childFallbackChain(undefined, agent);
+    expect(chain).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b|low"]);
+    const env = buildChildEnv(
+      { runId: "sub-0015", agent: "worker" },
+      "w5:p1",
+      "/runs",
+      ["worker"],
+      chain,
+    );
+    expect(env.PI_FALLBACK_CHAIN).toBe("openai/gpt-5.6-sol,qwen/qwen3.8-27b|low");
+  });
+
+  test("a single pinned primary is a chain: the router is the only place a pin applies", () => {
+    expect(
+      childFallbackChain(undefined, { model: "openai/gpt-5.6-sol|high", fallbackModels: [] }),
+    ).toEqual(["openai/gpt-5.6-sol|high"]);
+    expect(childFallbackChain(undefined, { model: "openai/gpt-5.6-sol|high" })).toEqual([
+      "openai/gpt-5.6-sol|high",
+    ]);
+  });
+
+  test("pins survive the handoff verbatim, in declaration order", () => {
+    expect(
+      childFallbackChain(undefined, {
+        model: "openai/gpt-5.6-sol|high",
+        fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b|low"],
+      }),
+    ).toEqual([
+      "openai/gpt-5.6-sol|high",
+      "anthropic/claude-opus-5",
+      "qwen/qwen3.8-27b|low",
+    ]);
+  });
+
+  test("dedup is by ref, case-insensitively, first occurrence winning — pin or no pin", () => {
+    expect(
+      childFallbackChain(undefined, {
+        model: "qwen/qwen3.8-27b",
+        fallbackModels: ["QWEN/qwen3.8-27b|high", "openai/gpt-5.6-sol"],
+      }),
+    ).toEqual(["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"]);
+    expect(
+      childFallbackChain(undefined, {
+        model: "QWEN/qwen3.8-27b|high",
+        fallbackModels: ["qwen/qwen3.8-27b"],
+      }),
+    ).toEqual(["QWEN/qwen3.8-27b|high"]);
+  });
+
+  test("an item the item grammar rejects is dropped, so the launcher and router agree", () => {
+    // `qwen/qwen3.8-27b:high` carries a legacy `:level` suffix the router would
+    // drop; keeping it here would advertise a chain the child does not serve.
+    expect(
+      childFallbackChain(undefined, {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["qwen/qwen3.8-27b:high", "anthropic/claude-opus-5"],
+      }),
+    ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5"]);
   });
 });
 
@@ -1042,6 +1133,33 @@ describe("candidateModels", () => {
     expect(
       candidateModels(undefined, { model: "a", fallbackModels: ["c", "b", "c"] }),
     ).toEqual(["a", "c", "b"]);
+  });
+
+  test("a pinned item launches on its bare ref: the pin is routing metadata, not a model", () => {
+    expect(
+      candidateModels(undefined, {
+        model: "openai/gpt-5.6-sol|high",
+        fallbackModels: ["qwen/qwen3.8-27b|low"],
+      }),
+    ).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"]);
+  });
+
+  test("dedup is by ref, case-insensitively: a pinned duplicate of the primary buys no attempt", () => {
+    expect(
+      candidateModels(undefined, {
+        model: "qwen/qwen3.8-27b",
+        fallbackModels: ["QWEN/qwen3.8-27b|high", "openai/gpt-5.6-sol"],
+      }),
+    ).toEqual(["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"]);
+  });
+
+  test("an item the item grammar rejects passes through unchanged: pi reports the bad name", () => {
+    expect(
+      candidateModels(undefined, {
+        model: "openai/gpt-5.6-sol",
+        fallbackModels: ["qwen/qwen3.8-27b:high"],
+      }),
+    ).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b:high"]);
   });
 });
 
@@ -1563,6 +1681,25 @@ describe("launchAttempt fallback chain handoff", () => {
     expect(r.env()?.PI_FALLBACK_CHAIN).toBeUndefined();
     const argv = r.argv()!;
     expect(argv[argv.indexOf("--model") + 1]).toBe("openai/gpt-5.6-sol");
+  });
+
+  test("a one-entry pinned chain launches on the router, with the pin in its env", async () => {
+    // The pin can only be applied at route time, so the single pinned model
+    // gets the same treatment as a multi-model chain.
+    const r = recordingLauncher();
+    await launchAttempt(
+      stubAgent,
+      stubRec,
+      "/tmp",
+      "/tmp/p.md",
+      "openai/gpt-5.6-sol",
+      true,
+      r.launcher,
+      ["openai/gpt-5.6-sol|high"],
+    );
+    expect(r.env()?.PI_FALLBACK_CHAIN).toBe("openai/gpt-5.6-sol|high");
+    const argv = r.argv()!;
+    expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
   });
 
   test("the chain never displaces the run identity or lineage env", async () => {

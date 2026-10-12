@@ -37,13 +37,26 @@ export interface AgentInfo {
   description: string;
   /** Allowed tools, or undefined if the agent can use all tools. */
   tools?: string[];
-  /** Preferred LLM model, or undefined to use the default. */
+  /**
+   * Preferred LLM model, or undefined to use the default. The raw frontmatter
+   * value: a bare reference, or `ref|level` with a pinned thinking level
+   * (e.g. `openai/gpt-5.6-sol|high`). Levels are the seven case-sensitive
+   * words `off|minimal|low|medium|high|xhigh|max`; the pin is applied by the
+   * child's model-fallback router, so validation lives there — this parser
+   * keeps the value verbatim.
+   */
   model?: string;
   /**
    * Fallback models, from the file's `fallback_models` key. Tried in order by
    * the spawn path when a child fails to *launch* (an unknown model, or a
    * provider that is down or rate-limiting, makes pi exit before its TUI
    * appears). An explicit model on the delegation call suppresses them.
+   *
+   * Each entry is the raw frontmatter value: a bare reference, or `ref|level`
+   * pinning the thinking level that entry should run at (see {@link model}).
+   * The pin crosses to the child in `PI_FALLBACK_CHAIN` and is applied by the
+   * child's model-fallback router; this parser deliberately does not validate
+   * it — one parser per format, and the model-fallback extension owns it.
    */
   fallbackModels?: string[];
   /**
@@ -185,6 +198,14 @@ export function mergeAgents(global: AgentInfo[], skillAgents: AgentInfo[]): Agen
  * Parses one agent definition: YAML-ish frontmatter (name, description,
  * tools, model, fallback_models) plus the markdown body that becomes the
  * child's system prompt.
+ *
+ * `model` and each `fallback_models` entry may carry a pinned thinking level
+ * as `ref|level` (e.g. `openai/gpt-5.6-sol|high`); the levels are the seven
+ * case-sensitive words `off|minimal|low|medium|high|xhigh|max`. The parser
+ * keeps these values verbatim — validation and application belong to the
+ * model-fallback extension, which owns the item grammar
+ * (`parseChainItem`/`isRoutable`). An explicit model on the delegation call
+ * suppresses both the fallbacks and any agent-file pins.
  *
  * @returns The parsed agent, or `null` when the frontmatter is missing or
  *          has no `name` (such a file is skipped by discovery).

@@ -80,6 +80,18 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
   unreachable *tail* degrades a running child, so verify against
   `/model_group/info` rather than by eye.
+- **A chain entry may pin its thinking level: `ref|level`.** `model:` and each
+  `fallback_models:` entry accept `openai/gpt-5.6-sol|high` — the seven case-sensitive
+  levels `off|minimal|low|medium|high|xhigh|max`. The pin overrides the session's
+  selected level for the requests that entry answers, and it is applied only by the
+  child's `fallback/auto` router — so a **single pinned model is a chain**: it
+  registers the router and launches on it, even with no `fallback_models`.
+  An unpinned entry passes the selection through, so today's files (bare refs)
+  behave exactly as before. The item grammar is owned by
+  `extensions/model-fallback/lib.ts` (`parseChainItem`/`formatChainItem`/`isRoutable`);
+  `agents.ts` keeps the value verbatim, and `PI_FALLBACK_CHAIN` carries the same
+  `ref|level` text to the child. An explicit `model` on the delegation call
+  suppresses pins as well as fallbacks. Invalid levels drop the pin, keep the model.
 - **A searching agent declares `ffgrep`/`fffind`**, not just `grep`/`find`.
   `npm:@ff-labs/pi-fff` adds those as *extra* names and `tools` is an allowlist, so
   omitting them means never seeing them; the built-ins stay as the fallback for a session

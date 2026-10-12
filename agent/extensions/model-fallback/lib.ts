@@ -33,6 +33,19 @@
  */
 
 /**
+ * The thinking levels pi can select, in pi's order.
+ *
+ * Declared here rather than imported from `pi-ai` (`ModelThinkingLevel`):
+ * this module stays pi-free, and `index.ts` hands the same list to
+ * `registerVirtualModel`, so the registration typechecks against it — a
+ * level pi renames or drops fails the build rather than drifting silently.
+ */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** One of {@link THINKING_LEVELS}. */
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/**
  * One model in a chain, as the reference the human wrote.
  *
  * Deliberately *not* a split provider/id pair. pi's own resolver
@@ -46,6 +59,16 @@
 export interface ChainEntry {
 	/** The reference exactly as written, e.g. `qwen/qwen3.8-27b`. */
 	ref: string;
+	/**
+	 * Thinking level pinned for this model, when the entry was written as an
+	 * object (`{ "model": "provider/id", "thinking": "high" }`).
+	 *
+	 * Applied at route time: a pinned level overrides the user's selected
+	 * level for the requests this entry answers. Absent — the bare-string
+	 * form — means the selection passes through, the only thing a string
+	 * entry can do.
+	 */
+	thinking?: ThinkingLevel;
 }
 
 /**
@@ -136,9 +159,16 @@ export function initialState(): FallbackState {
  * {@link ChainEntry.ref}'s consumer, which applies pi's own matching rules
  * (canonical `provider/id`, then provider+id, then bare id).
  *
- * A trailing `:level` is rejected rather than stripped: a chain entry names a
- * model, and the thinking level passes through from the selection, so a
- * reference carrying one is a misunderstanding worth reporting.
+ * A trailing `:level` is rejected rather than stripped: in the bare-string
+ * form a level has no home — the object form (`{ "model": ..., "thinking":
+ * ... }`) owns pins in `settings.json`, and the `ref|level` item form
+ * ({@link parseChainItem}) owns them in agent files and env chains — so a
+ * string carrying a `:` is a misunderstanding worth reporting.
+ *
+ * Commas and internal whitespace are also rejected: they are the transport
+ * separators (env var token delimiter, frontmatter list delimiter), so a ref
+ * containing them would be split by `parseChainEnv` and the round-trip
+ * `join(",")` → `parseChainEnv` would be lossy.
  *
  * @param ref - A reference such as `qwen/qwen3.8-27b` or `litellm/gpt-4o`.
  * @returns The entry, or `undefined` when `ref` is not a usable reference.
@@ -146,11 +176,96 @@ export function initialState(): FallbackState {
 export function parseModelRef(ref: string): ChainEntry | undefined {
 	const trimmed = ref.trim();
 	if (!trimmed) return undefined;
-	// A level belongs to the selection, not to a chain entry.
+	// A `:level` suffix has no home in a string; a pin lives in the object or `|level` item form.
 	if (trimmed.includes(":")) return undefined;
+	// A comma is the transport separator (env var, frontmatter list) and a space
+	// is the env token separator — neither can appear inside a ref.
+	if (trimmed.includes(",") || /\s/.test(trimmed)) return undefined;
 	// A leading or trailing slash names nothing on either side of it.
 	if (trimmed.startsWith("/") || trimmed.endsWith("/")) return undefined;
 	return { ref: trimmed };
+}
+
+/**
+ * Type guard for {@link ThinkingLevel}.
+ *
+ * Named so the idiom `typeof x === "string" && list.includes(x)` — the one
+ * `subagent-herdr` and `kanban` already wrap in `is*` guards — does not recur
+ * at every call site with a fresh cast.
+ */
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Parse one chain item as written in an agent file's `model:`/
+ * `fallback_models:` key or in {@link CHAIN_ENV}.
+ *
+ * An item is a bare reference, or a reference with a `|level` suffix pinning
+ * the thinking level the entry's requests should use — the one grammar that
+ * can cross every surface a chain appears on: `settings.json` uses the object
+ * form, but agent frontmatter is a regex mini-grammar and the chain crosses
+ * to a delegated child as an env string, so a text item form is the only
+ * representation both accept. `|` was chosen because {@link parseModelRef}
+ * rejects `:`, the legacy level separator, so the two forms cannot be
+ * confused.
+ *
+ * The **first** `|` is structural: a ref containing a later `|` degrades to
+ * its prefix when that suffix is not a valid level, which is the same
+ * leniency as an object form with an invalid `thinking` — the reference is
+ * clearly intended, and the selection's level is the honest fallback.
+ *
+ * The level is exact: one of {@link THINKING_LEVELS}, case-sensitive, no
+ * trimming. An item's surrounding whitespace is trimmed (the env value is
+ * split on whitespace, and frontmatter items are trimmed by their parser),
+ * but `a/1| high` pins nothing — the compact `ref|level` form is the grammar.
+ *
+ * @param item - One item, e.g. `qwen/qwen3.8-27b` or `openai/gpt-5.6-sol|high`.
+ * @returns The entry, or `undefined` when the item names no usable model.
+ */
+export function parseChainItem(item: string): ChainEntry | undefined {
+	const trimmed = item.trim();
+	if (!trimmed) return undefined;
+	const bar = trimmed.indexOf("|");
+	if (bar === -1) return parseModelRef(trimmed);
+	const entry = parseModelRef(trimmed.slice(0, bar));
+	if (!entry) return undefined;
+	const level = trimmed.slice(bar + 1);
+	if (isThinkingLevel(level)) entry.thinking = level;
+	return entry;
+}
+
+/**
+ * Parse one chain entry as written in `settings.json`'s `modelFallback.chain`.
+ *
+ * Two forms, one identity. A bare string is the reference exactly as
+ * {@link parseModelRef} reads it; an object form
+ * `{ "model": "provider/id", "thinking": "high" }` pins the thinking level
+ * the entry's requests should use. The `model` value goes through the same
+ * grammar as a string entry — same trimming, same rejections — so the two
+ * forms cannot name the same model in two different ways, and a ref with a
+ * `:level` suffix is rejected in both.
+ *
+ * A `thinking` value is kept only when it is one of {@link THINKING_LEVELS}
+ * exactly (case-sensitive, no trimming). Anything else — `"ultra"`, `"HIGH"`,
+ * `7`, `null` — is dropped while the model is kept: the reference is clearly
+ * intended, and the selection's level is the honest fallback, which is what
+ * the bare-string form already does. Unknown properties are ignored.
+ *
+ * @param value - One element of the configured `chain` array.
+ * @returns The entry, or `undefined` when the value names no usable model.
+ */
+export function parseModelEntry(value: unknown): ChainEntry | undefined {
+	if (typeof value === "string") return parseModelRef(value);
+	if (!value || typeof value !== "object") return undefined;
+	const obj = value as Record<string, unknown>;
+	const entry = parseModelRef(typeof obj.model === "string" ? obj.model : "");
+	if (!entry) return undefined;
+	const level = obj.thinking;
+	if (isThinkingLevel(level)) {
+		entry.thinking = level;
+	}
+	return entry;
 }
 
 /** The reference as written, which is what humans read and pi resolves. */
@@ -159,25 +274,80 @@ export function formatModelRef(entry: ChainEntry): string {
 }
 
 /**
- * Build a chain from references, dropping unusable and repeated ones.
+ * One entry as a human should read it: the reference, plus the pinned
+ * thinking level when one was written.
  *
- * Duplicates are dropped so a fallback that repeats an earlier entry does not
- * buy a second identical attempt — the same rule the subagent launcher applies
- * to `fallback_models` (`subagent-herdr/lib.ts` `candidateModels`).
+ * Distinct from {@link formatModelRef} on purpose: the ref is the identity —
+ * dedup and resolution key on it — while the annotation is display. Mixing
+ * the two would make the same model with two levels into two different
+ * models, and the catalogue lookup would stop finding it.
+ */
+export function formatEntry(entry: ChainEntry): string {
+	return entry.thinking === undefined ? entry.ref : `${entry.ref} (thinking: ${entry.thinking})`;
+}
+
+/**
+ * One entry as written in an agent file or {@link CHAIN_ENV} — the transport
+ * form {@link parseChainItem} reads back.
  *
- * @param refs - References in priority order; the first is the primary.
+ * Distinct from {@link formatEntry} on purpose: that one is for humans
+ * (`` (thinking: X) `` reads well in a chat notice), while this one is the
+ * machine form that round-trips through {@link parseChainItem}. Serialising
+ * the pin anywhere else would drift from the grammar, the same reason the
+ * parser lives here rather than at each call site.
+ */
+export function formatChainItem(entry: ChainEntry): string {
+	return entry.thinking === undefined ? entry.ref : `${entry.ref}|${entry.thinking}`;
+}
+
+/**
+ * The thinking level a routed request should use.
+ *
+ * A level pinned on the entry at `index` overrides `selected`; an unpinned
+ * entry passes the selection through. `??` rather than `||`, so a pinned
+ * `"off"` is honoured instead of falling through.
+ *
+ * Lives here — not inline in `index.ts` `route()` — because it is the one
+ * decision in this feature that no state machine tests beside it: `route()`
+ * must pass the **final** index, after its reachability walk skipped
+ * unreachable entries. A lookup on the pre-walk index would leak a skipped
+ * entry's level onto the model that actually answers, and that bug would be
+ * hardest to notice on exactly the path that triggers it.
+ *
+ * @param chain - The chain as configured.
+ * @param index - The chain index the request was routed to, post-walk.
+ * @param selected - The user's selected level, the passthrough default.
+ */
+export function levelFor(
+	chain: readonly ChainEntry[],
+	index: number,
+	selected: ThinkingLevel,
+): ThinkingLevel {
+	return chain[index]!.thinking ?? selected;
+}
+
+/**
+ * Build a chain from entries, dropping unusable and repeated ones.
+ *
+ * An entry is a bare reference string or a `{ model, thinking }` object
+ * ({@link parseModelEntry}); both name the model by its reference, so
+ * duplicates are detected on `entry.ref` alone, case-insensitively — the way
+ * `index.ts` `resolve()` matches the catalogue — so a model that repeats an
+ * earlier entry does not buy a second identical attempt, no matter what
+ * level the later copy pins. The same rule the subagent launcher applies to
+ * `fallback_models` (`subagent-herdr/lib.ts` `candidateModels`), first
+ * occurrence winning.
+ *
+ * @param entries - Entries in priority order; the first is the primary.
  * @returns The chain, possibly empty when nothing parsed.
  */
-export function parseChain(refs: readonly string[]): ChainEntry[] {
+export function parseChain(entries: readonly unknown[]): ChainEntry[] {
 	const out: ChainEntry[] = [];
 	const seen = new Set<string>();
-	for (const ref of refs) {
-		const entry = parseModelRef(ref);
+	for (const value of entries) {
+		const entry = parseModelEntry(value);
 		if (!entry) continue;
-		const key = formatModelRef(entry);
-		if (seen.has(key)) continue;
-		seen.add(key);
-		out.push(entry);
+		pushUnique(out, seen, entry);
 	}
 	return out;
 }
@@ -188,10 +358,53 @@ export function parseChain(refs: readonly string[]): ChainEntry[] {
  * This is how a delegated child learns the chain its parent chose for it
  * ({@link CHAIN_ENV}); an unset or unparseable value yields an empty chain,
  * which callers treat as "no chain configured" rather than an error.
+ *
+ * Items go through {@link parseChainItem}, so an item may pin a thinking
+ * level with the `ref|level` suffix — the same item syntax an agent file's
+ * `model:`/`fallback_models:` uses, which is what keeps the two surfaces
+ * interchangeable. Dedup is by ref, case-insensitively, first occurrence
+ * winning, exactly as {@link parseChain} does for `settings.json`.
  */
 export function parseChainEnv(value: string | undefined): ChainEntry[] {
 	if (!value) return [];
-	return parseChain(value.split(/[,\s]+/));
+	const out: ChainEntry[] = [];
+	const seen = new Set<string>();
+	for (const token of value.split(/[,\s]+/)) {
+		const entry = parseChainItem(token);
+		if (!entry) continue;
+		pushUnique(out, seen, entry);
+	}
+	return out;
+}
+
+/**
+ * Whether a chain needs the virtual router at all.
+ *
+ * Two entries (or more) need it to hop between models on failure; a
+ * **single pinned entry** needs it too, because the route-time override in
+ * {@link levelFor} is the only place a pin is applied — a child launched
+ * directly on its one model would run at the session's selected level and
+ * the pin would be silently lost. One unpinned entry needs nothing: it
+ * launches on its own model exactly as before this feature existed.
+ *
+ * Takes the parsed chain, not the transport strings: a `ref|level` item has
+ * no visible `thinking` property until {@link parseChainItem} has run, and
+ * a length check on raw strings would misclassify the one-entry pin.
+ */
+export function isRoutable(chain: readonly ChainEntry[]): boolean {
+	return chain.length >= 2 || chain.some((entry) => entry.thinking !== undefined);
+}
+
+/**
+ * Case-insensitive dedup by ref, first occurrence winning — the rule both
+ * {@link parseChain} and {@link parseChainEnv} apply, so the two surfaces
+ * cannot drift apart on what "the same model" means.
+ */
+function pushUnique(out: ChainEntry[], seen: Set<string>, entry: ChainEntry): void {
+	const key = entry.ref.toLowerCase();
+	if (seen.has(key)) return;
+	seen.add(key);
+	out.push(entry);
 }
 
 /** Where {@link advance} says the next request should go. */
@@ -542,7 +755,7 @@ export function spellNumber(n: number): string {
  * fix the chain or the credentials, not to wait for a provider to recover.
  */
 export function describeNoneAvailable(chain: readonly ChainEntry[]): string {
-	const listed = chain.map((e) => `  - ${sanitizeModelRef(formatModelRef(e))}`).join("\n");
+	const listed = chain.map((e) => `  - ${sanitizeModelRef(formatEntry(e))}`).join("\n");
 	return (
 		`${NONE_AVAILABLE_MARKER}: no model in the chain is reachable. Check the names in ` +
 		`settings.modelFallback.chain and that each one's credentials are configured.\n${listed}`
@@ -583,7 +796,7 @@ export function describeExhaustion(
 	cycles: number,
 	lastError: string | undefined,
 ): string {
-	const tried = chain.map((e) => `  - ${sanitizeModelRef(formatModelRef(e))}`).join("\n");
+	const tried = chain.map((e) => `  - ${sanitizeModelRef(formatEntry(e))}`).join("\n");
 	// Spelled out rather than printed as a number: a count of 503 or 429 models
 	// is absurd, but the regex does not know that.
 	const laps = cycles === 1 ? "1 cycle" : `${spellNumber(cycles)} cycles`;
@@ -673,6 +886,11 @@ function describeShape(line: string): string {
 /**
  * The one-line notice for a hop, for the transcript or the status line.
  *
+ * Footer-only on purpose: `index.ts` routes it to `ctx.ui.setStatus` and never
+ * throws it, so — unlike {@link describeExhaustion} and
+ * {@link describeNoneAvailable} — it does not go through
+ * {@link sanitizeModelRef}. If it ever becomes an error message, it must.
+ *
  * @param from - Chain entry that failed, when known.
  * @param to - Chain entry taking over.
  * @param cycles - Laps completed so far, so a second lap is visible as one.
@@ -683,8 +901,8 @@ export function describeHop(
 	cycles: number,
 ): string {
 	const lap = cycles > 0 ? ` (cycle ${cycles + 1})` : "";
-	if (!from) return `model-fallback: routing to ${formatModelRef(to)}${lap}`;
-	return `model-fallback: ${formatModelRef(from)} failed, routing to ${formatModelRef(to)}${lap}`;
+	if (!from) return `model-fallback: routing to ${formatEntry(to)}${lap}`;
+	return `model-fallback: ${formatEntry(from)} failed, routing to ${formatEntry(to)}${lap}`;
 }
 
 /** Read {@link FallbackConfig} from a loosely-typed settings blob. */
@@ -701,17 +919,19 @@ export function readConfig(raw: unknown): FallbackConfig {
 /**
  * Read the chain from a settings blob.
  *
- * Accepts `chain: ["provider/id", ...]`, and also a bare array at the key so
- * `modelFallback: ["a/b", "c/d"]` means what it looks like. Anything else
- * yields an empty chain, which the caller reads as "not configured".
+ * Accepts `chain: ["provider/id", { "model": "...", "thinking": "high" }, ...]`
+ * — a mix of bare references and level-pinning objects — and also a bare array
+ * at the key so `modelFallback: ["a/b", "c/d"]` means what it looks like. Each
+ * entry is parsed leniently ({@link parseModelEntry}): malformed entries and
+ * malformed `thinking` values are dropped without discarding their neighbours.
+ * Anything that is not an array yields an empty chain, which the caller reads
+ * as "not configured".
  */
 export function readChain(raw: unknown): ChainEntry[] {
-	if (Array.isArray(raw)) return parseChain(raw.filter((v): v is string => typeof v === "string"));
+	if (Array.isArray(raw)) return parseChain(raw);
 	const obj = (raw ?? {}) as Record<string, unknown>;
 	const chain = obj.chain;
-	if (Array.isArray(chain)) {
-		return parseChain(chain.filter((v): v is string => typeof v === "string"));
-	}
+	if (Array.isArray(chain)) return parseChain(chain);
 	return [];
 }
 
