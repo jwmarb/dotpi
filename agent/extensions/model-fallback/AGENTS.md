@@ -66,6 +66,7 @@ router.
 | Question | Answer |
 |---|---|
 | What model answers the next request | `lib.ts` `advance()` — the whole decision, by `reason` |
+| Why a gateway 400 can still hop | `index.ts` `agent_before_settle` handler + `lib.ts` `isGatewayUpstreamFailure` / `upstreamHop` |
 | Why a lap costs one retry and not L | `lib.ts` module docstring, "The two budgets" |
 | Why the exhaustion message reads oddly flat | `lib.ts` `sanitizeProviderError` — pi retries on a *regex over the error text* |
 | How a subagent gets a chain | `subagent-herdr/lib.ts` `childFallbackChain` → `PI_FALLBACK_CHAIN` (items as `ref` or `ref|level`) → here |
@@ -86,6 +87,66 @@ The alternative was ruled out by reading pi's source: `retry` is decided inside
 `AgentSession._prepareRetry` (`core/agent-session.js`) and the model is resolved
 below it. **No extension event can change the model of a retry** — `before_agent_start`
 fires once per run, not per request, and there is no retry event at all.
+
+
+## GATEWAY-UPSTREAM RECOVERY (`agent_before_settle`)
+
+pi's own retry classifier (`pi-ai` `isRetryableAssistantError`) pattern-matches the
+assistant's `errorMessage`, and LiteLLM's gateway 400 — "Upstream request failed.
+Received Model Group=… Fallbacks=None" — matches none of its patterns, so pi treats
+the failure as non-retryable and settles the session. The chain therefore never sees a
+`retry` reason, and a subagent (with no human to nudge it) sits waiting on the dead
+model. The `agent_before_settle` boundary (pi 1.1.0) is the one seam that runs before
+settlement and may force exactly one more request, so `index.ts` handles that case there.
+It only acts when the session is on `fallback/auto` (on a physical model `route()` never
+runs, so forcing a request would just re-ask the failing model), and only on the run's
+**most recent** assistant — an older retained 400 is not this run's failure.
+
+1. Decide with `upstreamRecovery` (`lib.ts`, pure and tested): settle, exhausted, or hop
+   with the new state, `from`/`to`, and whether it wrapped. It reads the phrasing via
+   `isGatewayUpstreamFailure`, which never matches this module's own exhaustion or
+   unreachable messages — the boundary's loop safety rests on that, so it is structural.
+2. Read the router state from `ctx.sessionManager.getBranch()` — the same source the
+   router reads. `event.context.contextEntries` is compaction-trimmed and can miss the
+   latest state entry.
+3. `upstreamHop` (`lib.ts`) takes pi's own `retry` step (`advance("retry")`: same target,
+   laps, probes) and adds `forced: true`. The forced request reaches the router as a
+   `continuation`, which normally means "the last request succeeded" — hand back to
+   `home`, zero `cycles`. That would undo the hop *and* make the budget unreachable
+   (cycles reset after every hop, so a fully-down gateway looped forever). `forced` makes
+   that one continuation route to `index` and keep `cycles`; it is consumed there.
+4. On a **wrap** (the hop re-asks models that all just failed) wait pi's retry backoff
+   first — `upstreamDelayMs`: `retry.baseDelayMs × 2^(cycles−1)`, capped at
+   `MAX_UPSTREAM_DELAY_MS` (15 s). Hops to an untried model are immediate. Without this a
+   gateway down for a few seconds burns all `maxCycles` laps in one burst. The cap is short
+   because no run is active at this boundary, so `ctx.signal` is normally undefined and Esc
+   is only honoured once the handler returns.
+5. Append a visible `custom_message` notice (`describeUpstreamHop`). pi converts custom
+   messages to user-role LLM messages, which is what makes `canContinue` accept
+   `continue: true`; in the session projection it stays `role: "custom"`, so it does not
+   turn the request into a `user` turn. Because the model reads it as the latest user
+   message, it is written *to the model* ("automatic notice … continue the task") — a
+   footer-style "X failed, routing to Y" invites a reply like "Noted." that ends the turn.
+
+**The failed attempt is deliberately not omitted** (no `context_edit`), unlike pi's own
+`_prepareRetry`. pi computes `userTurn` as "a user message after the last assistant" over
+the projection. On a turn's first request — a subagent's very first request, the exact
+case this exists for — omitting the failed assistant exposes the user prompt to that test,
+the forced request becomes `user`, and `advance("user")` resets onto the dead primary in a
+backoff-free loop. Keeping it is free: pi-ai's `transformMessages` never replays an
+errored assistant to a provider.
+
+The handler returns `{ entries: [...event.entries, ...drafts], continue: true }` — it
+accumulates `event.entries` because the boundary runner is last-writer-wins per handler.
+It settles on: no gateway-upstream failure, a one-model chain, or a spent cycle budget (then
+it appends a visible `describeUpstreamExhausted` notice without `continue`, so headless and
+print-mode runs record why the chain stopped). Each hop leaves one errored assistant and one
+notice in the session — pi's own retry would have omitted the attempt, but here omitting it
+is the bug described above. The composition upstreamHop → forced
+continuation → failure is pinned in `lib.test.ts` (`a burst of all-upstream failures
+exhausts within maxCycles laps`), as are every exit of `upstreamRecovery`; the handler's
+remaining glue (model guard, branch read, sleep, draft assembly) has no test against a live
+gateway.
 
 ## SUBAGENTS, AND THE TRAP WHEN TESTING THEM
 

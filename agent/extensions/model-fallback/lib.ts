@@ -98,6 +98,14 @@ export interface FallbackState {
 	 * answered, so its failure is a failed probe rather than an ordinary error.
 	 */
 	probing: boolean;
+	/**
+	 * The next request was forced by the gateway-upstream recovery
+	 * ({@link upstreamHop}) rather than by pi's own retry. pi routes that request
+	 * as a `continuation`, but the request before it failed, so the continuation
+	 * branch must route to {@link FallbackState.index} and keep `cycles` instead
+	 * of treating it as a success. Consumed (cleared) by that one request.
+	 */
+	forced?: boolean;
 }
 
 /** Why pi is routing a request. Mirrors pi's `ModelRouteReason`. */
@@ -451,6 +459,9 @@ function sanitize(state: FallbackState | undefined, chainLength: number): Fallba
 		probes: Number.isInteger(base.probes) && base.probes >= 0 ? base.probes : 0,
 		home: clamp(base.home),
 		probing: base.probing === true,
+		// Optional so states stored before `forced` existed, and every ordinary
+		// state, keep their exact shape.
+		...(base.forced === true ? { forced: true } : {}),
 	};
 }
 
@@ -461,7 +472,8 @@ function sameState(a: FallbackState, b: FallbackState): boolean {
 		a.cycles === b.cycles &&
 		a.probes === b.probes &&
 		a.home === b.home &&
-		a.probing === b.probing
+		a.probing === b.probing &&
+		(a.forced === true) === (b.forced === true)
 	);
 }
 
@@ -511,6 +523,16 @@ export function advance(input: AdvanceInput): AdvanceResult {
 	}
 
 	if (reason === "continuation") {
+		if (prior.forced) {
+			// The request the gateway-upstream recovery forced (see `upstreamHop`).
+			// The previous request did NOT succeed: it failed and was never retried
+			// by pi, so the burst is still running. Route to the hop target and keep
+			// `cycles` — zeroing it here would make the burst unbounded.
+			return settle(
+				{ index: prior.index, cycles: prior.cycles, probes: prior.probes, home: prior.home, probing: false },
+				prior.index,
+			);
+		}
 		if (prior.index !== prior.home) {
 			// A fallback answered. Hand the next request back to the primary —
 			// "try the original model against the new response".
@@ -886,9 +908,11 @@ function describeShape(line: string): string {
 /**
  * The one-line notice for a hop, for the transcript or the status line.
  *
- * Footer-only on purpose: `index.ts` routes it to `ctx.ui.setStatus` and never
- * throws it, so — unlike {@link describeExhaustion} and
- * {@link describeNoneAvailable} — it does not go through
+ * Never an error message: `index.ts` shows it in the footer
+ * (`ctx.ui.setStatus`) and, on the gateway-upstream path, as a visible
+ * `custom_message` — neither is an assistant error, so pi's retry classifier
+ * never reads it. That is why, unlike {@link describeExhaustion} and
+ * {@link describeNoneAvailable}, it does not go through
  * {@link sanitizeModelRef}. If it ever becomes an error message, it must.
  *
  * @param from - Chain entry that failed, when known.
@@ -964,4 +988,235 @@ export function readLimits(raw: unknown): { contextWindow?: number; maxTokens?: 
 		...(contextWindow === undefined ? {} : { contextWindow }),
 		...(maxTokens === undefined ? {} : { maxTokens }),
 	};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway-upstream failure detection (agent_before_settle recovery)
+//
+// pi's own `isRetryableAssistantError` (pi-ai/utils/retry.js) pattern-matches
+// the assistant's errorMessage against a list of known transient phrases.
+// LiteLLM's "Upstream request failed" 400 matches none of them, so pi settles
+// the session instead of retrying — and the chain never gets a chance to hop.
+// These helpers let the extension intercept that case at the
+// `agent_before_settle` boundary and force a continuation on the next model.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Matches gateway/proxy errors where the *upstream* model failed, as opposed
+ * to a genuine client-side 400 (malformed request, auth, context overflow).
+ *
+ * Case-insensitive. Covers LiteLLM's canonical phrasing and common variants.
+ * Deliberately narrow: a broad match would move non-transient 400s to another
+ * model, which cannot fix them.
+ */
+export const GATEWAY_UPSTREAM_FAILURE_PATTERN = /upstream[\s-]?(?:request[\s-]?)?failed/i;
+
+/**
+ * Whether an assistant error message indicates a gateway upstream failure
+ * (the upstream model behind the proxy failed, not the request itself).
+ *
+ * @param errorMessage - The `errorMessage` string from a failed assistant message.
+ * @returns `true` when the failure is upstream-side and a different model may succeed.
+ */
+export function isGatewayUpstreamFailure(errorMessage: string): boolean {
+	// This module's own terminal errors are never a reason to hop again: the
+	// boundary's loop safety rests on that, so it is structural rather than an
+	// accident of how `sanitizeProviderError` happens to phrase a cause or how
+	// `sanitizeModelRef` happens to break a model name.
+	if (errorMessage.includes(EXHAUSTION_MARKER) || errorMessage.includes(NONE_AVAILABLE_MARKER)) return false;
+	return GATEWAY_UPSTREAM_FAILURE_PATTERN.test(errorMessage);
+}
+
+/**
+ * `customType` of the session entry pi stores router state in. Mirrors pi
+ * 1.1.0's exported `VIRTUAL_MODEL_STATE_ENTRY`, kept local so this module stays
+ * pi-free; `lib.test.ts` asserts the two are equal so a pi rename fails the
+ * suite instead of silently reading nothing.
+ */
+export const VIRTUAL_MODEL_STATE_CUSTOM_TYPE = "pi.virtual-model-state";
+
+/**
+ * Read the latest router state for a given virtual model from session entries.
+ *
+ * Mirrors pi's internal `getVirtualModelState`: walks backward, returns the
+ * `data.state` of the last matching entry, `undefined` when none matches.
+ * Pass the **full branch** (`ctx.sessionManager.getBranch()`), which is what
+ * the router reads — not the compaction-trimmed `contextEntries`, which can
+ * drop the latest state entry and hand back a stale one.
+ *
+ * @param entries - Raw session entries, in branch order.
+ * @param provider - Provider id of the virtual model (e.g. `"fallback"`).
+ * @param modelId - Model id of the virtual model (e.g. `"auto"`).
+ * @returns The stored state, or `undefined` if none found.
+ */
+export function readVirtualModelState<T = unknown>(
+	entries: readonly { type: string; customType?: string; data?: unknown }[],
+	provider: string,
+	modelId: string,
+): T | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "custom" || entry.customType !== VIRTUAL_MODEL_STATE_CUSTOM_TYPE) continue;
+		const data = entry.data as { provider: string; modelId: string; state: unknown } | undefined;
+		if (data?.provider === provider && data.modelId === modelId) {
+			return data.state as T;
+		}
+	}
+	return undefined;
+}
+
+/** Result of {@link upstreamHop}. */
+export type UpstreamHopResult =
+	| { kind: "hop"; state: FallbackState }
+	| { kind: "exhausted"; cycles: number }
+	| { kind: "noop" };
+
+/**
+ * Compute the router state after a gateway-upstream failure forces a hop.
+ *
+ * This is pi's own `retry` decision, taken where pi did not take it: the step
+ * to the next model, the lap count and the probe accounting are exactly
+ * {@link advance}'s `retry` branch. The one addition is `forced: true`. The
+ * request the boundary then forces reaches the router as a `continuation`
+ * (pi did not mark it a retry), and a plain continuation means "the previous
+ * request succeeded" — it would hand back to `home` and zero `cycles`, which
+ * both undoes the hop and makes the burst unbounded. `forced` tells that one
+ * continuation to route to `index` and keep `cycles`; it is cleared there.
+ *
+ * @param input.state - Current router state (may be `undefined` on first request).
+ * @param input.chainLength - Number of entries in the chain.
+ * @param input.config - Chain tunables (`maxCycles`, `maxProbes`).
+ * @returns The post-hop state, `exhausted` when the budget is spent, or `noop`
+ *          when there is nowhere to hop (single-model chain).
+ */
+export function upstreamHop(input: {
+	state: FallbackState | undefined;
+	chainLength: number;
+	config: FallbackConfig;
+}): UpstreamHopResult {
+	if (input.chainLength < 2) return { kind: "noop" };
+	const result = advance({
+		reason: "retry",
+		chainLength: input.chainLength,
+		state: input.state,
+		config: input.config,
+	});
+	if (result.kind === "exhausted") return { kind: "exhausted", cycles: result.cycles };
+	// With two or more models a retry always moves `index`, so `state` is set;
+	// the fallback only satisfies the type.
+	const next = result.state ?? { ...initialState(), index: result.index };
+	return { kind: "hop", state: { ...next, forced: true } };
+}
+
+/** The smallest slice of a context message {@link upstreamRecovery} reads. */
+export interface RecoveryMessage {
+	role: string;
+	stopReason?: string;
+	errorMessage?: string;
+}
+
+/** What the `agent_before_settle` handler should do. See {@link upstreamRecovery}. */
+export type UpstreamRecovery =
+	| { kind: "settle" }
+	| { kind: "exhausted"; cycles: number }
+	| {
+			kind: "hop";
+			state: FallbackState;
+			from: ChainEntry | undefined;
+			to: ChainEntry;
+			/** The hop wrapped the chain, so it re-asks models that already failed. */
+			wrapped: boolean;
+	  };
+
+/**
+ * The whole gateway-upstream decision, pure so its exits are testable.
+ *
+ * - `settle` — not this module's failure: the run's most recent assistant did
+ *   not error, its error is not a gateway-upstream failure, or the chain has
+ *   one model. Only the **most recent** assistant counts; an older retained
+ *   400 is not this run's failure.
+ * - `exhausted` — it is, but the cycle budget is spent.
+ * - `hop` — force one more request with the stored `state`.
+ *
+ * @param input.messages - The boundary's context messages, oldest first.
+ * @param input.state - Router state read from the full session branch.
+ * @param input.chain - The chain.
+ * @param input.config - Chain tunables.
+ */
+export function upstreamRecovery(input: {
+	messages: readonly RecoveryMessage[];
+	state: FallbackState | undefined;
+	chain: readonly ChainEntry[];
+	config: FallbackConfig;
+}): UpstreamRecovery {
+	let errorMessage: string | undefined;
+	for (let i = input.messages.length - 1; i >= 0; i--) {
+		const m = input.messages[i]!;
+		if (m.role !== "assistant") continue;
+		if (m.stopReason === "error") errorMessage = m.errorMessage;
+		break;
+	}
+	if (!errorMessage || !isGatewayUpstreamFailure(errorMessage)) return { kind: "settle" };
+	const hop = upstreamHop({ state: input.state, chainLength: input.chain.length, config: input.config });
+	if (hop.kind === "noop") return { kind: "settle" };
+	if (hop.kind === "exhausted") return hop;
+	const prior = sanitize(input.state, input.chain.length);
+	return {
+		kind: "hop",
+		state: hop.state,
+		from: input.chain[prior.index],
+		to: input.chain[hop.state.index]!,
+		wrapped: hop.state.cycles > prior.cycles,
+	};
+}
+
+/**
+ * Ceiling on one gateway-upstream backoff.
+ *
+ * Kept short on purpose: during `agent_before_settle` there is no active run,
+ * so `ctx.signal` is normally undefined and Esc is only honoured once the
+ * handler returns (pi checks `_abortDuringBeforeSettle` afterwards). The cap is
+ * therefore also the worst-case delay before Esc takes effect.
+ */
+export const MAX_UPSTREAM_DELAY_MS = 15_000;
+
+/**
+ * Backoff before a forced gateway-upstream request.
+ *
+ * Hopping to a model that has not failed yet is immediate, as pi's own retry
+ * hop is worth no less. A **wrap** re-asks models that all just failed, so it
+ * waits pi's retry backoff for the lap (`baseDelayMs * 2^(cycles-1)`, capped at
+ * {@link MAX_UPSTREAM_DELAY_MS}) — without it a gateway that is down for a few
+ * seconds burns every lap in one burst.
+ *
+ * @param baseDelayMs - `settings.retry.baseDelayMs` (pi's default is 2000).
+ * @param cycles - Laps completed, after the wrap.
+ * @param wrapped - Whether this hop wrapped the chain.
+ */
+export function upstreamDelayMs(baseDelayMs: number, cycles: number, wrapped: boolean): number {
+	if (!wrapped || !(baseDelayMs > 0)) return 0;
+	const delay = baseDelayMs * 2 ** Math.max(0, cycles - 1);
+	return Math.min(Number.isFinite(delay) ? delay : MAX_UPSTREAM_DELAY_MS, MAX_UPSTREAM_DELAY_MS);
+}
+
+/**
+ * The visible notice the gateway-upstream path appends before forcing a request.
+ *
+ * pi delivers it to the model as the latest **user** message, so it is written
+ * to the model: a footer-style "X failed, routing to Y" invites a reply such as
+ * "Noted." that ends the turn — the stall this path exists to prevent. Never an
+ * assistant error, so pi's retry classifier never reads it.
+ */
+export function describeUpstreamHop(from: ChainEntry | undefined, to: ChainEntry): string {
+	const was = from ? ` on ${formatModelRef(from)}` : "";
+	return (
+		`[model-fallback] The previous request${was} failed at the gateway and has been ` +
+		`re-routed to ${formatModelRef(to)}. This is an automatic notice, not a new ` +
+		`instruction: continue the task from where it left off.`
+	);
+}
+
+/** The notice recorded when the gateway-upstream path settles on a spent budget. */
+export function describeUpstreamExhausted(cycles: number): string {
+	return `model-fallback: gateway-upstream failures exhausted the chain after ${spellNumber(cycles)} cycle(s); stopping.`;
 }

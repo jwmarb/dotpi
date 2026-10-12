@@ -19,16 +19,21 @@ import {
 	type FallbackConfig,
 	type FallbackState,
 	type RouteReason,
+	GATEWAY_UPSTREAM_FAILURE_PATTERN,
+	MAX_UPSTREAM_DELAY_MS,
 	advance,
 	describeBudgetShortfall,
 	describeExhaustion,
 	describeHop,
 	describeNoneAvailable,
+	describeUpstreamExhausted,
+	describeUpstreamHop,
 	formatChainItem,
 	formatEntry,
 	formatModelRef,
 	initialState,
 	isDisabled,
+	isGatewayUpstreamFailure,
 	isOwnError,
 	isRoutable,
 	isThinkingLevel,
@@ -41,12 +46,17 @@ import {
 	readChain,
 	readConfig,
 	readLimits,
+	readVirtualModelState,
 	THINKING_LEVELS,
 	VIRTUAL_MODEL_API,
+	VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
 	requiredPhysicalRetries,
 	sanitizeModelRef,
 	sanitizeProviderError,
 	spellNumber,
+	upstreamDelayMs,
+	upstreamHop,
+	upstreamRecovery,
 } from "./lib.ts";
 
 const CONFIG: FallbackConfig = { maxCycles: 10, maxProbes: 2 };
@@ -1285,5 +1295,285 @@ describe("VIRTUAL_MODEL_API", () => {
 		// is not routable, which is the whole reason resolve() filters on it.
 		expect(VIRTUAL_MODEL_API).not.toBe("");
 		expect(typeof VIRTUAL_MODEL_API).toBe("string");
+	});
+});
+
+describe("isGatewayUpstreamFailure", () => {
+	const litellm400 =
+		'400: {"message":"litellm.BadRequestError: OpenAIException - Upstream request failed. Received Model Group=anthropic/claude-opus-5.5\\nAvailable Model Group Fallbacks=None","type":"api_error","param":null,"code":"400"}';
+
+	test("matches the real LiteLLM gateway 400", () => {
+		// The exact text that killed live subagents: pi's classifier does not
+		// match it, so this is the pattern the whole recovery path hangs on.
+		expect(isGatewayUpstreamFailure(litellm400)).toBe(true);
+	});
+
+	test("matches the phrasing variants, case-insensitively", () => {
+		expect(isGatewayUpstreamFailure("Upstream request failed.")).toBe(true);
+		expect(isGatewayUpstreamFailure("upstream-request failed")).toBe(true);
+		expect(isGatewayUpstreamFailure("UPSTREAM REQUEST FAILED")).toBe(true);
+		expect(isGatewayUpstreamFailure("upstream failed")).toBe(true);
+		expect(isGatewayUpstreamFailure("500: Upstream Request Failed after 3 tries")).toBe(true);
+	});
+
+	test("does not match genuine client-side 400s", () => {
+		// Hopping cannot fix these: a different model fails the same way.
+		expect(isGatewayUpstreamFailure('400: {"message":"context_length_exceeded"}')).toBe(false);
+		expect(isGatewayUpstreamFailure("401: invalid api key")).toBe(false);
+		expect(isGatewayUpstreamFailure("400: bad request")).toBe(false);
+		expect(isGatewayUpstreamFailure("422: malformed tool call arguments")).toBe(false);
+		expect(isGatewayUpstreamFailure("")).toBe(false);
+	});
+
+	test("the pattern is exported for callers that need the raw match", () => {
+		expect(typeof GATEWAY_UPSTREAM_FAILURE_PATTERN.test).toBe("function");
+		expect(GATEWAY_UPSTREAM_FAILURE_PATTERN.test("upstream request failed")).toBe(true);
+	});
+});
+
+describe("readVirtualModelState", () => {
+	const state = (s: FallbackState) => ({
+		type: "custom" as const,
+		customType: "pi.virtual-model-state",
+		data: { provider: "fallback", modelId: "auto", state: s },
+	});
+
+	test("returns the state of the LAST matching entry", () => {
+		const entries = [
+			state({ index: 0, cycles: 0, probes: 0, home: 0, probing: false }),
+			{ type: "custom", customType: "other", data: { provider: "fallback", modelId: "auto", state: "noise" } },
+			state({ index: 1, cycles: 2, probes: 0, home: 1, probing: false }),
+		];
+		expect(readVirtualModelState<FallbackState>(entries, "fallback", "auto")).toEqual({
+			index: 1,
+			cycles: 2,
+			probes: 0,
+			home: 1,
+			probing: false,
+		});
+	});
+
+	test("ignores entries for other providers or model ids", () => {
+		const entries = [
+			{ type: "custom", customType: "pi.virtual-model-state", data: { provider: "other", modelId: "auto", state: { index: 9 } } },
+			{ type: "custom", customType: "pi.virtual-model-state", data: { provider: "fallback", modelId: "other", state: { index: 8 } } },
+		];
+		expect(readVirtualModelState(entries, "fallback", "auto")).toBeUndefined();
+	});
+
+	test("returns undefined when no entry matches (fresh branch)", () => {
+		expect(readVirtualModelState([], "fallback", "auto")).toBeUndefined();
+		expect(
+			readVirtualModelState([{ type: "message", message: { role: "user" } } as never], "fallback", "auto"),
+		).toBeUndefined();
+	});
+});
+
+describe("upstreamHop", () => {
+	test("is advance's retry step, plus the forced marker", () => {
+		// Same target, laps and probe accounting as pi's own retry would get.
+		for (const state of [
+			undefined,
+			{ index: 1, cycles: 0, probes: 1, home: 0, probing: true },
+			{ index: 2, cycles: 3, probes: 0, home: 0, probing: false },
+		]) {
+			const res = upstreamHop({ state, chainLength: 3, config: CONFIG });
+			const retry = advance({ reason: "retry", chainLength: 3, state, config: CONFIG });
+			expect(res.kind).toBe("hop");
+			if (res.kind === "hop" && retry.kind === "route") {
+				expect(res.state).toEqual({ ...retry.state!, forced: true });
+			}
+		}
+	});
+
+	test("a fresh state hops 0 -> 1 without moving home", () => {
+		const res = upstreamHop({ state: undefined, chainLength: 3, config: CONFIG });
+		expect(res).toEqual({
+			kind: "hop",
+			state: { index: 1, cycles: 0, probes: 0, home: 0, probing: false, forced: true },
+		});
+	});
+
+	test("a wrap counts a cycle", () => {
+		const res = upstreamHop({
+			state: { index: 2, cycles: 0, probes: 0, home: 0, probing: false },
+			chainLength: 3,
+			config: CONFIG,
+		});
+		expect(res.kind === "hop" && res.state.index === 0 && res.state.cycles === 1).toBe(true);
+	});
+
+	test("exhausts when the cycle budget is spent, with advance's cycle count", () => {
+		const res = upstreamHop({
+			state: { index: 2, cycles: CONFIG.maxCycles - 1, probes: 0, home: 0, probing: false },
+			chainLength: 3,
+			config: CONFIG,
+		});
+		expect(res).toEqual({ kind: "exhausted", cycles: CONFIG.maxCycles });
+	});
+
+	test("a single-model chain is a noop: nowhere to hop", () => {
+		// A pinned one-entry chain registers the router for its level, not for hops.
+		expect(upstreamHop({ state: initialState(), chainLength: 1, config: CONFIG }).kind).toBe("noop");
+		expect(upstreamHop({ state: undefined, chainLength: 1, config: CONFIG }).kind).toBe("noop");
+	});
+});
+
+describe("forced continuation (upstreamHop -> the request pi forces)", () => {
+	const hopThen = (state: FallbackState | undefined, chainLength = 3) => {
+		const hop = upstreamHop({ state, chainLength, config: CONFIG });
+		if (hop.kind !== "hop") throw new Error(`expected a hop, got ${hop.kind}`);
+		return advance({ reason: "continuation", chainLength, state: hop.state, config: CONFIG });
+	};
+
+	test("routes to the hop target, not back to home", () => {
+		const res = hopThen(undefined);
+		expect(res.kind).toBe("route");
+		if (res.kind === "route") expect(res.index).toBe(1);
+	});
+
+	test("consumes the marker and keeps the lap count", () => {
+		const res = hopThen({ index: 2, cycles: 0, probes: 0, home: 0, probing: false });
+		expect(res.kind).toBe("route");
+		if (res.kind === "route") {
+			expect(res.index).toBe(0);
+			expect(res.state).toEqual({ index: 0, cycles: 1, probes: 0, home: 0, probing: false });
+		}
+	});
+
+	test("a burst of all-upstream failures exhausts within maxCycles laps", () => {
+		// Every model fails upstream: boundary hop, forced continuation, fail, ...
+		// Before `forced`, the continuation zeroed `cycles` and this never ended.
+		for (const chainLength of [2, 3, 4]) {
+			for (const maxCycles of [1, 2, 3, 10]) {
+				const config = { maxCycles, maxProbes: 2 };
+				let state: FallbackState | undefined;
+				let failures = 0;
+				for (;;) {
+					failures += 1; // the request at `state` failed upstream
+					const hop = upstreamHop({ state, chainLength, config });
+					if (hop.kind !== "hop") break;
+					const next = advance({ reason: "continuation", chainLength, state: hop.state, config });
+					if (next.kind !== "route") throw new Error("continuation cannot exhaust");
+					state = next.state ?? hop.state;
+					if (failures > 1000) throw new Error("unbounded burst");
+				}
+				expect(failures).toBe(requiredPhysicalRetries(chainLength, maxCycles));
+			}
+		}
+	});
+
+	test("after the forced request succeeds, work hands back to the primary", () => {
+		const forced = hopThen(undefined);
+		if (forced.kind !== "route") throw new Error("expected a route");
+		const after = advance({ reason: "continuation", chainLength: 3, state: forced.state, config: CONFIG });
+		expect(after.kind === "route" && after.index === 0).toBe(true);
+	});
+
+	test("a state without the marker keeps the ordinary continuation meaning", () => {
+		const res = advance({
+			reason: "continuation",
+			chainLength: 3,
+			state: { index: 1, cycles: 2, probes: 0, home: 0, probing: false },
+			config: CONFIG,
+		});
+		expect(res.kind === "route" && res.index === 0).toBe(true);
+	});
+});
+
+describe("VIRTUAL_MODEL_STATE_CUSTOM_TYPE", () => {
+	test("matches pi's exported VIRTUAL_MODEL_STATE_ENTRY", async () => {
+		const pi = await import("@earendil-works/pi-coding-agent");
+		expect(VIRTUAL_MODEL_STATE_CUSTOM_TYPE).toBe(pi.VIRTUAL_MODEL_STATE_ENTRY);
+	});
+});
+
+describe("the boundary never hops on this module's own errors", () => {
+	const upstream400 = '400: {"message":"Upstream request failed. Received Model Group=x"}';
+	test("exhaustion and unreachable messages are not gateway-upstream failures", () => {
+		for (const refs of [
+			["a/1", "b/2"],
+			["upstream-failed/x", "upstream/request-failed", "timeout/model"],
+		]) {
+			const chain = parseChain(refs);
+			for (const last of [undefined, upstream400, "upstream request failed"]) {
+				expect(isGatewayUpstreamFailure(describeExhaustion(chain, 3, last))).toBe(false);
+			}
+			expect(isGatewayUpstreamFailure(describeNoneAvailable(chain))).toBe(false);
+		}
+		expect(isGatewayUpstreamFailure(describeUpstreamExhausted(4))).toBe(false);
+	});
+});
+
+describe("upstreamRecovery", () => {
+	const chain = parseChain(["a/1", "b/2", "c/3"]);
+	const user = { role: "user" };
+	const failed = (errorMessage: string) => ({ role: "assistant", stopReason: "error", errorMessage });
+	const upstream = failed("400: Upstream request failed. Received Model Group=a/1");
+	const run = (messages: { role: string; stopReason?: string; errorMessage?: string }[], state?: FallbackState) =>
+		upstreamRecovery({ messages, state, chain, config: CONFIG });
+
+	test("hops on a gateway-upstream failure, naming from and to", () => {
+		const res = run([user, upstream]);
+		expect(res).toEqual({
+			kind: "hop",
+			state: { index: 1, cycles: 0, probes: 0, home: 0, probing: false, forced: true },
+			from: chain[0],
+			to: chain[1],
+			wrapped: false,
+		});
+	});
+
+	test("only the most recent assistant counts", () => {
+		// An older retained 400 is not this run's failure.
+		expect(run([user, upstream, user, { role: "assistant", stopReason: "stop" }]).kind).toBe("settle");
+		expect(run([user, upstream, user, failed("401: invalid api key")]).kind).toBe("settle");
+		// Trailing non-assistant messages do not hide the failure.
+		expect(run([user, upstream, { role: "custom" }]).kind).toBe("hop");
+	});
+
+	test("settles on other errors, no assistant, and a one-model chain", () => {
+		expect(run([user, failed("400: bad request")]).kind).toBe("settle");
+		expect(run([user]).kind).toBe("settle");
+		expect(run([]).kind).toBe("settle");
+		expect(
+			upstreamRecovery({ messages: [user, upstream], state: undefined, chain: parseChain(["a/1"]), config: CONFIG }).kind,
+		).toBe("settle");
+	});
+
+	test("reports a wrap and exhaustion", () => {
+		const wrap = run([user, upstream], { index: 2, cycles: 0, probes: 0, home: 0, probing: false });
+		expect(wrap.kind === "hop" && wrap.wrapped && wrap.from === chain[2] && wrap.to === chain[0]).toBe(true);
+		const spent = run([user, upstream], { index: 2, cycles: CONFIG.maxCycles - 1, probes: 0, home: 0, probing: false });
+		expect(spent).toEqual({ kind: "exhausted", cycles: CONFIG.maxCycles });
+	});
+});
+
+describe("upstreamDelayMs", () => {
+	test("a hop to an untried model is immediate", () => {
+		expect(upstreamDelayMs(2000, 0, false)).toBe(0);
+		expect(upstreamDelayMs(2000, 5, false)).toBe(0);
+	});
+	test("a wrap backs off like pi's retry, capped", () => {
+		expect(upstreamDelayMs(2000, 1, true)).toBe(2000);
+		expect(upstreamDelayMs(2000, 2, true)).toBe(4000);
+		expect(upstreamDelayMs(2000, 3, true)).toBe(8000);
+		expect(upstreamDelayMs(2000, 10, true)).toBe(MAX_UPSTREAM_DELAY_MS);
+		expect(upstreamDelayMs(2000, 5000, true)).toBe(MAX_UPSTREAM_DELAY_MS);
+	});
+	test("a non-positive or missing base disables the delay", () => {
+		expect(upstreamDelayMs(0, 3, true)).toBe(0);
+		expect(upstreamDelayMs(-1, 3, true)).toBe(0);
+		expect(upstreamDelayMs(Number.NaN, 3, true)).toBe(0);
+	});
+});
+
+describe("describeUpstreamHop", () => {
+	test("addresses the model and tells it to continue", () => {
+		const text = describeUpstreamHop({ ref: "a/1" }, { ref: "b/2", thinking: "high" });
+		expect(text).toContain("a/1");
+		expect(text).toContain("b/2");
+		expect(text).toContain("continue the task");
+		expect(text).not.toContain("thinking"); // identity only, as in the ref
 	});
 });
