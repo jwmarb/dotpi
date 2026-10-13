@@ -67,6 +67,10 @@ agent/subagent-sessions/
 # .exit sidecar, system prompt, meta.json). Machine state, never config.
 agent/subagent-runs/
 
+# herdr's pi integration. Installed and overwritten by herdr itself (its header
+# says so), so tracking it would only record herdr upgrades as diffs here.
+agent/extensions/herdr-agent-state.ts
+
 # Generated Dockerfiles for the ralph-loop runtime gate, one dir per project.
 # Derived from each project's manifests and rebuildable on demand — deleting them
 # costs one image build.
