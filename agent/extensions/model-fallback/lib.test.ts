@@ -19,6 +19,7 @@ import {
 	type FallbackConfig,
 	type FallbackState,
 	type RouteReason,
+	CHAIN_ENV,
 	GATEWAY_UPSTREAM_FAILURE_PATTERN,
 	MAX_UPSTREAM_DELAY_MS,
 	advance,
@@ -53,12 +54,14 @@ import {
 	requiredPhysicalRetries,
 	sanitizeModelRef,
 	sanitizeProviderError,
+	shouldRegisterRouter,
 	spellNumber,
 	upstreamDelayMs,
 	upstreamHop,
 	upstreamRecovery,
 } from "./lib.ts";
-
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 const CONFIG: FallbackConfig = { maxCycles: 10, maxProbes: 2 };
 
 /** Drive one step and return the state pi would carry next. */
@@ -327,7 +330,36 @@ describe("isRoutable", () => {
 		expect(isRoutable([{ ref: "a/1", thinking: "low" }, { ref: "b/2" }])).toBe(true);
 	});
 });
+describe("shouldRegisterRouter", () => {
+	test("an empty chain is rejected for both sources", () => {
+		// Nothing to serve is nothing to register, from whichever surface it
+		// came from.
+		expect(shouldRegisterRouter([], "settings")).toBe(false);
+		expect(shouldRegisterRouter([], "environment")).toBe(false);
+	});
 
+	test("a single unpinned env chain is accepted: the parent launched this process on the router", () => {
+		// The chain crossed in PI_FALLBACK_CHAIN, which only a parent that
+		// launches its child on `fallback/auto` sets. Without the router that
+		// model is unresolvable and the child dies on its first request — so
+		// "worth registering" is the wrong question here; "present" is.
+		expect(shouldRegisterRouter([{ ref: "a/1" }], "environment")).toBe(true);
+	});
+
+	test("a single unpinned settings chain is rejected: nothing to hop to, no pin to apply", () => {
+		// Nothing in this process has been committed to the router, so an
+		// unpinned one-entry chain would publish a `fallback/auto` that only
+		// ever picks one model — strictly worse than its absence.
+		expect(shouldRegisterRouter([{ ref: "a/1" }], "settings")).toBe(false);
+	});
+
+	test("a pinned single entry and a multi-entry chain are accepted for both sources", () => {
+		expect(shouldRegisterRouter([{ ref: "a/1", thinking: "high" }], "settings")).toBe(true);
+		expect(shouldRegisterRouter([{ ref: "a/1", thinking: "high" }], "environment")).toBe(true);
+		expect(shouldRegisterRouter([{ ref: "a/1" }, { ref: "b/2" }], "settings")).toBe(true);
+		expect(shouldRegisterRouter([{ ref: "a/1" }, { ref: "b/2" }], "environment")).toBe(true);
+	});
+});
 // ---------------------------------------------------------------------------
 // The core rule: an error hops, and a lap costs one retry
 
@@ -1575,5 +1607,69 @@ describe("describeUpstreamHop", () => {
 		expect(text).toContain("b/2");
 		expect(text).toContain("continue the task");
 		expect(text).not.toContain("thinking"); // identity only, as in the ref
+	});
+});
+
+// ---------------------------------------------------------------------------
+// index.ts — router registration
+// ---------------------------------------------------------------------------
+
+describe("index.ts registration", () => {
+	let importCounter = 0;
+
+	/**
+	 * Drive the extension factory against one settings.json and one env chain,
+	 * returning the virtual model it registered (or undefined when it
+	 * registered nothing). Each call gets a fresh module instance.
+	 */
+	async function registeredModel(
+		settings: Record<string, unknown> | null,
+		envChain: string | undefined,
+	): Promise<{ provider: string; id: string } | undefined> {
+		const dir = mkdtempSync(join(tmpdir(), "model-fallback-"));
+		if (settings) writeFileSync(join(dir, "settings.json"), JSON.stringify(settings), "utf-8");
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const originalEnvChain = process.env[CHAIN_ENV];
+		process.env.PI_CODING_AGENT_DIR = dir;
+		if (envChain === undefined) delete process.env[CHAIN_ENV];
+		else process.env[CHAIN_ENV] = envChain;
+		try {
+			const mod = await import(`./index.js?mf=${++importCounter}`);
+			let registered: { provider: string; id: string } | undefined;
+			mod.default({
+				on: () => {},
+				getSettings: () => ({}),
+				registerVirtualModel: (def: { provider: string; id: string }) => {
+					registered = { provider: def.provider, id: def.id };
+				},
+				registerCommand: () => {},
+			} as unknown as Parameters<typeof mod.default>[0]);
+			return registered;
+		} finally {
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			if (originalEnvChain === undefined) delete process.env[CHAIN_ENV];
+			else process.env[CHAIN_ENV] = originalEnvChain;
+		}
+	}
+
+	test("registers the router when settings say enabled:false but PI_FALLBACK_CHAIN is non-empty", async () => {
+		// The parent committed this process to the router, so the settings
+		// switch cannot unregister the chain the env var carried in.
+		const model = await registeredModel(
+			{ modelFallback: { enabled: false, chain: ["a/1", "b/2"] } },
+			"openai/x|high,qwen/y",
+		);
+		expect(model).toEqual({ provider: "fallback", id: "auto" });
+	});
+
+	test("registers nothing when settings say enabled:false and no env chain crosses", async () => {
+		// The switch governs exactly the sessions that got no chain from a
+		// parent: nothing to serve, nothing to register.
+		const model = await registeredModel(
+			{ modelFallback: { enabled: false, chain: ["a/1", "b/2"] } },
+			undefined,
+		);
+		expect(model).toBeUndefined();
 	});
 });

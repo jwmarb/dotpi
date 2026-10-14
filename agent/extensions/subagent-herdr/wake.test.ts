@@ -14,7 +14,7 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/wake.test.ts`
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -65,6 +65,7 @@ const herdrState = {
   waitAgentWorking: async (): Promise<boolean> => true,
   closePane: async (): Promise<boolean> => true,
   getAgent: async (): Promise<{ status: string; name?: string } | null> => null,
+  paneLabel: async (): Promise<string | undefined> => undefined,
   readAgent: async (): Promise<string | null> => null,
 };
 
@@ -81,6 +82,7 @@ mock.module("./herdr.js", () => ({
     herdrState.waitAgentWorking(paneId, timeoutMs),
   closePane: (paneId: string, timeoutMs?: number) => herdrState.closePane(paneId, timeoutMs),
   getAgent: (paneId: string) => herdrState.getAgent(paneId),
+  paneLabel: (paneId: string, timeoutMs?: number) => herdrState.paneLabel(paneId, timeoutMs),
   readAgent: (paneId: string, lines?: number) => herdrState.readAgent(paneId, lines),
 }));
 
@@ -245,6 +247,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 beforeEach(() => {
   herdrState.createChildPane = async () => ({ paneId: "w9:pHC", tabId: "w9:tHC" });
   herdrState.getAgent = async () => null;
+  herdrState.paneLabel = async () => undefined;
   herdrState.readAgent = async () => null;
 });
 
@@ -1068,13 +1071,15 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
         // The seam the tests use for herdr reads: the target's block degrades
         // when the pane probe throws.
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pT" ? "worker sub-eeee" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
-
         // Tick 1: the scan re-enqueues the release; the flush delivers the
         // check's block plus the degraded target block (pointing at
         // subagent_tasks), and marks NEITHER id briefed.
@@ -1111,6 +1116,7 @@ describe("wake path (extension factory)", () => {
         getShutdownHandler()();
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
     },
     30000,
@@ -1147,7 +1153,10 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pT" ? "worker sub-eeee" : paneId === "w9:pHC" ? "healthcheck sub-ffff" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1175,6 +1184,7 @@ describe("wake path (extension factory)", () => {
         expect(sent.length).toBe(1);
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
       getShutdownHandler()();
     },
@@ -1204,7 +1214,10 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pHC" ? "healthcheck sub-ffff" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1231,6 +1244,7 @@ describe("wake path (extension factory)", () => {
         expect(sent.length).toBe(1);
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
       getShutdownHandler()();
     },
@@ -1278,7 +1292,10 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pT" ? "worker sub-eeee" : paneId === "w9:pHC" ? "healthcheck sub-ffff" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1305,6 +1322,7 @@ describe("wake path (extension factory)", () => {
         expect(sent.length).toBe(1);
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
       getShutdownHandler()();
     },
@@ -1358,7 +1376,10 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pR" ? "healthcheck sub-9999" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1399,6 +1420,7 @@ describe("wake path (extension factory)", () => {
         expect(hooks.briefedFinishedRunIds.has("sub-eeee")).toBe(true);
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
         herdrState.getAgent = savedGetAgent;
       }
       getShutdownHandler()();
@@ -1438,11 +1460,14 @@ describe("wake path (extension factory)", () => {
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
       const savedGetAgent = herdrState.getAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
         // The target's pane is alive (it is genuinely still running); the
         // check is terminal, so the sweep never probes it.
         herdrState.getAgent = async (paneId: string) =>
           paneId === "w9:pT" ? { status: "working" } : null;
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pHC" ? "healthcheck sub-1a02" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1475,6 +1500,7 @@ describe("wake path (extension factory)", () => {
       } finally {
         herdrState.readAgent = savedReadAgent;
         herdrState.getAgent = savedGetAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
       getShutdownHandler()();
     },
@@ -1509,7 +1535,10 @@ describe("wake path (extension factory)", () => {
         },
       ]);
       const savedReadAgent = herdrState.readAgent;
+      const savedPaneLabel = herdrState.paneLabel;
       try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pT" ? "worker sub-1b01" : undefined;
         herdrState.readAgent = async () => {
           throw new Error("pane gone");
         };
@@ -1533,6 +1562,7 @@ describe("wake path (extension factory)", () => {
         getShutdownHandler()();
       } finally {
         herdrState.readAgent = savedReadAgent;
+        herdrState.paneLabel = savedPaneLabel;
       }
     },
     20000,
@@ -2023,6 +2053,218 @@ describe("run ownership (cross-process sweep)", () => {
         readFileSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", runId, "meta.json"), "utf-8"),
       ) as Record<string, unknown>;
       expect(meta.ownerPane).toBe(process.env.HERDR_PANE_ID);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a failed launch records the router attempt and links the kept pane in meta.json",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const closed: string[] = [];
+      const realClose = herdrState.closePane;
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return realClose(paneId);
+      };
+      const realStart = herdrState.startAgent;
+      herdrState.startAgent = async () => ({ ok: false, error: null });
+
+      try {
+        const out = (await stub
+          .getTool("subagent")
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+          details: { ok: boolean };
+        };
+        expect(out.details.ok).toBe(false);
+
+        // The one run dir on disk is this failed spawn's.
+        const runsDir = join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs");
+        const entries = readdirSync(runsDir);
+        expect(entries.length).toBe(1);
+        const meta = JSON.parse(readFileSync(join(runsDir, entries[0]!, "meta.json"), "utf-8")) as Record<
+          string,
+          unknown
+        >;
+        expect(meta.status).toBe("failed");
+        // The attempt ran on the router, so the record names it.
+        const attempts = meta.failedAttempts as Array<{ model: string; error: string }>;
+        expect(attempts).toEqual([
+          { model: "fallback/auto", error: expect.stringContaining("did not become interactive") },
+        ]);
+        // The pane is kept (it is the evidence), and the record links to it.
+        expect(meta.paneId).toBe("w9:pHC");
+        expect(meta.tabId).toBe("w9:tHC");
+        expect(closed).toEqual([]);
+      } finally {
+        herdrState.startAgent = realStart;
+        herdrState.closePane = realClose;
+      }
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a spawn hands its chain to the child's env and records it in meta.json",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      let seenEnv: Record<string, string> | undefined;
+      const realCreate = herdrState.createChildPane;
+      herdrState.createChildPane = async (cwd: string, label: string, env?: Record<string, string>) => {
+        seenEnv = env;
+        return realCreate(cwd, label, env);
+      };
+
+      try {
+        const readMeta = (runId: string) =>
+          JSON.parse(
+            readFileSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", runId, "meta.json"), "utf-8"),
+          ) as Record<string, unknown>;
+
+        // No `model` on the call: the agent's declared model is the chain.
+        const out1 = (await stub
+          .getTool("subagent")
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+          details: { ok: boolean; task: string };
+        };
+        expect(out1.details.ok).toBe(true);
+        expect(seenEnv?.PI_FALLBACK_CHAIN).toBe("test/model");
+        const meta1 = readMeta(out1.details.task);
+        expect(meta1.model).toBe("test/model");
+        expect(meta1.fallbackChain).toEqual(["test/model"]);
+
+        // A pinned explicit model: a one-entry chain with the pin, and the
+        // record's `model` is the head ref the pin was stripped from.
+        const out2 = (await stub
+          .getTool("subagent")
+          .execute(
+            "t2",
+            { agent: "healthcheck", task: "a self-contained task", model: "openai/x|high" },
+            undefined,
+            () => {},
+            {},
+          )) as { details: { ok: boolean; task: string } };
+        expect(out2.details.ok).toBe(true);
+        expect(seenEnv?.PI_FALLBACK_CHAIN).toBe("openai/x|high");
+        const meta2 = readMeta(out2.details.task);
+        expect(meta2.model).toBe("openai/x");
+        expect(meta2.fallbackChain).toEqual(["openai/x|high"]);
+      } finally {
+        herdrState.createChildPane = realCreate;
+      }
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "pane output renders only when the pane still carries this run's label",
+    async () => {
+      const createExtension = await freshExtension([
+        // A terminal health check with no answer: its block probes the pane.
+        // Its pane id was reused by herdr: the label no longer matches, so no
+        // pane output may be attributed to this run.
+        {
+          runId: "sub-c1c1",
+          agent: "healthcheck",
+          healthCheckOf: "sub-a001",
+          hasSession: false,
+          hasSidecar: false,
+          status: "failed",
+          paneId: "w9:pReused",
+        },
+        // Its pane still carries the run's label: the output is read.
+        {
+          runId: "sub-d2d2",
+          agent: "healthcheck",
+          healthCheckOf: "sub-a002",
+          hasSession: false,
+          hasSidecar: false,
+          status: "failed",
+          paneId: "w9:pKeep",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const savedPaneLabel = herdrState.paneLabel;
+      const savedReadAgent = herdrState.readAgent;
+      try {
+        herdrState.paneLabel = async (paneId: string) =>
+          paneId === "w9:pReused" ? "explorer sub-other" : paneId === "w9:pKeep" ? "healthcheck sub-d2d2" : undefined;
+        herdrState.readAgent = async () => "PANE OUTPUT MARKER";
+
+        stub.getInputHandler()({ text: formatNotice("sub-c1c1", "healthcheck", "done") });
+        stub.getInputHandler()({ text: formatNotice("sub-d2d2", "healthcheck", "done") });
+        await sleep(1500);
+
+        expect(stub.sent.length).toBe(1);
+        const text = stub.sent[0].text;
+        expect(text).toContain("=== sub-c1c1");
+        expect(text).toContain("=== sub-d2d2");
+        // The marker appears exactly once: only the labelled pane's output.
+        expect(text.split("PANE OUTPUT MARKER").length - 1).toBe(1);
+      } finally {
+        herdrState.paneLabel = savedPaneLabel;
+        herdrState.readAgent = savedReadAgent;
+      }
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a model the router cannot serve is refused before any run dir or pane",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      let paneCreates = 0;
+      const realCreate = herdrState.createChildPane;
+      herdrState.createChildPane = async (...args: Parameters<typeof realCreate>) => {
+        paneCreates++;
+        return realCreate(...args);
+      };
+
+      try {
+        // `fallback/auto` is the router itself: a child cannot route to it, so
+        // the delegation is refused up front, and the message names the
+        // requested model, not the agent file.
+        const out = (await stub
+          .getTool("subagent")
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task", model: "fallback/auto" }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+          details: { ok: boolean };
+        };
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0].text).toContain('Requested model "fallback/auto"');
+
+        // A ref the item grammar rejects is refused the same way.
+        const out2 = (await stub
+          .getTool("subagent")
+          .execute("t2", { agent: "healthcheck", task: "a self-contained task", model: "bad ref:" }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+          details: { ok: boolean };
+        };
+        expect(out2.details.ok).toBe(false);
+        expect(out2.content[0].text).toContain("bad ref:");
+      } finally {
+        herdrState.createChildPane = realCreate;
+      }
+
+      // The refusal spends nothing: no pane was created, and no run dir exists.
+      expect(paneCreates).toBe(0);
+      const runsDir = join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs");
+      expect(existsSync(runsDir) ? readdirSync(runsDir) : []).toEqual([]);
       stub.getShutdownHandler()();
     },
     20000,

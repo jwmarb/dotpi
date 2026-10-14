@@ -73,20 +73,21 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 - **Both gates run on a fallback chain, not one model.** `resolveGateAgent` in
   `gate-agent.ts` — the single resolution seam shared by the static gate and the
   runtime gate — reads the agent's `model` and `fallback_models` through
-  `childFallbackChain` and launches the headless child on `fallback/auto` with the chain in
+  `childFallbackChain` and returns a required non-empty `chain` (a missing or
+  malformed declaration yields `[fallbackModel]` as a singleton). The gate always
+  launches the headless child on `--model fallback/auto` with the chain in
   `PI_FALLBACK_CHAIN`. Before the chain existed they read `info.model` alone, so the oracle's and
   verifier's declared fallbacks were inert here: a gate audit against an erroring provider
   burned pi's retry budget on one dead model and returned `inconclusive`, which **stops the
   loop**. A gate is an agent like any other, so "any agent that errors moves to its next
   fallback" has to include it. Each gate passes its own `defaultTools` so the seam does not
   couple the two gates' tool policy.
-- **Chain items may pin a thinking level (`ref|level`), and the routability test is shared.**
-  `withChainEnv` (gate.ts) and both `useChain` decisions (gate.ts, runtime-gate.ts) no longer
-  re-derive `length > 1`: they parse the serialized items with `parseChainEnv` and ask
-  `isRoutable` — the one definition in `../model-fallback/lib.ts`. Consequence: a gate agent
-  whose declaration collapses to a **single pinned model** now takes the router path too
-  (`--provider` omitted, `PI_FALLBACK_CHAIN` set), because only the router applies the pin;
-  a single *unpinned* model still launches directly with its provider.
+- **Chain items may pin a thinking level (`ref|level`), and the chain is always non-empty.**
+  `withChainEnv` (gate.ts) requires a non-empty chain and always sets `PI_FALLBACK_CHAIN`
+  around the spawn, restoring the previous value in `finally`. There is no `useChain`
+  boolean and no `isRoutable` check at the gate: the chain is guaranteed non-empty by
+  `resolveGateAgent`, and the child always launches on `fallback/auto`, so even a single
+  unpinned entry must cross. `--provider` is always omitted.
 - **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
   calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
   `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the
@@ -95,8 +96,9 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
   documented side-effect free, and a function that mutates `process.env` has no business
   there. It is **not reentrant**, which is sound only while the loop awaits its gates one
   at a time; two gates in flight would need an explicit `env` on a direct `spawn`.
-- **`--provider` is omitted when the router is used.** The router's provider is `fallback`,
-  not the gate's `GATE_PROVIDER`, so passing both made the model unresolvable.
+- **`--provider` is always omitted.** The gate always launches on `fallback/auto`,
+  and the router's provider is `fallback`, not the provider that serves the
+  chain's models, so passing `--provider` made the model unresolvable.
 
 - **Continuations dispatch from `setTimeout(0)`, never inline.** Not for the obvious
   reason: `agent_settled` is emitted inside `_runAgentPrompt`'s `finally` *after*

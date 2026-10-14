@@ -46,12 +46,13 @@
  *
  * ## Subagents
  *
- * Children are spawned by `subagent-herdr`, which already walks an agent's
- * `fallback_models` — but only to get the child *launched*. Once running, a
- * child is a plain pi process whose own errors were nobody's business. It now
- * inherits this extension (the agent directory is shared) and reads its chain
- * from `PI_FALLBACK_CHAIN`, which the launcher sets from the same
- * `fallback_models` it was already using. One declaration, two jobs.
+ * Children are spawned by `subagent-herdr`, which launches each child on
+ * `fallback/auto` — this router — and hands it the agent's model chain via
+ * `PI_FALLBACK_CHAIN`. Every non-empty chain must register: a process launched
+ * on `fallback/auto` cannot resolve that model without the router. In a plain
+ * pi process the rule is stricter — a single unpinned model registers nothing,
+ * because nothing there has been committed to the router (`shouldRegisterRouter`
+ * in `lib.ts` owns both halves).
  *
  * @module model-fallback
  */
@@ -81,13 +82,13 @@ import {
 	formatEntry,
 	formatModelRef,
 	isDisabled,
-	isRoutable,
 	levelFor,
 	parseChainEnv,
 	readChain,
 	readConfig,
 	readLimits,
 	readVirtualModelState,
+	shouldRegisterRouter,
 	upstreamDelayMs,
 	upstreamRecovery,
 	VIRTUAL_MODEL_API,
@@ -199,28 +200,38 @@ export default function (pi: ExtensionAPI) {
 	// extension load, and the chain must be known now because
 	// `registerVirtualModel` happens at load. See `settings.ts`.
 	const raw = readSettingsKey(SETTINGS_KEY);
-	if (isDisabled(raw)) return;
+	// The parent's chain for this process wins over the settings switch, so the
+	// env var is read *before* the disable check: a process launched on
+	// `fallback/auto` with `PI_FALLBACK_CHAIN` set cannot resolve its model
+	// without the router, so `modelFallback.enabled: false` must not unregister
+	// a chain the parent already committed it to.
+	const envChain = parseChainEnv(process.env[CHAIN_ENV]);
+	if (process.env[CHAIN_ENV] !== undefined && envChain.length === 0) {
+		// The unparseable value cannot serve: the settings.json chain is the
+		// fallback when there is one, and without one the session's own model
+		// selection decides silently.
+		const settingsChain = readChain(raw);
+		console.warn(
+			`model-fallback: ${CHAIN_ENV} is set to "${process.env[CHAIN_ENV]}" but no entry parses; ` +
+			(settingsChain.length > 0 ? "falling back to the settings.json chain" : "the router registers nothing"),
+		);
+	}
+	if (isDisabled(raw) && envChain.length === 0) return;
 
 	const config = readConfig(raw);
 	// A parent's choice for this child wins over the global chain: the launcher
 	// knows which agent is running here, and `settings.json` does not.
-	const envChain = parseChainEnv(process.env[CHAIN_ENV]);
 	const chain = envChain.length > 0 ? envChain : readChain(raw);
 
-	// A chain the router cannot serve is not a chain: `isRoutable` is the one
-	// definition of "worth registering", shared with the launcher and the
-	// Ralph-loop gates. Two entries (or more) need the router to hop between
-	// models on failure; a **single pinned entry** needs it too, because the
-	// route-time override is the only place a pin is applied. What it rules
-	// out is one unpinned model: registering anyway would publish a selectable
-	// `fallback/auto` that spends a logical cycle per failure with nowhere to
-	// hop — strictly worse than its absence, because pi's own retry already
-	// does that and does it honestly.
-	//
-	// The threshold lives in `lib.ts` rather than being re-derived here: it
-	// used to be `length < 2` in every consumer, and the pinned one-entry case
-	// is exactly the kind of rule that drifts when five copies disagree.
-	if (!isRoutable(chain)) return;
+	// Registration is source-dependent; `shouldRegisterRouter` in `lib.ts`
+	// owns both halves. The split's one rationale: the parent committed this
+	// process to the router (an env chain registers whenever it is non-empty),
+	// while a settings chain has committed nothing (a settings singleton
+	// needs no router). An empty or malformed env value parses to nothing, so
+	// it cannot mask a valid settings chain: `envChain.length > 0` above is
+	// what picks the source.
+	const source = envChain.length > 0 ? "environment" : "settings";
+	if (!shouldRegisterRouter(chain, source)) return;
 
 	/** The last error text seen, for {@link describeExhaustion}. */
 	let lastError: string | undefined;

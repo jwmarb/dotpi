@@ -19,15 +19,14 @@ import { findSkills } from "../lib/skill-tree.js";
 import {
   type ChainEntry,
   CHAIN_ENV,
+  FALLBACK_MODEL_ID,
   FALLBACK_MODEL_REF,
   formatChainItem,
-  isRoutable,
-  parseChainEnv,
+  isThinkingLevel,
   parseChainItem,
 } from "../model-fallback/lib.js";
 import {
   type ChildReport,
-  type FailedAttempt,
   type RunRecord,
   isSessionFileFor,
   parseReportLine,
@@ -69,8 +68,6 @@ export interface ChildLaunchOptions {
   runDir: string;
   /** The run id, used as the child's `--session-id`. */
   runId: string;
-  /** Model override, e.g. `openai/gpt-5.6-sol`. */
-  model?: string;
   /** The agent's declared tools; `undefined`/empty means "all tools". */
   tools?: string[];
   /** Absolute path to the composed system prompt, passed by file not by value. */
@@ -117,11 +114,12 @@ export function buildChildEnv(
     PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
-  // Only when the child's router will actually register: `isRoutable` is the
-  // shared definition (two entries to hop, or one pinned entry whose level
-  // only the router can apply). An absent var leaves the child's model
-  // selection exactly as it was before this feature.
-  if (fallbackChain && isRoutable(parseChainEnv(fallbackChain.join(",")))) {
+  // The child always launches on `fallback/auto`, so the chain must cross
+  // whenever it is non-empty — a single unpinned entry included: without the
+  // var the child's router registers nothing and `fallback/auto` is
+  // unresolvable. An absent var is only what a chain-less child gets, which
+  // `spawnRun` refuses before any pane exists.
+  if (fallbackChain && fallbackChain.length > 0) {
     env[CHAIN_ENV] = fallbackChain.join(",");
   }
   return env;
@@ -175,8 +173,13 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
     opts.runDir,
     "--session-id",
     opts.runId,
+    // The child always launches on the router: `fallback/auto` names it, and
+    // the chain in the env (see `buildChildEnv`) tells it what to route
+    // between. There is no physical-model launch path, so the flag is a
+    // constant, not an option.
+    "--model",
+    FALLBACK_MODEL_REF,
   ];
-  if (opts.model) argv.push("--model", opts.model);
   if (opts.tools && opts.tools.length > 0) {
     const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME, TODO_TOOL_NAME])];
     argv.push("--tools", tools.join(","));
@@ -830,124 +833,102 @@ export function buildHealthCheckTask(
 }
 
 /**
- * Every model to try for one run, in order: the requested (or declared) model
- * first, then the agent file's `fallback_models`.
+ * Normalise a model requested on the delegation call.
  *
- * An explicit `model` on the delegation call suppresses the fallbacks: the
- * caller named a model, and silently running a different one would be a
- * surprise rather than a recovery. Duplicates are dropped so a fallback that
- * repeats the primary does not buy a second identical attempt — by **ref**,
- * case-insensitively, first occurrence winning: a `model: a/1` and a
- * `fallback_models: A/1|low` name the same model, and the pin is routing
- * metadata the launcher does not apply.
- *
- * The `--model` argv takes bare references, so a `ref|level` item is parsed
- * down to its ref here; the pin crosses to the child in {@link CHAIN_ENV}
- * instead, where the router applies it. An item that parses to nothing is
- * passed through unchanged — a bad model name is a launch failure pi reports,
- * not a parse problem this module should fix.
- *
- * @param requested - The model named on the delegation call, if any.
- * @param agent - The agent definition, for its model and fallbacks.
- * @returns At least one entry; `[undefined]` means "pi's default model".
+ * A whitespace-only request is no request. pi's own `ref:level` form is
+ * translated to this module's `ref|level` item form before parsing — but only
+ * when the ref itself is a plain reference (no other `:`): `openai/gpt-5.6-sol:high`
+ * is `openai/gpt-5.6-sol|high`, while `bad:ref:high` keeps its `:` and fails
+ * the item grammar, as any other malformed ref does.
  */
-export function candidateModels(
-  requested: string | undefined,
-  agent: { model?: string; fallbackModels?: string[] },
-): (string | undefined)[] {
-  if (requested) return [requested];
-  const out: (string | undefined)[] = [];
-  const seen = new Set<string>();
-  for (const raw of [agent.model, ...(agent.fallbackModels ?? [])]) {
-    if (raw === undefined) {
-      // No declared model: pi's default takes the first slot.
-      if (out.length === 0) out.push(undefined);
-      continue;
-    }
-    const ref = parseChainItem(raw)?.ref ?? raw;
-    const key = ref.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(ref);
-  }
-  return out;
+function normalizeRequestedModel(requested: string | undefined): string | undefined {
+  const raw = requested?.trim();
+  if (!raw) return undefined;
+  const match = raw.match(/^(.+):(off|minimal|low|medium|high|xhigh|max)$/);
+  if (match && !match[1].includes(":")) return `${match[1]}|${match[2]}`;
+  return raw;
 }
 
 /**
- * The runtime fallback chain for a child, or `undefined` for none.
+ * The model chain a child launches on, as chain items for {@link CHAIN_ENV}.
  *
- * This is the *second* job of an agent's `fallback_models`. {@link candidateModels}
- * uses the same list to get the child **launched** — one attempt per model until
- * one accepts the task. That covered a model being unreachable at spawn time
- * and nothing after: once a child was running, its own mid-task provider errors
- * were pi's generic retry, which asks the same failing model again.
+ * Every launch goes through the router: the child is started on
+ * `fallback/auto`, and this is what the router serves. So the chain is the
+ * declaration, canonicalised, never filtered by "worth routing": a single
+ * unpinned model is a legal chain, because the parent has already committed
+ * the launch to the router and a child without a registered router cannot
+ * resolve `fallback/auto` at all.
  *
- * So the list is also handed to the child as {@link CHAIN_ENV}, where the
- * `model-fallback` extension turns it into `fallback/auto` and hops on error.
- * One declaration, two jobs: the launcher's and the running child's.
+ * An explicit `model` on the delegation call is a one-entry chain with its
+ * `|level` pin kept verbatim: the caller chose exactly this model for this
+ * run, so no agent fallbacks are appended — a silent switch mid-run would be
+ * a surprise rather than a recovery.
+ *
+ * The router's own reference is unusable in every position: `fallback/auto`
+ * names the router, not a physical model, and the router cannot route to
+ * itself — a chain that advertises it is a dead child. It is matched
+ * case-insensitively, and a request for it yields `undefined` so the caller
+ * refuses the launch with a message.
  *
  * Items are canonicalised through the child's own item grammar
  * ({@link parseChainItem} → {@link formatChainItem}), so a `ref|level` pin in
  * the agent file survives the handoff verbatim. An entry the grammar rejects
- * is dropped here too: keeping it would advertise a chain the child's router
- * does not serve, and the two halves of the handoff disagreeing is the drift
- * this module exists to prevent. Dedup is by ref, case-insensitively, first
- * occurrence winning — the same rule {@link candidateModels} applies.
+ * is dropped: keeping it would advertise a chain the child's router does not
+ * serve, and the two halves of the handoff disagreeing is the drift this
+ * module exists to prevent. Dedup is by ref, case-insensitively, first
+ * occurrence winning.
  *
- * Returns `undefined` when the child's router will not register — an explicit
- * `model` on the delegation call (the caller pinned it, so a silent switch
- * would be a surprise, the same rule {@link candidateModels} applies), or a
- * declaration that is one unpinned model. In those cases the child launches
- * exactly as it did before this feature existed. A **single pinned model is
- * routable**: the pin is applied at route time, which only the router does.
+ * Returns `undefined` only when no valid reference exists at all — nothing
+ * requested (or a request that normalises to nothing, names the router, is a
+ * bare `auto`, carries an invalid `|level` pin, or parses to nothing) and
+ * nothing declared that the item grammar accepts. The caller must then refuse
+ * the launch: there is no model the router could serve.
  *
  * @param requested - The model named on the delegation call, if any.
  * @param agent - The agent definition, for its model and fallbacks.
- * @returns Chain items in priority order, or `undefined`.
+ * @returns Chain items in priority order, or `undefined` when nothing parses.
  */
 export function childFallbackChain(
   requested: string | undefined,
   agent: { model?: string; fallbackModels?: string[] },
 ): string[] | undefined {
-  if (requested) return undefined;
+  const req = normalizeRequestedModel(requested);
+  if (req) {
+    // A bare `auto` is the router's own model id, not a physical model: it
+    // cannot serve a request, so an explicit request for it is refused like
+    // any other unusable reference.
+    if (req.toLowerCase() === FALLBACK_MODEL_ID) return undefined;
+    const entry = parseChainItem(req);
+    if (!entry) return undefined;
+    // An explicit request names exactly this model for this run, so a pin it
+    // wrote must be one the router applies: an invalid `|level` is refused
+    // here rather than silently dropped by the item grammar's degradation.
+    const bar = req.indexOf("|");
+    if (bar !== -1 && !isThinkingLevel(req.slice(bar + 1))) return undefined;
+    if (entry.ref.toLowerCase() === FALLBACK_MODEL_REF.toLowerCase()) return undefined;
+    return [formatChainItem(entry)];
+  }
   const chain: ChainEntry[] = [];
   const seen = new Set<string>();
   for (const raw of [agent.model, ...(agent.fallbackModels ?? [])]) {
     if (raw === undefined) continue;
     const entry = parseChainItem(raw);
     if (!entry) continue;
+    if (entry.ref.toLowerCase() === FALLBACK_MODEL_REF.toLowerCase()) continue;
     const key = entry.ref.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     chain.push(entry);
   }
-  return isRoutable(chain) ? chain.map(formatChainItem) : undefined;
-}
-
-/**
- * The error text for a spawn where every candidate model failed to launch.
- *
- * Names each model tried, because "did not become interactive" on its own sends
- * a reader to the pane when the cause may simply be that no declared model is
- * reachable.
- */
-export function describeLaunchFailure(failures: readonly FailedAttempt[]): string {
-  const first = failures[0];
-  if (failures.length <= 1) {
-    return first?.error ?? "The child could not be launched.";
-  }
-  const tried = failures
-    .map((f) => `  - ${f.model ?? "(default model)"}: ${f.error}`)
-    .join("\n");
-  return `All ${failures.length} candidate models failed to launch:\n${tried}`;
+  return chain.length > 0 ? chain.map(formatChainItem) : undefined;
 }
 
 /**
  * herdr's rule for an agent name, verified against herdr 0.9.0 by asking it.
  *
  * `agent start` rejects a name outside this shape with `invalid_agent_name`,
- * which the spawn path used to surface as "did not become interactive" on every
- * candidate model — a failure that looks like a broken model and is not.
+ * which the spawn path used to surface as "did not become interactive" — a
+ * failure that looks like a broken model and is not.
  *
  * The 32-character ceiling is why {@link herdrAgentName} appends `-sub-xxxx`
  * (9 chars) to the *agent* name rather than embedding anything longer: the
@@ -964,9 +945,9 @@ const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
  * pane. Registering a child under its bare definition name therefore let the
  * *first* live `librarian` own the name and made every concurrent or
  * overlapping `librarian` unlaunchable — the failure is instant (measured 4-11 ms), so
- * all candidate models were burned in under 100 ms and the run reported
- * "did not become interactive" on every one of them, which reads as a dead
- * fleet and is really a name collision.
+ * the old per-model launch loop burned every candidate model in under 100 ms
+ * and the run reported "did not become interactive" on all of them, which
+ * read as a dead fleet and was really a name collision.
  *
  * Scoping by run id makes the name unique by construction, which is the same
  * reason pane and tab ids are never predicted: identity comes from the thing
@@ -976,7 +957,7 @@ const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
  * @param runId - The run id (e.g. `sub-9622`). {@link makeRunId} draws from
  *        ~65k values without a registry check, so uniqueness is overwhelmingly
  *        likely rather than guaranteed; a collision now surfaces as a clear
- *        fatal `agent_name_taken` instead of the fake fleet outage above.
+ *        `agent_name_taken` instead of the fake fleet outage above.
  */
 export function herdrAgentName(agentName: string, runId: string): string {
   return `${agentName}-${runId}`;
@@ -991,9 +972,9 @@ export function herdrAgentName(agentName: string, runId: string): string {
  * own (24 chars) and illegal once scoped (33). Checking the bare name let that
  * through to fail after a pane had already been opened and closed.
  *
- * The late path still classifies `invalid_agent_name` as fatal, so this check
- * is defence in depth — it converts a late, pane-wasting failure into an
- * immediate and clearer one.
+ * The late path still closes the pane on `invalid_agent_name` and reports it
+ * without a pane id, so this check is defence in depth — it converts a late,
+ * pane-wasting failure into an immediate and clearer one.
  *
  * @param agentName - The agent definition's `name`.
  * @param runId - The run id this child will use.

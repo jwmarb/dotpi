@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolveGateAgent } from "./gate-agent.js";
-import { FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
+import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { withChainEnv } from "./gate.js";
 import {
 	type LoopState,
@@ -223,7 +223,6 @@ export interface RuntimeGateRequest {
 	web: boolean;
 	/** Absolute path of the running `pi` binary. */
 	piBinary: string;
-	provider: string;
 }
 
 /**
@@ -239,7 +238,7 @@ export async function runRuntimeGate(
 	pi: ExtensionAPI,
 	req: RuntimeGateRequest,
 ): Promise<VerificationResult> {
-	const { model, chain, tools, promptBody } = await resolveGateAgent({
+	const { chain, tools, promptBody } = await resolveGateAgent({
 		name: RUNTIME_AGENT,
 		fallbackModel: RUNTIME_FALLBACK_MODEL,
 		defaultTools: DEFAULT_RUNTIME_TOOLS,
@@ -265,17 +264,14 @@ export async function runRuntimeGate(
 		};
 	}
 
-	// --no-extensions is deliberately absent: the provider serving the model is
-	// itself a local extension — which is also what makes the fallback router
-	// available to the child. `isRoutable` (the shared definition: two entries
-	// to hop, or one pinned entry) decides whether the router gets used.
-	const useChain = !!chain && isRoutable(parseChainEnv(chain.join(",")));
+	// The gate always launches on `fallback/auto` with its chain in the env:
+	// the router is the only path, and a provider error during the check hops
+	// rather than burning pi's retry budget against a dead model.
 	const args = [
 		"-p",
 		"--no-session",
-		...(useChain ? [] : ["--provider", req.provider]),
 		"--model",
-		useChain ? FALLBACK_MODEL_REF : model,
+		FALLBACK_MODEL_REF,
 		"--tools",
 		tools.join(","),
 	];
@@ -285,7 +281,7 @@ export async function runRuntimeGate(
 	let result: Awaited<ReturnType<ExtensionAPI["exec"]>>;
 	try {
 		// See withChainEnv in gate.ts for why the chain crosses as env.
-		result = await withChainEnv(chain, useChain, () =>
+		result = await withChainEnv(chain, () =>
 			pi.exec(req.piBinary, args, {
 				cwd: req.evidence.cwd,
 				timeout: RUNTIME_TIMEOUT_MS,

@@ -128,10 +128,8 @@ import {
   buildChildArgv,
   buildChildEnv,
   buildHealthCheckTask,
-  candidateModels,
   childFallbackChain,
   childNameRejection,
-  describeLaunchFailure,
   discoverSkills,
   extractRunResult,
   herdrAgentName,
@@ -146,7 +144,7 @@ import {
   skillEntriesFromPi,
 } from "./lib.js";
 // The router model id, owned by the extension that registers it.
-import { FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
+import { FALLBACK_MODEL_REF, parseChainItem } from "../model-fallback/lib.js";
 import {
   type AgentInfo,
   discoverAgents,
@@ -156,7 +154,6 @@ import {
 import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
 import {
   exitPath,
-  type FailedAttempt,
   isRunRecord,
   metaPath,
   type Notice,
@@ -170,6 +167,7 @@ import {
   closePane,
   createChildPane,
   getAgent,
+  paneLabel,
   promptAgent,
   readAgent,
   renamePane,
@@ -397,48 +395,43 @@ export interface Launcher {
 
 const realLauncher: Launcher = { createChildPane, renamePane, startAgent, closePane };
 
-/** Outcome of trying to get one pi child interactive on one model. */
+/** Outcome of the one launch attempt. */
 export interface AttemptOutcome {
   ok: boolean;
   paneId?: string;
   tabId?: string;
   /** Set when the attempt failed; the reason to record and to report. */
   error?: string;
-  /**
-   * True when no other model could possibly help: herdr itself is unavailable
-   * (no pane at all), or it refused the agent name outright. Stops the
-   * candidate-model loop instead of re-proving the same refusal per model.
-   */
-  fatal?: boolean;
 }
 
 /**
- * Opens a pane and tries to get a pi child interactive on one model.
+ * Opens a pane and tries to get a pi child interactive on the fallback router.
  *
- * A failure here is a *launch* failure: pi exits non-zero before its TUI comes
- * up when a model is unknown or its provider refuses, which herdr reports as
- * "did not become interactive". That is the signal a fallback acts on, and the
- * reason the retry lives at this seam rather than around the whole run.
+ * The child always launches on `fallback/auto` with its chain in the env, so
+ * there is no physical-model launch path. A failure here is a *launch*
+ * failure — pi exited before its TUI came up, which herdr reports as "did not
+ * become interactive". With a non-empty chain the router registers, so pi
+ * starts: it exits at startup only when the router does *not* register (the
+ * chain-less case `spawnRun` refuses up front), which is why a dead model
+ * never reaches this path — an unservable chain fails at the first request.
  *
- * The pane is closed on failure unless `keepPaneOnFailure`, which the last
- * attempt sets: herdr destroys scrollback with the pane, and the final failure
- * is the one a human needs to read. A *name* refusal is the exception — herdr
- * never ran pi, so there is no scrollback to keep and the pane is always closed.
+ * The pane is kept on a genuine failure: herdr destroys scrollback with the
+ * pane, and the failure is the one a human needs to read. A *name* refusal is
+ * the exception — herdr never ran pi, so there is no scrollback to keep and the
+ * pane is always closed.
  *
- * Exported (with `Launcher`) so a test can supply its own world: the `fatal`
- * classification below is the logic that stops a name refusal from being
- * retried against every candidate model, and a stub launcher is the only way to
- * pin it without a live herdr.
+ * Exported (with `Launcher`) so a test can supply its own world: the name-
+ * refusal handling below is the logic that keeps a name refusal from being
+ * read as a dead model, and a stub launcher is the only way to pin it without
+ * a live herdr.
  */
 export async function launchAttempt(
   agent: AgentInfo,
   rec: RunRecord,
   dir: string,
   promptPath: string,
-  model: string | undefined,
-  keepPaneOnFailure: boolean,
   launcher: Launcher = realLauncher,
-  fallbackChain?: readonly string[],
+  fallbackChain: readonly string[],
 ): Promise<AttemptOutcome> {
   // The child's pane env: its run identity, and — the key to child →
   // orchestrator messaging — this orchestrator's own pane id, which herdr
@@ -459,24 +452,20 @@ export async function launchAttempt(
   if (!pane) {
     return {
       ok: false,
-      fatal: true,
       error:
         "Could not open a herdr tab: is the herdr server running? Check `herdr status`. Subagents need herdr to spawn their agent tabs.",
     };
   }
   await launcher.renamePane(pane.paneId, label);
 
-  // A child whose chain is routable launches on the router, not on one model:
-  // that is what lets it hop mid-task instead of re-asking a model that just
-  // failed — and, since `childFallbackChain` only returns a chain the router
-  // will serve, it is also what applies a pinned thinking level. Without a
-  // routable chain the model passes through unchanged, so a pinned or
-  // fallback-less agent launches exactly as it did before.
+  // The child always launches on the router: `fallback/auto` names the router,
+  // and the chain in the env tells it what to route between (and applies any
+  // pinned thinking level at route time). There is no physical-model path, so
+  // the `--model` flag is the constant `buildChildArgv` pushes on its own.
   const argv = buildChildArgv({
     childDonePath: join(SELF_DIR, "child-done.ts"),
     runDir: dir,
     runId: rec.runId,
-    model: fallbackChain && isRoutable(parseChainEnv(fallbackChain.join(","))) ? FALLBACK_MODEL_REF : model,
     tools: agent.tools,
     systemPromptPath: promptPath,
   });
@@ -489,9 +478,9 @@ export async function launchAttempt(
   }
 
   // Name rejections are not launch failures: herdr refused before pi ever ran,
-  // so no other model can help, and the pane holds nothing but a shell prompt
-  // (no scrollback to preserve, hence the unconditional close). Reported as
-  // fatal so the fallback loop stops instead of re-proving it three times.
+  // and the pane holds nothing but a shell prompt (no scrollback to preserve,
+  // hence the unconditional close). Reported without a pane id so the refusal
+  // is not read as a dead model.
   //
   // The two codes get different remedies on purpose: they are distinct failures
   // and `herdr agent list` is a dead end for a malformed name. Collapsing them
@@ -502,7 +491,6 @@ export async function launchAttempt(
     await launcher.closePane(pane.paneId);
     return {
       ok: false,
-      fatal: true,
       error:
         `herdr already has a live agent named "${scoped}" (agent_name_taken), so this child could not register. ` +
         `Names are unique among live agents; run \`herdr agent list\` to see what holds it.`,
@@ -512,7 +500,6 @@ export async function launchAttempt(
     await launcher.closePane(pane.paneId);
     return {
       ok: false,
-      fatal: true,
       error:
         `herdr rejected the name "${scoped}" as malformed (invalid_agent_name). A name must match ` +
         `[a-z][a-z0-9_-]{0,31} — at most 32 characters including the "-${rec.runId}" suffix (9). ` +
@@ -520,39 +507,41 @@ export async function launchAttempt(
     };
   }
 
-  if (!keepPaneOnFailure) await launcher.closePane(pane.paneId);
   return {
     ok: false,
     paneId: pane.paneId,
-    error: `pi in pane ${pane.paneId} did not become interactive${
-      model ? ` on model ${model}` : ""
-    }${started.error ? ` (herdr said: ${started.error})` : ""} (see that pane's output).`,
+    tabId: pane.tabId,
+    error: `pi in pane ${pane.paneId} did not become interactive on ${FALLBACK_MODEL_REF}${
+      started.error ? ` (herdr said: ${started.error})` : ""
+    } (see that pane's output).`,
   };
 }
 
 /**
  * Spawns one herdr agent for a subagent definition: a new tab in this
- * workspace (one fresh shell pane, native `pi` child), task prompt. Every
- * failure path cleans up the pane it already created, so a failed spawn
- * leaves no orphan running (closing the tab's only pane closes the tab).
+ * workspace (one fresh shell pane, native `pi` child), task prompt.
  *
- * Models come from `candidateModels` and are tried in order. The trigger is
- * *prompt rejection*, not launch failure, because a dead model does not fail
- * the launch: pi exits before its TUI appears, the pane's shell survives, and
- * herdr reports `interactive_ready: true` anyway. The task then lands in a bash
- * prompt, which herdr refuses — and that is the first reliable signal. So one
- * attempt spans opening the pane *and* getting the task accepted.
+ * The child launches once, on `fallback/auto` with its chain
+ * (`childFallbackChain`) in the env — there is no per-model launch loop, because
+ * a launch failure names the router, not one of the chain's models, and hopping
+ * is the running child's job. A declaration with no syntactically usable
+ * reference is refused up front, before any run dir, registry entry, or pane.
  *
- * A pre-spawn model check was tried and removed: the only pi invocations that
- * validate a model cost ~7s each (`--list-models` ignores `--model` entirely),
- * and this signal catches the same failure a few seconds later for free.
+ * With a non-empty chain the router registers, so pi starts and accepts the
+ * prompt; a chain the router cannot *serve* (an entry it cannot resolve) fails
+ * at the first request, not at the launch. Pi exits at startup only when the
+ * router does not register — the chain-less case the up-front refusal covers.
+ * The prompt half of the attempt therefore guards a lost keypress (herdr typed
+ * the task but the turn never started), not a dead model.
  *
- * The model that actually ran and the ones that failed are both recorded, so a
- * degraded fleet is visible rather than silently slower.
+ * The pane is kept on a genuine failure: herdr destroys scrollback with the
+ * pane, and the failure is what a human needs to read. A *name* refusal is the
+ * exception — herdr never ran pi, so the pane is closed and no pane id is
+ * reported (closing the tab's only pane closes the tab).
  *
- * Only *getting started* is retried. A child that accepted its task and then
- * died has written part of a transcript and burned tokens; re-running it is a
- * decision for the caller, not a reflex here.
+ * A child that accepted its task and then died has written part of a
+ * transcript and burned tokens; re-running it is a decision for the caller,
+ * not a reflex here.
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
   // Resolve against the global roster PLUS every skill's agents. Unlike the
@@ -584,11 +573,23 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage);
   if (lineageProblem) return { ok: false, error: lineageProblem };
 
-  const models = candidateModels(params.model, agent);
-  // The same `fallback_models` list, in its second role: the chain the running
-  // child hops along when its own requests error. `undefined` when the caller
-  // pinned a model or the agent declares no fallbacks.
-  const fallbackChain = childFallbackChain(params.model, agent);
+  // The child's model chain, in its only role now: the router it launches on.
+  // A child is started on `fallback/auto` with this chain in its env, so a
+  // declaration with no syntactically usable reference is a launch refusal, not
+  // a fallback to pi's default — refuse it before any run dir, registry entry,
+  // or pane. The two messages split on who is at fault: a bad `model` on the
+  // delegation call is the caller's to fix; an empty declaration is the agent
+  // file's.
+  const chain = childFallbackChain(params.model, agent);
+  if (!chain) {
+    // A whitespace-only `model` is no request (the chain rule normalises it to
+    // nothing), so it is the agent file's declaration that failed, not the
+    // caller's.
+    const error = params.model?.trim()
+      ? `Requested model "${params.model}" is not usable. The accepted grammar is \`provider/id\` or \`provider/id|level\` (level: off|minimal|low|medium|high|xhigh|max); a pi-style \`ref:level\` is translated only when the ref is itself a plain \`provider/id\`, and \`fallback/auto\` is not accepted — the router cannot route to itself. Pass a valid model, or omit \`model\` to use the agent's declaration.`
+      : `Agent "${agent.name}" declares no usable model: its model/fallback_models contains no reference the router can serve. Fix the agent definition — children launch on fallback/auto, which needs at least one entry.`;
+    return { ok: false, error };
+  }
   const runId = makeRunId();
 
   // Validate the name herdr will actually receive, not the definition name:
@@ -603,12 +604,14 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     agent: agent.name,
     task: params.task,
     cwd: params.cwd ?? baseCwd,
-    model: models[0],
+    // The parsed head ref, for diagnostics only: the child runs on the router,
+    // and which physical model answers is up to it.
+    model: parseChainItem(chain[0]!)!.ref,
     status: "running",
     startedAt: Date.now(),
-    // Recorded even before a launch succeeds: a reader of a failed run should
-    // still see whether this child would have been able to hop.
-    ...(fallbackChain ? { fallbackChain: [...fallbackChain] } : {}),
+    // The chain handed to the router, recorded so a reader of a finished run
+    // can see what the child could hop between.
+    fallbackChain: [...chain],
     ...(params.healthCheckOf ? { healthCheckOf: params.healthCheckOf } : {}),
     // The spawning parent's pane, stamped before the record is registered:
     // only this pane's process may autonomously sweep the run (see
@@ -644,74 +647,56 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error: `Could not write the child's system prompt to ${promptPath}.` };
   }
 
-  const failures: FailedAttempt[] = [];
-  // One attempt = open a pane, get pi interactive, and get the task accepted.
-  // The prompt is part of the attempt because a dead model does not fail the
-  // launch: pi exits, the pane's shell survives, herdr still reports
-  // interactive-ready, and the task then lands in a bash prompt instead.
-  let launched: AttemptOutcome | undefined;
-  for (const [i, model] of models.entries()) {
-    const isLast = i === models.length - 1;
-    const attempt = await launchAttempt(
-      agent,
-      rec,
-      dir,
-      promptPath,
-      model,
-      isLast,
-      realLauncher,
-      fallbackChain,
-    );
-    if (!attempt.ok) {
-      failures.push({ model, error: attempt.error ?? "unknown launch failure" });
-      // Nothing model-specific went wrong (herdr unavailable, or it refused
-      // the name): trying another model would just repeat the same refusal.
-      if (attempt.fatal) break;
-      continue;
-    }
-
-    // Deliver the task and verify the turn actually started (see promptAgent in
-    // herdr.ts for why the plain form is not enough).
-    await sleep(PROMPT_SETTLE_MS);
-    const prompted = await promptAgent(attempt.paneId!, params.task);
-    let turnStarted = prompted.ok;
-    if (!turnStarted) {
-      // herdr typed the text but the turn never started — most likely the
-      // submitting Enter was lost to the TUI, with the task text sitting in the
-      // editor. One recovery Enter fixes exactly that.
-      await sendKeys(attempt.paneId!, "enter");
-      turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
-    }
-    if (turnStarted) {
-      launched = attempt;
-      rec.paneId = attempt.paneId;
-      rec.tabId = attempt.tabId;
-      // Record the fallback only when one was actually used, so the common case
-      // leaves no trace to read past.
-      if (i > 0 || failures.length > 0) {
-        rec.resolvedModel = model;
-        rec.failedAttempts = failures;
-      }
-      break;
-    }
-
-    failures.push({
-      model,
-      error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`,
-    });
-    // The pane is a dead end either way. Keep the last one to read; reclaim the
-    // rest so a three-model fallback does not leave three tabs behind.
-    if (!isLast) await closePane(attempt.paneId!);
-  }
-
-  if (!launched) {
+  // One attempt: open the pane, get pi interactive on the router, and get the
+  // task accepted. The prompt half is a guard against a lost keypress, not a
+  // model check: with a non-empty chain the router registers and pi starts,
+  // so an unservable chain fails at the first request, after the prompt is in.
+  const attempt = await launchAttempt(agent, rec, dir, promptPath, realLauncher, chain);
+  if (!attempt.ok) {
     rec.status = "failed";
     rec.finishedAt = Date.now();
-    rec.failedAttempts = failures;
+    // Link the record to the kept pane so a reader of meta.json can find the
+    // failure's scrollback; a name refusal closed its pane, so it reports none.
+    if (attempt.paneId) {
+      rec.paneId = attempt.paneId;
+      rec.tabId = attempt.tabId;
+    }
+    // The attempt ran on the router, so the record names it, not the head ref.
+    rec.failedAttempts = [{ model: FALLBACK_MODEL_REF, error: attempt.error ?? "unknown launch failure" }];
     saveMeta(rec);
-    return { ok: false, error: describeLaunchFailure(failures) };
+    return { ok: false, error: attempt.error ?? "The child could not be launched." };
   }
 
+  // Deliver the task and verify the turn actually started (see promptAgent in
+  // herdr.ts for why the plain form is not enough).
+  await sleep(PROMPT_SETTLE_MS);
+  const prompted = await promptAgent(attempt.paneId!, params.task);
+  let turnStarted = prompted.ok;
+  if (!turnStarted) {
+    // herdr typed the text but the turn never started — most likely the
+    // submitting Enter was lost to the TUI, with the task text sitting in the
+    // editor. One recovery Enter fixes exactly that.
+    await sendKeys(attempt.paneId!, "enter");
+    turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
+  }
+  if (!turnStarted) {
+    rec.status = "failed";
+    rec.finishedAt = Date.now();
+    // The pane is kept, so link the record to it like the launch-failure path.
+    rec.paneId = attempt.paneId;
+    rec.tabId = attempt.tabId;
+    rec.failedAttempts = [
+      { model: FALLBACK_MODEL_REF, error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})` },
+    ];
+    saveMeta(rec);
+    return {
+      ok: false,
+      error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`,
+    };
+  }
+
+  rec.paneId = attempt.paneId;
+  rec.tabId = attempt.tabId;
   saveMeta(rec);
   return { ok: true, rec };
 }
@@ -934,6 +919,12 @@ async function reconcile(rec: RunRecord): Promise<boolean> {
 /** Terminal text used as a failure diagnostic when the transcript has nothing. */
 async function paneDiagnostic(rec: RunRecord): Promise<string | null> {
   if (!rec.paneId) return null;
+  // herdr reuses pane ids, so the recorded id may now belong to a different
+  // pane: read it only when it still carries the label this run was given.
+  // An unreadable label (pane gone, herdr unreachable) is treated the same —
+  // the output could be anyone's, so no pane output at all.
+  const label = await paneLabel(rec.paneId);
+  if (label !== `${rec.agent} ${rec.runId}`) return null;
   return readAgent(rec.paneId, 40);
 }
 
@@ -1459,7 +1450,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
           "The task, self-contained: the child has no access to this conversation. Include every path, constraint, and definition it needs.",
       }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the child (default: the orchestrator's cwd)" })),
-      model: Type.Optional(Type.String({ description: "Model override for the child (default: the agent's declared model)" })),
+      model: Type.Optional(Type.String({ description: "Model override for the child: `provider/id` or `provider/id|level` (level: off|minimal|low|medium|high|xhigh|max; a pi-style `ref:level` is translated when the ref is plain). `fallback/auto` is not accepted — the router cannot route to itself. Default: the agent's declared model." })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

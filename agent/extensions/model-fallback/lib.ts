@@ -343,7 +343,7 @@ export function levelFor(
  * `index.ts` `resolve()` matches the catalogue — so a model that repeats an
  * earlier entry does not buy a second identical attempt, no matter what
  * level the later copy pins. The same rule the subagent launcher applies to
- * `fallback_models` (`subagent-herdr/lib.ts` `candidateModels`), first
+ * `fallback_models` (`subagent-herdr/lib.ts` `childFallbackChain`), first
  * occurrence winning.
  *
  * @param entries - Entries in priority order; the first is the primary.
@@ -390,17 +390,47 @@ export function parseChainEnv(value: string | undefined): ChainEntry[] {
  *
  * Two entries (or more) need it to hop between models on failure; a
  * **single pinned entry** needs it too, because the route-time override in
- * {@link levelFor} is the only place a pin is applied — a child launched
- * directly on its one model would run at the session's selected level and
- * the pin would be silently lost. One unpinned entry needs nothing: it
- * launches on its own model exactly as before this feature existed.
- *
+ * {@link levelFor} is the only place a pin is applied — a session running its
+ * one model directly would do so at the session's selected level and the pin
+ * would be silently lost. One unpinned entry needs nothing **for the
+ * settings source**: such a session launches on its own model exactly as
+ * before this feature existed. The env source is the exception — see
+ * {@link shouldRegisterRouter}: that process was launched on the router by its
+ * parent, so even a single unpinned entry must register.
  * Takes the parsed chain, not the transport strings: a `ref|level` item has
  * no visible `thinking` property until {@link parseChainItem} has run, and
  * a length check on raw strings would misclassify the one-entry pin.
  */
 export function isRoutable(chain: readonly ChainEntry[]): boolean {
 	return chain.length >= 2 || chain.some((entry) => entry.thinking !== undefined);
+}
+/**
+ * Whether the virtual router should be registered for a chain of a given source.
+ *
+ * The two sources differ in who made the commitment:
+ *
+ * - `"settings"` — the chain is the user's own `settings.json` configuration.
+ *   Here {@link isRoutable} is the rule: a single *unpinned* model needs no
+ *   router (nowhere to hop, no pin to apply), and registering one would
+ *   publish a selectable `fallback/auto` that spends a logical cycle per
+ *   failure with nowhere to hop — strictly worse than its absence, because
+ *   pi's own retry already does that.
+ *
+ * - `"environment"` — the chain crossed in {@link CHAIN_ENV} from a parent
+ *   that *already launched this process on `fallback/auto`* (the subagent
+ *   launcher and the Ralph-loop gates). If the process does not register the
+ *   router, that model reference is unresolvable and it dies on its first
+ *   request — so any non-empty chain must register, a single unpinned entry
+ *   included. The parent guarantees the chain is non-empty, so the router is
+ *   never registered with nothing to serve.
+ *
+ * @param chain - The parsed chain.
+ * @param source - Where the chain came from.
+ * @returns Whether `fallback/auto` should be registered.
+ */
+export function shouldRegisterRouter(chain: readonly ChainEntry[], source: "settings" | "environment"): boolean {
+	if (source === "environment") return chain.length > 0;
+	return isRoutable(chain);
 }
 
 /**
