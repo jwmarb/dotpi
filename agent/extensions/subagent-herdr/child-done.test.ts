@@ -258,7 +258,10 @@ describe("completion gate", () => {
 
     expect(outcome.kind).toBe("no-answer");
     expect(shutdownCalled).toBe(false);
-    // Critically: no sidecar. The parent must not classify this run as done.
+    // Critically: no sidecar. This supplies no sidecar completion signal — filler
+    // remains non-qualifying, so the parent will not treat this run as finished.
+    // (The parent may still finish it on its own if a qualifying transcript
+    // result exists; that is the parent's completion predicate, not this gate's.)
     expect(calls.length).toBe(0);
   });
 

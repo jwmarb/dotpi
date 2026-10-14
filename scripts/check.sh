@@ -77,10 +77,8 @@ if [ "$staged" -eq 1 ]; then
 		fi
 	done < <(find agent -name node_modules -type d -not -path 'agent/git/*' -not -path '*/node_modules/*' -print0)
 	cd "$TMP" || exit 1
-	ROOT=$(pwd)
 else
 	cd "$REPO" || exit 1
-	ROOT=$(pwd)
 fi
 
 red=$'\e[31m'; green=$'\e[32m'; dim=$'\e[2m'; bold=$'\e[1m'; off=$'\e[0m'
@@ -147,7 +145,10 @@ while IFS= read -r file; do
 			note "$green" "parse" "$file ${dim}(cli entrypoint; parsed, not run)${off}"
 			continue
 		fi
-	elif err=$(bun -e "await import('$ROOT/$file')" 2>&1); then
+	# Relative "./$file", not "$ROOT/$file": Git Bash hands bun a POSIX path
+	# (/c/Users/...) that Windows bun cannot resolve, while "./$file" resolves
+	# from the CWD we cd'd to above on every platform.
+	elif err=$(bun -e "await import('./$file')" 2>&1); then
 		note "$green" "ok   " "$file"
 		continue
 	fi

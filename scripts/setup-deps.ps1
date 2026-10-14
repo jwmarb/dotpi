@@ -88,6 +88,43 @@ foreach ($pkg in $manifests) {
     Pop-Location
 }
 
+# pi's own packages (@earendil-works/*, typebox) are NOT npm dependencies of this
+# repo: at run time pi supplies them from its global install. Outside pi --
+# `bun test`, scripts\check.sh, the pre-commit hook -- a bare import resolves by
+# walking up from the importing file, so without a node_modules above the
+# extensions every suite importing them dies with "Cannot find package 'typebox'".
+# The bash twin resolves `pi` into its package tree via readlink; on Windows pi is
+# a standalone bun .exe shim with no tree to resolve into, so locate bun's global
+# node_modules directly. NODE_PATH is not an alternative: `bun test` ignores it.
+# Repaired when the link is missing or stale.
+$bunGlobalDir = $env:BUN_CONFIG_GLOBAL_INSTALL_DIR
+if (-not $bunGlobalDir) { $bunGlobalDir = Join-Path $env:USERPROFILE ".bun\install\global" }
+$bunGlobal = Join-Path $bunGlobalDir "node_modules"
+if (-not (Test-Path (Join-Path $bunGlobal "typebox"))) { $bunGlobal = $null }
+$nm = Join-Path $root "node_modules"
+if ($bunGlobal) {
+    $existing = Get-Item $nm -ErrorAction SilentlyContinue
+    $isLink = $existing -and ($existing.LinkType -eq "SymbolicLink" -or $existing.LinkType -eq "Junction")
+    if ($isLink -and $existing.Target -ne $bunGlobal) {
+        Remove-Item $nm
+        $existing = $null
+    }
+    if (-not (Test-Path $nm)) {
+        try {
+            New-Item -ItemType Junction -Path $nm -Target $bunGlobal -ErrorAction Stop | Out-Null
+            Write-Host "setup-deps: linked node_modules -> $bunGlobal"
+        } catch {
+            Write-Host "setup-deps: could not link node_modules -> $bunGlobal ($($_.Exception.Message))"
+            $status = 1
+        }
+    } elseif ($existing -and -not $isLink) {
+        Write-Host "setup-deps: ./node_modules exists and is not a link; leaving it"
+    }
+} else {
+    Write-Host "setup-deps: could not locate pi's global node_modules; tests importing pi packages will fail"
+    $status = 1
+}
+
 # A run that discovered nothing means the globs stopped matching the tree -- the
 # exact silent failure the bash twin had when it looked at extensions only.
 # Report it instead of exiting 0 on an empty loop.

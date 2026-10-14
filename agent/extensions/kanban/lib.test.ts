@@ -458,14 +458,19 @@ describe("decideSplit", () => {
 	});
 });
 
+// The quoting under test is POSIX `sh` semantics (single-quote escaping), so it
+// can only be round-tripped where a POSIX shell exists. On Windows `/bin/sh` is
+// absent from bun's PATH, so these skip rather than fail; the PowerShell twin
+// (powershellQuote) is covered by the platform-tagged paneCommand tests.
+const sh = process.platform === "win32" ? undefined : "/bin/sh";
 describe("shell quoting", () => {
-	test.each(["plain", "with space", "it's", "$HOME", "`id`", "a\nb", "", "--flag=x"])("round-trips %p through sh", (value) => {
-		const out = execFileSync("/bin/sh", ["-c", `printf %s ${shellQuote(value)}`], { encoding: "utf-8" });
+	test.each(["plain", "with space", "it's", "$HOME", "`id`", "a\nb", "", "--flag=x"]).skipIf(!sh)("round-trips %p through sh", (value) => {
+		const out = execFileSync(sh!, ["-c", `printf %s ${shellQuote(value)}`], { encoding: "utf-8" });
 		expect(out).toBe(value);
 	});
 
-	test("join quotes each argument independently", () => {
-		const out = execFileSync("/bin/sh", ["-c", `printf '[%s]' ${shellJoin(["a b", "c'd", "e"])}`], { encoding: "utf-8" });
+	test.skipIf(!sh)("join quotes each argument independently", () => {
+		const out = execFileSync(sh!, ["-c", `printf '[%s]' ${shellJoin(["a b", "c'd", "e"])}`], { encoding: "utf-8" });
 		expect(out).toBe("[a b][c'd][e]");
 	});
 });

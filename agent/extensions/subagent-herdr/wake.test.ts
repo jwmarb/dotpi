@@ -41,7 +41,7 @@ afterAll(() => {
 });
 
 import * as realHerdr from "./herdr.js";
-import { formatExitSidecar, formatNotice, type RunRecord } from "./rundir.js";
+import { formatExitSidecar, formatNotice, systemPromptPath, type RunRecord } from "./rundir.js";
 import type { SubagentHerdrHooks } from "./index.js";
 // ---------------------------------------------------------------------------
 // herdr CLI mock
@@ -100,6 +100,12 @@ interface RunFixture {
   status?: RunRecord["status"];
   /** false → the session file has no visible assistant text (no answer). */
   visibleAnswer?: boolean;
+  /**
+   * Written to the run's `system-prompt.md` when set. A prompt containing
+   * `<result>` puts the child under the `<result>` contract, so `qualifiesAsAnswer`
+   * requires a complete `<result>…</result>` element rather than any visible text.
+   */
+  systemPrompt?: string;
   /** Set on a health-check record: the target run it diagnoses. */
   healthCheckOf?: string;
   /** Recorded pane id; records without one are classified from disk. */
@@ -140,7 +146,7 @@ async function loadExtensionInDir(
  * agent definition, so the parent can spawn one programmatically), and imports
  * a fresh instance of the extension factory pointed at it.
  */
-async function freshExtension(runs: RunFixture[]) {
+async function freshExtensionWithDir(runs: RunFixture[]) {
   const dir = mkdtempSync(join(tmpdir(), "herdr-wake-"));
 
   const agentsDirPath = join(dir, "agents");
@@ -196,11 +202,25 @@ async function freshExtension(runs: RunFixture[]) {
         writeFileSync(sessionFile + ".exit", formatExitSidecar());
       }
     }
+    if (r.systemPrompt) {
+      writeFileSync(systemPromptPath(runDir), r.systemPrompt);
+    }
   }
 
-  return loadExtensionInDir(dir);
+  const factory = await loadExtensionInDir(dir);
+  return { factory, dir };
 }
 
+/**
+ * Creates a temp agent dir with the given run fixtures (plus a `healthcheck`
+ * agent definition, so the parent can spawn one programmatically), and imports
+ * a fresh instance of the extension factory pointed at it. Returns only the
+ * factory; use `freshExtensionWithDir` when a test must reach the on-disk run
+ * directory (to append a transcript entry or drop a `.exit` sidecar after load).
+ */
+async function freshExtension(runs: RunFixture[]) {
+  return (await freshExtensionWithDir(runs)).factory;
+}
 /** Minimal pi ExtensionAPI stub. */
 function stubPi() {
   const sent: Array<{ text: string; options?: { deliverAs?: string } }> = [];
@@ -2394,6 +2414,253 @@ describe("run ownership (cross-process sweep)", () => {
       } finally {
         herdrState.getAgent = savedGetAgent;
       }
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+});
+
+describe("issue #1: done-pane completion signals and late-completion revival", () => {
+  // A pane reporting `done` is "ready for input", not "run finished". These
+  // tests pin the new contract: a run only goes terminal on a real completion
+  // signal (the `.exit` sidecar, a qualifying `<result>`, or a gone pane), and
+  // a run already mis-marked `failed` is revived when its report appears.
+
+  const RESULT_PROMPT = "Only what is inside <result> reaches the orchestrator.";
+
+  function writeResultTranscript(runDir: string, runId: string, body: string) {
+    const sessionFile = join(runDir, `1750000000000_${runId}.jsonl`);
+    writeFileSync(
+      sessionFile,
+      JSON.stringify({
+        message: { role: "assistant", content: [{ type: "text", text: body }], stopReason: "stop" },
+      }) + "\n",
+    );
+  }
+
+  test(
+    "a done pane with no completion signal stays running",
+    async () => {
+      const { factory } = await freshExtensionWithDir([
+        { runId: "sub-h00d", agent: "worker", hasSession: false, hasSidecar: false, status: "running", paneId: "w9:pH" },
+      ]);
+      // The pane is live and reports `done` (ready for input) — not a finish.
+      herdrState.getAgent = async () => ({ status: "done" });
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(500);
+
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-h00d");
+      expect(rec?.status).toBe("running");
+      // No terminal classification: no finishedAt, no briefing, no health check.
+      expect(stub.sent.length).toBe(0);
+      expect(tasks.filter((t) => t.agent === "healthcheck").length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a done pane with a qualifying <result> answer finishes and delivers the report",
+    async () => {
+      const { factory } = await freshExtensionWithDir([
+        {
+          runId: "sub-0002", agent: "worker", hasSession: true, hasSidecar: false,
+          systemPrompt: RESULT_PROMPT, answer: "<result>Here is the complete report for sub-0002.</result>",
+          status: "running", paneId: "w9:p2",
+        },
+      ]);
+      herdrState.getAgent = async () => ({ status: "done" });
+
+      const closedPanes: string[] = [];
+      herdrState.closePane = async (id: string) => { closedPanes.push(id); };
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(1500);
+
+      // Terminal `done`, with a finishedAt stamped, and the report delivered.
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-0002");
+      expect(rec?.status).toBe("done");
+      expect(stub.sent.length).toBe(1);
+      expect(stub.sent[0].options?.deliverAs).toBe("steer");
+      expect(stub.sent[0].text).toContain("complete report for sub-0002");
+      // The qualifying answer is the report, not a fallback label.
+      expect(stub.sent[0].text).not.toContain("(no final answer in transcript)");
+      expect(stub.sent[0].text).not.toContain("NOT AN ANSWER");
+      // No health check is spawned for an answered run.
+      expect(tasks.filter((t) => t.agent === "healthcheck").length).toBe(0);
+      // A qualifying answer with no sidecar still closes the pane (cleanup):
+      // the run no longer owns it.
+      expect(closedPanes).toContain("w9:p2");
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a done pane with only a sidecar becomes terminal and defers behind a health check",
+    async () => {
+      const { factory } = await freshExtensionWithDir([
+        { runId: "sub-s1d3", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "running", paneId: "w9:p3" },
+      ]);
+      // The target's pane reports `done`; a spawned health-check pane stays live.
+      herdrState.getAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? { status: "working" } : { status: "done" };
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(1500);
+
+      // The sidecar is a real completion signal: the run is terminal `done`, not
+      // left running. With no answer it is deferred behind a health check.
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-s1d3");
+      expect(rec?.status).toBe("done");
+      const hcs = tasks.filter((t) => t.agent === "healthcheck" && t.status === "running");
+      expect(hcs.length).toBe(1);
+      expect(hcs[0].healthCheckOf).toBe("sub-s1d3");
+      expect(stub.sent.length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a done pane with filler text under the <result> contract stays running",
+    async () => {
+      const { factory } = await freshExtensionWithDir([
+        {
+          runId: "sub-f11r", agent: "worker", hasSession: true, hasSidecar: false,
+          systemPrompt: RESULT_PROMPT, answer: "Compiling the report now.",
+          status: "running", paneId: "w9:pF",
+        },
+      ]);
+      herdrState.getAgent = async () => ({ status: "done" });
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(500);
+
+      // `answered` is true for the filler, but it is `non-conforming` — not a
+      // completion signal. The run must stay running, not be mis-marked failed.
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-f11r");
+      expect(rec?.status).toBe("running");
+      expect(stub.sent.length).toBe(0);
+      expect(tasks.filter((t) => t.agent === "healthcheck").length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a failed run that gains a <result> is revived and delivered",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        { runId: "sub-r3v1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pR", rawMeta: { finishedAt: Date.now() - 10000 } },
+      ]);
+      herdrState.getAgent = async () => null; // pane gone
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+
+      // The child's report lands in the transcript after the run was failed.
+      const runDir = join(dir, "subagent-runs", "sub-r3v1");
+      writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
+      writeResultTranscript(runDir, "sub-r3v1", "<result>The recovered report for sub-r3v1.</result>");
+
+      await hooks.runLivenessTick();
+      await sleep(1500);
+
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-r3v1");
+      expect(rec?.status).toBe("done");
+      expect(stub.sent.length).toBe(1);
+      expect(stub.sent[0].text).toContain("recovered report for sub-r3v1");
+      expect(stub.sent[0].text).not.toContain("NOT AN ANSWER");
+      expect(tasks.filter((t) => t.agent === "healthcheck").length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a revived run that was already briefed gets exactly one corrective briefing, then goes quiet",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        { runId: "sub-c0r4", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "running", paneId: "w9:pC4" },
+      ]);
+      // Target pane gone; a spawned health-check pane stays live until we end it.
+      herdrState.getAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? { status: "working" } : null;
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      const handler = stub.getInputHandler();
+
+      // The child dies with no answer: the tick classifies it `failed` and defers
+      // it behind a health check.
+      await hooks.runLivenessTick();
+      await sleep(1500);
+      const tasks1 = await listTasks(stub as any);
+      const hcs = tasks1.filter((t) => t.agent === "healthcheck" && t.status === "running");
+      expect(hcs.length).toBe(1);
+      expect(hcs[0].healthCheckOf).toBe("sub-c0r4");
+
+      // Complete the health check: the target's no-answer briefing is delivered,
+      // so the run is now in the briefed dedup set.
+      herdrState.getAgent = async () => null;
+      const hcId = hcs[0].task;
+      handler({ text: formatNotice(hcId, "healthcheck", "done") });
+      await sleep(1500);
+      expect(stub.sent.length).toBe(1);
+      expect(stub.sent[0].text).toContain("(no final answer in transcript)");
+
+      // The report appears late; the revive scan re-classifies and corrects.
+      const runDir = join(dir, "subagent-runs", "sub-c0r4");
+      writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
+      writeResultTranscript(runDir, "sub-c0r4", "<result>The corrective report for sub-c0r4.</result>");
+
+      await hooks.runLivenessTick();
+      await sleep(1500);
+      expect(stub.sent.length).toBe(2);
+      expect(stub.sent[1].text).toContain("corrective report for sub-c0r4");
+
+      // A further tick delivers nothing new: the run is `done` and briefed.
+      await hooks.runLivenessTick();
+      await sleep(1500);
+      expect(stub.sent.length).toBe(2);
+      stub.getShutdownHandler()();
+    },
+    30000,
+  );
+
+  test(
+    "a failed run with no new completion signal is left alone",
+    async () => {
+      const { factory } = await freshExtensionWithDir([
+        { runId: "sub-q1u1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pQ", rawMeta: { finishedAt: Date.now() - 10000 } },
+      ]);
+      herdrState.getAgent = async () => null;
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(500);
+      await hooks.runLivenessTick();
+      await sleep(500);
+
+      const tasks = await listTasks(stub as any);
+      const rec = tasks.find((t) => t.task === "sub-q1u1");
+      expect(rec?.status).toBe("failed");
+      expect(stub.sent.length).toBe(0);
       stub.getShutdownHandler()();
     },
     20000,

@@ -58,6 +58,20 @@ function gitInit(root: string): void {
   run("commit", "-qm", "init");
 }
 
+// git is an external binary. Where it cannot be spawned (some Windows bun
+// setups resolve execFileSync through a `/bin/sh` that is not on PATH), the
+// git-discovery tests skip rather than fail; the non-git path is covered by the
+// "walked directly" test. The guard uses the same spawn call as the tests, so it
+// is true exactly when they can run.
+const gitOk = (() => {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 /**
  * A directory shaped to clear the "create" threshold: >20 files, >70% code,
  * a build config, a module boundary file, and enough exported symbols.
@@ -193,7 +207,7 @@ describe("discovery works with and without git", () => {
     expect(plan.tiers.some((t) => t.rel === "core")).toBe(true);
   });
 
-  test("a git repository is read through ls-files and reports isGit", () => {
+  test.skipIf(!gitOk)("a git repository is read through ls-files and reports isGit", () => {
     const root = scratch();
     fatModule(root, "core");
     gitInit(root);
@@ -202,7 +216,7 @@ describe("discovery works with and without git", () => {
     expect(plan.tiers.some((t) => t.rel === "core")).toBe(true);
   });
 
-  test("an untracked file is invisible in a git repo, which is the point of ls-files", () => {
+  test.skipIf(!gitOk)("an untracked file is invisible in a git repo, which is the point of ls-files", () => {
     // A build artifact must not pull a directory over the threshold.
     const root = scratch();
     fatModule(root, "core");
@@ -277,7 +291,7 @@ describe("maxDepth and scope", () => {
     }
   });
 
-  test("a scope inside a git repo still resolves", () => {
+  test.skipIf(!gitOk)("a scope inside a git repo still resolves", () => {
     const root = scratch();
     fatModule(root, "keep/core");
     gitInit(root);

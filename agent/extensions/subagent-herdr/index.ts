@@ -844,30 +844,67 @@ async function spawnHealthCheck(
 }
 
 /**
- * Classifies a run herdr says is `done`: sidecar → done (pane closed as
- * cleanup — closing the tab's only pane closes the tab); no sidecar → failed
- * (pane kept open as evidence).
+ * Whether an extracted run result is a *clean* completion — a complete answer
+ * that was not salvaged out of an unfinished transcript. A clean answer has
+ * `salvagedFrom === undefined`; the salvage paths (`earlier-message`,
+ * `done-arguments`, `truncated-answer`) all mean the child answered and then
+ * kept working, so they are NOT safe to treat as terminal: closing the pane on
+ * one would kill a child that is still going. `answered` alone is far too loose
+ * (`extractRunResult` sets it for the non-conforming "any visible text" salvage
+ * too), so only the clean answer and the `.exit` sidecar count.
+ */
+function isQualifyingCompletionResult(result: RunResult): boolean {
+  return result.answered && result.salvagedFrom === undefined;
+}
+
+/**
+ * Whether a run has a real completion signal on disk: the `.exit` sidecar
+ * (written when the child exits cleanly) or a *clean* answer in the transcript.
+ * herdr's `done` pane status is NOT a signal — it means "ready for input", and
+ * a child moves in and out of it between turns while it works. A salvage
+ * (`earlier-message`/`done-arguments`/`truncated-answer`) is deliberately NOT a
+ * signal here: it only proves the child produced some text, not that it stopped.
+ */
+async function hasCompletionSignal(rec: RunRecord): Promise<boolean> {
+  const result = await extractRunResult(dirFor(rec.runId), rec.runId);
+  if (!result.sessionFile) return false;
+  if (existsSync(exitPath(result.sessionFile))) return true;
+  return isQualifyingCompletionResult(result);
+}
+
+/**
+ * Classifies a terminal run: a real completion signal — the `.exit` sidecar
+ * (clean exit) or a qualifying `<result>` in the transcript — means `done`
+ * (pane closed as cleanup: closing the tab's only pane closes the tab); no
+ * signal means `failed` (pane kept open as evidence).
  *
- * The sidecar is checked a couple of times with a short settle: herdr
+ * The signal is re-extracted a couple of times with a short settle: herdr
  * detects the finished turn from the terminal, and the child's sidecar write
- * races that detection by a few milliseconds.
+ * and final transcript entry race that detection by a few milliseconds.
  */
 async function finishRun(rec: RunRecord): Promise<RunResult> {
-  const result = await extractRunResult(dirFor(rec.runId), rec.runId);
-  const sidecarPresent = (): boolean =>
-    !!result.sessionFile && existsSync(exitPath(result.sessionFile));
+  // Re-read on every observation: a qualifying answer can land during the
+  // settle window, and the first read would otherwise stay invisible.
+  let result = await extractRunResult(dirFor(rec.runId), rec.runId);
+  const completed = (): boolean =>
+    (!!result.sessionFile && existsSync(exitPath(result.sessionFile))) ||
+    isQualifyingCompletionResult(result);
 
-  let clean = sidecarPresent();
+  let clean = completed();
   if (!clean && result.found) {
     for (let i = 0; i < 2 && !clean; i++) {
       await new Promise((r) => setTimeout(r, 750));
-      clean = sidecarPresent();
+      result = await extractRunResult(dirFor(rec.runId), rec.runId);
+      clean = completed();
     }
   }
 
   rec.finishedAt = Date.now();
   if (clean) {
     rec.status = "done";
+    // Terminal evidence is captured either way — by the sidecar (clean exit) or
+    // by a qualifying answer that outran it — so a done run's tab is closed;
+    // leaving it alive would leak a pane the run no longer owns.
     if (rec.paneId) await closePane(rec.paneId);
   } else {
     rec.status = "failed";
@@ -908,9 +945,19 @@ async function reconcile(rec: RunRecord): Promise<boolean> {
     return false;
   }
   const live = await getAgent(rec.paneId);
-  // Pane gone (herdr reaps it after the child exits) or the turn finished:
-  // either way the child is not coming back.
-  if (!live || live.status === "done") {
+  // Pane gone: herdr reaps it after the child exits, so the child is not coming
+  // back. Classify from disk now.
+  if (!live) {
+    await finishRun(rec);
+    return false;
+  }
+  // A live pane reporting `done` is NOT proof the run finished. In herdr
+  // `done` means "ready for input", and a pi child moves in and out of that
+  // state between turns while it is still working. Only a real completion
+  // signal — the `.exit` sidecar, a qualifying `<result>` in the transcript, or
+  // a gone pane — may classify the run; with none of those the child is between
+  // turns, so leave it running.
+  if (live.status === "done" && (await hasCompletionSignal(rec))) {
     await finishRun(rec);
     return false;
   }
@@ -1813,6 +1860,33 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       // here would close their pane, overwrite their meta, and brief their
       // session's orchestrator through this one.
       const finished = await collectFinished([...runs.values()].filter((r) => isOwnedBy(r, ownerPane)), briefedFinishedRunIds, reconcile);
+      // Revive scan: a `failed` record whose transcript has since gained a real
+      // completion signal — a late `<result>`, a sidecar written after the
+      // classification — was called failed before its child finished. The `done`
+      // pane status that caused it is "ready for input", not termination, so the
+      // child may still be going. Re-classify from disk and deliver the late
+      // completion. The one-way `failed → done` transition is its own bound: a
+      // revived record is `done` on the next tick and never re-selected.
+      const revived: RunRecord[] = [];
+      for (const rec of [...runs.values()]) {
+        if (rec.status !== "failed" || !isOwnedBy(rec, ownerPane)) continue;
+        let signal = false;
+        try {
+          signal = await hasCompletionSignal(rec);
+        } catch {
+          continue; // one bad record: the next tick retries
+        }
+        if (!signal) continue;
+        await finishRun(rec);
+        // finishRun rewrites rec.status; the pre-call narrowing to "failed" is
+        // stale, so compare against the record's declared status type.
+        if ((rec.status as RunRecord["status"]) === "done") {
+          // Let the late answer correct an already-delivered false failure: the
+          // dedup set would otherwise suppress the corrective briefing.
+          briefedFinishedRunIds.delete(rec.runId);
+          revived.push(rec);
+        }
+      }
       // Release notices the finished loop enqueued this tick. The flush is
       // ~1200 ms away, so a check classified done here is still
       // terminal-and-unbriefed when the stranded-release scan below runs;
@@ -1820,7 +1894,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       // time, and the compose's local dedup only catches it on the clean
       // path (a degraded pair marks neither id, so it renders twice).
       const enqueuedThisTick = new Set<string>();
-      for (const rec of finished) {
+      for (const rec of [...finished, ...revived]) {
         try {
           if (healthCheckOfId(rec)) {
             enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
