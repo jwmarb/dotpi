@@ -1,9 +1,9 @@
 {
-  "lastChangelogVersion": "1.1.0",
+  "lastChangelogVersion": "1.2.0",
   "defaultProvider": "fallback",
   "defaultModel": "auto",
   "defaultThinkingLevel": "xhigh",
-  "hideThinkingBlock": true,
+  "hideThinkingBlock": false,
   "steeringMode": "all",
   "extensions": [
     "+builtin:mcp",
@@ -26,9 +26,15 @@
   },
   "modelFallback": {
     "chain": [
-      { "model": "anthropic/claude-opus-5.5", "thinking": "low" },
-      { "model": "anthropic/claude-opus-5", "thinking": "low" },
       "qwen/qwen3.8-27b",
+      {
+        "model": "anthropic/claude-opus-5.5",
+        "thinking": "low"
+      },
+      {
+        "model": "anthropic/claude-opus-5",
+        "thinking": "low"
+      },
       "openai/gpt-5.6-sol"
     ],
     "maxCycles": 10,
