@@ -78,7 +78,7 @@ bun test agent/extensions/lib/                          # widget/agents/layout/s
 bun test agent/extensions/trade-journal/lib.test.ts     # trade-journal mode logic
 bun test agent/extensions/subagent-herdr/               # herdr: lib + child-done + wake (3 suites, not 1)
 bun test agent/extensions/ralph-loop/lib.test.ts        # ralph-loop
-bun test agent/extensions/kanban/                       # kanban: reducer, replay, guard, layout, board args, runs + the role gate
+bun test agent/extensions/kanban/                       # kanban: reducer, replay, guard, layout, board args, runs, the role gate + projection publish (Windows rename)
 bun test agent/extensions/model-fallback/lib.test.ts    # fallback-chain state machine
 bun test agent/extensions/lib/widget.test.ts            # one file
 bun test agent/extensions/lib/ -t "wide characters"     # one test by name

@@ -51,7 +51,7 @@
  * persists it if no tool result did.
  */
 
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,6 +238,28 @@ function sweepDeadRuntimeDirs(root: string, prefix: string): void {
 	}
 }
 
+/**
+ * Install `tmp` as `target`, replacing it. POSIX `rename` replaces an existing
+ * target; on Windows `rename` can fail with EPERM while the target exists
+ * (build- and environment-dependent — some setups replace it fine), so on
+ * retried. The unlink-then-rename window is race-free: this extension is the
+ * only writer and `publish` runs synchronously, so nothing else can create
+ * `target` between the two calls — the board viewer is the only reader and its
+ * `load()` tolerates a missing file ("projection missing" banner).
+ */
+export function replaceSync(tmp: string, target: string): void {
+	try {
+		renameSync(tmp, target);
+	} catch {
+		try {
+			unlinkSync(target);
+		} catch {
+			// target already gone: the retry below installs tmp
+		}
+		renameSync(tmp, target);
+	}
+}
+
 /** A private (0700) runtime directory. Never under agent/, which is synced. */
 function makeRuntimeDir(): string {
 	const xdg = process.env.XDG_RUNTIME_DIR;
@@ -308,7 +330,7 @@ export default function kanban(pi: ExtensionAPI) {
 		const tmp = `${rec.projectionFile}.tmp`;
 		try {
 			writeFileSync(tmp, JSON.stringify(projection), { mode: 0o600 });
-			renameSync(tmp, rec.projectionFile);
+			replaceSync(tmp, rec.projectionFile);
 			projectionFailureNotified = false;
 		} catch (err) {
 			// The canonical mutation already succeeded; only the view is stale.
