@@ -1,0 +1,47 @@
+% <Course> <Exam> note sheet (<date>): <N> sheet(s), <page limit> pages max.
+% Print at Actual Size / 100%. Scope: <what the instructor said is in scope>.
+\documentclass[10pt]{article}
+\usepackage[letterpaper,landscape,margin=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[scaled=0.92]{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage{amsmath,amssymb}
+\usepackage{multicol}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usepackage{microtype}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\columnsep}{5pt}
+\setlength{\columnseprule}{0.2pt}
+\setlist{nosep,leftmargin=6pt,labelsep=2pt}
+\newcommand{\Hd}[1]{\par\vspace{1.2pt}{\color{white}\colorbox{MidnightBlue}{\makebox[\dimexpr\linewidth-2\fboxsep\relax][l]{\bfseries #1}}}\par\vspace{0.4pt}}
+\newcommand{\hd}[1]{\par\vspace{0.6pt}{\bfseries\color{BrickRed}#1}\enspace}
+\newcommand{\fg}[1]{\par\vspace{0.6pt}{\bfseries\color{ForestGreen}Fig: #1}\enspace}
+\newcommand{\B}[1]{\textbf{#1}}
+\newcommand{\ra}{$\rightarrow$}
+\setlength{\fboxsep}{0.6pt}
+\begin{document}
+\fontsize{5.5}{6.15}\selectfont
+\begin{multicols*}{5}
+\raggedright
+
+{\colorbox{Goldenrod!35}{\parbox{\dimexpr\linewidth-2\fboxsep}{\B{Answering:} principle + what it buys + what it costs, then apply. Ops: step by step (who sends what, table changes, when it stops). Compare: named axes (convergence, scalability, memory, msg overhead, loss handling), both sides. Short answers are fine; don't fill the space. Fig Q: say what the axes are, what the curves show, and the paper idea it proves.}}}
+
+{\colorbox{Goldenrod!35}{\parbox{\dimexpr\linewidth-2\fboxsep}{\B{Answering:} <strategy for this exam's question types>.}}}
+
+\Hd{1. TOPIC (Author year)}
+\hd{Label}terse fact chunk; \B{key term} \ra\ consequence.
+\fg{Figure name}axes; what the curves show \ra\ what it proves.
+
+\hd{Worked numbers}...
+
+\Hd{N. COMMON TRAPS}
+\hd{Topic}the mistake, and the correct version.
+\end{multicols*}
+\end{document}

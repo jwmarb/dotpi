@@ -1,0 +1,171 @@
+% =====================================================================
+%  preamble.tex — shared packages, colours, boxes and macros
+%  Used by every top-level guide file. Chapters only use the environments defined here.
+% =====================================================================
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{libertinus}
+\usepackage{libertinust1math}
+\usepackage[scaled=0.92]{zi4}            % Inconsolata for code
+\usepackage[english]{babel}
+\usepackage{microtype}
+\usepackage[letterpaper,margin=1in,headheight=14pt]{geometry}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs,tabularx,array,longtable,multirow,makecell}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{siunitx}
+\usepackage{xspace}
+\usepackage{etoolbox}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{bytefield}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tocloft}
+\usepackage{pifont}
+\usepackage{multicol}
+\usepackage{varwidth}
+
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.misc,
+  calc,fit,backgrounds,decorations.pathreplacing,matrix,patterns}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\usepackage[most]{tcolorbox}
+
+\usepackage[hidelinks,bookmarksnumbered,bookmarksopen]{hyperref}
+\usepackage{bookmark}
+\usepackage[nameinlink,capitalise]{cleveref}
+\crefname{appendix}{Appendix}{Appendices}\Crefname{appendix}{Appendix}{Appendices}
+
+% ---------------------------------------------------------------------
+%  Colours
+% ---------------------------------------------------------------------
+\definecolor{primary}{HTML}{0C234B}     % UA navy
+\definecolor{accent}{HTML}{AB0520}      % UA red
+\definecolor{keyc}{HTML}{1F5FA8}
+\definecolor{defc}{HTML}{2E7D32}
+\definecolor{exc}{HTML}{E07A00}
+\definecolor{warnc}{HTML}{C62828}
+\definecolor{tipc}{HTML}{6A1B9A}
+\definecolor{readc}{HTML}{455A64}
+\definecolor{checkc}{HTML}{00838F}
+\definecolor{lightgray}{HTML}{F4F6F8}
+
+% ---------------------------------------------------------------------
+%  Page style
+% ---------------------------------------------------------------------
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.55em plus 0.2em minus 0.1em}
+\setlist{itemsep=0.2em,topsep=0.3em,parsep=0.1em}
+\setlist[itemize,1]{label=\textcolor{primary}{\small$\blacktriangleright$}}
+\setlist[itemize,2]{label=\textcolor{primary!70}{--}}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{primary}\textsc{<Course> Study Guide}}
+\fancyhead[R]{\small\color{primary}\nouppercase{\leftmark}}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\chaptermark}[1]{\markboth{\thechapter.\ #1}{}}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\titleformat{\chapter}[display]
+  {\normalfont\color{primary}}
+  {\large\scshape \chaptertitlename\ \thechapter}
+  {0.3em}
+  {\Huge\bfseries}
+  [\vspace{0.2em}{\color{accent}\titlerule[1.2pt]}]
+\titlespacing*{\chapter}{0pt}{-10pt}{18pt}
+\titleformat{\section}{\Large\bfseries\color{primary}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{primary!85!black}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\color{primary!75!black}}{}{0em}{}
+\titleformat{\part}[display]
+  {\centering\normalfont\color{primary}}
+  {\LARGE\scshape Part \thepart}
+  {1em}
+  {\Huge\bfseries}
+\setcounter{secnumdepth}{2}
+\setcounter{tocdepth}{1}
+
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,
+  frame=single,rulecolor=\color{black!20},backgroundcolor=\color{lightgray},
+  xleftmargin=4pt,xrightmargin=4pt,showstringspaces=false,breaklines=true,
+  commentstyle=\color{defc}\itshape,keywordstyle=\color{keyc}\bfseries}
+
+% ---------------------------------------------------------------------
+%  Boxes.  Usage:
+%    \begin{keyidea}[Optional title] ... \end{keyidea}
+%    \begin{definition}{Term} ... \end{definition}
+%    \begin{example}[Optional title] ... \end{example}
+%    \begin{pitfall}[Optional title] ... \end{pitfall}
+%    \begin{examtip}[Optional title] ... \end{examtip}
+%    \begin{reading}{Paper title}{Authors, venue, year} ... \end{reading}
+%    \begin{selfcheck} \item Q ... \end{selfcheck}   (numbered list)
+%    \begin{answers} \item A ... \end{answers}        (numbered list)
+%    \begin{glance} ... \end{glance}                 (chapter overview)
+% ---------------------------------------------------------------------
+\tcbset{
+  sgbase/.style={enhanced,breakable,boxrule=0pt,leftrule=3pt,arc=1.5pt,
+    left=8pt,right=8pt,top=9pt,bottom=5pt,before skip=12pt,after skip=9pt,
+    fonttitle=\bfseries\small,coltitle=white,
+    attach boxed title to top left={xshift=6pt,yshift=-2.2mm},
+    boxed title style={arc=1pt,boxrule=0pt},
+    varwidth boxed title*=-28pt},
+}
+\newtcolorbox{keyidea}[1][Key idea]{sgbase,colback=keyc!6,colframe=keyc,
+  boxed title style={colback=keyc},title={\ding{72}\ #1}}
+\newtcolorbox{definition}[1]{sgbase,colback=defc!6,colframe=defc,
+  boxed title style={colback=defc},title={Definition: #1}}
+\newtcolorbox{example}[1][Worked example]{sgbase,colback=exc!7,colframe=exc,
+  boxed title style={colback=exc},title={#1}}
+\newtcolorbox{pitfall}[1][Common mistake]{sgbase,colback=warnc!6,colframe=warnc,
+  boxed title style={colback=warnc},title={\ding{54}\ #1}}
+\newtcolorbox{examtip}[1][Exam tip]{sgbase,colback=tipc!6,colframe=tipc,
+  boxed title style={colback=tipc},title={\ding{43}\ #1}}
+\newtcolorbox{reading}[2]{sgbase,colback=readc!5,colframe=readc,
+  boxed title style={colback=readc},title={Reading: #1},
+  before upper={{\small\itshape #2}\par\smallskip}}
+\newtcolorbox{glance}{enhanced,breakable,colback=primary!4,colframe=primary,
+  boxrule=0.6pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt,
+  fonttitle=\bfseries,title={Chapter at a glance},coltitle=white,colbacktitle=primary}
+\newtcolorbox{selfcheckbox}{sgbase,colback=checkc!6,colframe=checkc,
+  boxed title style={colback=checkc},title={Check yourself}}
+\newtcolorbox{answersbox}{sgbase,colback=black!3,colframe=black!45,
+  boxed title style={colback=black!55},title={Answers}}
+\newenvironment{selfcheck}{\begin{selfcheckbox}\begin{enumerate}[label=\textbf{Q\arabic*.},leftmargin=2.2em]}{\end{enumerate}\end{selfcheckbox}}
+\newenvironment{answers}{\begin{answersbox}\small\begin{enumerate}[label=\textbf{A\arabic*.},leftmargin=2.2em]}{\end{enumerate}\end{answersbox}}
+
+% Small inline helpers
+\newcommand{\term}[1]{\textbf{\textcolor{primary}{#1}}}        % first use of a term
+\newcommand{\code}[1]{\texttt{#1}}
+% Long unbreakable \code{} tokens (IPs, prefixes) otherwise stick out of the margin;
+% allow a little extra inter-word stretch before declaring a line overfull.
+\setlength{\emergencystretch}{2.5em}
+\newcommand{\paper}[1]{\emph{#1}}                             % paper title inline
+\newcommand{\src}[1]{{\footnotesize\textcolor{black!55}{[#1]}}} % provenance tag
+\newcommand{\yes}{\textcolor{defc}{\ding{51}}}
+\newcommand{\no}{\textcolor{warnc}{\ding{55}}}
+\newcommand{\ie}{i.e.,\xspace}
+\newcommand{\eg}{e.g.,\xspace}
+\newcommand{\vs}{vs.\xspace}
+
+% Glance-box rows:  \glanceitem{Label}{Text}
+\newcommand{\glanceitem}[2]{\par\noindent\textbf{#1:}\ #2}
+
+% TikZ styles shared by all diagrams
+\tikzset{
+  lnk/.style={thick,draw=black!65},
+  msg/.style={-{Stealth[length=2mm]},thick,draw=exc},
+  lbl/.style={font=\footnotesize,fill=white,inner sep=1pt},
+  box/.style={rectangle,draw=primary,fill=primary!6,rounded corners=2pt,thick,align=center,font=\small,inner sep=4pt},
+}
+
+\captionsetup{font=small,labelfont={bf,color=primary}}

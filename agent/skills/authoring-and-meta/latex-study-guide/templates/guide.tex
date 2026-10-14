@@ -1,0 +1,34 @@
+% =====================================================================
+%  <Course> — <Title> Study Guide
+%  Build (from this folder):  latexmk -pdf guide.tex
+% =====================================================================
+\documentclass[11pt,openany]{report}
+\input{preamble}
+\fancyhead[L]{\small\color{primary}\textsc{<Course> <Title> Guide}}
+\hypersetup{pdftitle={<Course> <Title> Study Guide}}
+
+\begin{document}
+\begin{titlepage}
+\centering
+\vspace*{1.5cm}
+{\color{accent}\rule{\linewidth}{1.5pt}}\[0.8em]
+{\Huge\bfseries\color{primary} <Title>}\[0.9em]
+{\LARGE\color{primary} A Study Guide}\[0.4em]
+{\color{accent}\rule{\linewidth}{1.5pt}}\[1.6cm]
+{\large <Course> \textbullet\ <Institution> \textbullet\ <Term>}\[2.2cm]
+\begin{minipage}{0.82\linewidth}\small
+<What the exam covers, and what this guide builds up, in order. Name the running example.>
+\end{minipage}
+\vfill
+{\footnotesize Built from <sources>. Items marked ``(general background)'' go beyond the course material.}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+\input{chapters/01-topic}
+% one \input per chapter; then a walkthrough chapter and the problem bank
+\appendix
+% \input{chapters/A-reference}
+
+\end{document}
