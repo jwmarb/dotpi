@@ -31,10 +31,10 @@ completion claim is accepted only if every active gate agrees. They run in seque
 static first, and a static rejection short-circuits — no point spending a container run to
 prove a defect already found. `maxVerifications` (default 3) bounds gate rounds per loop.
 
-**Static** (`gate.ts`, `oracle`, fallback `openai/gpt-5.6-sol`) *reads* the repo: goal, starting `HEAD` + `git status`,
+**Static** (`gate.ts`, `oracle`, chain `anthropic/claude-opus-5, qwen/qwen3.8-27b`) *reads* the repo: goal, starting `HEAD` + `git status`,
 touched paths, and the agent's claim. Catches "runs green but does the wrong thing". ~20s.
 
-**Runtime** (`runtime-gate.ts`, `verifier`, fallback `anthropic/claude-opus-5`) *executes* the project's own tests in Docker.
+**Runtime** (`runtime-gate.ts`, `verifier`, chain `openai/gpt-5.6-sol, anthropic/claude-opus-5.5|off`) *executes* the project's own tests in Docker.
 
 Catches "reads fine but does not run". Minutes cold, ~20s once the image is cached:
 

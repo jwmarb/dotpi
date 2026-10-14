@@ -27,7 +27,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   `extensions/lib/agents.ts`: `name`, `description`, `tools` (comma-separated; omit for
   all), `model`, `fallback_models`, and the two optional keys `skills` and `callable_by`.
   Only the first five are required, so no file carries all seven — `explorer.md` has five,
-  `summarizer.md` is the sole user of `callable_by`. Multi-word keys are
+  `summarizer.md` (`callable_by: librarian`) and `healthcheck.md` (`callable_by: orchestrator`) are the two users of `callable_by`. Multi-word keys are
   **snake_case** — a camelCase key silently never matches, which `parseAgentFile`'s tests
   pin both ways. Body after the closing `---` is the child's system prompt, verbatim
   except for the appended skills catalogue.
@@ -76,7 +76,8 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   running child as well as a launching one. An explicit `model` on the delegation call
   suppresses both: the caller pinned it. See `extensions/model-fallback/AGENTS.md`. Recon
   agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
-  `librarian` on `occamy-1.0`, `summarizer` on `deepseek-v4-flash`. A model reference here
+  agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
+  `librarian` on `occamy-1.0`, `summarizer` on `openai/gpt-5.6-terra`. A model reference here
   must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
   unreachable *tail* degrades a running child, so verify against
   `/model_group/info` rather than by eye.
@@ -130,7 +131,8 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   invocation is a bug. `argument-hint` prefills the slash prompt.
 - **Personal-identity skills stay on disk and untracked**, not placeholdered —
   a gitignored skill directory under its category is the pattern (one is on disk
-  right now: `other/uarizona-hpc/`). Add a `.gitignore` path rather than sanitising in place.
+  a gitignored skill directory under its category is the pattern (none is on disk
+  right now — the pattern stands, the instance does not). Add a `.gitignore` path rather than sanitising in place.
 - **The superpowers bootstrap extension is deliberately disabled.** Its package entry is
   the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only the 15
   skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block every turn

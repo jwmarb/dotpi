@@ -8,7 +8,7 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 
 The queue structure and `deliverAs` were last re-verified against an installed pi in the 1.0.x
 line; `index.ts`'s comment still cites the original 0.99.2 measurement, and the running pi is
-now **1.0.4**. Two revisions of this paragraph disagreed about which 1.0.x it was, so re-measure
+now **1.2.0**. Two revisions of this paragraph disagreed about which 1.0.x it was, so re-measure
 against the installed bundle rather than trusting any version written here.
 
 ## WHERE TO LOOK
@@ -68,16 +68,19 @@ runtime. Run it from here with the local binary:
 ./node_modules/.bin/tsc -p tsconfig.json
 ```
 
-This is the **one typecheck scope whose own `tsconfig.json` has no `paths` entry**, so its
-`@earendil-works/*` types come from the stale `~/node_modules` (0.75.4) rather than the running
-pi — and, because bun honours `paths` at runtime too, so does anything `bun` runs *that lives
-in this directory* (resolution keys off the file's location, not your cwd). Note this is an
-opt-*out*: `agent/extensions/tsconfig.json` one level up does map `paths` at the live bundle,
-and a paths-less tsconfig here shadows it — so sibling dirs with no tsconfig at all
-(`trade-journal/`, `auto-update/`) resolve the live bundle while this one does not. It gets
-away with it by importing `ExtensionAPI` as a **type** only. Add a `paths` entry (copy
-`model-fallback/tsconfig.json`) the moment anything here touches a post-0.75.4 API; the root
-AGENTS.md COMMANDS section has the per-scope table.
+This is the **one typecheck scope whose own `tsconfig.json` has no `paths` entry**. That used
+to mean its `@earendil-works/*` types came from the stale `~/node_modules` (0.75.4) rather
+than the running pi; that tree is gone, and the upward walk now lands on the repo-root
+`node_modules` symlink — the live 1.2.0 bundle — so this scope and anything `bun` runs in
+this directory (resolution keys off the file's location, not your cwd) resolve the running
+pi like everyone else, *while the link exists*. Note this is still an opt-*out*:
+`agent/extensions/tsconfig.json` one level up maps `paths` at the live bundle, and a
+paths-less tsconfig here shadows it — so sibling dirs with no tsconfig at all
+(`trade-journal/`, `auto-update/`) keep resolving the live bundle through the inherited
+`paths` even if the root link is deleted, while this scope is the first to fail. It imports
+`ExtensionAPI` as a **type** only, which no longer saves it (the module is missing, not the
+API). Add a `paths` entry (copy `model-fallback/tsconfig.json`) if this directory should keep
+typechecking without the link; the root AGENTS.md COMMANDS section has the per-scope table.
 
 ## ANTI-PATTERNS
 

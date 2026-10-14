@@ -122,7 +122,9 @@ export default function (pi: ExtensionAPI) {
 
     // A `/skill:name` invocation is expanded into this turn's prompt as
     // `<skill name=… location=…>`, which is the only place it is observable.
-    activation.notePrompt(event.prompt ?? '');
+    // `prompt` exists only on user-triggered runs (1.2.0's `BeforeAgentStartEvent`
+    // is a user/custom discriminated union); a custom-triggered turn has none to scan.
+    activation.notePrompt(event.messageType === 'user' ? event.prompt : '');
 
     // --- Gate skill-owned tools on their skill being active ---
     // selectedTools is mutable here and is what the model is offered for this run.

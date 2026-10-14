@@ -19,7 +19,7 @@ failed; once a fallback answers, the **original model gets the next request**.
 "defaultModel": "auto",
 "retry": { "maxRetries": 30, ... },
 "modelFallback": {
-  "chain": ["qwen/qwen3.8-27b", { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
+  "chain": ["qwen/qwen3.8-27b", { "model": "anthropic/claude-opus-5.5", "thinking": "low" }, { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
   "contextWindow": 262144, "maxTokens": 32768
 }
@@ -34,9 +34,10 @@ because the CLI flag goes through `findExactModelReferenceMatch` instead. Two di
 grammars for the same thing, so check `/model` or the session's `model_change` entry after
 changing either.
 
-`retry.maxRetries` is 30 rather than 10 because a lap of a 3-model chain spends 3 of pi's
-retries, and 10 cycles therefore needs 30 (see THE TWO BUDGETS). With 10 only 3 cycles were
-reachable and `/fallback-chain` warned about it.
+`retry.maxRetries` is 30. The chain is now **4 models**, so one lap spends 4 and the 10
+configured cycles need 40 — 30 reaches 7 full laps plus 2 requests, so `index.ts`'s
+once-per-session "too small" warning is live on this host (see THE TWO BUDGETS). It covered
+the old 3-model chain exactly (3 × 10); with 10 only 3 cycles were reachable and it warned.
 
 **A chain entry may pin a thinking level.** An entry is either a bare reference
 string or an object `{ "model": "provider/id", "thinking": "level" }` — both forms
@@ -172,7 +173,7 @@ answered, the next request went back to the primary, task completed.
 
 ## MEASURED BEHAVIOUR
 
-Everything below was produced by running pi 1.0.2 (the running pi is now **1.0.4**), not
+Everything below was produced by running pi 1.0.2 (the running pi is now **1.2.0**), not
 inferred. The harness used a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection
 refused on every request), so the primary fails deterministically. The chains quoted below
 (`deadend/void`, `deadend/void2`, `claude-haiku-4.5`) are that harness's, **not** the live
@@ -315,9 +316,9 @@ from the formula stopped pi mid-lap and the last models in the chain were never 
 silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
 20 configurations (chain 1/2/3/4/7 × cycles 1/2/3/10) by asserting *failed requests* rather than
 
-This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At the previous
-`maxRetries: 10` only 3 cycles were reachable and `/fallback-chain` warned about it.
-
+This repo sets `maxRetries: 30` for its 4-model chain and `maxCycles: 10` — short of the 40
+the 10 cycles need, so the warning is live; at the previous `maxRetries: 10` only 3 cycles
+were reachable and `/fallback-chain` warned about it.
 ## ANTI-PATTERNS
 
 - Restating pi's retry patterns instead of importing `isRetryableAssistantError`.
@@ -334,9 +335,11 @@ This repo sets `maxRetries: 30` for its 3-model chain and `maxCycles: 10`. At th
   retries. That false assurance is exactly why the dated-model-id leak survived
   the first round of hardening. Assert `includes("503") === false`, or better,
   assert against `isRetryableAssistantError` itself.
-- Assuming `~/node_modules`'s `@earendil-works/*` (0.75.4) can typecheck this: it
-  has no virtual-model API at all. `tsconfig.json` points at the running pi's
-  bundle for exactly that reason.
+- Assuming a paths-less scope can typecheck this: 0.75.4 has no virtual-model API at all, and
+  while `~/node_modules` (once that 0.75.4) existed it was the default resolution for any
+  scope without `paths`. That tree is gone — such a scope now walks to the repo-root symlink
+  (the live bundle) — but `tsconfig.json` keeps its `paths` entry for exactly the reason it
+  was added.
 
 ## COMMANDS
 

@@ -18,6 +18,7 @@ scripts, so every command below comes from the repo root).
 | `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context |
 | `firecrawl-cli.ts` | No tool, no command. Loads `agent/.env` so `FIRECRAWL_API_URL` reaches the real `process.env`, where the `firecrawl` CLI (run via `bash`) can see it — the librarian's research path. Also sets `FIRECRAWL_NO_UPDATE_CHECK`/`_NO_TELEMETRY` when unset, so a registry banner cannot land inside an agent's `<result>`. Reports a missing URL and returns rather than throwing: pi must start without the research stack |
 | `git-hooks.ts` | No tool. Self-arms `core.hooksPath` and runs `scripts/setup-deps.sh` at startup; swallows every failure |
+| `herdr-agent-state.ts` | **Not in git** — herdr installs and overwrites this file itself (`.gitignore` excludes it); auto-loaded like every top-level `*.ts`, a fresh clone's first copy arrives from herdr's next start |
 | `init.ts` | `/init` — local deterministic tiering (score > 15 create, >= 8 candidate, `--max-depth` default 3; root 50–150 lines, nested 30–80), then hands the model a brief |
 | `litellm.ts` | `registerProvider("litellm")` — model catalog, per-token + cache costs, `contextWindow`, thinking-level maps |
 | `model-fallback/` | `registerVirtualModel("fallback/auto")` + `/fallback-chain` — on an error, route the retry to the **next** model in a chain, then hand the following request back to the original. One full lap of the chain is one logical retry. Consumed by the orchestrator (settings), delegated children (`PI_FALLBACK_CHAIN`) and both ralph-loop gates. Own AGENTS.md |
@@ -47,7 +48,7 @@ scripts, so every command below comes from the repo root).
   `promptGuidelines`: pi folds those into the prompt only while the tool is in the active
   set, so gating the tool and gating its advice are the same act.
 - **Skill activation is inferred, not reported, and the inference is load-bearing.**
-  Re-probed against the installed pi (1.0.x; the running pi is now 1.0.4): there is still **no `skill_invoke` event**,
+  Re-probed against the installed pi (1.2.0): there is still **no `skill_invoke` event**,
   and `systemPromptOptions.skills` is the **catalogue** (every discovered skill, every
   turn), *not* the loaded set — reading it as "loaded" silently ungates everything. The two
   real signals are a `/skill:x` invocation, which pi expands into `before_agent_start`'s
@@ -156,8 +157,8 @@ scripts, so every command below comes from the repo root).
   directory.** The constraint is where the file sits, not what it may reach: pi auto-loads
   every top-level `*.ts`, so a `*.test.ts` here imports `bun:test` and kills startup. A test
   in `lib/` is invisible to pi and can import `../<extension>.js` freely —
-  `lib/sessions.test.ts` has done exactly that all along, and all 11 top-level extensions
-  import cleanly from there (measured, 11/11). Export the pure logic and test it in place.
+  `lib/sessions.test.ts` has done exactly that all along, and all 12 top-level extensions
+  import cleanly from there (measured, 12/12 — including `herdr-agent-state.ts`, which is gitignored). Export the pure logic and test it in place.
 - **Keep pure logic out of `index.ts`.** Every subdirectory extension splits `lib.ts` (pure,
   tested) from `index.ts` (session wiring). `trade-journal/` is the worked example. But
   become a directory when it improves the module's **interface** or **locality** — not
