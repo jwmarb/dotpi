@@ -916,6 +916,21 @@ export function shellQuote(value: string): string {
 
 export const shellJoin = (argv: readonly string[]): string => argv.map(shellQuote).join(" ");
 
+/** PowerShell single-quote quoting: inside '...' only ' is special, doubled as ''. */
+export function powershellQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * The command a pane runs to become `argv`, closing when it exits. POSIX
+ * shells `exec`; on Windows the pane shell is PowerShell, which has no `exec`,
+ * so call the program with `&` and exit with its status.
+ */
+export function paneCommand(argv: readonly string[], platform: NodeJS.Platform = process.platform): string {
+	if (platform !== "win32") return shellJoin(["exec", ...argv]);
+	return `& ${argv.map(powershellQuote).join(" ")}; exit $LASTEXITCODE`;
+}
+
 /**
  * Locate an executable on a PATH string. Pure: the filesystem check is injected,
  * so the search order is testable without a filesystem.
@@ -925,10 +940,24 @@ export function findOnPath(
 	pathEnv: string | undefined,
 	isExecutable: (path: string) => boolean,
 	extra: readonly string[] = [],
+	platform: NodeJS.Platform = process.platform,
+	pathExt: string | undefined = process.env.PATHEXT,
 ): string | undefined {
-	const dirs = (pathEnv ?? "").split(":").filter((d) => d.length > 0);
-	for (const candidate of [...dirs.map((d) => `${d.replace(/\/+$/, "")}/${name}`), ...extra]) {
-		if (isExecutable(candidate)) return candidate;
+	const win = platform === "win32";
+	// Windows: PATH is ';'-separated (':' would split drive letters), and
+	// executables carry a PATHEXT suffix such as .exe.
+	const dirs = (pathEnv ?? "").split(win ? ";" : ":").filter((d) => d.length > 0);
+	const exts = win
+		? ["", ...(pathExt ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((e) => e.length > 0).map((e) => e.toLowerCase())]
+		: [""];
+	const bases = [
+		...dirs.map((d) => (win ? `${d.replace(/[\\/]+$/, "")}\\${name}` : `${d.replace(/\/+$/, "")}/${name}`)),
+		...extra,
+	];
+	for (const base of bases) {
+		for (const ext of exts) {
+			if (isExecutable(base + ext)) return base + ext;
+		}
 	}
 	return undefined;
 }

@@ -16,6 +16,7 @@ import {
 	describeOp,
 	emptyState,
 	findOnPath,
+	paneCommand,
 	formatCardList,
 	KanbanError,
 	linkedRunIds,
@@ -472,9 +473,18 @@ describe("shell quoting", () => {
 describe("findOnPath", () => {
 	test("searches PATH in order, then extras", () => {
 		const has = new Set(["/b/bun", "/x/bun"]);
-		expect(findOnPath("bun", "/a:/b:/c", (p) => has.has(p))).toBe("/b/bun");
-		expect(findOnPath("bun", "/a", (p) => has.has(p), ["/x/bun"])).toBe("/x/bun");
+		expect(findOnPath("bun", "/a:/b:/c", (p) => has.has(p), [], "linux")).toBe("/b/bun");
+		expect(findOnPath("bun", "/a", (p) => has.has(p), ["/x/bun"], "linux")).toBe("/x/bun");
 		expect(findOnPath("bun", undefined, () => false)).toBeUndefined();
+	});
+	test("posix PATH on linux is unchanged", () => {
+		expect(findOnPath("bun", "/a:/b", (p) => p === "/b/bun", [], "linux")).toBe("/b/bun");
+	});
+	test("windows: ';' separator, drive letters, PATHEXT", () => {
+		const want = String.raw`C:\Users\me\.bun\bin\bun.exe`;
+		const pathEnv = String.raw`C:\Windows;C:\Users\me\.bun\bin` + "\\"; // trailing separator is stripped
+		expect(findOnPath("bun", pathEnv, (p) => p === want, [], "win32", ".COM;.EXE")).toBe(want);
+		expect(findOnPath("bun", "", (p) => p === "D:/x/bun.exe", ["D:/x/bun"], "win32", ".EXE")).toBe("D:/x/bun.exe");
 	});
 });
 
@@ -596,5 +606,16 @@ describe("staleRuntimeOwner", () => {
 		// A stranger's dir in a shared tmpdir: our prefix or nothing.
 		expect(staleRuntimeOwner("systemd-private-42-abc123", "pi-kanban-")).toBeUndefined();
 		expect(staleRuntimeOwner("42-abc123", "pi-kanban-")).toBeUndefined();
+	});
+});
+
+describe("paneCommand", () => {
+	test("posix shells exec", () => {
+		expect(paneCommand(["/b/bun", "x y"], "linux")).toBe("exec /b/bun 'x y'");
+	});
+	test("windows uses PowerShell call operator and exits", () => {
+		expect(paneCommand([String.raw`C:\b\bun.exe`, "it's"], "win32")).toBe(
+			String.raw`& 'C:\b\bun.exe' 'it''s'; exit $LASTEXITCODE`,
+		);
 	});
 });

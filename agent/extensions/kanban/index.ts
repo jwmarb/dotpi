@@ -81,7 +81,7 @@ import {
 	opFromParams,
 	parseCommand,
 	reconstructFromEntries,
-	shellJoin,
+	paneCommand,
 	staleRuntimeOwner,
 	STATE_ENTRY_TYPE,
 	stateDigest,
@@ -440,7 +440,7 @@ export default function kanban(pi: ExtensionAPI) {
 		const paneId = await splitPaneOf(rec.ownerPaneId, split.kind, split.ratio, ctx.cwd);
 		if (!paneId) return fallBack(ctx, "herdr refused to split the pane");
 		await renamePane(paneId, BOARD_LABEL);
-		const command = shellJoin(["exec", bun, BOARD_SCRIPT, "--file", rec.projectionFile!, "--owner-pid", String(process.pid), "--agent-dir", agentDir()]);
+		const command = paneCommand([bun, BOARD_SCRIPT, "--file", rec.projectionFile!, "--owner-pid", String(process.pid), "--agent-dir", agentDir()]);
 		const ran = await runInPane(paneId, command);
 		if (!ran.ok) {
 			await closePane(paneId);
@@ -451,7 +451,7 @@ export default function kanban(pi: ExtensionAPI) {
 		widgetFallback = false;
 		refreshWidget(ctx);
 
-		// `exec` makes the pane's lifetime the board's: a pane that is gone a
+		// `exec` (or `; exit` under PowerShell) makes the pane's lifetime the board's: a pane that is gone a
 		// moment later means the board died on startup (missing module, bad bun).
 		await delay(LAUNCH_CHECK_MS);
 		// Still this process's record and pane? A /new or /kanban close in the
