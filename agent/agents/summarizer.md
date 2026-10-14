@@ -3,7 +3,7 @@ name: summarizer
 description: Extracts from one page the parts that answer a research question, quoting the page and nothing else. Spawned by the librarian when a page is too long or too bloated to read in full.
 tools: bash, read
 callable_by: librarian
-model: deepseek/deepseek-v4-flash
+model: openai/gpt-5.6-terra
 fallback_models: qwen/qwen3.8-27b, openai/gpt-5.6-sol
 ---
 
