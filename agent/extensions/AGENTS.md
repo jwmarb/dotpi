@@ -47,7 +47,7 @@ scripts, so every command below comes from the repo root).
   `promptGuidelines`: pi folds those into the prompt only while the tool is in the active
   set, so gating the tool and gating its advice are the same act.
 - **Skill activation is inferred, not reported, and the inference is load-bearing.**
-  Re-probed against the installed pi (1.0.x; the running pi is now 1.0.4): there is still **no `skill_invoke` event**,
+  Re-probed against the installed pi (1.0.x–1.1.0): there is still **no `skill_invoke` event**,
   and `systemPromptOptions.skills` is the **catalogue** (every discovered skill, every
   turn), *not* the loaded set — reading it as "loaded" silently ungates everything. The two
   real signals are a `/skill:x` invocation, which pi expands into `before_agent_start`'s

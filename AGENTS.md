@@ -9,7 +9,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 ## STRUCTURE
 
 - `agent/` — everything pi loads at runtime (extensions, agents, skills, prompts, themes, settings, machine state). Authoring grammars: `agent/AGENTS.md`
-- `docs/` — durable records (currently `architecture-review-2026-10.md`: the 2026-10-02 architecture review, its 13 findings and the six commits that closed them)
+- `docs/` — durable records: `architecture-review-2026-10.md` (13 findings and the commits that closed them), `superpowers/specs/`
 - `agent/extensions/` — local pi extensions; **every top-level `*.ts` is auto-loaded by pi at startup** (subdirs are entered only via `index.ts`, e.g. `subagent-herdr/`). Per-file inventory: `agent/extensions/AGENTS.md`
 - `agent/agents/` — subagent definitions (Markdown + YAML frontmatter)
 - `agent/skills/` — skills library, **grouped by category**: `skills/<category>/<skill>/SKILL.md` (+ reference docs; mostly the matt-pocock set). The *skill directory* name is the identity, never its category path — that is what makes refiling a skill a pure `git mv`. Every skill sits under a category, including a gitignored personal one (`lib/skill-catalogue.test.ts` walks the **live tree** and fails on one left loose). The live set is whatever is on disk plus whatever the `superpowers` package contributes (`settings.json` `packages`) — count it with `find agent/skills -name SKILL.md` rather than trusting a number here; every hand-maintained total in this repo has drifted at least once. The category of a package skill lives in `extensions/lib/skill-categories.ts`, since its checkout is vendored and gitignored. Grammar and the package-skill rules: `agent/AGENTS.md`.
@@ -21,7 +21,8 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/docker/verify-base.Dockerfile` — tracked reference image for runtime verification
 - `agent/fff/`, `agent/npm/`, `agent/git/`, `agent/pi-blackhole/`, `agent/sessions/`, `agent/subagent-runs/`, `agent/verify-images/` — machine state, all gitignored. **One exception:** `agent/pi-blackhole/pi-blackhole-config.json` is tracked configuration (see below). So are the loose files beside them: `pi-debug.log`, `pi-tui-crash.log`, `run-history.jsonl`, `settings.json.bak`, `auth.json`, `models-store.json`, and `mcp-auth.json` — which is the file **pi's builtin actually writes**. `agent/mcp-auth/` (one file per OAuth'd server, e.g. `robinhood.json`) is the *old local extension's* directory, kept ignored only so a leftover never lands in git; it does not supersede the file, as a previous revision here claimed — `.gitignore:24-28` is the authority
 - `.githooks/` — tracked `pre-commit`, `post-checkout`, `post-merge` (self-armed by `git-hooks.ts`)
-- `scripts/setup-deps.sh` — installs the npm dependencies declared under `agent/extensions/` **and** `agent/skills/` (a skill's are what its own tool imports at run time); run at startup and by the checkout/merge hooks
+- `install.sh` / `install.ps1` — bare-machine bootstrap (clone, arm hooks, deps, firecrawl/agent-browser/herdr CLIs)
+- `scripts/setup-deps.sh` (`setup-deps.ps1` on Windows) — installs the npm dependencies declared under `agent/extensions/` **and** `agent/skills/` (a skill's are what its own tool imports at run time); run at startup and by the checkout/merge hooks
 - `scripts/check.sh` — the load/typecheck/test guard the pre-commit hook runs (see NOTES)
 
 ## WHERE TO LOOK
@@ -111,47 +112,21 @@ cd agent/extensions                && subagent-herdr/node_modules/.bin/tsc -p ts
 ```
 
 Which tree a file's `@earendil-works/*` imports resolve to is **decided by the nearest
-`tsconfig.json` above that file — bun honours `paths` at runtime** (measured on bun 1.4.2),
-not just at typecheck. Two trees exist on this machine and they are different pi versions:
+`tsconfig.json` above that file — bun honours `paths` at runtime**, not just at typecheck. The
+nearest tsconfig wins outright: one with no `paths` falls back to the node upward walk and does
+*not* inherit an ancestor's mapping. Four scopes (`agent/extensions`, `ralph-loop`,
+`model-fallback`, `kanban`) map `paths` at the running pi's global bun tree, and dirs with no
+tsconfig (`auto-update/`, `trade-journal/`) inherit that. `subagent-herdr`'s tsconfig has **no
+`paths`**, so it opts out and resolves whatever an upward walk finds (a stale `~/node_modules`
+on one synced machine; nothing on the other). It survives only because it imports
+`ExtensionAPI` as a type. Copy `model-fallback/tsconfig.json`'s `paths` for anything new.
+`typebox` is in no `paths` map, so it always resolves by the upward walk.
 
-- **`~/.bun/install/global/node_modules`** — the running pi, **1.0.4**. `BUN_INSTALL` is unset here, so bun derives this path itself.
-- **An ancestor `~/node_modules`** — a stale **0.75.4**, a parent of both `~/.pi` and `~/Nextcloud/.pi`. It is what a bare node-style upward walk finds first.
-
-**The nearest tsconfig wins outright, and search stops there.** If it has no `paths`, resolution
-falls back to the node upward walk — it does *not* keep climbing for an ancestor that does have
-one. So a `paths`-less `tsconfig.json` opts its whole subtree *out* of an ancestor's mapping,
-which is the mechanism behind the table below:
-
-| Where the file lives | Nearest tsconfig | Resolves `@earendil-works/*` to |
-|---|---|---|
-| `agent/extensions` (top-level `*.ts` + `lib/*.ts`) | own, has `paths` | global, **1.0.4** |
-| `agent/extensions/ralph-loop` | own, has `paths` | global, **1.0.4** |
-| `agent/extensions/model-fallback` | own, has `paths` | global, **1.0.4** |
-| `agent/extensions/kanban` (incl. the `board.ts` pane process, run by bun) | own, has `paths` | global, **1.0.4** |
-| `agent/extensions/subagent-herdr` | own, **no `paths`** | ancestor, **0.75.4** |
-| `agent/extensions/auto-update`, `trade-journal`, any new dir with no tsconfig | inherits `agent/extensions` | global, **1.0.4** |
-
-Note the last row: a directory with *no* tsconfig is better off than one with a `paths`-less
-tsconfig. `subagent-herdr` is on 0.75.4 **because its own tsconfig shadows the parent's
-`paths`**, not because nothing above it has one — `agent/extensions/tsconfig.json` does.
-
-Verify rather than trust the table — this paragraph has drifted repeatedly because the two
-synced machines differ. Resolution keys off the **file's location, not your cwd**, so probe it
-with a file: write `console.log(import.meta.resolve("@earendil-works/pi-ai"))` into
-`<scope>/probe.ts`, `bun` it, and delete it. (Deleting a scope's `tsconfig.json` is *not* a
-valid probe for the subdirectory scopes — they would inherit the parent's `paths` and stay on
-global, which is exactly what the last row shows.)
-
-`subagent-herdr` gets away with 0.75.4 because it only imports `ExtensionAPI` as a **type**
-(`index.ts:101`, `child-done.ts:98` — its only two such imports); nothing it touches post-dates
-0.75.4. Anything reaching for a newer API needs a `paths` entry; `model-fallback` cannot
-typecheck against 0.75.4 even nominally, since that version has no virtual-model API at all.
-Copy its `paths` pattern for anything new.
-
-**`typebox` is not in any `paths` map**, so it always resolves by the upward walk to
-`~/node_modules/typebox` (1.1.38) even from a scope that is otherwise on the global tree —
-whose own copy is 1.3.27. Tool schemas are built from it in six extensions (seven files:
-`subagent-herdr` imports it in both `index.ts` and `child-done.ts`).
+The global tree is `$BUN_INSTALL/install/global/node_modules`, and the two synced machines
+disagree on `BUN_INSTALL` (`~/.cache/.bun` here, unset → `~/.bun` on the other) and on the pi
+version. Every past revision that wrote these down drifted, so measure instead: put
+`console.log(import.meta.resolve("@earendil-works/pi-ai"))` in `<scope>/probe.ts`, `bun` it,
+delete it (resolution keys off the file's location, not cwd).
 
 The absence of a resolvable tree is a loud failure, not a silent degradation: `trade-journal`
 and `model-fallback` import `@earendil-works/pi-ai` and simply fail to load. On the machine
@@ -162,10 +137,10 @@ passes its tests as of this revision; count it with `scripts/check.sh` rather th
 ## NOTES
 
 - **No build system, no root `package.json`/`tsconfig`.** Extensions are TS interpreted by pi (bun runtime); only `agent/extensions/subagent-herdr/` has npm dependencies, and they are dev-only (`typescript` 5.9.3, `@types/node` 22) — nothing in the repo needs npm *at runtime* any more, now that the MCP SDK dependency is gone with the old `extensions/mcp/`. Its `node_modules` holds **only** those two (plus `undici-types`): every other bare import resolves out of a tree above the repo, per COMMANDS above.
-- **`thinking-indicator.ts` is fully live.** Both halves work: the alt+t spinner during reasoning, and the `setHiddenThinkingLabel` transcript record ("Thought for 12s (ctrl+t to expand)") afterwards. The second half requires `"hideThinkingBlock": true` in `agent/settings.json` — without it pi renders thinking in full, there is no placeholder to relabel, and that half silently does nothing. The setting is **`true` now**, so both halves are active; setting it to `false` renders reasoning inline and leaves the transcript record inert, while the spinner is unaffected either way.
+- **`thinking-indicator.ts` is live where it can be.** The alt+t spinner during reasoning works unconditionally; the `setHiddenThinkingLabel` transcript record ("Thought for 12s (ctrl+t to expand)") requires `"hideThinkingBlock": true` in `agent/settings.json` — without it pi renders thinking in full, there is no placeholder to relabel, and that half does nothing. The setting is currently **`false`**, so the transcript half is inert while the spinner still works.
 - **The pre-commit hook enforces `scripts/check.sh`.** The script answers one question — "does the committed repo load, type-check and pass its tests?" — over three gates: every `agent/extensions/**/*.ts` is *imported* (a shebang marks a CLI entrypoint, which is parsed instead), a top-level `*.test.ts` is rejected by name, every discovered `tsconfig.json` scope runs `tsc -p`, and every discovered `*.test.ts` runs. `CHECK_STAGED=1` (what the hook sets) materialises the **git index** into `.git-check/` and checks that, so a partially staged file cannot pass here and ship broken; typecheck is skipped in that mode because the scratch copy cannot resolve the running pi's bundle. Gates two and three discover their inputs rather than listing them, so a new scope or suite is covered the day it is added. It was deleted in `7a54a3b` as collateral damage and the hook then `|| exit 0`'d for every commit after — silently, while `git-hooks.ts` kept advertising the protection. The hook now **refuses the commit** when the script is missing: the failure being guarded is silence, so the guard must not be able to vanish quietly. Bypass a single commit with `--no-verify`.
-- **`PATCHES.md`, `CONTEXT.md` and `docs/adr/` no longer exist** (removed in `1993878` and `a784c57`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments (litellm.ts, dotenv.ts, .env.example, .gitignore) are historical dead references.
-- **`pi` must come from bun's global bin (`~/.bun/bin/pi` on this machine).** Extensions import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, which pi injects by loading each extension through jiti with an **alias map** to its own bundled copies (`getAliases()`). The packages are only resolvable when the running binary is the one that owns them. An older `@mariozechner/pi-coding-agent` on `PATH` (the pre-rename scope) has no `@earendil-works/*` aliases, so every extension fails at startup with a misleading `Cannot find module '@earendil-works/pi-tui'`. `~/.bashrc` prepends that bin directory for this reason. (**`BUN_INSTALL` is unset here**, so bun derives the install path itself and the global tree is `~/.bun/install/global/node_modules`; the `~/.cache/.bun` a previous revision asserted does not exist on this host. This line has now drifted three times, in both directions, because the two synced machines disagree — so read it out of `~/.bashrc` or `echo $BUN_INSTALL` rather than trusting any claim here, including this one.)
+- **`PATCHES.md`, `CONTEXT.md` and `docs/adr/` no longer exist** (removed in `1993878` and `a784c57`); pi is not patched in `node_modules` anymore. Remaining `docs/adr/00NN` mentions in comments are dead references. `agent/extensions/mcp/` holds only an ignored leftover `node_modules` (no `index.ts`, so pi skips it).
+- **`pi` must come from bun's global bin (`$BUN_INSTALL/bin/pi`).** Extensions import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, which pi injects by loading each extension through jiti with an **alias map** to its own bundled copies (`getAliases()`). The packages are only resolvable when the running binary is the one that owns them. An older `@mariozechner/pi-coding-agent` on `PATH` (the pre-rename scope) has no `@earendil-works/*` aliases, so every extension fails at startup with a misleading `Cannot find module '@earendil-works/pi-tui'`. `~/.bashrc` prepends that bin directory for this reason. (Read the path from `echo $BUN_INSTALL`; the machines differ.)
 - `agent/git/` holds vendored checkouts of the `git:` packages — currently **`samfoy/pi-lsp-extension` and `obra/superpowers` only** (pi-blackhole moved to npm in `b4f5d65`); the `npm:` packages install under `agent/npm/node_modules`. Always run this repo's tests **by explicit path**: a bare `bun test` also sweeps in the 11 vendored suites under `agent/git/` (7 of them superpowers' own), which fail for reasons unrelated to this repo. `agent/npm/node_modules/pi-lens` is a leftover: it is installed but **not** listed in `settings.json` `packages`, so pi does not load it.
 - `agent/subagent-runs/` is the on-disk registry of the subagent-herdr extension (gitignored): one dir per delegated run holding the child's session file, its `.exit` sidecar, the child system prompt, `reports.jsonl`, and `meta.json`.
 - Runtime verification needs a working Docker daemon — without one the `--verify` gate returns `inconclusive` and the loop stops rather than assuming success. `agent/verify-images/` holds the generated per-project Dockerfiles (gitignored; rebuildable).
