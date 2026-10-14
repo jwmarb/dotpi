@@ -263,8 +263,9 @@ export async function renamePane(paneId: string, label: string): Promise<boolean
  * *not* "pi never came up": `agent_name_taken` (the name is held by another
  * live pane) and `invalid_agent_name` are both instant rejections that used to
  * be flattened into "did not become interactive" and then retried against every
- * candidate model — turning one clear, actionable code into the appearance of a
- * fleet-wide model outage. Callers surface the code instead of guessing.
+ * candidate model of the old launch loop — turning one clear, actionable code
+ * into the appearance of a fleet-wide model outage. Callers surface the code
+ * instead of guessing.
  */
 export async function startAgent(
   name: string,

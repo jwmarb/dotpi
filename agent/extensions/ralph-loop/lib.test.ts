@@ -40,10 +40,11 @@ import {
 	type VerificationSource,
 	type VerificationTransition,
 } from "./lib.js";
-import { parseRuntimeVerdict, renderRuntimePrompt } from "./runtime-gate.js";
+import { parseRuntimeVerdict, renderRuntimePrompt, RUNTIME_FALLBACK_MODEL } from "./runtime-gate.js";
 import { withChainEnv } from "./gate.js";
 import { resolveGateAgent } from "./gate-agent.js";
-import { CHAIN_ENV } from "../model-fallback/lib.js";
+import { GATE_FALLBACK_MODEL } from "./index.js";
+import { CHAIN_ENV, parseChainItem } from "../model-fallback/lib.js";
 import {
 	REFERENCE_IMAGE,
 	detectsWebProject,
@@ -1159,7 +1160,7 @@ describe("withChainEnv", () => {
 		// inherits process.env. This is the only seam that can reach it.
 		delete process.env[KEY];
 		let seen: string | undefined = "unset-marker";
-		await withChainEnv(["a/1", "b/2"], true, async () => {
+		await withChainEnv(["a/1", "b/2"], async () => {
 			seen = process.env[KEY];
 		});
 		expect(seen).toBe("a/1,b/2");
@@ -1171,7 +1172,7 @@ describe("withChainEnv", () => {
 		// instead of restoring would silently re-route the loop's own requests
 		// for the rest of the session.
 		process.env[KEY] = "outer/1,outer/2";
-		await withChainEnv(["inner/1", "inner/2"], true, async () => {
+		await withChainEnv(["inner/1", "inner/2"], async () => {
 			expect(process.env[KEY]).toBe("inner/1,inner/2");
 		});
 		expect(process.env[KEY]).toBe("outer/1,outer/2");
@@ -1180,46 +1181,41 @@ describe("withChainEnv", () => {
 	test("restores even when the spawn throws", async () => {
 		process.env[KEY] = "outer/1,outer/2";
 		await expect(
-			withChainEnv(["inner/1", "inner/2"], true, async () => {
+			withChainEnv(["inner/1", "inner/2"], async () => {
 				throw new Error("spawn failed");
-			}),
+			})
 		).rejects.toThrow("spawn failed");
 		expect(process.env[KEY]).toBe("outer/1,outer/2");
 	});
 
-	test("does nothing when inactive or when there is nothing to hop between", async () => {
-		// Each of these must leave the launch byte-identical to pre-feature.
-		for (const [chain, active] of [
-			[["a/1", "b/2"], false],
-			[["a/1"], true],
-			[[], true],
-			[undefined, true],
-		] as const) {
-			delete process.env[KEY];
-			let seen: string | undefined = "unset-marker";
-			await withChainEnv(chain, active, async () => {
-				seen = process.env[KEY];
-			});
-			expect(seen).toBeUndefined();
-			expect(process.env[KEY]).toBeUndefined();
-		}
-	});
-
-	test("installs a one-entry pinned chain, because the router must apply the pin", async () => {
-		// The contrast with the unpinned single entry above: the pin is the
-		// reason the router exists, so the var must cross.
+	test("does nothing when the chain is empty", async () => {
+		// An empty chain means no router: the var must not be set, so the
+		// child's model selection is unchanged.
 		delete process.env[KEY];
 		let seen: string | undefined = "unset-marker";
-		await withChainEnv(["a/1|high"], true, async () => {
+		await withChainEnv([], async () => {
 			seen = process.env[KEY];
 		});
-		expect(seen).toBe("a/1|high");
+		expect(seen).toBeUndefined();
+		expect(process.env[KEY]).toBeUndefined();
+	});
+
+	test("installs any non-empty chain, including a single unpinned entry", async () => {
+		// The gate always launches on `fallback/auto`, so even a one-model chain
+		// must cross: without the var the child's router registers nothing and
+		// `fallback/auto` is unresolvable.
+		delete process.env[KEY];
+		let seen: string | undefined = "unset-marker";
+		await withChainEnv(["a/1"], async () => {
+			seen = process.env[KEY];
+		});
+		expect(seen).toBe("a/1");
 		expect(process.env[KEY]).toBeUndefined();
 	});
 
 	test("passes the spawn's result through", async () => {
-		expect(await withChainEnv(["a/1", "b/2"], true, async () => 42)).toBe(42);
-		expect(await withChainEnv(undefined, false, async () => "x")).toBe("x");
+		expect(await withChainEnv(["a/1", "b/2"], async () => 42)).toBe(42);
+		expect(await withChainEnv([], async () => "x")).toBe("x");
 	});
 });
 
@@ -1251,7 +1247,7 @@ describe("resolveGateAgent", () => {
 		writeFileSync(join(agentRoot, "agents", `${name}.md`), body, "utf8");
 	}
 
-	test("resolves model, chain, tools and prompt body from the definition", async () => {
+	test("resolves chain, tools and prompt body from the definition", async () => {
 		writeAgent("gate-x", [
 			"---",
 			"name: gate-x",
@@ -1265,17 +1261,15 @@ describe("resolveGateAgent", () => {
 			"",
 		].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-x", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r.model).toBe("openai/gpt-test");
 		expect(r.chain).toEqual(["openai/gpt-test", "anthropic/claude-test"]);
 		expect(r.tools).toEqual(["read", "bash"]);
 		expect(r.promptBody).toBe("You are a test gate.");
 	});
 
-	test("falls back to the caller's model when the definition declares none", async () => {
+	test("falls back to the caller's model as a one-entry chain when the definition declares none", async () => {
 		writeAgent("gate-y", ["---", "name: gate-y", "description: d", "---", "body"].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-y", fallbackModel: "fb/model", defaultTools: ["read", "grep"] });
-		expect(r.model).toBe("fb/model");
-		expect(r.chain).toBeUndefined();
+		expect(r.chain).toEqual(["fb/model"]);
 		expect(r.tools).toEqual(["read", "grep"]);
 		expect(r.promptBody).toBe("body");
 	});
@@ -1288,26 +1282,24 @@ describe("resolveGateAgent", () => {
 
 	test("returns all defaults when the file is missing", async () => {
 		const r = await resolveGateAgent({ name: "missing-agent", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r).toEqual({ model: "fb/model", tools: ["read"], promptBody: "" });
+		expect(r).toEqual({ chain: ["fb/model"], tools: ["read"], promptBody: "" });
 	});
 
 	test("returns all defaults for a definition with no frontmatter", async () => {
 		writeAgent("gate-bad", "no frontmatter here\n");
 		const r = await resolveGateAgent({ name: "gate-bad", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r).toEqual({ model: "fb/model", tools: ["read"], promptBody: "" });
+		expect(r).toEqual({ chain: ["fb/model"], tools: ["read"], promptBody: "" });
 	});
 
-	test("chain is undefined when the declaration yields a single model", async () => {
+	test("a single model declaration yields a one-entry chain", async () => {
 		writeAgent("gate-one", ["---", "name: gate-one", "description: d", "model: p/m", "fallback_models: p/m", "---", ""].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-one", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r.model).toBe("p/m");
-		expect(r.chain).toBeUndefined();
+		expect(r.chain).toEqual(["p/m"]);
 	});
 
 	test("a single pinned model yields a chain: the pin needs the router", async () => {
 		writeAgent("gate-pinned", ["---", "name: gate-pinned", "description: d", "model: p/m|high", "---", ""].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-pinned", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r.model).toBe("p/m|high");
 		expect(r.chain).toEqual(["p/m|high"]);
 	});
 
@@ -1316,7 +1308,31 @@ describe("resolveGateAgent", () => {
 		// same rule the launcher applies, so the gate and the launch agree.
 		writeAgent("gate-dup", ["---", "name: gate-dup", "description: d", "model: p/m", "fallback_models: P/m|high", "---", ""].join("\n"));
 		const r = await resolveGateAgent({ name: "gate-dup", fallbackModel: "fb/model", defaultTools: ["read"] });
-		expect(r.chain).toBeUndefined();
+		expect(r.chain).toEqual(["p/m"]);
+	});
+
+	test("a model-less declaration keeps its declared fallbacks in order", async () => {
+		// No `model` at all: the declared `fallback_models` feed the chain
+		// directly, and the caller's model is not appended.
+		writeAgent("gate-fb", ["---", "name: gate-fb", "description: d", "fallback_models: q/1, a/2", "---", ""].join("\n"));
+		const r = await resolveGateAgent({ name: "gate-fb", fallbackModel: "fb/model", defaultTools: ["read"] });
+		expect(r.chain).toEqual(["q/1", "a/2"]);
+	});
+
+	test("the caller's model is canonicalised through the item grammar", async () => {
+		// A pinned fallback model keeps its pin: the gate is launched on the
+		// router, so the pin can only be applied there.
+		const r = await resolveGateAgent({ name: "missing-agent", fallbackModel: "fb/model|low", defaultTools: ["read"] });
+		expect(r.chain).toEqual(["fb/model|low"]);
+	});
+
+	test("the gate fallback constants parse, so canonicalChainItem's degrade branch stays unreachable", () => {
+		// `canonicalChainItem` in gate-agent.ts degrades a model that does not
+		// parse to the bare string rather than throwing; that branch is
+		// unreachable only while both constants are plain `provider/id` refs.
+		// Pinning them here makes any change to a constant a visible failure.
+		expect(parseChainItem(GATE_FALLBACK_MODEL)).not.toBeNull();
+		expect(parseChainItem(RUNTIME_FALLBACK_MODEL)).not.toBeNull();
 	});
 });
 

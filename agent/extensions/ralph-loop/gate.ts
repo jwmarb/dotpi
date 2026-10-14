@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import { writeFile, mkdtemp } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolveGateAgent } from "./gate-agent.js";
-import { CHAIN_ENV, FALLBACK_MODEL_REF, isRoutable, parseChainEnv } from "../model-fallback/lib.js";
+import { CHAIN_ENV, FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
 	VERIFY_TIMEOUT_MS,
 	type LoopState,
@@ -68,11 +68,10 @@ import {
  * explicit `env` on a direct `spawn` instead of a global mutation.
  */
 export async function withChainEnv<T>(
-	chain: readonly string[] | undefined,
-	active: boolean,
+	chain: readonly string[],
 	spawn: () => Promise<T>,
 ): Promise<T> {
-	if (!active || !chain || !isRoutable(parseChainEnv(chain.join(",")))) return spawn();
+	if (chain.length === 0) return spawn();
 	const previous = process.env[CHAIN_ENV];
 	process.env[CHAIN_ENV] = chain.join(",");
 	try {
@@ -131,8 +130,6 @@ export interface GateRequest {
 	evidence: VerificationEvidence;
 	/** Absolute path of the running `pi` binary (`process.argv[1]`). */
 	piBinary: string;
-	/** Provider that serves the gate model. */
-	provider: string;
 	/** Agent definition name, e.g. `oracle`. */
 	agent: string;
 	/** Model used when the definition yields none. */
@@ -159,7 +156,7 @@ export async function runGate(
 	pi: ExtensionAPI,
 	req: GateRequest,
 ): Promise<VerificationResult> {
-	const { model, chain, tools, promptBody } = await resolveGateAgent({
+	const { chain, tools, promptBody } = await resolveGateAgent({
 		name: req.agent,
 		fallbackModel: req.fallbackModel,
 		defaultTools: DEFAULT_GATE_TOOLS,
@@ -191,23 +188,15 @@ export async function runGate(
 		};
 	}
 
-	// Note: --no-extensions is deliberately NOT passed. The provider serving the
-	// gate model is itself a local extension (`litellm.ts`), so disabling
-	// extension discovery would make the model unresolvable. That is also what
-	// makes the fallback router available to the child.
-	//
-	// With a routable chain, the child launches on `fallback/auto` instead of one
-	// model, so a provider error during the audit hops rather than burning pi's
-	// retry budget against a dead model and returning `inconclusive` (which stops
-	// the loop). `isRoutable` is the shared definition: two entries to hop,
-	// or a single pinned entry whose thinking level only the router applies.
-	const useChain = !!chain && isRoutable(parseChainEnv(chain.join(",")));
+	// The gate always launches on `fallback/auto` with its chain in the env:
+	// the router is the only path, and a provider error during the audit hops
+	// rather than burning pi's retry budget against a dead model and returning
+	// `inconclusive` (which stops the loop).
 	const args = [
 		"-p",
 		"--no-session",
-		...(useChain ? [] : ["--provider", req.provider]),
 		"--model",
-		useChain ? FALLBACK_MODEL_REF : model,
+		FALLBACK_MODEL_REF,
 		"--tools",
 		tools.join(","),
 	];
@@ -223,7 +212,7 @@ export async function runGate(
 		// *previous* value rather than deleting matters: this process may itself be
 		// a delegated child with its own chain, and clobbering it would change how
 		// the loop's own model requests are routed.
-		result = await withChainEnv(chain, useChain, () =>
+		result = await withChainEnv(chain, () =>
 			pi.exec(req.piBinary, args, {
 				cwd: req.evidence.cwd,
 				timeout: VERIFY_TIMEOUT_MS,

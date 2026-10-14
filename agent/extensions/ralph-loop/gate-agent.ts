@@ -2,12 +2,12 @@
  * Ralph loop — the gate agent's resolution seam.
  *
  * Both verification gates launch a headless `pi` child from an agent
- * definition, and both need the same four facts from it: which model, which
- * fallback chain, which tools, and which system-prompt body. This module is
- * the one place that reads `agent/agents/<name>.md` for a gate — the static
- * gate (`gate.ts`) and the runtime gate (`runtime-gate.ts`) are adapters at
- * this seam, parameterised only by what they are (name, fallback model,
- * default tools).
+ * definition, and both need the same three facts from it: which fallback
+ * chain, which tools, and which system-prompt body. This module is the one
+ * place that reads `agent/agents/<name>.md` for a gate — the static gate
+ * (`gate.ts`) and the runtime gate (`runtime-gate.ts`) are adapters at this
+ * seam, parameterised only by what they are (name, fallback model, default
+ * tools).
  *
  * ## Why a chain and not just a model
  *
@@ -30,11 +30,11 @@ import { agentsDir } from "../lib/layout.js";
 // The chain rule is owned by the module that defines it: one parser per
 // format, so the gates cannot drift from the launcher.
 import { childFallbackChain } from "../subagent-herdr/lib.js";
+import { formatChainItem, parseChainItem } from "../model-fallback/lib.js";
 
-/** The four facts both gates launch a child with. */
+/** The three facts both gates launch a child with. */
 export interface ResolvedGateAgent {
-	model: string;
-	chain?: string[];
+	chain: string[];
 	tools: string[];
 	promptBody: string;
 }
@@ -50,11 +50,17 @@ export interface GateAgentDefaults {
 }
 
 /**
- * Resolve the gate's model, chain and tools from its agent definition.
+ * Resolve the gate's chain and tools from its agent definition.
  *
  * Read from `agent/agents/<name>.md` so the gate tracks the fleet definition
  * rather than duplicating a model id. Falls back rather than throwing: a
  * missing or malformed definition must not take the loop down.
+ *
+ * The chain is the declaration canonicalised through the shared chain rule —
+ * a model-less declaration keeps its declared `fallback_models` in order,
+ * and only a declaration that yields nothing at all degrades to the
+ * fallback model alone (canonicalised the same way, so a pinned fallback
+ * model keeps its pin).
  *
  * @param defaults The adapter's identity: agent name, fallback model and
  *   default tools.
@@ -69,10 +75,7 @@ export async function resolveGateAgent(
 		const info = parseAgentFile(content, `${name}.md`);
 		if (info) {
 		  return {
-		    model: info.model ?? fallbackModel,
-		    // `undefined` when the definition declares no usable chain, which
-		    // leaves the launch byte-identical to pre-feature.
-		    chain: childFallbackChain(undefined, info),
+		    chain: childFallbackChain(undefined, info) ?? canonicalChainItem(fallbackModel),
 		    tools: info.tools?.length ? info.tools : [...defaultTools],
 		    promptBody: info.promptBody,
 		  };
@@ -80,5 +83,17 @@ export async function resolveGateAgent(
 	} catch {
 		// Fall through to defaults.
 	}
-	return { model: fallbackModel, tools: [...defaultTools], promptBody: "" };
+	return { chain: canonicalChainItem(fallbackModel), tools: [...defaultTools], promptBody: "" };
+}
+
+/** One fallback model as a chain item, canonicalised through the item grammar. */
+function canonicalChainItem(model: string): string[] {
+	const entry = parseChainItem(model);
+	// The `: [model]` branch is unreachable for the two gate constants
+	// (`GATE_FALLBACK_MODEL`, `RUNTIME_FALLBACK_MODEL`), which are both plain
+	// `provider/id` refs that parse — and this seam is documented never to
+	// throw, so a future constant that does not parse degrades to the bare
+	// string instead of taking the loop down. `lib.test.ts` pins that both
+	// constants parse, so the branch cannot become reachable silently.
+	return entry ? [formatChainItem(entry)] : [model];
 }

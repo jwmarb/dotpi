@@ -65,33 +65,33 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   orchestrator is always allowed, which is how you debug one by hand. Unspawnable agents
   are filtered out of the "Available agents" error list too, so a caller is never
   advertised what it cannot use.
-- **Every agent declares `fallback_models`** (all 10 do), and the list now has **two jobs**.
-  It still covers a failure to *launch* — unknown model, provider down or rate-limiting —
-  which is `candidateModels` in `extensions/subagent-herdr/lib.ts`: one spawn attempt per
-  model until one accepts the task. It is now **also** the child's runtime chain: the same
-  list crosses as `PI_FALLBACK_CHAIN` (`childFallbackChain`), the child launches on
-  `fallback/auto`, and a provider error *mid-task* moves work to the next model instead of
-  re-asking the one that just failed — then hands the following request back to the primary.
-  So the order now matters twice, and a chain whose later entries are unreachable degrades a
-  running child as well as a launching one. An explicit `model` on the delegation call
-  suppresses both: the caller pinned it. See `extensions/model-fallback/AGENTS.md`. Recon
+- **Every agent declares `fallback_models`** (all 10 do), and the list feeds the **router**.
+  `childFallbackChain` in `extensions/subagent-herdr/lib.ts` builds a non-empty deduped
+  canonical chain from the agent's `model` and `fallback_models`; that chain crosses as
+  `PI_FALLBACK_CHAIN` and the child always launches on `fallback/auto`. A provider error
+  *mid-task* moves work to the next model instead of re-asking the one that just failed —
+  then hands the following request back to the primary. So the order matters: a chain whose
+  later entries are unreachable degrades a running child. An explicit `model` on the
+  delegation call yields a **singleton chain** (the caller's pin is preserved, agent-file
+  fallbacks are suppressed). See `extensions/model-fallback/AGENTS.md`. Recon
   agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
   `librarian` on `occamy-1.0`, `summarizer` on `deepseek-v4-flash`. A model reference here
-  must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
+  must exist on the gateway: an unreachable primary costs the router a hop per run, and an
   unreachable *tail* degrades a running child, so verify against
   `/model_group/info` rather than by eye.
 - **A chain entry may pin its thinking level: `ref|level`.** `model:` and each
   `fallback_models:` entry accept `openai/gpt-5.6-sol|high` — the seven case-sensitive
   levels `off|minimal|low|medium|high|xhigh|max`. The pin overrides the session's
   selected level for the requests that entry answers, and it is applied only by the
-  child's `fallback/auto` router — so a **single pinned model is a chain**: it
-  registers the router and launches on it, even with no `fallback_models`.
+  child's `fallback/auto` router. **Any non-empty chain is valid** — the router registers
+  for every non-empty `PI_FALLBACK_CHAIN`, including a single unpinned entry, because the
+  child always launches on `fallback/auto` and needs at least one resolvable entry.
   An unpinned entry passes the selection through, so today's files (bare refs)
   behave exactly as before. The item grammar is owned by
-  `extensions/model-fallback/lib.ts` (`parseChainItem`/`formatChainItem`/`isRoutable`);
+  `extensions/model-fallback/lib.ts` (`parseChainItem`/`formatChainItem`);
   `agents.ts` keeps the value verbatim, and `PI_FALLBACK_CHAIN` carries the same
   `ref|level` text to the child. An explicit `model` on the delegation call
-  suppresses pins as well as fallbacks. Invalid levels drop the pin, keep the model.
+  yields a singleton chain with its pin preserved. Invalid levels drop the pin, keep the model.
 - **A searching agent declares `ffgrep`/`fffind`**, not just `grep`/`find`.
   `npm:@ff-labs/pi-fff` adds those as *extra* names and `tools` is an allowlist, so
   omitting them means never seeing them; the built-ins stay as the fallback for a session

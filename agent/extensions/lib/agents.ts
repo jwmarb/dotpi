@@ -47,10 +47,12 @@ export interface AgentInfo {
    */
   model?: string;
   /**
-   * Fallback models, from the file's `fallback_models` key. Tried in order by
-   * the spawn path when a child fails to *launch* (an unknown model, or a
-   * provider that is down or rate-limiting, makes pi exit before its TUI
-   * appears). An explicit model on the delegation call suppresses them.
+   * Fallback models, from the file's `fallback_models` key. They feed the
+   * child's runtime chain: the child launches on `fallback/auto` and a
+   * provider failure *mid-task* hops to the next entry instead of re-asking
+   * the one that just failed. An explicit model on the delegation call
+   * replaces the whole declaration with a one-entry chain (its own pin kept,
+   * no fallbacks appended).
    *
    * Each entry is the raw frontmatter value: a bare reference, or `ref|level`
    * pinning the thinking level that entry should run at (see {@link model}).
@@ -204,8 +206,8 @@ export function mergeAgents(global: AgentInfo[], skillAgents: AgentInfo[]): Agen
  * case-sensitive words `off|minimal|low|medium|high|xhigh|max`. The parser
  * keeps these values verbatim — validation and application belong to the
  * model-fallback extension, which owns the item grammar
- * (`parseChainItem`/`isRoutable`). An explicit model on the delegation call
- * suppresses both the fallbacks and any agent-file pins.
+ * (`parseChainItem`). An explicit model on the delegation call replaces the
+ * whole declaration with a one-entry chain (its own pin kept, no fallbacks).
  *
  * @returns The parsed agent, or `null` when the frontmatter is missing or
  *          has no `name` (such a file is skipped by discovery).

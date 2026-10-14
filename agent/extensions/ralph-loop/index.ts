@@ -99,10 +99,7 @@ const GATE_AGENT = "oracle";
  * Fallback model if the agent definition cannot be read. Matches oracle.md's
  * declared model so behaviour does not silently change.
  */
-const GATE_FALLBACK_MODEL = "openai/gpt-5.6-sol";
-
-/** Provider that serves the gate model (see `agent/extensions/litellm.ts`). */
-const GATE_PROVIDER = "litellm";
+export const GATE_FALLBACK_MODEL = "openai/gpt-5.6-sol";
 
 /** Tool argument keys that carry a file path, in preference order. */
 const PATH_KEYS = ["path", "file", "file_path", "filePath"] as const;
@@ -494,7 +491,6 @@ export default function activate(pi: ExtensionAPI): void {
 					state: snapshot,
 					evidence,
 					piBinary: piBinaryPath(),
-					provider: GATE_PROVIDER,
 					agent: GATE_AGENT,
 					fallbackModel: GATE_FALLBACK_MODEL,
 				});
@@ -556,7 +552,6 @@ export default function activate(pi: ExtensionAPI): void {
 					artifacts,
 					web: image.web,
 					piBinary: piBinaryPath(),
-					provider: GATE_PROVIDER,
 				});
 				return void finish(result, "runtime");
 			}

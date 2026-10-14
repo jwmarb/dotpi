@@ -19,7 +19,9 @@ failed; once a fallback answers, the **original model gets the next request**.
 "defaultModel": "auto",
 "retry": { "maxRetries": 30, ... },
 "modelFallback": {
-  "chain": ["qwen/qwen3.8-27b", { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
+  "chain": [{ "model": "anthropic/claude-opus-5.5", "thinking": "low" },
+            { "model": "anthropic/claude-opus-5", "thinking": "low" },
+            "qwen/qwen3.8-27b", "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
   "contextWindow": 262144, "maxTokens": 32768
 }
@@ -153,10 +155,10 @@ gateway.
 A child gets its chain from `PI_FALLBACK_CHAIN`, which `subagent-herdr` sets from the
 agent's `model:` and `fallback_models:` (each entry may be a bare ref or `ref|level`
 with a pinned thinking level); it then launches on `--model fallback/auto` instead of one
-model. All 10 agent files declare fallbacks, so all 10 compose a chain — verified by
-composing the real spawn inputs from the real files and asserting that the chain starts at
-each agent's declared `model`, that the `--model` flag and the env agree, that the
-handshake vars survive, and that a pinned `model` suppresses the chain for every one.
+model. All 10 agent files declare fallbacks, so all 10 compose a non-empty chain — verified
+by composing the real spawn inputs from the real files and asserting that the chain starts at
+each agent's declared `model`, that the `--model` flag is always `fallback/auto`, and that
+an explicit `model` on the delegation call yields a singleton chain.
 
 **A running pi holds the extension code it started with.** Delegating from a session that
 started before `subagent-herdr/index.ts` changed spawns a child with the *old* launcher: it
@@ -172,7 +174,7 @@ answered, the next request went back to the primary, task completed.
 
 ## MEASURED BEHAVIOUR
 
-Everything below was produced by running pi 1.0.2 (the running pi is now **1.0.4**), not
+Everything below was produced by running pi 1.0.2 (the running pi has since moved to 1.1.x), not
 inferred. The harness used a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection
 refused on every request), so the primary fails deterministically. The chains quoted below
 (`deadend/void`, `deadend/void2`, `claude-haiku-4.5`) are that harness's, **not** the live
@@ -265,7 +267,8 @@ is what made the formula wrong rather than merely conservative.
   that is when the virtual model is registered. `settings.ts` owns that read;
   `retry.maxRetries` still goes through `pi.getSettings()` at call time, where it
   is live and `/reload` can change it.
-- **`isRoutable` is the one definition of "worth registering the router"** (`index.ts` guards `!isRoutable(chain)`). Two entries (or more) need it to hop; a **single pinned entry** needs it too, because the route-time override is the only place a pin is applied. What it rules out is one *unpinned* model: a `fallback/auto` over one unpinned model would be a selectable model that spends a logical cycle per failure with nowhere to hop — worse than its absence, since pi's own retry already does that and does it honestly. The threshold lives in `lib.ts` rather than being re-derived in each consumer (`subagent-herdr/lib.ts` `childFallbackChain`/`buildChildEnv`, `subagent-herdr/index.ts` `launchAttempt`, `ralph-loop/gate.ts` `withChainEnv`/`runGate`, `ralph-loop/runtime-gate.ts` `runRuntimeGate`), so a future change to the rule cannot drift across six call sites.
+- **`shouldRegisterRouter(chain, source)` is the registration guard** (`index.ts` calls it with `"environment"` or `"settings"`). For `"environment"` (the `PI_FALLBACK_CHAIN` var set by `subagent-herdr` or `ralph-loop`), any non-empty chain registers: the child always launches on `fallback/auto`, so even a single unpinned entry must be routable. For `"settings"` (the `settings.json` chain read at load), `isRoutable(chain)` applies: two or more entries, or at least one pinned entry. This split exists because the env var is set by code that has already validated the chain, while settings.json is user-authored and a single unpinned entry there is a misconfiguration the router should not silently accept. An empty or malformed env value must not mask a valid settings.json chain: `index.ts` checks the env first and only falls through to settings when the env yields nothing. The threshold lives in `lib.ts` rather than being re-derived in each consumer, so a future change to the rule cannot drift across call sites.
+- **`modelFallback.enabled: false` cannot unregister a chain the parent committed.** The env var is read *before* the disable check, and `isDisabled` is skipped whenever the env chain is non-empty: a process launched on `fallback/auto` with `PI_FALLBACK_CHAIN` set cannot resolve its model without the router, so the settings switch only governs sessions that got no chain from a parent. A `PI_FALLBACK_CHAIN` that is set but parses to nothing logs a one-line `console.warn` at load: the session falls back to the settings.json chain when there is one, and nothing registers otherwise.
 - **A virtual model is never a valid route, so `resolve()` filters it out.**
   `getAvailable()` *includes* virtual entries (`virtual-models.js`
   `withVirtualModels` adds them to the provider's `getModels()`) and a keyless

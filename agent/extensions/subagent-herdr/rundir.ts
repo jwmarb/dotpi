@@ -118,12 +118,12 @@ export type RunStatus = "running" | "done" | "failed" | "cancelled";
 /**
  * One launch attempt that failed before the run started.
  *
- * Kept on the record so a degraded fleet is visible after the fact: a run that
- * succeeded on its second model looks identical to one that succeeded on its
- * first unless the failure is written down.
+ * Kept on the record so a failed spawn is diagnosable after the fact. At most
+ * one entry exists now (one launch attempt), and `model` names the router the
+ * attempt ran on, not a head ref.
  */
 export interface FailedAttempt {
-	/** The model that failed to launch, or `undefined` for pi's default. */
+	/** The model the attempt ran on — the router, since there is no other path. */
 	model?: string;
 	/** Why it failed, as reported by the launcher. */
 	error: string;
@@ -147,17 +147,12 @@ export interface RunRecord {
 	startedAt: number;
 	finishedAt?: number;
 	/**
-	 * The model the run actually launched on, set only when it is *not* the model
-	 * first requested (i.e. a launch fallback was used). Absent is the common case
-	 * and means `model` ran.
-	 *
-	 * This is the *launch* model, not necessarily what answered a given request:
-	 * a child with a `fallbackChain` launches on the router and its requests are
-	 * dispatched across the chain, so the authority for "what answered" is the
-	 * child's own transcript, where each assistant message names its physical
-	 * model. Reading this field as "the model that did the work" was true before
-	 * the runtime chain existed and is not any more.
-	 */
+	 * Legacy: the launch-fallback model, written by the pre-router launch loop
+	 * (one attempt per candidate model). Nothing reads it anymore — it is kept
+	 * only so old records stay valid — and nothing writes it. Every launch is
+	 * on `fallback/auto`, so `model` plus `fallbackChain` is the whole story;
+	 * what answered a given request is the child's own transcript, where each
+	 * assistant message names its physical model.
 	resolvedModel?: string;
 	/**
 	 * The runtime fallback chain handed to the child, when it has one.
@@ -166,7 +161,7 @@ export interface RunRecord {
 	 * from one that could not, which `resolvedModel` alone no longer answers.
 	 */
 	fallbackChain?: string[];
-	/** Launch attempts that failed before this run started, in order. */
+	/** The failed launch attempt, when there is one — at most one entry now. */
 	failedAttempts?: FailedAttempt[];
 	/**
 	 * The target run id for a programmatically spawned health-check run. Absent

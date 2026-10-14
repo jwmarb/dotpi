@@ -19,9 +19,7 @@ import {
   buildHealthCheckTask,
   agentNameRejection,
   childNameRejection,
-  candidateModels,
   childFallbackChain,
-  describeLaunchFailure,
   DONE_TOOL_NAME,
   extractRunResult,
   herdrAgentName,
@@ -119,14 +117,13 @@ describe("buildChildArgv", () => {
     expect(argv).not.toContain("--tools");
   });
 
-  test("includes model and system prompt when given, and never a positional task", () => {
+  test("always launches on the router, and never a positional task", () => {
     const argv = buildChildArgv({
       ...base,
-      model: "openai/gpt-5.6-sol",
       systemPromptPath: "/abs/runs/sub-0001/system-prompt.md",
     });
     expect(argv).toContain("--model");
-    expect(argv).toContain("openai/gpt-5.6-sol");
+    expect(argv).toContain(FALLBACK_MODEL_REF);
     expect(argv).toContain("--append-system-prompt");
     expect(argv[argv.length - 1]).toBe("/abs/runs/sub-0001/system-prompt.md");
   });
@@ -745,16 +742,16 @@ describe("buildChildEnv", () => {
     expect(env.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b,anthropic/claude-opus-5");
   });
 
-  test("omits the chain var entirely when there is nothing to hop between", () => {
-    // An absent var must leave the child byte-identical to pre-feature: a
-    // one-model "chain" would register a router that can only ever pick one
-    // model, which is a selectable model that silently does nothing.
+  test("emits the var for any non-empty chain, including a single unpinned entry", () => {
+    // The child always launches on `fallback/auto`, so a one-model chain must
+    // cross too: without the var the child's router registers nothing and
+    // `fallback/auto` is unresolvable. Only an absent or empty chain omits it.
     const none = buildChildEnv({ runId: "sub-0011", agent: "worker" }, "w5:p1", "/runs");
     expect(none.PI_FALLBACK_CHAIN).toBeUndefined();
     const single = buildChildEnv({ runId: "sub-0012", agent: "worker" }, "w5:p1", "/runs", [
       "worker",
     ], ["qwen/qwen3.8-27b"]);
-    expect(single.PI_FALLBACK_CHAIN).toBeUndefined();
+    expect(single.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b");
     const empty = buildChildEnv({ runId: "sub-0013", agent: "worker" }, "w5:p1", "/runs", [
       "worker",
     ], []);
@@ -785,38 +782,125 @@ describe("childFallbackChain", () => {
     ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5", "qwen/qwen3.8-27b"]);
   });
 
-  test("an explicitly requested model suppresses the chain", () => {
-    // Same rule candidateModels applies: the caller pinned a model, so hopping
-    // off it mid-task would be a surprise rather than a recovery.
+  test("an explicitly requested model is a one-entry chain, pin kept and no fallbacks appended", () => {
+    // The caller named exactly this model for this run, so the chain is just
+    // that model — hopping off it mid-run would be a surprise, not a recovery.
     expect(
-      childFallbackChain("my/pinned", {
+      childFallbackChain("my/pinned|low", {
         model: "openai/gpt-5.6-sol",
         fallbackModels: ["qwen/qwen3.8-27b"],
       }),
+    ).toEqual(["my/pinned|low"]);
+  });
+  test("an explicitly requested pinned model is a one-entry chain with its pin", () => {
+    const agent = {
+      model: "openai/gpt-5.6-sol",
+      fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
+    };
+    expect(childFallbackChain("openai/x|high", agent)).toEqual(["openai/x|high"]);
+  });
+
+  test("naming the router itself yields no chain — it cannot route to itself", () => {
+    // The chain is only ever served by the router, and the router resolves to
+    // a physical model, never to `fallback/auto` again: such a child is dead
+    // on its first request, so the launcher refuses up front.
+    const agent = {
+      model: "openai/gpt-5.6-sol",
+      fallbackModels: ["qwen/qwen3.8-27b"],
+    };
+    expect(childFallbackChain("fallback/auto", agent)).toBeUndefined();
+    // Case-insensitive, so `FALLBACK/AUTO` in a hand-edited call is refused too.
+    expect(childFallbackChain("FALLBACK/AUTO", agent)).toBeUndefined();
+    // Whitespace around the ref is normalised before the comparison.
+    expect(childFallbackChain("  fallback/auto  ", agent)).toBeUndefined();
+  });
+
+  test("an explicit request with an invalid |level pin is refused, not silently dropped", () => {
+    // The item grammar degrades `openai/x|ultra` to `openai/x`; an explicit
+    // request names exactly this model for this run, so a pin it wrote must be
+    // one the router applies. An invalid pin is a refusal, and the spawn then
+    // reports it with the requested-model message.
+    const agent = { model: "openai/gpt-5.6-sol", fallbackModels: ["qwen/qwen3.8-27b"] };
+    expect(childFallbackChain("openai/x|ultra", agent)).toBeUndefined();
+    // Levels are exact: case-sensitive, no trimming.
+    expect(childFallbackChain("openai/x|HIGH", agent)).toBeUndefined();
+    expect(childFallbackChain("openai/x|", agent)).toBeUndefined();
+    // A valid pin is still accepted.
+    expect(childFallbackChain("openai/x|high", agent)).toEqual(["openai/x|high"]);
+  });
+
+  test("a bare `auto` is the router's own model id and is refused in an explicit request", () => {
+    // `auto` is `FALLBACK_MODEL_ID` — the router's model, not a physical model
+    // the router can route to. A request for it is refused like `fallback/auto`.
+    const agent = { model: "openai/gpt-5.6-sol", fallbackModels: ["qwen/qwen3.8-27b"] };
+    expect(childFallbackChain("auto", agent)).toBeUndefined();
+    expect(childFallbackChain("  AUTO  ", agent)).toBeUndefined();
+  });
+
+  test("a whitespace-only request is treated as no request", () => {
+    const agent = {
+      model: "openai/gpt-6.0-sol",
+      fallbackModels: ["qwen/qwen3.8-27b"],
+    };
+    expect(childFallbackChain("   ", agent)).toEqual([
+      "openai/gpt-6.0-sol",
+      "qwen/qwen3.8-27b",
+    ]);
+  });
+
+  test("a declared model naming the router itself is skipped, not a chain head", () => {
+    // `fallback/auto` in a declaration names the router, not a model: it is
+    // unusable, so the next valid entry becomes the head (or nothing, if none).
+    expect(
+      childFallbackChain(undefined, {
+        model: "fallback/auto",
+        fallbackModels: ["qwen/qwen3.8-27b"],
+      }),
+    ).toEqual(["qwen/qwen3.8-27b"]);
+    expect(
+      childFallbackChain(undefined, { model: "FALLBACK/AUTO", fallbackModels: [] }),
     ).toBeUndefined();
   });
 
-  test("an agent with no fallbacks gets no chain", () => {
-    expect(childFallbackChain(undefined, { model: "qwen/qwen3.8-27b" })).toBeUndefined();
+  test("a pi-style `ref:level` request is converted to `ref|level`", () => {
+    // pi's own `--model ref:level` form is translated on the way in, so a
+    // request written the way pi writes it keeps working.
+    const agent = { model: "openai/gpt-5.6-sol", fallbackModels: ["qwen/qwen3.8-27b"] };
+    expect(childFallbackChain("openai/gpt-5.6-sol:high", agent)).toEqual([
+      "openai/gpt-5.6-sol|high",
+    ]);
+    // Only a plain ref (no other colon) is converted: `openai:gpt:high` does
+    // not parse at all and stays a refusal.
+    expect(childFallbackChain("openai:gpt:high", agent)).toBeUndefined();
+  });
+
+  test("an agent with no fallbacks still gets a one-entry chain", () => {
+    // A single unpinned model is a legal chain: the child launches on the
+    // router, so there is no "no chain" case for a declared model.
+    expect(childFallbackChain(undefined, { model: "qwen/qwen3.8-27b" })).toEqual([
+      "qwen/qwen3.8-27b",
+    ]);
     expect(
       childFallbackChain(undefined, { model: "qwen/qwen3.8-27b", fallbackModels: [] }),
-    ).toBeUndefined();
+    ).toEqual(["qwen/qwen3.8-27b"]);
   });
 
-  test("an agent with no declared model gets no chain", () => {
-    // Without a primary there is no "original model" to come back to, and the
-    // chain's first entry would silently become the first fallback.
-    expect(childFallbackChain(undefined, { fallbackModels: ["qwen/qwen3.8-27b"] })).toBeUndefined();
+  test("an agent with no declared model uses its first valid fallback as the chain head", () => {
+    // Without a primary the first fallback becomes the chain head; a single
+    // valid fallback is still a one-entry chain.
+    expect(childFallbackChain(undefined, { fallbackModels: ["qwen/qwen3.8-27b"] })).toEqual([
+      "qwen/qwen3.8-27b",
+    ]);
   });
 
-  test("drops a fallback that repeats the primary, leaving no chain", () => {
-    // The dedupe collapses this to one model, which is the no-chain case.
+  test("drops a fallback that repeats the primary, leaving a one-entry chain", () => {
+    // The dedupe collapses this to one model, which is still a legal chain.
     expect(
       childFallbackChain(undefined, {
         model: "qwen/qwen3.8-27b",
         fallbackModels: ["qwen/qwen3.8-27b"],
       }),
-    ).toBeUndefined();
+    ).toEqual(["qwen/qwen3.8-27b"]);
   });
 
   test("keeps declared order and drops later duplicates", () => {
@@ -827,34 +911,29 @@ describe("childFallbackChain", () => {
     ]);
   });
 
-  test("agrees with candidateModels on which models are in play", () => {
-    // The two functions read the same declaration for different jobs; if they
-    // disagreed, a child could launch on a model its router cannot route to.
+  test("returns the declaration canonicalised, in priority order", () => {
+    // The chain is the declaration itself, canonicalised through the item
+    // grammar — the primary first, then the fallbacks, deduped by ref.
     const agent = {
       model: "openai/gpt-5.6-sol",
       fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
     };
-    expect(childFallbackChain(undefined, agent)).toEqual(candidateModels(undefined, agent));
+    expect(childFallbackChain(undefined, agent)).toEqual([
+      "openai/gpt-5.6-sol",
+      "anthropic/claude-opus-5",
+      "qwen/qwen3.8-27b",
+    ]);
   });
 
-  test("a grammar-rejected item: lenient launcher, strict chain, one runtime consequence — together", () => {
-    // `bad:ref` carries the legacy `:` separator, so the item grammar rejects it.
-    // The two halves intentionally disagree on it: `candidateModels` passes it
-    // through (a bad name is a launch failure pi reports), `childFallbackChain`
-    // drops it (the router must not advertise a model it cannot resolve). With
-    // two valid entries left the chain is routable, so at runtime the malformed
-    // item never reaches `--model`: the child launches on `fallback/auto` with
-    // the strict chain in the env var. Pinning all three together keeps the
-    // asymmetry from drifting back into silent agreement.
+  test("a grammar-rejected item is dropped from the chain, and the env carries the strict chain", () => {
+    // `bad:ref` carries the legacy `:` separator, so the item grammar rejects
+    // it. The chain drops it: the router must not advertise a model it cannot
+    // resolve. With the valid entries the child launches on `fallback/auto`
+    // with the strict chain in the env var.
     const agent = {
       model: "openai/gpt-5.6-sol",
       fallbackModels: ["bad:ref", "qwen/qwen3.8-27b|low"],
     };
-    expect(candidateModels(undefined, agent)).toEqual([
-      "openai/gpt-5.6-sol",
-      "bad:ref",
-      "qwen/qwen3.8-27b",
-    ]);
     const chain = childFallbackChain(undefined, agent);
     expect(chain).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b|low"]);
     const env = buildChildEnv(
@@ -913,6 +992,15 @@ describe("childFallbackChain", () => {
         fallbackModels: ["qwen/qwen3.8-27b:high", "anthropic/claude-opus-5"],
       }),
     ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5"]);
+  });
+  test("returns undefined only when no valid reference exists at all", () => {
+    // Nothing requested and nothing declared that the item grammar accepts:
+    // the caller must refuse the launch, because the router has nothing to serve.
+    expect(childFallbackChain(undefined, {})).toBeUndefined();
+    expect(
+      childFallbackChain(undefined, { model: "bad:ref", fallbackModels: ["also:bad"] }),
+    ).toBeUndefined();
+    expect(childFallbackChain("bad:ref", { model: "openai/gpt-5.6-sol" })).toBeUndefined();
   });
 });
 
@@ -1082,119 +1170,6 @@ describe("rundir record shapes", () => {
 
 });
 
-// ---------------------------------------------------------------------------
-// Model fallback
-// ---------------------------------------------------------------------------
-
-describe("candidateModels", () => {
-  test("tries the agent's model first, then its fallbacks in order", () => {
-    expect(
-      candidateModels(undefined, {
-        model: "openai/gpt-5.6-sol",
-        fallbackModels: ["anthropic/claude-opus-5", "qwen/qwen3.8-27b"],
-      }),
-    ).toEqual(["openai/gpt-5.6-sol", "anthropic/claude-opus-5", "qwen/qwen3.8-27b"]);
-  });
-
-  test("an explicitly requested model suppresses the fallbacks", () => {
-    // The caller named a model; silently running a different one would be a
-    // surprise, not a recovery.
-    expect(
-      candidateModels("my/pinned-model", {
-        model: "openai/gpt-5.6-sol",
-        fallbackModels: ["qwen/qwen3.8-27b"],
-      }),
-    ).toEqual(["my/pinned-model"]);
-  });
-
-  test("an agent with no fallbacks yields exactly one attempt", () => {
-    expect(candidateModels(undefined, { model: "qwen/qwen3.8-27b" })).toEqual([
-      "qwen/qwen3.8-27b",
-    ]);
-  });
-
-  test("an agent with no model at all still yields one attempt: pi's default", () => {
-    // `[undefined]` means "launch without --model", not "launch nothing".
-    expect(candidateModels(undefined, {})).toEqual([undefined]);
-  });
-
-  test("drops a fallback that repeats the primary", () => {
-    // A duplicate would buy a second identical attempt against the same dead
-    // provider.
-    expect(
-      candidateModels(undefined, {
-        model: "qwen/qwen3.8-27b",
-        fallbackModels: ["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"],
-      }),
-    ).toEqual(["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"]);
-  });
-
-  test("keeps the declared order rather than sorting or deduping globally", () => {
-    expect(
-      candidateModels(undefined, { model: "a", fallbackModels: ["c", "b", "c"] }),
-    ).toEqual(["a", "c", "b"]);
-  });
-
-  test("a pinned item launches on its bare ref: the pin is routing metadata, not a model", () => {
-    expect(
-      candidateModels(undefined, {
-        model: "openai/gpt-5.6-sol|high",
-        fallbackModels: ["qwen/qwen3.8-27b|low"],
-      }),
-    ).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"]);
-  });
-
-  test("dedup is by ref, case-insensitively: a pinned duplicate of the primary buys no attempt", () => {
-    expect(
-      candidateModels(undefined, {
-        model: "qwen/qwen3.8-27b",
-        fallbackModels: ["QWEN/qwen3.8-27b|high", "openai/gpt-5.6-sol"],
-      }),
-    ).toEqual(["qwen/qwen3.8-27b", "openai/gpt-5.6-sol"]);
-  });
-
-  test("an item the item grammar rejects passes through unchanged: pi reports the bad name", () => {
-    expect(
-      candidateModels(undefined, {
-        model: "openai/gpt-5.6-sol",
-        fallbackModels: ["qwen/qwen3.8-27b:high"],
-      }),
-    ).toEqual(["openai/gpt-5.6-sol", "qwen/qwen3.8-27b:high"]);
-  });
-});
-
-describe("describeLaunchFailure", () => {
-  test("a single failure reports its own error verbatim", () => {
-    expect(
-      describeLaunchFailure([{ model: "qwen/q", error: "pane w5:p1 did not become interactive" }]),
-    ).toBe("pane w5:p1 did not become interactive");
-  });
-
-  test("several failures name every model tried", () => {
-    // Otherwise "did not become interactive" sends a reader to the pane when
-    // the real cause is that no declared model is reachable.
-    const text = describeLaunchFailure([
-      { model: "openai/gpt-5.6-sol", error: "exited 1" },
-      { model: "qwen/qwen3.8-27b", error: "exited 1" },
-    ]);
-    expect(text).toContain("All 2 candidate models failed");
-    expect(text).toContain("openai/gpt-5.6-sol");
-    expect(text).toContain("qwen/qwen3.8-27b");
-  });
-
-  test("names the default model when no model was declared", () => {
-    const text = describeLaunchFailure([
-      { model: undefined, error: "a" },
-      { model: "x", error: "b" },
-    ]);
-    expect(text).toContain("(default model)");
-  });
-
-  test("an empty list still produces a usable message", () => {
-    expect(describeLaunchFailure([])).toBe("The child could not be launched.");
-  });
-});
-
 describe("agentNameRejection", () => {
   test("accepts the names this repo's agents actually use", () => {
     for (const n of ["worker", "explorer", "librarian", "oracle", "planner", "reviewer", "spiker"]) {
@@ -1288,38 +1263,34 @@ describe("childNameRejection", () => {
     expect(agents.length).toBeGreaterThan(0);
     for (const a of agents) {
       const chain = childFallbackChain(undefined, a);
-      const models = candidateModels(undefined, a);
+      // Every agent declares a model, so every agent composes a non-empty
+      // chain that the router serves.
+      expect(chain).toBeDefined();
       const env = buildChildEnv({ runId: "sub-0001", agent: a.name }, "w5:p1", "/runs", [a.name], chain);
       const argv = buildChildArgv({
         childDonePath: "/x/child-done.ts",
         runDir: "/runs",
         runId: "sub-0001",
-        model: chain && chain.length > 1 ? FALLBACK_MODEL_REF : models[0],
         tools: a.tools,
       });
       const flagModel = argv[argv.indexOf("--model") + 1];
 
-      if (chain) {
-        // A chain means the router runs, and the env must describe it.
-        expect(flagModel).toBe(FALLBACK_MODEL_REF);
-        expect(env.PI_FALLBACK_CHAIN).toBe(chain.join(","));
-        // The primary must be the model the agent declared, or the agent's
-        // stated preference is silently not what runs first.
-        expect(chain[0]).toBe(a.model);
-        expect(chain).toEqual(models as string[]);
-      } else {
-        // No chain: launch exactly as before this feature existed.
-        expect(flagModel).not.toBe(FALLBACK_MODEL_REF);
-        expect(env.PI_FALLBACK_CHAIN).toBeUndefined();
-      }
+      // The child always launches on the router, and the env must describe the
+      // chain it serves.
+      expect(flagModel).toBe(FALLBACK_MODEL_REF);
+      expect(env.PI_FALLBACK_CHAIN).toBe(chain!.join(","));
+      // The primary must be the model the agent declared, or the agent's
+      // stated preference is silently not what runs first.
+      expect(chain![0]).toBe(a.model);
 
-      // The handshake and the cycle check must survive either way.
+      // The handshake and the cycle check must survive.
       expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0001");
       expect(env.PI_SUBAGENT_AGENT).toBe(a.name);
       expect(env.PI_SUBAGENT_LINEAGE).toContain(a.name);
 
-      // A pinned model suppresses the chain for every agent, with no exception.
-      expect(childFallbackChain("some/pinned", a)).toBeUndefined();
+      // An explicit model is a one-entry chain with its pin kept and no
+      // fallbacks appended.
+      expect(childFallbackChain("some/pinned|low", a)).toEqual(["some/pinned|low"]);
     }
   });
 
@@ -1493,8 +1464,8 @@ describe("errorPayload", () => {
   });
 
   // The contract that protects real failures: a crash must never be mistaken
-  // for a structured refusal, or the fallback loop would stop on a genuine
-  // problem it should have reported verbatim.
+  // for a structured refusal, or a genuine problem would stop the launch with
+  // a code it should have reported verbatim.
   test("does not mistake a crash or non-herdr output for a refusal", () => {
     for (const raw of [
       undefined,
@@ -1525,7 +1496,7 @@ describe("errorPayload", () => {
 });
 
 // ---------------------------------------------------------------------------
-// launchAttempt — the fatal classification
+// launchAttempt — name refusals vs genuine failures
 // ---------------------------------------------------------------------------
 
 /** A launcher whose `startAgent` fails with one herdr code, recording cleanup. */
@@ -1550,27 +1521,29 @@ const stubAgent = {
 
 const stubRec = { runId: "sub-9622", agent: "librarian", task: "t", cwd: "/tmp", status: "running", startedAt: 0 } as Parameters<typeof launchAttempt>[1];
 
-describe("launchAttempt fatal classification", () => {
-  // Regression: a name refusal is not model-specific, but it was retried
-  // against all three candidate models in well under 100 ms, which read as a
-  // dead fleet instead of one actionable error.
-  test("a name collision is fatal, so the model loop stops", async () => {
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
+/** The chain every direct `launchAttempt` call in this suite hands the child. */
+const stubChain = ["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"];
+describe("launchAttempt name refusals vs genuine failures", () => {
+  // Regression: a name refusal is not model-specific, so it must not be read
+  // as a dead fleet; it is one actionable error, not a broken model.
+  test("a name collision is a clean rejection, so it is not read as a dead model", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("agent_name_taken"), stubChain);
     expect(out.ok).toBe(false);
-    expect(out.fatal).toBe(true);
+    expect(out.paneId).toBeUndefined();
   });
 
-  test("a malformed name is fatal too", async () => {
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("invalid_agent_name"));
-    expect(out.fatal).toBe(true);
+  test("a malformed name is a clean rejection too", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("invalid_agent_name"), stubChain);
+    expect(out.ok).toBe(false);
+    expect(out.paneId).toBeUndefined();
   });
 
   // The remedies must stay distinct: `herdr agent list` is a dead end for a
   // malformed name, and collapsing the two codes into one message would repeat
   // the flattening this change exists to undo.
   test("each code gets its own remedy, and names the code", async () => {
-    const taken = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
-    const invalid = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("invalid_agent_name"));
+    const taken = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("agent_name_taken"), stubChain);
+    const invalid = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("invalid_agent_name"), stubChain);
     expect(taken.error).toContain("agent_name_taken");
     expect(taken.error).toContain("herdr agent list");
     expect(invalid.error).toContain("invalid_agent_name");
@@ -1584,23 +1557,23 @@ describe("launchAttempt fatal classification", () => {
       asked = name;
       return { ok: false, error: "agent_name_taken" };
     };
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, l);
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", l, stubChain);
     expect(asked).toBe("librarian-sub-9622");
     expect(out.error).toContain("librarian-sub-9622");
   });
 
   // A name refusal means herdr never ran pi, so the pane holds no scrollback
-  // and must not be retained as "evidence" — not even on the last attempt.
-  test("a name refusal always closes its pane, even when keepPaneOnFailure", async () => {
+  // and must not be retained as "evidence".
+  test("a name refusal always closes its pane", async () => {
     const closed: string[] = [];
-    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken", closed));
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("agent_name_taken", closed), stubChain);
     expect(closed).toEqual(["w9:p1"]);
   });
 
   // A refusal-closed pane must never be reported back, or a later cleanup path
   // could try to close it a second time.
-  test("a fatal name refusal reports no pane id", async () => {
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("agent_name_taken"));
+  test("a name refusal reports no pane id", async () => {
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("agent_name_taken"), stubChain);
     expect(out.paneId).toBeUndefined();
   });
 });
@@ -1633,8 +1606,7 @@ function recordingLauncher(): {
 }
 
 describe("launchAttempt fallback chain handoff", () => {
-  const chain = ["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"];
-
+  const chain = stubChain;
   test("a child with a chain launches on the router, with the chain in its env", async () => {
     // The two halves must agree: launching on `fallback/auto` without the chain
     // would register a router with nothing to route between, and the chain
@@ -1645,8 +1617,6 @@ describe("launchAttempt fallback chain handoff", () => {
       stubRec,
       "/tmp",
       "/tmp/p.md",
-      "openai/gpt-5.6-sol",
-      true,
       r.launcher,
       chain,
     );
@@ -1656,31 +1626,26 @@ describe("launchAttempt fallback chain handoff", () => {
     expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
   });
 
-  test("without a chain the model passes through unchanged", async () => {
-    // The no-regression case: a pinned or fallback-less agent must launch
-    // exactly as it did before this feature.
+  test("with no chain the child still launches on the router, and no chain var crosses", async () => {
+    // `spawnRun` refuses a chain-less agent before any pane, so this is the
+    // degenerate direct call: the model is always the router, and only a
+    // non-empty chain sets the env var.
     const r = recordingLauncher();
-    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "openai/gpt-5.6-sol", true, r.launcher);
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", r.launcher, []);
     expect(r.env()?.PI_FALLBACK_CHAIN).toBeUndefined();
     const argv = r.argv()!;
-    expect(argv[argv.indexOf("--model") + 1]).toBe("openai/gpt-5.6-sol");
+    expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
   });
 
-  test("a one-model chain is treated as no chain", async () => {
+  test("a single unpinned chain sets the env var and launches on the router", async () => {
+    // A one-model chain is a legal chain: the child launches on the router and
+    // the chain crosses, because a child without the router cannot resolve
+    // `fallback/auto`.
     const r = recordingLauncher();
-    await launchAttempt(
-      stubAgent,
-      stubRec,
-      "/tmp",
-      "/tmp/p.md",
-      "openai/gpt-5.6-sol",
-      true,
-      r.launcher,
-      ["openai/gpt-5.6-sol"],
-    );
-    expect(r.env()?.PI_FALLBACK_CHAIN).toBeUndefined();
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", r.launcher, ["openai/gpt-5.6-sol"]);
+    expect(r.env()?.PI_FALLBACK_CHAIN).toBe("openai/gpt-5.6-sol");
     const argv = r.argv()!;
-    expect(argv[argv.indexOf("--model") + 1]).toBe("openai/gpt-5.6-sol");
+    expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
   });
 
   test("a one-entry pinned chain launches on the router, with the pin in its env", async () => {
@@ -1692,8 +1657,6 @@ describe("launchAttempt fallback chain handoff", () => {
       stubRec,
       "/tmp",
       "/tmp/p.md",
-      "openai/gpt-5.6-sol",
-      true,
       r.launcher,
       ["openai/gpt-5.6-sol|high"],
     );
@@ -1706,40 +1669,35 @@ describe("launchAttempt fallback chain handoff", () => {
     // Regression guard: the chain is an addition, and the vars the handshake
     // and the cycle check depend on must survive it.
     const r = recordingLauncher();
-    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, r.launcher, chain);
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", r.launcher, chain);
     const env = r.env()!;
     expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-9622");
     expect(env.PI_SUBAGENT_AGENT).toBe("librarian");
     expect(env.PI_SUBAGENT_LINEAGE).toContain("librarian");
   });
 
-  // The contrast that matters: a real launch failure IS model-specific, so it
-  // must stay non-fatal and let the next candidate model be tried.
-  test("a genuine launch failure is not fatal and keeps its pane for evidence", async () => {
+  // A genuine launch failure keeps its pane for a human to read: with one
+  // launch attempt, the pane *is* the evidence.
+  test("a genuine launch failure keeps its pane for evidence", async () => {
     const closed: string[] = [];
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher("timeout", closed));
-    expect(out.fatal).toBeUndefined();
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher("timeout", closed), stubChain);
+    expect(out.ok).toBe(false);
     expect(out.paneId).toBe("w9:p1");
     expect(closed).toEqual([]);
     expect(out.error).toContain("did not become interactive");
     expect(out.error).toContain("timeout");
   });
 
-  test("a non-last genuine failure reclaims its pane", async () => {
-    const closed: string[] = [];
-    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", false, stubLauncher("timeout", closed));
-    expect(closed).toEqual(["w9:p1"]);
-  });
-
-  test("no pane at all is fatal: another model cannot help", async () => {
+  test("no pane at all reports no pane id: there is nothing to keep", async () => {
     const l = stubLauncher(null);
     l.createChildPane = async () => null;
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, l);
-    expect(out.fatal).toBe(true);
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", l, stubChain);
+    expect(out.ok).toBe(false);
+    expect(out.paneId).toBeUndefined();
   });
 
   test("a successful start reports the pane and tab it got", async () => {
-    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", "m", true, stubLauncher(null));
+    const out = await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", stubLauncher(null), stubChain);
     expect(out).toMatchObject({ ok: true, paneId: "w9:p1", tabId: "w9:t1" });
   });
 });
