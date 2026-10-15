@@ -116,7 +116,7 @@
  *
  * @module subagent-herdr
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -153,8 +153,9 @@ import {
 } from "../lib/agents.js";
 import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
 import {
-  exitPath,
+  hasExitSidecar,
   isRunRecord,
+  isSessionFileFor,
   metaPath,
   type Notice,
   parseNotice,
@@ -177,6 +178,12 @@ import {
   waitAgentIdle,
   waitAgentWorking,
 } from "./herdr.js";
+import {
+  createRunLifecycle,
+  type PaneObservation,
+  type RunLifecycle,
+  type RunObservation,
+} from "./run-lifecycle.js";
 
 // ---------------------------------------------------------------------------
 // Run registry
@@ -362,6 +369,37 @@ function loadRegistry(): void {
 }
 
 loadRegistry();
+
+/**
+ * A cheap fingerprint of a run's completion evidence: its session file's size
+ * and mtime. Revival extracts a failed run's transcript only when this moved.
+ */
+function evidenceStamp(runDirPath: string, runId: string): string | undefined {
+  try {
+    const name = readdirSync(runDirPath).find((n) => isSessionFileFor(n, runId));
+    if (!name) return undefined;
+    const stat = statSync(join(runDirPath, name));
+    return `${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The one production run lifecycle: every owned-run reconciliation, launch
+ * failure, cancellation and sweep goes through it (see `run-lifecycle.ts`).
+ */
+const lifecycle: RunLifecycle = createRunLifecycle({
+  probe: probeAgent,
+  close: (paneId) => closePane(paneId),
+  extract: extractRunResult,
+  hasSidecar: hasExitSidecar,
+  evidenceStamp,
+  saveMeta,
+  runDirOf: dirFor,
+  now: Date.now,
+  delay: sleep,
+});
 
 // ---------------------------------------------------------------------------
 // Run lifecycle
@@ -653,17 +691,14 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // so an unservable chain fails at the first request, after the prompt is in.
   const attempt = await launchAttempt(agent, rec, dir, promptPath, realLauncher, chain);
   if (!attempt.ok) {
-    rec.status = "failed";
-    rec.finishedAt = Date.now();
     // Link the record to the kept pane so a reader of meta.json can find the
     // failure's scrollback; a name refusal closed its pane, so it reports none.
-    if (attempt.paneId) {
-      rec.paneId = attempt.paneId;
-      rec.tabId = attempt.tabId;
-    }
     // The attempt ran on the router, so the record names it, not the head ref.
-    rec.failedAttempts = [{ model: FALLBACK_MODEL_REF, error: attempt.error ?? "unknown launch failure" }];
-    saveMeta(rec);
+    lifecycle.launchFailed(
+      rec,
+      { model: FALLBACK_MODEL_REF, error: attempt.error ?? "unknown launch failure" },
+      attempt.paneId ? { paneId: attempt.paneId, tabId: attempt.tabId } : undefined,
+    );
     return { ok: false, error: attempt.error ?? "The child could not be launched." };
   }
 
@@ -680,19 +715,10 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
   }
   if (!turnStarted) {
-    rec.status = "failed";
-    rec.finishedAt = Date.now();
+    const error = `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`;
     // The pane is kept, so link the record to it like the launch-failure path.
-    rec.paneId = attempt.paneId;
-    rec.tabId = attempt.tabId;
-    rec.failedAttempts = [
-      { model: FALLBACK_MODEL_REF, error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})` },
-    ];
-    saveMeta(rec);
-    return {
-      ok: false,
-      error: `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`,
-    };
+    lifecycle.launchFailed(rec, { model: FALLBACK_MODEL_REF, error }, { paneId: attempt.paneId!, tabId: attempt.tabId });
+    return { ok: false, error };
   }
 
   rec.paneId = attempt.paneId;
@@ -844,135 +870,17 @@ async function spawnHealthCheck(
 }
 
 /**
- * Whether an extracted run result is a *clean* completion — a complete answer
- * that was not salvaged out of an unfinished transcript. A clean answer has
- * `salvagedFrom === undefined`; the salvage paths (`earlier-message`,
- * `done-arguments`, `truncated-answer`) all mean the child answered and then
- * kept working, so they are NOT safe to treat as terminal: closing the pane on
- * one would kill a child that is still going. `answered` alone is far too loose
- * (`extractRunResult` sets it for the non-conforming "any visible text" salvage
- * too), so only the clean answer and the `.exit` sidecar count.
+ * How a pane observation reads in `status`/`result` output: the herdr state for
+ * a live pane, a named reachability failure for an unreachable herdr, and
+ * null for a gone (or never-probed) pane. Unreachable is never shown as gone —
+ * absence was not proven.
  */
-function isQualifyingCompletionResult(result: RunResult): boolean {
-  return result.answered && result.salvagedFrom === undefined;
-}
-
-/**
- * Whether a run has a real completion signal on disk: the `.exit` sidecar
- * (written when the child exits cleanly) or a *clean* answer in the transcript.
- * herdr's `done` pane status is NOT a signal — it means "ready for input", and
- * a child moves in and out of it between turns while it works. A salvage
- * (`earlier-message`/`done-arguments`/`truncated-answer`) is deliberately NOT a
- * signal here: it only proves the child produced some text, not that it stopped.
- */
-async function hasCompletionSignal(rec: RunRecord): Promise<boolean> {
-  const result = await extractRunResult(dirFor(rec.runId), rec.runId);
-  if (!result.sessionFile) return false;
-  if (existsSync(exitPath(result.sessionFile))) return true;
-  return isQualifyingCompletionResult(result);
-}
-
-/**
- * Classifies a terminal run: a real completion signal — the `.exit` sidecar
- * (clean exit) or a qualifying `<result>` in the transcript — means `done`
- * (pane closed as cleanup: closing the tab's only pane closes the tab); no
- * signal means `failed` (pane kept open as evidence).
- *
- * The signal is re-extracted a couple of times with a short settle: herdr
- * detects the finished turn from the terminal, and the child's sidecar write
- * and final transcript entry race that detection by a few milliseconds.
- */
-async function finishRun(rec: RunRecord): Promise<RunResult> {
-  // Re-read on every observation: a qualifying answer can land during the
-  // settle window, and the first read would otherwise stay invisible.
-  let result = await extractRunResult(dirFor(rec.runId), rec.runId);
-  const completed = (): boolean =>
-    (!!result.sessionFile && existsSync(exitPath(result.sessionFile))) ||
-    isQualifyingCompletionResult(result);
-
-  let clean = completed();
-  if (!clean && result.found) {
-    for (let i = 0; i < 2 && !clean; i++) {
-      await new Promise((r) => setTimeout(r, 750));
-      result = await extractRunResult(dirFor(rec.runId), rec.runId);
-      clean = completed();
-    }
-  }
-
-  rec.finishedAt = Date.now();
-  if (clean) {
-    rec.status = "done";
-    // Terminal evidence is captured either way — by the sidecar (clean exit) or
-    // by a qualifying answer that outran it — so a done run's tab is closed;
-    // leaving it alive would leak a pane the run no longer owns.
-    if (rec.paneId) await closePane(rec.paneId);
-  } else {
-    rec.status = "failed";
-    // Deliberately NOT closed: herdr destroys scrollback with the pane, and a
-    // failure nobody can read is a diagnosis nobody can do.
-  }
-  saveMeta(rec);
-  return result;
-}
-
-/**
- * Live herdr status for a record, null when the pane is gone. An unreachable
- * herdr is named as such — never rendered as a missing pane, because absence
- * was not proven.
- */
-async function liveStatus(rec: RunRecord): Promise<string | null> {
-  if (!rec.paneId) return null;
-  const a = await probeAgent(rec.paneId);
-  if (a.kind === "state") return a.status;
-  if (a.kind === "unreachable") return `unreachable (${a.error ?? "unknown"})`;
+function paneStateLabel(pane: PaneObservation): string | null {
+  if (pane.kind === "state") return pane.status;
+  if (pane.kind === "unreachable") return `unreachable (${pane.error ?? "unknown"})`;
   return null;
 }
 
-/**
- * Brings a `running` record up to date without blocking on it.
- *
- * With no blocking `wait`, nothing sits on a child watching it end, so a record
- * can say `running` after the child is already gone — the notice was lost, or
- * the parent restarted. This is the lazy reconciliation every read path goes
- * through first: a child herdr reports `done`, or whose pane has vanished, is
- * classified from its sidecar here and now.
- *
- * One probe, never a loop: a run that really is still working must cost a
- * status check, not a stall.
- *
- * @returns Whether the record is still running after reconciling.
- */
-async function reconcile(rec: RunRecord): Promise<boolean> {
-  if (rec.status !== "running") return false;
-  // No pane was ever recorded: nothing to probe, and nothing will ever report.
-  // Classify from disk so the run cannot be stuck as `running` forever.
-  if (!rec.paneId) {
-    await finishRun(rec);
-    return false;
-  }
-  const probe = await probeAgent(rec.paneId);
-  // Pane gone (herdr answered `agent_not_found`, the only proof of absence):
-  // the child is not coming back. Classify from disk now.
-  if (probe.kind === "gone") {
-    await finishRun(rec);
-    return false;
-  }
-  // herdr could not be asked, or answered something else: that says nothing
-  // about the child, so the run stays running and the next read retries.
-  if (probe.kind === "unreachable") return true;
-  const live = probe;
-  // A live pane reporting `done` is NOT proof the run finished. In herdr
-  // `done` means "ready for input", and a pi child moves in and out of that
-  // state between turns while it is still working. Only a real completion
-  // signal — the `.exit` sidecar, a qualifying `<result>` in the transcript, or
-  // a gone pane — may classify the run; with none of those the child is between
-  // turns, so leave it running.
-  if (live.status === "done" && (await hasCompletionSignal(rec))) {
-    await finishRun(rec);
-    return false;
-  }
-  return true;
-}
 /** Terminal text used as a failure diagnostic when the transcript has nothing. */
 async function paneDiagnostic(rec: RunRecord): Promise<string | null> {
   if (!rec.paneId) return null;
@@ -1040,38 +948,20 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
  * pane gone) is folded into the same briefing, so a fan-out that finishes
  * together wakes the orchestrator once, not once per child.
  *
+ * A thin adapter over {@link RunLifecycle.sweep}, which owns the concurrency,
+ * isolation and ordering; kept as an export for callers and tests.
+ *
  * @param recs - Snapshot of all registry records.
  * @param exclude - Run ids already covered by the current batch or previously briefed.
- * @param reconcileOne - Classifies one running record; resolves false when the
- *   record is no longer running. Injected for testability.
- * @returns Records that finished, in registry order.
+ * @param owner - The lifecycle that sweeps; the production one by default.
+ * @returns Observations of the runs that finished, in registry order.
  */
 export async function collectFinished(
   recs: readonly RunRecord[],
   exclude: ReadonlySet<string>,
-  reconcileOne: (rec: RunRecord) => Promise<boolean>,
-): Promise<RunRecord[]> {
-  const candidates = recs.filter(
-    (rec) => rec.status === "running" && !exclude.has(rec.runId),
-  );
-  const finished: RunRecord[] = [];
-  const CONCURRENCY = 8;
-  for (let i = 0; i < candidates.length; i += CONCURRENCY) {
-    const slice = candidates.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(
-      slice.map(async (rec) => {
-        try {
-          return !(await reconcileOne(rec));
-        } catch {
-          return false; // one bad record must not abort the sweep
-        }
-      }),
-    );
-    for (let j = 0; j < slice.length; j++) {
-      if (results[j]) finished.push(slice[j]);
-    }
-  }
-  return finished;
+  owner: Pick<RunLifecycle, "sweep"> = lifecycle,
+): Promise<RunObservation[]> {
+  return (await owner.sweep(recs, { exclude })).finished;
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,8 +970,8 @@ export async function collectFinished(
 
 /**
  * Pushes one completed run's block (header, answer, diagnostics, reports)
- * onto the caller's output array. The caller must have already called
- * `reconcile` on the record.
+ * onto the caller's output array. The caller must have already brought the
+ * record up to date (`lifecycle.read`, or a sweep).
  */
 async function renderResultBlock(
   rec: RunRecord,
@@ -1112,6 +1002,43 @@ async function renderResultBlock(
     if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
   }
   await pushReports(rec, out);
+}
+
+/**
+ * Terminal results already read, so one transcript is not read twice between a
+ * liveness tick and the compose it triggers (they can be 1 MB).
+ *
+ * Each entry is keyed to the record's `finishedAt` as well as its id. Every
+ * lifecycle transition stamps a fresh `finishedAt`, so a result cached before a
+ * later one — a `failed` run revived to `done` by a late `<result>` — can never
+ * be served for it: staleness is impossible by construction rather than by
+ * every writer remembering to refresh.
+ */
+export interface TerminalResultCache {
+  /** The cached result, or undefined when absent or cached for an earlier transition. */
+  get(rec: RunRecord): RunResult | undefined;
+  set(rec: RunRecord, result: RunResult): void;
+  delete(runId: string): void;
+  readonly size: number;
+}
+
+export function createTerminalResultCache(): TerminalResultCache {
+  const entries = new Map<string, { finishedAt: number | undefined; result: RunResult }>();
+  return {
+    get(rec) {
+      const e = entries.get(rec.runId);
+      return e && e.finishedAt === rec.finishedAt ? e.result : undefined;
+    },
+    set(rec, result) {
+      entries.set(rec.runId, { finishedAt: rec.finishedAt, result });
+    },
+    delete(runId) {
+      entries.delete(runId);
+    },
+    get size() {
+      return entries.size;
+    },
+  };
 }
 
 /**
@@ -1180,8 +1107,8 @@ async function doneBlock(rec: RunRecord, result?: RunResult): Promise<string> {
  * not rendered a second time.
  *
  * @param batch - Notices from the closed coalesce window, in arrival order.
- * @param swept - Registry records that finished since the last wake, found by
- *   the flush-time sweep. Rendered after the batch blocks.
+ * @param swept - Observations of runs that finished since the last wake, found
+ *   by the flush-time lifecycle sweep. Rendered after the batch blocks.
  * @param briefedFinishedRunIds - The factory's dedup set of run ids already
  *   delivered in a completed briefing; a release never re-renders one.
  * @param isOwned - The autonomous-work boundary for the "Still running" tail:
@@ -1189,12 +1116,19 @@ async function doneBlock(rec: RunRecord, result?: RunResult): Promise<string> {
  *   running children are not this orchestrator's to report on (direct batch
  *   notices are unfiltered — a notice addressed to this pane is evidence of
  *   ownership).
+ * @param results - The factory's cache of results already extracted for
+ *   terminal runs (by the liveness tick or an earlier compose), so a block is
+ *   not re-read; filled here for every terminal run a block is rendered from.
+ *   Entries are keyed to the run's `finishedAt`, so one cached before a later
+ *   transition is never served. The factory drops an entry when its run is
+ *   marked briefed.
  */
 async function composeBriefing(
   batch: readonly Notice[],
-  swept: readonly RunRecord[],
+  swept: readonly RunObservation[],
   briefedFinishedRunIds: ReadonlySet<string>,
   isOwned: (rec: RunRecord) => boolean,
+  results: TerminalResultCache,
 ): Promise<ComposedBriefing> {
   const blocks: string[] = [];
   const briefed = new Set<string>();
@@ -1212,8 +1146,20 @@ async function composeBriefing(
    * same briefing — unless the target already briefed, in which case
    * `briefedFinishedRunIds` keeps it from rendering twice.
    */
-  const renderFinished = async (rec: RunRecord): Promise<void> => {
+  const renderFinished = async (observation: RunObservation): Promise<void> => {
+    const rec = observation.run;
     if (briefed.has(rec.runId) || briefedFinishedRunIds.has(rec.runId)) return;
+    /** This run's result: cached, or read once through its observation. */
+    const resultOfRun = async (): Promise<RunResult> => {
+      // A run that transitioned in this observation (a late completion, say)
+      // has fresher evidence than anything cached before it.
+      const cached = observation.transition ? undefined : results.get(rec);
+      if (cached) return cached;
+      const result = await observation.result();
+      // Only terminal results are cached: a running record's answer may still change.
+      if (rec.status !== "running") results.set(rec, result);
+      return result;
+    };
 
     const healthCheckOf = healthCheckOfId(rec);
     if (healthCheckOf) {
@@ -1233,7 +1179,10 @@ async function composeBriefing(
       let targetDegraded = false;
       if (releasable && target) {
         try {
-          const targetResult = await extractRunResult(dirFor(target.runId), target.runId);
+          // A release target is not necessarily part of this sweep, so it
+          // falls back to its own direct read when nothing is cached.
+          const targetResult =
+            results.get(target) ?? (await extractRunResult(dirFor(target.runId), target.runId));
           targetBlock = await doneBlock(target, targetResult);
         } catch {
           // The target's block is degraded, not dropped: the check's block is
@@ -1262,7 +1211,7 @@ async function composeBriefing(
       // flush can never mark the pair delivered while a block is undelivered.
       // A degraded target block marks neither: the pair stays unbriefed so
       // the backstop re-drives it.
-      blocks.push(await doneBlock(rec));
+      blocks.push(await doneBlock(rec, await resultOfRun()));
       if (targetBlock !== undefined) blocks.push(targetBlock);
       if (!targetDegraded) briefed.add(rec.runId);
       if (targetBlock !== undefined && target !== undefined && !targetDegraded)
@@ -1270,7 +1219,7 @@ async function composeBriefing(
       return;
     }
 
-    const result = await extractRunResult(dirFor(rec.runId), rec.runId);
+    const result = await resultOfRun();
     if (result.answered) {
       blocks.push(await doneBlock(rec, result));
       briefed.add(rec.runId);
@@ -1312,9 +1261,9 @@ async function composeBriefing(
       continue;
     }
 
-    // Reconcile before deciding: a report notice may have arrived while the
-    // child was still working, but by flush time the child may have finished.
-    await reconcile(rec);
+    // Read before deciding: a report notice may have arrived while the child
+    // was still working, but by flush time the child may have finished.
+    const observation = await lifecycle.read(rec);
 
     if (rec.status === "running") {
       if (notice.kind === "stalled") {
@@ -1341,12 +1290,12 @@ async function composeBriefing(
 
     // Finished (done, failed, or cancelled): the full result block, with the
     // no-answer gate.
-    await renderFinished(rec);
+    await renderFinished(observation);
   }
 
   // Append swept runs (finished since last wake, not in the batch).
-  for (const rec of swept) {
-    await renderFinished(rec);
+  for (const observation of swept) {
+    await renderFinished(observation);
   }
 
   const stillRunning = [...runs.values()].filter((r) => r.status === "running" && isOwned(r));
@@ -1453,6 +1402,12 @@ export interface SubagentHerdrHooks {
    * first register — the state the synchronous in-flight marker exists for.
    */
   spawnHealthCheck(target: RunRecord, trigger: HealthCheckTrigger): Promise<SpawnOutcome>;
+  /**
+   * Test-only seam: how many terminal results are cached. Exposed so a test
+   * can assert every briefed-mark retires its entry (the degraded-bound path
+   * once leaked one per pair).
+   */
+  terminalResultCount(): number;
 }
 
 export default function (pi: ExtensionAPI): SubagentHerdrHooks {
@@ -1591,6 +1546,24 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
   /** Run ids already delivered in a completed briefing, so a later duplicate notice is swallowed. */
   const briefedFinishedRunIds = new Set<string>();
   /**
+   * Results already extracted for terminal runs, so the tick's gate read and
+   * the compose that follows it do not read the transcript twice. Only
+   * terminal results are cached (a running answer can still change), an entry
+   * is dropped once its run is marked briefed, and one cached before a later
+   * transition (a revival) is never served — see {@link createTerminalResultCache}.
+   *
+   * Bounded by the registry: an entry outlives its briefing only for a target
+   * deferred behind a health check, and that pair retires through
+   * `markBriefed` on every path (clean release, degraded bound, compose
+   * failure).
+   */
+  const terminalResults = createTerminalResultCache();
+  /** Marks a run briefed and retires its cached result. */
+  const markBriefed = (runId: string): void => {
+    briefedFinishedRunIds.add(runId);
+    terminalResults.delete(runId);
+  };
+  /**
    * Degraded-release retry counter, keyed on the health-check run id.
    *
    * The liveness tick's stranded-release scan re-drives a release whose target
@@ -1654,19 +1627,20 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       if (fresh.length === 0) return;
 
       // Sweep: find other runs that finished since the last wake.
-      const swept: RunRecord[] = [];
+      const swept: RunObservation[] = [];
       try {
         const exclude = new Set([...fresh.map((n) => n.runId), ...briefedFinishedRunIds]);
         // Only this pane's records are swept: the registry is global, and a
         // foreign run's finished state is its owner's to deliver.
-        swept.push(...(await collectFinished([...runs.values()].filter((r) => isOwnedBy(r, ownerPane)), exclude, reconcile)));
+        const sweep = await lifecycle.sweep([...runs.values()].filter((r) => isOwnedBy(r, ownerPane)), { exclude });
+        swept.push(...sweep.finished);
       } catch {
         // Best effort: the notice-driven briefing still goes out below.
       }
 
       let composed: ComposedBriefing;
       try {
-        composed = await composeBriefing(fresh, swept, briefedFinishedRunIds, (rec) => isOwnedBy(rec, ownerPane));
+        composed = await composeBriefing(fresh, swept, briefedFinishedRunIds, (rec) => isOwnedBy(rec, ownerPane), terminalResults);
       } catch {
         // Composing reads run dirs and probes herdr; if that fails the orchestrator
         // must still be told something, or the event is silently lost. The degraded
@@ -1714,7 +1688,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
             // its block. Marking it briefed here would suppress that real
             // answer — the dedup set is never cleared for a running record.
             if (target.status === "running") return;
-            briefedFinishedRunIds.add(target.runId);
+            markBriefed(target.runId);
             releasedTargets.push({ kind: "registered", runId: target.runId, agent: target.agent, status: target.status });
           } else {
             // Unregistered target: there is no record to ask, so it cannot
@@ -1728,17 +1702,17 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
           const rec = runs.get(n.runId);
           if (!rec) continue;
           if (rec.status !== "running") {
-            briefedFinishedRunIds.add(n.runId);
+            markBriefed(n.runId);
             releaseTargetOf(rec);
           }
         }
-        for (const r of swept) {
+        for (const { run: r } of swept) {
           // Swept records are terminal by construction: the sweep only
           // collects records that stopped running this flush.
-          briefedFinishedRunIds.add(r.runId);
+          markBriefed(r.runId);
           releaseTargetOf(r);
         }
-        const briefing = fallbackBriefing(fresh, swept, releasedTargets);
+        const briefing = fallbackBriefing(fresh, swept.map((o) => o.run), releasedTargets);
         try {
           pi.sendUserMessage(briefing, { deliverAs: "steer" });
         } catch {
@@ -1751,7 +1725,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       // exactly the runs whose blocks were delivered, never a run whose block
       // was deferred behind a health check.
       for (const id of composed.briefedRunIds) {
-        briefedFinishedRunIds.add(id);
+        markBriefed(id);
         // A pair that delivered cleanly no longer needs its degraded-retry
         // counter.
         degradedReleaseAttempts.delete(id);
@@ -1869,33 +1843,23 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       // is owned by someone else (or no one, for legacy), and sweeping it
       // here would close their pane, overwrite their meta, and brief their
       // session's orchestrator through this one.
-      const finished = await collectFinished([...runs.values()].filter((r) => isOwnedBy(r, ownerPane)), briefedFinishedRunIds, reconcile);
-      // Revive scan: a `failed` record whose transcript has since gained a real
-      // completion signal — a late `<result>`, a sidecar written after the
-      // classification — was called failed before its child finished. The `done`
-      // pane status that caused it is "ready for input", not termination, so the
-      // child may still be going. Re-classify from disk and deliver the late
-      // completion. The one-way `failed → done` transition is its own bound: a
-      // revived record is `done` on the next tick and never re-selected.
-      const revived: RunRecord[] = [];
-      for (const rec of [...runs.values()]) {
-        if (rec.status !== "failed" || !isOwnedBy(rec, ownerPane)) continue;
-        let signal = false;
-        try {
-          signal = await hasCompletionSignal(rec);
-        } catch {
-          continue; // one bad record: the next tick retries
-        }
-        if (!signal) continue;
-        await finishRun(rec);
-        // finishRun rewrites rec.status; the pre-call narrowing to "failed" is
-        // stale, so compare against the record's declared status type.
-        if ((rec.status as RunRecord["status"]) === "done") {
-          // Let the late answer correct an already-delivered false failure: the
-          // dedup set would otherwise suppress the corrective briefing.
-          briefedFinishedRunIds.delete(rec.runId);
-          revived.push(rec);
-        }
+      //
+      // One lifecycle sweep reconciles running records and examines failed
+      // ones for a late completion — a late `<result>` or a sidecar written
+      // after the classification. Revival is bounded inside the lifecycle (six
+      // liveness intervals since the terminal transition, only when the
+      // session file changed since last examined, never a launch failure).
+      //
+      // The exclude set is the dedup set restricted to running records: a
+      // terminal briefed record must stay a revival candidate, because a late
+      // answer is exactly what corrects an already-delivered false failure.
+      const owned = [...runs.values()].filter((r) => isOwnedBy(r, ownerPane));
+      const exclude = new Set(owned.filter((r) => r.status === "running" && briefedFinishedRunIds.has(r.runId)).map((r) => r.runId));
+      const sweep = await lifecycle.sweep(owned, { exclude });
+      for (const t of sweep.transitions) {
+        // Let the late answer correct an already-delivered false failure: the
+        // dedup set would otherwise suppress the corrective briefing.
+        if (t.cause === "late-completion") briefedFinishedRunIds.delete(t.run.runId);
       }
       // Release notices the finished loop enqueued this tick. The flush is
       // ~1200 ms away, so a check classified done here is still
@@ -1904,14 +1868,17 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
       // time, and the compose's local dedup only catches it on the clean
       // path (a degraded pair marks neither id, so it renders twice).
       const enqueuedThisTick = new Set<string>();
-      for (const rec of [...finished, ...revived]) {
+      for (const observation of sweep.finished) {
+        const rec = observation.run;
         try {
           if (healthCheckOfId(rec)) {
             enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
             enqueuedThisTick.add(rec.runId);
             continue;
           }
-          const result = await extractRunResult(dirFor(rec.runId), rec.runId);
+          const result = await observation.result();
+          // The compose that this notice triggers reuses it instead of re-reading.
+          terminalResults.set(rec, result);
           if (result.answered) {
             enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
             enqueuedThisTick.add(rec.runId);
@@ -1929,8 +1896,8 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
         }
       }
 
-      // Stranded-release scan: `collectFinished` only ever sees `running`
-      // records, so a terminal target whose release — the done notice for its
+      // Stranded-release scan: the sweep only transitions records, never
+      // re-delivers one, so a terminal target whose release — the done notice for its
       // terminal health check — was lost (session shutdown clears `pending`,
       // `sessionGone` makes `enqueueNotice` a no-op) transitions again for no
       // tick, and its deferred block would never be delivered. Re-enqueue the
@@ -1989,8 +1956,10 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
         // Bound: the degraded re-drive is bounded; past it, the last degraded
         // block stands and the pair goes quiet.
         if ((degradedReleaseAttempts.get(check.runId) ?? 0) >= MAX_DEGRADED_RELEASE_ATTEMPTS) {
-          briefedFinishedRunIds.add(check.runId);
-          briefedFinishedRunIds.add(target.runId);
+          // Through markBriefed, like every other briefed-mark: it also
+          // retires the target's cached result, which would otherwise leak.
+          markBriefed(check.runId);
+          markBriefed(target.runId);
           degradedReleaseAttempts.delete(check.runId);
           continue;
         }
@@ -2053,7 +2022,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
     livenessTimer.unref?.();
   }
 
-  return { runLivenessTick, briefedFinishedRunIds, spawnHealthCheck };
+  return { runLivenessTick, briefedFinishedRunIds, spawnHealthCheck, terminalResultCount: () => terminalResults.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,14 +2031,15 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
 
 /**
  * The effects one interrupt needs, so the seam is testable without a live
- * herdr. `reconcile` is the module's own (it classifies a finished pane from
+ * herdr. `read` is the lifecycle's own (it classifies a finished pane from
  * its sidecar before an Escape is ever sent).
  */
 export interface InterruptEffects {
   sendKeys: typeof sendKeys;
   waitAgentIdle: typeof waitAgentIdle;
   sendPrompt: typeof sendPrompt;
-  reconcile: (rec: RunRecord) => Promise<boolean>;
+  /** Bring the record up to date (the lifecycle's `read`). */
+  read: (rec: RunRecord) => Promise<RunObservation>;
 }
 
 /**
@@ -2084,7 +2054,7 @@ export interface DispatchEffects {
 }
 
 /**
- * Interrupts one run: reconcile, send Escape, wait (bounded) for the pane to
+ * Interrupts one run: read (reconcile), send Escape, wait (bounded) for the pane to
  * report idle, then deliver the replacement prompt — and only then.
  *
  * The order is load-bearing. Reconcile first, because an Escape typed into a
@@ -2131,7 +2101,7 @@ export async function interruptRun(
 
   // Reconcile before touching the pane: a run that already finished (sidecar on
   // disk, pane gone) must be reported by its real status, not interrupted.
-  await effects.reconcile(rec);
+  await effects.read(rec);
   if (rec.status !== "running" || !rec.paneId) {
     return { interrupted: false, delivered: false, status: rec.status };
   }
@@ -2151,7 +2121,7 @@ export async function interruptRun(
   const idle = await effects.waitAgentIdle(rec.paneId, timeoutMs);
   if (!idle) {
     // The run may have finished while we waited; one reconcile tells us.
-    await effects.reconcile(rec);
+    await effects.read(rec);
     if (rec.status !== "running") {
       return { interrupted: true, delivered: false, status: rec.status };
     }
@@ -2169,7 +2139,7 @@ export async function interruptRun(
     // reported stale as "running"; one more reconcile catches that case.
     // Failure-tolerant: a reconcile that throws keeps the pre-prompt status.
     try {
-      await effects.reconcile(rec);
+      await effects.read(rec);
     } catch {
       // Keep the pre-prompt status.
     }
@@ -2207,15 +2177,15 @@ async function dispatchTasks(
       const lines: string[] = [];
       const details: Record<string, unknown> = {};
       for (const rec of recs) {
-        // Reconcile first: a status that reports `running` for a child that
+        // Read first: a status that reports `running` for a child that
         // already exited is the one answer this action must never give.
-        // Reconcile mutates (finishRun may close the pane and saves meta), and
-        // the herdr probe is a round-trip, so both run only for records this
+        // A read mutates (a finish may close the pane and saves meta), and
+        // the herdr probe is a round-trip, so it runs only for records this
         // pane owns; a foreign or legacy record reports its on-disk state
-        // untouched.
+        // untouched. The displayed herdr state comes from that same probe.
         const owned = isOwnedBy(rec, ownerPane);
-        if (owned) await reconcile(rec);
-        const live = owned && rec.status === "running" ? await liveStatus(rec) : null;
+        const observation = owned ? await lifecycle.read(rec) : undefined;
+        const live = observation && rec.status === "running" ? paneStateLabel(observation.pane) : null;
         lines.push(`${rec.runId} (${rec.agent}): ${rec.status}${live ? ` [herdr: ${live}]` : ""}`);
         details[rec.runId] = { status: rec.status, herdr: live, owned };
       }
@@ -2253,15 +2223,16 @@ async function dispatchTasks(
       const details: Record<string, unknown> = {};
       for (const rec of recs) {
         // A result asked for right after a child finished must not answer "still
-        // running" just because no notice has been processed yet. Reconcile
-        // mutates (finishRun may close the pane and saves meta), so it runs only
+        // running" just because no notice has been processed yet. A read
+        // mutates (a finish may close the pane and saves meta), so it runs only
         // for records this pane owns; a foreign or legacy record reports its
         // on-disk state without probing herdr on this arm (a foreign terminal
         // record may still be read via the result block's pane diagnostic;
         // reads do not mutate).
         const owned = isOwnedBy(rec, ownerPane);
-        if (owned ? await reconcile(rec) : rec.status === "running") {
-          const live = owned ? await liveStatus(rec) : null;
+        const observation = owned ? await lifecycle.read(rec) : undefined;
+        if (rec.status === "running") {
+          const live = observation ? paneStateLabel(observation.pane) : null;
           // A foreign or legacy record was not probed: the marker keeps its
           // "still running" legible as unverified on-disk state, not a live
           // probe. Legacy (no `ownerPane`) and foreign (someone else's pane)
@@ -2280,7 +2251,7 @@ async function dispatchTasks(
           details[rec.runId] = { status: "running" };
           continue;
         }
-        await renderResultBlock(rec, out);
+        await renderResultBlock(rec, out, observation ? await observation.result() : undefined);
         details[rec.runId] = { status: rec.status };
       }
       return { content: [{ type: "text", text: unknownNote + out.join("\n\n") }], details };
@@ -2290,11 +2261,11 @@ async function dispatchTasks(
       const out: string[] = [];
       const details: Record<string, unknown> = {};
       for (const rec of recs) {
-        if (rec.status === "running") {
-          if (rec.paneId) await closePane(rec.paneId);
-          rec.status = "cancelled";
-          rec.finishedAt = Date.now();
-          saveMeta(rec);
+        // The lifecycle persists the cancellation before it closes the pane
+        // (closing is destructive and can hang or fail; the cancel must stay
+        // durable either way). A non-running record does not transition.
+        const observation = await lifecycle.cancel(rec);
+        if (observation.transition?.to === "cancelled") {
           // A cancelled health check releases its deferred target: its done
           // notice is what carries the release through the ordinary
           // coalesced path, exactly as the liveness tick enqueues one for a
@@ -2324,7 +2295,7 @@ async function dispatchTasks(
           sendKeys,
           waitAgentIdle,
           sendPrompt,
-          reconcile,
+          read: lifecycle.read,
         });
         if (!r.interrupted) {
           const why =

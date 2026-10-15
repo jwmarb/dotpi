@@ -37,12 +37,14 @@ import {
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
 import { classifyExecFailure, errorPayload, paneRectFrom, probeFromCall, splitArgs, waitArgs, type HerdrCall } from "./herdr.js";
-import { interruptRun, launchAttempt, type Launcher } from "./index.js";
+import { createTerminalResultCache, interruptRun, launchAttempt, type Launcher } from "./index.js";
+import type { RunObservation } from "./run-lifecycle.js";
 import {
   exitPath,
   formatExitSidecar,
   formatNotice,
   formatReportLine,
+  hasExitSidecar,
   isRunRecord,
   isSessionFileFor,
   metaPath,
@@ -1070,6 +1072,38 @@ describe("rundir paths", () => {
     expect(isSessionFileFor("2026-01-01T00-00-00_sub-a3f1x.jsonl", "sub-a3f1")).toBe(false);
     expect(isSessionFileFor("meta.json", "sub-a3f1")).toBe(false);
     expect(isSessionFileFor("2026_sub-a3f1.jsonl.exit", "sub-a3f1")).toBe(false);
+  });
+});
+
+describe("hasExitSidecar", () => {
+  const ID = "sub-5e1d";
+  const fixture = (names: string[]): string => {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-sidecar-"));
+    for (const n of names) writeFileSync(join(dir, n), "");
+    return dir;
+  };
+
+  test("a matching session file with its sidecar beside it", () => {
+    expect(hasExitSidecar(fixture([`1750_${ID}.jsonl`, `1750_${ID}.jsonl.exit`]), ID)).toBe(true);
+  });
+
+  test("a session file without a sidecar", () => {
+    expect(hasExitSidecar(fixture([`1750_${ID}.jsonl`, "meta.json"]), ID)).toBe(false);
+  });
+
+  test("a sidecar that belongs to another run", () => {
+    expect(hasExitSidecar(fixture([`1750_${ID}.jsonl`, "1750_sub-0000.jsonl", "1750_sub-0000.jsonl.exit"]), ID)).toBe(false);
+  });
+
+  test("sidecar-like names with no valid session file", () => {
+    expect(hasExitSidecar(fixture([`1750_${ID}.jsonl.exit`, `${ID}.exit`, `1750_${ID}x.jsonl`, `1750_${ID}x.jsonl.exit`]), ID)).toBe(false);
+  });
+
+  test("a missing or unreadable directory is false, never a throw", () => {
+    expect(hasExitSidecar(join(tmpdir(), "herdr-sidecar-does-not-exist", "x"), ID)).toBe(false);
+    // A regular file where the directory should be: readdirSync throws ENOTDIR.
+    const dir = fixture(["not-a-dir"]);
+    expect(hasExitSidecar(join(dir, "not-a-dir"), ID)).toBe(false);
   });
 });
 
@@ -2419,10 +2453,10 @@ describe("interruptRun", () => {
     idle?: boolean;
     promptOk?: boolean;
     promptError?: string | null;
-    onReconcile?: (rec: RunRecord, callNumber: number) => void;
+    onRead?: (rec: RunRecord, callNumber: number) => void;
   }) {
     const calls: Array<[string, ...unknown[]]> = [];
-    let reconcileCalls = 0;
+    let readCalls = 0;
     const effects = {
       sendKeys: async (paneId: string, ...keys: string[]) => {
         calls.push(["sendKeys", paneId, ...keys]);
@@ -2437,11 +2471,11 @@ describe("interruptRun", () => {
         const ok = opts?.promptOk ?? true;
         return { ok, error: ok ? null : (opts?.promptError ?? "agent_blocked") };
       },
-      reconcile: async (rec: RunRecord) => {
-        reconcileCalls += 1;
-        calls.push(["reconcile", rec.runId, reconcileCalls]);
-        opts?.onReconcile?.(rec, reconcileCalls);
-        return true;
+      read: async (rec: RunRecord): Promise<RunObservation> => {
+        readCalls += 1;
+        calls.push(["read", rec.runId, readCalls]);
+        opts?.onRead?.(rec, readCalls);
+        return { run: rec, pane: { kind: "none" }, result: async () => ({ found: false, answered: false, text: "" }) };
       },
     };
     return { calls, effects };
@@ -2449,10 +2483,10 @@ describe("interruptRun", () => {
 
   const names = (calls: Array<[string, ...unknown[]]>) => calls.map((c) => c[0]);
 
-  test("a running run gets reconcile → esc → bounded idle wait → replacement prompt → post-prompt reconcile, in that exact order", async () => {
+  test("a running run gets read → esc → bounded idle wait → replacement prompt → post-prompt read, in that exact order", async () => {
     const { calls, effects } = makeEffects();
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt", "reconcile"]);
+    expect(names(calls)).toEqual(["read", "sendKeys", "waitAgentIdle", "sendPrompt", "read"]);
     expect(calls[1]).toEqual(["sendKeys", "w9:p1", "esc"]);
     expect(calls[2]).toEqual(["waitAgentIdle", "w9:p1", 30_000]);
     expect(calls[3]).toEqual(["sendPrompt", "w9:p1", "new direction"]);
@@ -2461,60 +2495,60 @@ describe("interruptRun", () => {
 
   test("a run that finishes between the idle wait and the prompt is reported done, not running", async () => {
     const { calls, effects } = makeEffects({
-      // The second reconcile is the post-prompt one: the child finished while
+      // The second read is the post-prompt one: the child finished while
       // the prompt was in flight, so the reported status must be the fresh one.
-      onReconcile: (rec, n) => {
+      onRead: (rec, n) => {
         if (n === 2) rec.status = "done";
       },
     });
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt", "reconcile"]);
+    expect(names(calls)).toEqual(["read", "sendKeys", "waitAgentIdle", "sendPrompt", "read"]);
     expect(r).toEqual({ interrupted: true, delivered: true, status: "done" });
   });
 
-  test("a post-prompt reconcile that throws keeps the pre-prompt status", async () => {
+  test("a post-prompt read that throws keeps the pre-prompt status", async () => {
     const { effects } = makeEffects();
-    const originalReconcile = effects.reconcile;
+    const originalRead = effects.read;
     let n = 0;
-    effects.reconcile = async (rec) => {
+    effects.read = async (rec) => {
       n += 1;
       if (n === 2) throw new Error("probe failed");
-      return originalReconcile(rec);
+      return originalRead(rec);
     };
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
     expect(r).toEqual({ interrupted: true, delivered: true, status: "running" });
   });
 
-  test("a non-running run is rejected after reconcile, with no key delivery and no prompt", async () => {
+  test("a non-running run is rejected after read, with no key delivery and no prompt", async () => {
     const rec: RunRecord = { ...runningRec(), status: "done" };
     const { calls, effects } = makeEffects();
     const r = await interruptRun(rec, "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile"]);
+    expect(names(calls)).toEqual(["read"]);
     expect(r).toEqual({ interrupted: false, delivered: false, status: "done" });
   });
 
-  test("a running run with no pane is rejected after reconcile, with no key delivery", async () => {
+  test("a running run with no pane is rejected after read, with no key delivery", async () => {
     const rec: RunRecord = { ...runningRec(), paneId: undefined };
     const { calls, effects } = makeEffects();
     const r = await interruptRun(rec, "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile"]);
+    expect(names(calls)).toEqual(["read"]);
     expect(r).toEqual({ interrupted: false, delivered: false, status: "running" });
   });
 
   test("a failed Escape is an interrupt failure and never prompts", async () => {
     const { calls, effects } = makeEffects({ sendKeysOk: false });
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys"]);
+    expect(names(calls)).toEqual(["read", "sendKeys"]);
     expect(r.interrupted).toBe(false);
     expect(r.delivered).toBe(false);
     expect(r.status).toBe("running");
     expect(r.error).toBeDefined();
   });
 
-  test("an idle timeout never sends the replacement prompt, and reconciles once more", async () => {
+  test("an idle timeout never sends the replacement prompt, and reads once more", async () => {
     const { calls, effects } = makeEffects({ idle: false });
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "reconcile"]);
+    expect(names(calls)).toEqual(["read", "sendKeys", "waitAgentIdle", "read"]);
     expect(r.interrupted).toBe(true);
     expect(r.delivered).toBe(false);
     expect(r.status).toBe("running");
@@ -2525,19 +2559,19 @@ describe("interruptRun", () => {
     const rec = runningRec();
     const { calls, effects } = makeEffects({
       idle: false,
-      onReconcile: (r, n) => {
+      onRead: (r, n) => {
         if (n === 2) r.status = "done";
       },
     });
     const out = await interruptRun(rec, "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "reconcile"]);
+    expect(names(calls)).toEqual(["read", "sendKeys", "waitAgentIdle", "read"]);
     expect(out).toEqual({ interrupted: true, delivered: false, status: "done" });
   });
 
   test("a failed replacement prompt reports interrupted but not delivered, with the herdr error", async () => {
     const { calls, effects } = makeEffects({ promptOk: false, promptError: "agent_blocked" });
     const r = await interruptRun(runningRec(), "new direction", 30_000, effects);
-    expect(names(calls)).toEqual(["reconcile", "sendKeys", "waitAgentIdle", "sendPrompt"]);
+    expect(names(calls)).toEqual(["read", "sendKeys", "waitAgentIdle", "sendPrompt"]);
     expect(r).toEqual({ interrupted: true, delivered: false, status: "running", error: "agent_blocked" });
   });
 
@@ -2551,11 +2585,13 @@ describe("interruptRun", () => {
     expect(r.error).toBeDefined();
   });
 
-  // Regression pin: the cancel branch must keep doing exactly what it has always
-  // done — close the pane, stamp `cancelled`, stamp `finishedAt`, persist.
-  // There is no dispatchTasks-level seam to inject a record through, so the
-  // branch is pinned in source: byte-identical effect, not a paraphrase.
-  test("the cancel branch still closes the pane and stamps cancelled + finishedAt metadata (regression)", () => {
+  // Regression pin: the cancel arm owns no transition of its own. It routes
+  // through the lifecycle, which persists the cancellation BEFORE closing the
+  // pane (the ordering itself is pinned behaviourally in run-lifecycle.test.ts:
+  // "cancel: mutation → saveMeta → best-effort close"). There is no
+  // dispatchTasks-level seam to inject a record through, so the routing is
+  // pinned in source.
+  test("the cancel branch routes through lifecycle.cancel and writes nothing itself (regression)", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf-8");
     const start = src.indexOf('case "cancel":');
     expect(start).toBeGreaterThan(-1);
@@ -2564,21 +2600,13 @@ describe("interruptRun", () => {
     const end = src.indexOf('case "interrupt":', start);
     expect(end).toBeGreaterThan(start);
     const branch = src.slice(start, end);
-    const close = branch.indexOf("closePane(rec.paneId)");
-    const cancelled = branch.indexOf('rec.status = "cancelled"');
-    const stamped = branch.indexOf("rec.finishedAt = Date.now()");
-    const saved = branch.indexOf("saveMeta(rec)");
-    for (const [needle, i] of [
-      ["closePane", close],
-      ["cancelled", cancelled],
-      ["finishedAt", stamped],
-      ["saveMeta", saved],
-    ]) {
-      expect(i, `cancel branch must contain ${needle}`).toBeGreaterThan(-1);
+    expect(branch).toContain("lifecycle.cancel(rec)");
+    for (const needle of ["closePane(", "rec.status =", "rec.finishedAt =", "saveMeta("]) {
+      expect(branch.includes(needle), `cancel branch must not contain ${needle}`).toBe(false);
     }
-    // And in that order, inside the running-status guard.
-    expect(close < cancelled && cancelled < stamped && stamped < saved).toBe(true);
-    expect(branch.indexOf('rec.status === "running"')).toBeLessThan(close);
+    // The health-check release fires only on a real transition, so a repeated
+    // cancel enqueues nothing.
+    expect(branch).toContain('observation.transition?.to === "cancelled"');
   });
 });
 
@@ -2588,5 +2616,37 @@ describe("waitArgs", () => {
   test("pins the argv for the idle and working forms", () => {
     expect(waitArgs("w9:p1", "idle", 30_000)).toEqual(["agent", "wait", "w9:p1", "--until", "idle", "--timeout", "30000"]);
     expect(waitArgs("w9:p1", "working", 15_000)).toEqual(["agent", "wait", "w9:p1", "--until", "working", "--timeout", "15000"]);
+  });
+});
+
+describe("createTerminalResultCache", () => {
+  const answer = { found: true, answered: true, text: "<result>ok</result>" };
+  const record = (finishedAt: number | undefined) =>
+    ({ runId: "sub-0c01", agent: "worker", task: "t", cwd: "/", status: "done", startedAt: 1, finishedAt }) as RunRecord;
+
+  test("serves a result for the same transition", () => {
+    const cache = createTerminalResultCache();
+    const rec = record(100);
+    cache.set(rec, answer);
+    expect(cache.get(rec)).toBe(answer);
+  });
+
+  test("never serves a result cached before a later transition (a revival stamps a new finishedAt)", () => {
+    const cache = createTerminalResultCache();
+    const failed = record(100);
+    cache.set(failed, { found: true, answered: false, text: "" });
+    // The same run, revived failed → done by a late <result>: the lifecycle
+    // stamped a fresh finishedAt, so the stale unanswered result is not served.
+    const revived = { ...failed, status: "done", finishedAt: 200 } as RunRecord;
+    expect(cache.get(revived)).toBeUndefined();
+  });
+
+  test("delete retires the entry; size tracks live entries", () => {
+    const cache = createTerminalResultCache();
+    cache.set(record(100), answer);
+    expect(cache.size).toBe(1);
+    cache.delete("sub-0c01");
+    expect(cache.size).toBe(0);
+    expect(cache.get(record(100))).toBeUndefined();
   });
 });

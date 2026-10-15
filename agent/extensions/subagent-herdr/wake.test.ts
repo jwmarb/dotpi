@@ -43,6 +43,7 @@ afterAll(() => {
 import * as realHerdr from "./herdr.js";
 import { formatExitSidecar, formatNotice, systemPromptPath, type RunRecord } from "./rundir.js";
 import type { SubagentHerdrHooks } from "./index.js";
+import type { RunObservation } from "./run-lifecycle.js";
 // ---------------------------------------------------------------------------
 // herdr CLI mock
 // ---------------------------------------------------------------------------
@@ -286,7 +287,17 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("collectFinished", () => {
-  test("returns only newly-finished runs, preserving order", async () => {
+  // A thin adapter over the lifecycle's sweep: it passes the records and the
+  // exclude set through and returns the sweep's finished observations as-is.
+  // Concurrency, isolation and ordering are the lifecycle's own contract,
+  // pinned in run-lifecycle.test.ts.
+  const observation = (rec: RunRecord): RunObservation => ({
+    run: rec,
+    pane: { kind: "gone" },
+    result: async () => ({ found: false, answered: false, text: "" }),
+  });
+
+  test("returns the sweep's finished observations, in their order, and forwards the exclude set", async () => {
     const { collectFinished } = await import("./index.js?collect=1");
 
     const recs: RunRecord[] = [
@@ -296,40 +307,29 @@ describe("collectFinished", () => {
       { runId: "sub-0004", agent: "d", task: "t", cwd: "/", status: "running", startedAt: 4 },
     ];
     const exclude = new Set(["sub-0002"]);
-
-    // sub-0001 and sub-0004 are "no longer running" (reconcile returns false)
-    const finishedIds = new Set(["sub-0001", "sub-0004"]);
-    const reconcileOne = async (rec: RunRecord) => !finishedIds.has(rec.runId);
-
-    const result = await collectFinished(recs, exclude, reconcileOne);
-    expect(result.map((r) => r.runId)).toEqual(["sub-0001", "sub-0004"]);
-  });
-
-  test("isolates a rejected reconciliation to that record", async () => {
-    const { collectFinished } = await import("./index.js?collect=2");
-
-    const recs: RunRecord[] = [
-      { runId: "sub-aaaa", agent: "x", task: "t", cwd: "/", status: "running", startedAt: 1 },
-      { runId: "sub-bbbb", agent: "y", task: "t", cwd: "/", status: "running", startedAt: 2 },
-    ];
-
-    const reconcileOne = async (rec: RunRecord) => {
-      if (rec.runId === "sub-aaaa") throw new Error("probe failed");
-      return false; // sub-bbbb finished
+    let seen: { recs: readonly RunRecord[]; exclude?: ReadonlySet<string> } | undefined;
+    const owner = {
+      sweep: async (r: readonly RunRecord[], opts?: { exclude?: ReadonlySet<string> }) => {
+        seen = { recs: r, exclude: opts?.exclude };
+        const finished = [observation(r[0]), observation(r[3])];
+        return { transitions: [], finished };
+      },
     };
 
-    const result = await collectFinished(recs, new Set(), reconcileOne);
-    expect(result.map((r) => r.runId)).toEqual(["sub-bbbb"]);
+    const result = await collectFinished(recs, exclude, owner);
+    expect(result.map((o) => o.run.runId)).toEqual(["sub-0001", "sub-0004"]);
+    expect(seen?.recs).toBe(recs);
+    expect(seen?.exclude).toBe(exclude);
   });
 
-  test("returns empty when nothing is running", async () => {
+  test("returns empty when the sweep finishes nothing", async () => {
     const { collectFinished } = await import("./index.js?collect=3");
 
     const recs: RunRecord[] = [
       { runId: "sub-cccc", agent: "z", task: "t", cwd: "/", status: "done", startedAt: 1 },
     ];
 
-    const result = await collectFinished(recs, new Set(), async () => false);
+    const result = await collectFinished(recs, new Set(), { sweep: async () => ({ transitions: [], finished: [] }) });
     expect(result).toHaveLength(0);
   });
 });
@@ -1143,6 +1143,11 @@ describe("wake path (extension factory)", () => {
         await hooks.runLivenessTick();
         await sleep(1500);
         expect(sent.length).toBe(3);
+        // The bound retired the pair through markBriefed, so neither id is
+        // left holding a cached result (it once leaked one per pair).
+        expect(hooks.briefedFinishedRunIds.has("sub-eeee")).toBe(true);
+        expect(hooks.briefedFinishedRunIds.has("sub-ffff")).toBe(true);
+        expect(hooks.terminalResultCount()).toBe(0);
         getShutdownHandler()();
       } finally {
         herdrState.readAgent = savedReadAgent;
@@ -2435,6 +2440,12 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
   // tests pin the new contract: a run only goes terminal on a real completion
   // signal (the `.exit` sidecar, a qualifying `<result>`, or a gone pane), and
   // a run already mis-marked `failed` is revived when its report appears.
+  //
+  // Revival is bounded: only a run that actually launched (no
+  // `failedAttempts`), only within six liveness intervals of its terminal
+  // transition, and only when its session file changed (size/mtime) since the
+  // lifecycle last examined it — so an unchanged failed run is not re-read on
+  // every tick.
 
   const RESULT_PROMPT = "Only what is inside <result> reaches the orchestrator.";
 
@@ -2713,6 +2724,95 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
 
       const tasks = await listTasks(stub as any);
       const rec = tasks.find((t) => t.task === "sub-q1u1");
+      expect(rec?.status).toBe("failed");
+      expect(stub.sent.length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "an examined failed run is quiet while its transcript is unchanged, and revives once it changes",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        { runId: "sub-s7a1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pS", rawMeta: { finishedAt: Date.now() - 10000 } },
+      ]);
+      herdrState.probeAgent = async () => GONE;
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+
+      // First tick examines it (no signal); the second sees the same stamp.
+      await hooks.runLivenessTick();
+      await hooks.runLivenessTick();
+      await sleep(300);
+      expect(stub.sent.length).toBe(0);
+
+      // The late report rewrites the session file: size and mtime move.
+      const runDir = join(dir, "subagent-runs", "sub-s7a1");
+      writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
+      writeResultTranscript(runDir, "sub-s7a1", "<result>The late report for sub-s7a1.</result>");
+
+      await hooks.runLivenessTick();
+      await sleep(1500);
+      const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-s7a1");
+      expect(rec?.status).toBe("done");
+      expect(stub.sent.length).toBe(1);
+      expect(stub.sent[0].text).toContain("late report for sub-s7a1");
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a launch-failed record is never revived, even with a <result> on disk",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-l4f1",
+          agent: "worker",
+          hasSession: true,
+          hasSidecar: false,
+          visibleAnswer: false,
+          status: "failed",
+          paneId: "w9:pL",
+          rawMeta: { finishedAt: Date.now() - 10000, failedAttempts: [{ model: "fallback/auto", error: "task prompt not accepted" }] },
+        },
+      ]);
+      herdrState.probeAgent = async () => GONE;
+      const runDir = join(dir, "subagent-runs", "sub-l4f1");
+      writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
+      writeResultTranscript(runDir, "sub-l4f1", "<result>Should never be delivered.</result>");
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(1500);
+
+      const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-l4f1");
+      expect(rec?.status).toBe("failed");
+      expect(stub.sent.length).toBe(0);
+      stub.getShutdownHandler()();
+    },
+    20000,
+  );
+
+  test(
+    "a failed run outside the six-minute revival window is not revived",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        { runId: "sub-o1d1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pO", rawMeta: { finishedAt: Date.now() - 7 * 60_000 } },
+      ]);
+      herdrState.probeAgent = async () => GONE;
+      const runDir = join(dir, "subagent-runs", "sub-o1d1");
+      writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
+      writeResultTranscript(runDir, "sub-o1d1", "<result>Too late to matter.</result>");
+
+      const stub = stubPi();
+      const hooks = factory(stub.pi);
+      await hooks.runLivenessTick();
+      await sleep(1500);
+
+      const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-o1d1");
       expect(rec?.status).toBe("failed");
       expect(stub.sent.length).toBe(0);
       stub.getShutdownHandler()();

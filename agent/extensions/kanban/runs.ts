@@ -3,7 +3,7 @@
  * `subagent-runs/<runId>/meta.json` this extension has.
  *
  * The *shape* belongs to `subagent-herdr/rundir.ts` (`metaPath`, `isRunRecord`,
- * `RunStatus`, plus `isSessionFileFor`/`exitPath` for the completion sidecar);
+ * `RunStatus`, plus `hasExitSidecar` for the completion sidecar);
  * this module only reads, through those, so the record grammar is still spelled
  * once. Both the extension (settle guard, `show`) and the board process import
  * it, which is why it is separate from the pure `lib.ts`.
@@ -13,9 +13,9 @@
  * reported `done`, because the sidecar is what the parent itself classifies by.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 
-import { exitPath, isRunRecord, isSessionFileFor, metaPath, runDir } from "../subagent-herdr/rundir.js";
+import { hasExitSidecar, isRunRecord, metaPath, runDir } from "../subagent-herdr/rundir.js";
 import { RUN_ID_PATTERN, type RunInfo, type RunInfos } from "./lib.js";
 
 const KNOWN_STATUS = new Set(["running", "done", "failed", "cancelled"]);
@@ -34,18 +34,8 @@ export function readRunInfo(agentDir: string, runId: string): RunInfo {
 	if (!isRunRecord(record) || record.runId !== runId) return { status: "unknown" };
 	const agent = typeof record.agent === "string" ? record.agent : undefined;
 	const status = KNOWN_STATUS.has(record.status) ? record.status : "unknown";
-	if (status === "running" && finishedOnDisk(dir, runId)) return { status: "done", ...(agent ? { agent } : {}) };
+	if (status === "running" && hasExitSidecar(dir, runId)) return { status: "done", ...(agent ? { agent } : {}) };
 	return { status, ...(agent ? { agent } : {}) } as RunInfo;
-}
-
-/** Has the child written its completion sidecar? (The parent may not have looked yet.) */
-function finishedOnDisk(dir: string, runId: string): boolean {
-	try {
-		const names = readdirSync(dir);
-		return names.some((n) => isSessionFileFor(n, runId) && names.includes(exitPath(n)));
-	} catch {
-		return false;
-	}
 }
 
 /** Status for each id. Small and synchronous: a board links a handful of runs. */

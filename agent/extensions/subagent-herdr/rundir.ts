@@ -39,6 +39,7 @@
  * @module subagent-herdr/rundir
  */
 
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -110,6 +111,27 @@ export function exitPath(sessionFile: string): string {
  */
 export function isSessionFileFor(fileName: string, runId: string): boolean {
 	return fileName.endsWith(`_${runId}.jsonl`);
+}
+
+/**
+ * Has the child written its completion sidecar? Synchronous and never throws.
+ *
+ * One listing of the run directory: a session file for `runId` whose
+ * {@link exitPath} sibling is in the same listing. Every filesystem error is
+ * "no", because a sidecar nobody can read proves nothing. Shared by the
+ * parent's run lifecycle and the kanban board, so "the sidecar is on disk" is
+ * decided in one place.
+ *
+ * @param runDirPath - The run's directory.
+ * @param runId - The run id whose session file to look for.
+ */
+export function hasExitSidecar(runDirPath: string, runId: string): boolean {
+	try {
+		const names = readdirSync(runDirPath);
+		return names.some((n) => isSessionFileFor(n, runId) && names.includes(exitPath(n)));
+	} catch {
+		return false;
+	}
 }
 
 /** How a run ended, as recorded in `meta.json`. */
