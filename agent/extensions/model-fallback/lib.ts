@@ -433,6 +433,84 @@ export function shouldRegisterRouter(chain: readonly ChainEntry[], source: "sett
 	return isRoutable(chain);
 }
 
+/** What {@link planRegistration} decided for this process. */
+export interface RegistrationPlan {
+	/** Whether `fallback/auto` should be registered at all. */
+	register: boolean;
+	/** The chain the router will serve; `[]` when {@link register} is false. */
+	chain: ChainEntry[];
+	/**
+	 * Where the chain came from: `"environment"` for a non-empty
+	 * {@link CHAIN_ENV} chain, `"settings"` for the `settings.json` chain, and
+	 * `"none"` when the feature is switched off or no source yields an entry.
+	 * It names the source that was *tried*, so it is only meaningful when
+	 * {@link register} is true: an unroutable settings chain reports
+	 * `"settings"` with `register: false`.
+	 */
+	source: "environment" | "settings" | "none";
+	/** A one-line load-time warning for the caller to print, when there is one. */
+	warning?: string;
+}
+
+/**
+ * The whole "should this process register `fallback/auto`?" decision, as one
+ * pure function: `index.ts` only reads settings and the env var, and acts on
+ * the result.
+ *
+ * The branches, in the order they are taken, and why:
+ *
+ * 1. **The env chain is read first, before the disable check.** The parent's
+ *    chain for this process wins over the settings switch: a process launched
+ *    on `fallback/auto` with {@link CHAIN_ENV} set cannot resolve its model
+ *    without the router, so `modelFallback.enabled: false` must not unregister
+ *    a chain the parent already committed it to. It also wins over the
+ *    settings chain: the launcher knows which agent is running here, and
+ *    `settings.json` does not.
+ * 2. **A set but unparseable env value warns.** It cannot serve: the
+ *    settings.json chain is the fallback when there is one, and without one
+ *    the session's own model selection decides silently. The warning names
+ *    which of the two happens (it reads the settings chain even when the
+ *    switch is off, exactly as the load path always has). An empty or
+ *    malformed env value parses to nothing, so it cannot mask a valid
+ *    settings chain: a non-empty env chain is what picks the source.
+ * 3. **Disabled and no env chain registers nothing.** The switch governs
+ *    exactly the sessions that got no chain from a parent.
+ * 4. **Registration is source-dependent** — {@link shouldRegisterRouter} owns
+ *    both halves. The parent committed this process to the router (an env
+ *    chain registers whenever it is non-empty), while a settings chain has
+ *    committed nothing (a settings singleton without a pin needs no router;
+ *    see {@link isRoutable}).
+ *
+ * @param input.settings - The raw `modelFallback` settings value (any shape).
+ * @param input.envValue - The raw {@link CHAIN_ENV} value, `undefined` when unset.
+ * @param input.envName - The env var's name, for the warning; defaults to {@link CHAIN_ENV}.
+ */
+export function planRegistration(input: {
+	settings: unknown;
+	envValue: string | undefined;
+	envName?: string;
+}): RegistrationPlan {
+	const { settings, envValue, envName = CHAIN_ENV } = input;
+	const envChain = parseChainEnv(envValue);
+	const settingsChain = readChain(settings);
+	let warning: string | undefined;
+	if (envValue !== undefined && envChain.length === 0) {
+		warning =
+			`model-fallback: ${envName} is set to "${envValue}" but no entry parses; ` +
+			(settingsChain.length > 0 ? "falling back to the settings.json chain" : "the router registers nothing");
+	}
+	const withWarning = (plan: RegistrationPlan): RegistrationPlan => (warning ? { ...plan, warning } : plan);
+
+	if (envChain.length > 0) {
+		return withWarning({ register: shouldRegisterRouter(envChain, "environment"), chain: envChain, source: "environment" });
+	}
+	if (isDisabled(settings)) return withWarning({ register: false, chain: [], source: "none" });
+	if (settingsChain.length === 0) return withWarning({ register: false, chain: [], source: "none" });
+	return shouldRegisterRouter(settingsChain, "settings")
+		? withWarning({ register: true, chain: settingsChain, source: "settings" })
+		: withWarning({ register: false, chain: [], source: "settings" });
+}
+
 /**
  * Case-insensitive dedup by ref, first occurrence winning — the rule both
  * {@link parseChain} and {@link parseChainEnv} apply, so the two surfaces

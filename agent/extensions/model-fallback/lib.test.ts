@@ -44,6 +44,7 @@ import {
 	parseChainItem,
 	parseModelEntry,
 	parseModelRef,
+	planRegistration,
 	readChain,
 	readConfig,
 	readLimits,
@@ -1613,6 +1614,112 @@ describe("describeUpstreamHop", () => {
 // ---------------------------------------------------------------------------
 // index.ts — router registration
 // ---------------------------------------------------------------------------
+
+describe("planRegistration", () => {
+	const plan = (settings: unknown, envValue: string | undefined) => planRegistration({ settings, envValue });
+
+	test("a non-empty env chain registers even when settings say enabled:false", () => {
+		const result = plan({ enabled: false, chain: ["a/1", "b/2"] }, "openai/x|high,qwen/y");
+		expect(result).toEqual({
+			register: true,
+			chain: [{ ref: "openai/x", thinking: "high" }, { ref: "qwen/y" }],
+			source: "environment",
+		});
+	});
+
+	test("an env chain wins over a valid settings chain", () => {
+		const result = plan({ chain: ["a/1", "b/2"] }, "c/3,d/4");
+		expect(result.source).toBe("environment");
+		expect(result.chain).toEqual([{ ref: "c/3" }, { ref: "d/4" }]);
+	});
+
+	test("a single unpinned env entry registers: the parent launched this process on the router", () => {
+		expect(plan(undefined, "qwen/y")).toEqual({ register: true, chain: [{ ref: "qwen/y" }], source: "environment" });
+	});
+
+	test("an unparseable env value warns and falls back to a valid settings chain", () => {
+		const result = plan({ chain: ["a/1", "b/2"] }, "a/1:high");
+		expect(result.register).toBe(true);
+		expect(result.source).toBe("settings");
+		expect(result.chain).toEqual([{ ref: "a/1" }, { ref: "b/2" }]);
+		expect(result.warning).toBe(
+			`model-fallback: ${CHAIN_ENV} is set to "a/1:high" but no entry parses; falling back to the settings.json chain`,
+		);
+	});
+
+	test("an unparseable env value with no settings chain warns that nothing registers", () => {
+		const result = plan(undefined, "a:b, /c");
+		expect(result).toEqual({
+			register: false,
+			chain: [],
+			source: "none",
+			warning: `model-fallback: ${CHAIN_ENV} is set to "a:b, /c" but no entry parses; the router registers nothing`,
+		});
+	});
+
+	test("an empty but set env value warns too: set is not the same as unset", () => {
+		expect(plan(undefined, "").warning).toContain("the router registers nothing");
+	});
+
+	test("a malformed env value warns about the settings chain even when the switch is off", () => {
+		// Exactly the load path's wording: the warning reads the settings chain
+		// whether or not `enabled: false` then stops registration.
+		const result = plan({ enabled: false, chain: ["a/1", "b/2"] }, "x:y");
+		expect(result.register).toBe(false);
+		expect(result.warning).toContain("falling back to the settings.json chain");
+	});
+
+	test("enabled:false with no env chain registers nothing", () => {
+		expect(plan({ enabled: false, chain: ["a/1", "b/2"] }, undefined)).toEqual({
+			register: false,
+			chain: [],
+			source: "none",
+		});
+	});
+
+	test("a settings singleton without a pin registers nothing", () => {
+		const result = plan({ chain: ["a/1"] }, undefined);
+		expect(result.register).toBe(false);
+		expect(result.chain).toEqual([]);
+		expect(result.warning).toBeUndefined();
+	});
+
+	test("a pinned settings singleton registers", () => {
+		expect(plan({ chain: [{ model: "a/1", thinking: "low" }] }, undefined)).toEqual({
+			register: true,
+			chain: [{ ref: "a/1", thinking: "low" }],
+			source: "settings",
+		});
+	});
+
+	test("a two-entry settings chain registers, bare-array form included", () => {
+		expect(plan({ chain: ["a/1", "b/2"] }, undefined).register).toBe(true);
+		expect(plan(["a/1", "b/2"], undefined)).toEqual({
+			register: true,
+			chain: [{ ref: "a/1" }, { ref: "b/2" }],
+			source: "settings",
+		});
+	});
+
+	test("no env and no settings registers nothing, from no source", () => {
+		expect(plan(undefined, undefined)).toEqual({ register: false, chain: [], source: "none" });
+		expect(plan({}, undefined)).toEqual({ register: false, chain: [], source: "none" });
+	});
+
+	test("both sources keep their parser's dedup: first occurrence wins, case-insensitively", () => {
+		expect(plan(undefined, "a/1|high,A/1,b/2").chain).toEqual([{ ref: "a/1", thinking: "high" }, { ref: "b/2" }]);
+		expect(plan({ chain: ["a/1", { model: "A/1", thinking: "low" }, "b/2"] }, undefined).chain).toEqual([
+			{ ref: "a/1" },
+			{ ref: "b/2" },
+		]);
+	});
+
+	test("the warning names the env var the caller passes", () => {
+		expect(planRegistration({ settings: undefined, envValue: "x:y", envName: "OTHER" }).warning).toContain(
+			'OTHER is set to "x:y"',
+		);
+	});
+});
 
 describe("index.ts registration", () => {
 	let importCounter = 0;

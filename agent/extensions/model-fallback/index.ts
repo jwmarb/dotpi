@@ -51,8 +51,8 @@
  * `PI_FALLBACK_CHAIN`. Every non-empty chain must register: a process launched
  * on `fallback/auto` cannot resolve that model without the router. In a plain
  * pi process the rule is stricter — a single unpinned model registers nothing,
- * because nothing there has been committed to the router (`shouldRegisterRouter`
- * in `lib.ts` owns both halves).
+ * because nothing there has been committed to the router (`planRegistration`
+ * in `lib.ts` owns the whole decision).
  *
  * @module model-fallback
  */
@@ -81,14 +81,11 @@ import {
 	describeUpstreamHop,
 	formatEntry,
 	formatModelRef,
-	isDisabled,
 	levelFor,
-	parseChainEnv,
-	readChain,
+	planRegistration,
 	readConfig,
 	readLimits,
 	readVirtualModelState,
-	shouldRegisterRouter,
 	upstreamDelayMs,
 	upstreamRecovery,
 	VIRTUAL_MODEL_API,
@@ -200,38 +197,13 @@ export default function (pi: ExtensionAPI) {
 	// extension load, and the chain must be known now because
 	// `registerVirtualModel` happens at load. See `settings.ts`.
 	const raw = readSettingsKey(SETTINGS_KEY);
-	// The parent's chain for this process wins over the settings switch, so the
-	// env var is read *before* the disable check: a process launched on
-	// `fallback/auto` with `PI_FALLBACK_CHAIN` set cannot resolve its model
-	// without the router, so `modelFallback.enabled: false` must not unregister
-	// a chain the parent already committed it to.
-	const envChain = parseChainEnv(process.env[CHAIN_ENV]);
-	if (process.env[CHAIN_ENV] !== undefined && envChain.length === 0) {
-		// The unparseable value cannot serve: the settings.json chain is the
-		// fallback when there is one, and without one the session's own model
-		// selection decides silently.
-		const settingsChain = readChain(raw);
-		console.warn(
-			`model-fallback: ${CHAIN_ENV} is set to "${process.env[CHAIN_ENV]}" but no entry parses; ` +
-			(settingsChain.length > 0 ? "falling back to the settings.json chain" : "the router registers nothing"),
-		);
-	}
-	if (isDisabled(raw) && envChain.length === 0) return;
-
+	// The whole registration decision — source pick, disable switch, malformed
+	// env warning, source-dependent threshold — is `planRegistration` in `lib.ts`.
+	const plan = planRegistration({ settings: raw, envValue: process.env[CHAIN_ENV] });
+	if (plan.warning) console.warn(plan.warning);
+	if (!plan.register) return;
+	const chain = plan.chain;
 	const config = readConfig(raw);
-	// A parent's choice for this child wins over the global chain: the launcher
-	// knows which agent is running here, and `settings.json` does not.
-	const chain = envChain.length > 0 ? envChain : readChain(raw);
-
-	// Registration is source-dependent; `shouldRegisterRouter` in `lib.ts`
-	// owns both halves. The split's one rationale: the parent committed this
-	// process to the router (an env chain registers whenever it is non-empty),
-	// while a settings chain has committed nothing (a settings singleton
-	// needs no router). An empty or malformed env value parses to nothing, so
-	// it cannot mask a valid settings chain: `envChain.length > 0` above is
-	// what picks the source.
-	const source = envChain.length > 0 ? "environment" : "settings";
-	if (!shouldRegisterRouter(chain, source)) return;
 
 	/** The last error text seen, for {@link describeExhaustion}. */
 	let lastError: string | undefined;
@@ -489,7 +461,7 @@ export default function (pi: ExtensionAPI) {
 				`Primary probes before settling on a fallback: ${config.maxProbes}`,
 				`settings.retry.maxRetries: ${pi.getSettings().retry?.maxRetries ?? 0}`,
 				...(warning ? ["", warning] : []),
-				...(envChain.length > 0 ? ["", `Chain came from ${CHAIN_ENV} (set by the parent).`] : []),
+				...(plan.source === "environment" ? ["", `Chain came from ${CHAIN_ENV} (set by the parent).`] : []),
 			];
 			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), warning ? "warning" : "info");
 		},
