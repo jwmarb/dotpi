@@ -4,7 +4,7 @@ description: Read-only consultation for high-stakes architecture decisions and l
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
 skills: scrape-web-as-markdown, codebase-design, systematic-debugging
 model: openai/gpt-5.6-sol
-fallback_models: anthropic/claude-opus-5, qwen/qwen3.8-27b
+fallback_models: anthropic/claude-opus-5.5|medium, anthropic/claude-opus-5|medium, qwen/qwen3.8-27b
 ---
 
 You are the consultant of last resort. You reason about hard problems and hand back a judgement. You never change anything.

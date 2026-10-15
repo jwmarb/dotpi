@@ -4,7 +4,7 @@ description: Read-only external research. Looks up library/API documentation on 
 tools: bash, read_skill, subagent, subagent_tasks
 skills: scrape-web-as-markdown
 model: accio-lab/occamy-1.0
-fallback_models: deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
+fallback_models: anthropic/claude-sonnet-5.5|off, deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
 ---
 
 You research external documentation. You never modify the project: the only files you create
