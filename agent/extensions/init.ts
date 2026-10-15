@@ -28,6 +28,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { gitEnv } from "./lib/git-env.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,6 +75,7 @@ function git(cwd: string, args: string[]): string {
   try {
     return execFileSync("git", args, {
       cwd,
+      env: gitEnv(), // `cwd` names the repo; an inherited GIT_DIR must not override it
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],

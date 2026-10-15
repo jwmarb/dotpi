@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseInitArgs, planTiers, tierStatus } from "../init.js";
+import { gitEnv } from "./git-env.js";
 
 const made: string[] = [];
 
@@ -47,10 +48,18 @@ function file(root: string, rel: string, body = "export const x = 1;\n"): void {
   writeFileSync(abs, body);
 }
 
-/** Make `root` a git repo with everything committed, so `ls-files` sees it. */
+/**
+ * Make `root` a git repo with everything committed, so `ls-files` sees it.
+ *
+ * `env: gitEnv()` is load-bearing: under a linked worktree's pre-commit hook the
+ * test process inherits `GIT_DIR`/`GIT_INDEX_FILE`, and without stripping them
+ * these calls ignore `cwd` and rewrite the REAL repository (this once set
+ * `core.bare=true` and a test identity in the real `.git/config`). See
+ * `lib/git-env.ts`.
+ */
 function gitInit(root: string): void {
   const run = (...args: string[]) =>
-    execFileSync("git", args, { cwd: root, stdio: ["ignore", "ignore", "ignore"] });
+    execFileSync("git", args, { cwd: root, env: gitEnv(), stdio: ["ignore", "ignore", "ignore"] });
   run("init", "-q");
   run("config", "user.email", "t@example.com");
   run("config", "user.name", "T");
@@ -65,7 +74,7 @@ function gitInit(root: string): void {
 // is true exactly when they can run.
 const gitOk = (() => {
   try {
-    execFileSync("git", ["--version"], { stdio: "ignore" });
+    execFileSync("git", ["--version"], { env: gitEnv(), stdio: "ignore" });
     return true;
   } catch {
     return false;

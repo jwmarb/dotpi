@@ -40,6 +40,16 @@ force=0
 # the script's own directory asks the question that was always meant: where is
 # the repo containing this script? (It is the same repo, so the symlinked ~/.pi
 # path resolves identically.)
+#
+# The repo-locating env must go first, for the same reason (see
+# agent/extensions/lib/git-env.ts). post-checkout/post-merge run this script,
+# and in a LINKED worktree git runs those hooks with GIT_DIR exported; with
+# GIT_DIR set, `git -C "$here" rev-parse --show-toplevel` answers the current
+# directory (scripts/) instead of the repo root — measured — so the link below
+# landed in scripts/node_modules and the manifest scan found nothing. This
+# script only ever means the repo it lives in, so it never inherits them.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+	GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CONFIG
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || root=$(dirname "$here")
 cd "$root" || exit 0

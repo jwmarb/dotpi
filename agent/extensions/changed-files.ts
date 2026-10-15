@@ -31,6 +31,7 @@ import {
 	Key,
 	matchesKey,
 } from "@earendil-works/pi-tui";
+import { gitEnv } from "./lib/git-env.js";
 import { cachedByWidth, frame, row } from "./lib/widget.js";
 
 /** Maximum number of files shown in the inline widget. */
@@ -205,6 +206,7 @@ function collectNumstat(
 function execSyncGit(cwd: string, args: string[]): string {
 	return execFileSync("git", args, {
 		cwd,
+		env: gitEnv(), // `cwd` names the repo; an inherited GIT_DIR must not override it
 		encoding: "utf-8",
 		timeout: 5_000,
 		maxBuffer: 4 * 1024 * 1024,
@@ -340,6 +342,7 @@ function runGitDiff(cwd: string, path: string): string[] {
 	try {
 		const out = execFileSync("git", ["diff", "HEAD", "--", path], {
 			cwd,
+			env: gitEnv(),
 			encoding: "utf-8",
 			timeout: 10_000,
 			maxBuffer: 8 * 1024 * 1024,
