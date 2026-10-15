@@ -66,6 +66,8 @@ agent/subagent-sessions/
 # subagent-herdr extension: one dir per delegated run (child session file,
 # .exit sidecar, system prompt, meta.json). Machine state, never config.
 agent/subagent-runs/
+# pi's managed install: releases/, current-version — machine state.
+agent/install/
 
 # herdr's pi integration. Installed and overwritten by herdr itself (its header
 # says so), so tracking it would only record herdr upgrades as diffs here.

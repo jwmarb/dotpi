@@ -97,6 +97,8 @@ foreach ($pkg in $manifests) {
 # a standalone bun .exe shim with no tree to resolve into, so locate bun's global
 # node_modules directly. NODE_PATH is not an alternative: `bun test` ignores it.
 # Repaired when the link is missing or stale.
+# pi's managed install (agent\install\releases\<current-version>\node_modules,
+# behind a launcher script) is resolved by setup-deps.sh only -- not yet here.
 $bunGlobalDir = $env:BUN_CONFIG_GLOBAL_INSTALL_DIR
 if (-not $bunGlobalDir) { $bunGlobalDir = Join-Path $env:USERPROFILE ".bun\install\global" }
 $bunGlobal = Join-Path $bunGlobalDir "node_modules"

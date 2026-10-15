@@ -87,12 +87,40 @@ done
 # extensions every suite importing them dies with "Cannot find package
 # 'typebox'". (This used to work by accident via a stray ~/node_modules; when it
 # went away, 53 tests and the commit hook failed on a clean HEAD.) Link the
-# running pi's global node_modules at the repo root -- the same copy pi uses, so
-# tests see the exact version that loads the extensions. NODE_PATH is not an
+# running pi's node_modules at the repo root -- the same copy pi uses, so tests
+# see the exact version that loads the extensions. NODE_PATH is not an
 # alternative: `bun test` ignores it. Repaired when the link is missing or stale.
+#
+# Two layouts are recognised, in order: (a) a bun/npm global tree, found by
+# readlink-ing `pi` on PATH into .../@earendil-works/pi-coding-agent/...; (b) pi's
+# managed install, where `pi` is a shell launcher that execs
+# <agent>/install/releases/<install/current-version>/node_modules/.bin/pi. For (b)
+# the agent dir is this repo's own agent/, then ${PI_CODING_AGENT_DIR:-~/.pi/agent}
+# (a worktree lacks the untracked install/) -- never `command -v pi`, which may
+# belong to another install.
 pi_cli=$(command -v pi 2>/dev/null) && pi_cli=$(readlink -f "$pi_cli")
 pi_mods=${pi_cli%%/@earendil-works/pi-coding-agent/*}
-if [ -n "$pi_cli" ] && [ "$pi_mods" != "$pi_cli" ] && [ -d "$pi_mods/typebox" ]; then
+if ! { [ -n "$pi_cli" ] && [ "$pi_mods" != "$pi_cli" ] && [ -d "$pi_mods/typebox" ]; }; then
+	pi_mods=
+	seen=
+	for agent_dir in "$root/agent" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; do
+		agent_dir=$(cd "$agent_dir" 2>/dev/null && pwd -P) || continue
+		case " $seen " in *" $agent_dir "*) continue ;; esac
+		seen="$seen $agent_dir"
+		version=
+		IFS= read -r version 2>/dev/null < "$agent_dir/install/current-version" || [ -n "$version" ] || continue
+		# Same validation as pi's launcher: a single safe path segment.
+		case "$version" in
+		"" | . | .. | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*) continue ;;
+		esac
+		candidate="$agent_dir/install/releases/$version/node_modules"
+		if [ -d "$candidate/typebox" ]; then
+			pi_mods=$candidate
+			break
+		fi
+	done
+fi
+if [ -n "$pi_mods" ]; then
 	if [ -L node_modules ] && [ "$(readlink node_modules)" != "$pi_mods" ]; then
 		rm node_modules
 	fi
