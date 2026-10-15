@@ -184,6 +184,18 @@ import {
   type RunLifecycle,
   type RunObservation,
 } from "./run-lifecycle.js";
+import {
+  createReleaseLedger,
+  healthCheckOfId,
+  isOwnedBy,
+  LIVENESS_BACKSTOP_MS,
+  ownerPaneOf,
+  type ReleasedTarget,
+} from "./release-ledger.js";
+
+// The terminal result cache moved to the release ledger; re-exported so its
+// importers keep their path.
+export { createTerminalResultCache, type TerminalResultCache } from "./release-ledger.js";
 
 // ---------------------------------------------------------------------------
 // Run registry
@@ -197,18 +209,6 @@ const dirFor = (runId: string): string => runDir(agentDir(), runId);
 
 /** Directory of this extension, so `child-done.ts` can be passed to a child by absolute path. */
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
-
-/**
- * How long to let notices accumulate before waking the orchestrator.
- *
- * Children finish independently but often together (a fan-out of recon agents
- * launched in one turn). Without a window, each arrival starts its own turn and
- * the orchestrator re-reads its context once per child. One short window
- * collapses that into a single briefing; it is deliberately far shorter than a
- * human would notice and far longer than the spread between two `herdr agent
- * prompt` deliveries.
- */
-const NOTICE_COALESCE_MS = 1200;
 
 /** Answers are truncated in tool output at this size; the transcript stays complete on disk. */
 const RESULT_MAX_CHARS = 20_000;
@@ -236,44 +236,6 @@ const PROMPT_RECOVERY_MS = 15_000;
  * interrupt takes effect.
  */
 const INTERRUPT_IDLE_TIMEOUT_MS = 30_000;
-
-/**
- * Cadence of the parent's liveness backstop: one bounded reconciliation tick
- * per interval.
- *
- * Not a wait, and not a poll: the tick snapshots the running records, asks
- * herdr once per record, and returns. A live child costs one status probe and
- * nothing else; a dead child is classified from its sidecar and woken through
- * the ordinary coalesced path. It exists because a notice is a prompt to look,
- * never the evidence — a lost child delivery (the child's detached
- * `sendUserMessage` dying with its process) or a restarted parent can leave a
- * record saying `running` while the child is long gone.
- */
-const LIVENESS_BACKSTOP_MS = 60_000;
-
-/**
- * How many times the liveness tick's stranded-release scan re-drives a release
- * whose target block degraded (the target's result read threw) before marking
- * the pair briefed and letting the last degraded block stand as the final
- * delivery. `extractRunResult` is throw-resistant but not unthrowable — OOM on
- * a huge transcript, a permissions problem — and a persistently unreadable
- * target would otherwise produce a 60-second wake storm of re-delivered
- * health-check blocks.
- *
- * The bound is "at least 3", not "exactly 3", and the looseness is deliberate:
- * the counter is incremented in `flushNotices` (once per *delivered* degraded
- * compose) while the bound is read in the scan, and the two are separated in
- * time — the dominant slack is the serialized `flushChain` plus compose
- * latency: ticks are 60 s apart, but a compose doing herdr probes at
- * `HERDR_TIMEOUT_MS` (30 s) can outlast a tick interval, so tick N+1 can read
- * a counter that tick N has not yet incremented, and the coalesce window
- * (1200 ms) adds a little more. What the bound caps is the steady-state
- * 60-second re-drive, not a same-tick race. Do not move the increment into
- * the scan to tighten it: the scan only *enqueues*, and a notice that never
- * reaches a compose (`sessionGone` makes `enqueueNotice` a no-op) would burn
- * the bound on a release the orchestrator never saw.
- */
-const MAX_DEGRADED_RELEASE_ATTEMPTS = 3;
 
 /**
  * Tools that can open a skill file. An agent whose allowlist has none of these
@@ -304,20 +266,6 @@ const LINEAGE_ENV = "PI_SUBAGENT_LINEAGE";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 const runs = new Map<string, RunRecord>();
-
-/**
- * Synchronous in-flight marker for health-check spawns.
- *
- * `spawnRun` registers the new record in `runs` only after its initial awaits
- * (agent discovery), so two concurrent callers to `spawnHealthCheck` can both
- * see no match in the map and both proceed to spawn. This marker is added
- * synchronously before any await, so the second caller sees it and bails.
- *
- * Cleared when `spawnRun` resolves (success: the map now holds the record;
- * failure: the record is terminal, so the map scan won't match it). No path
- * leaks the marker.
- */
-const healthCheckInFlight = new Set<string>();
 
 /**
  * pi's resolved skill catalogue for this session, captured from the most recent
@@ -728,88 +676,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
 }
 
 /**
- * The target run id a health-check record points at, or `undefined` when the
- * record is not a health check. A non-string `healthCheckOf` (a corrupted or
- * truncated meta.json) is treated as absent, matching `isRunRecord` in
- * rundir.ts, so it can neither trip the recursion guard nor key a bogus
- * deferral.
- */
-function healthCheckOfId(rec: RunRecord): string | undefined {
-  return typeof rec.healthCheckOf === "string" ? rec.healthCheckOf : undefined;
-}
-
-/**
- * The herdr pane id that owns a record — the spawning parent's pane, stamped
- * at spawn — or `undefined` when the record is legacy (no stamp) or carries a
- * corrupted (non-string) one. A non-string `ownerPane` is treated as absent,
- * matching `isRunRecord` in rundir.ts, so ownership is loadable but not
- * sweepable: the record stays queryable, it is just never swept.
- */
-function ownerPaneOf(rec: RunRecord): string | undefined {
-  return typeof rec.ownerPane === "string" ? rec.ownerPane : undefined;
-}
-
-/**
- * Whether `paneId` (this process's herdr pane) owns a record: string equality
- * only. `undefined` owns nothing — a process that does not know its own pane
- * (`HERDR_PANE_ID` unset) does not autonomously sweep any record, because it
- * cannot tell its own apart from the others'.
- */
-function isOwnedBy(rec: RunRecord, paneId: string | undefined): boolean {
-  return paneId !== undefined && ownerPaneOf(rec) === paneId;
-}
-
-/**
- * The health check currently running for a target, if one is in flight.
- *
- * The single definition of "a health check is running for this target": the
- * spawn-reuse scan (a second trigger reuses the in-flight record rather than
- * opening a second tab) and the deferral itself (a target is deferred iff
- * this returns a record) both read through here, so the predicate cannot
- * drift between the two.
- */
-function runningHealthCheckFor(runId: string): RunRecord | undefined {
-  for (const rec of runs.values()) {
-    if (rec.status === "running" && healthCheckOfId(rec) === runId) return rec;
-  }
-  return undefined;
-}
-
-/**
- * A health check that has gone terminal (done, failed, or cancelled) for a
- * target, if one exists.
- *
- * The terminal twin of `runningHealthCheckFor`: the liveness tick's
- * stranded-release scan reads through here, so "a check is terminal for this
- * target" is defined once, beside "a check is running for this target". The
- * `exclude` set keeps a check that already briefed from satisfying the scan —
- * a delivered release must not be re-enqueued on every tick, and when a
- * target had several checks (a stall diagnosis, then a no-answer one), the
- * briefed earlier check must not shadow the terminal one that carries the
- * stranded release. The required `isOwned` predicate is the ownership guard:
- * the scan only re-drives a release whose check belongs to the same pane as
- * its target, so a foreign process's pair is never re-driven here.
- */
-function terminalHealthCheckFor(
-  runId: string,
-  isOwned: (rec: RunRecord) => boolean,
-  exclude: ReadonlySet<string> = new Set(),
-): RunRecord | undefined {
-  for (const rec of runs.values()) {
-    if (
-      rec.status !== "running" &&
-      healthCheckOfId(rec) === runId &&
-      !exclude.has(rec.runId) &&
-      isOwned(rec)
-    ) {
-      return rec;
-    }
-  }
-  return undefined;
-}
-
-/**
- * Spawns (or reuses) the health-check run that diagnoses a target.
+ * Spawns the health-check run that diagnoses a target: the release ledger's
+ * `spawnHealthCheck` collaborator.
  *
  * A health check is a child like any other — same spawn path, same tools,
  * same wake — with two differences: it is spawned by this module rather than
@@ -817,56 +685,24 @@ function terminalHealthCheckFor(
  * exists to diagnose. The `healthcheck` definition's declared model and
  * fallback chain are used as-is.
  *
- * Two guards:
- *
- * - **At most one running health check per target.** A second stall notice,
- *   or a flush that meets the same finished target, reuses the in-flight
- *   record instead of opening a second tab.
- * - **A health check is never health-checked.** A target that is itself a
- *   health check is refused, so the diagnostic cannot recurse.
- *
- * Return shapes: `{ ok: false, error }` (refused or spawn failed); `{ ok: true,
- * rec }` (this call spawned the check); and `{ ok: true }` with no `rec` on an
- * in-flight collision — a second entrant while the first `spawnRun` is still
- * settling bails here, and the first entrant's record (and its completion) is
- * what releases any deferred target. Callers must treat `ok` as "a health
- * check is running or about to run" and never read `rec` off the collision
- * shape.
+ * Policy-free by design: the recursion guard (a health check is never
+ * health-checked), the reuse of a running check, and the synchronous
+ * in-flight marker all live in `release-ledger.ts`, which calls this only
+ * once it has decided a spawn is due.
  */
-async function spawnHealthCheck(
+async function spawnHealthCheckRun(
   target: RunRecord,
   trigger: HealthCheckTrigger,
 ): Promise<SpawnOutcome> {
-  if (target.agent === "healthcheck" || healthCheckOfId(target)) {
-    return {
-      ok: false,
-      error: `Run ${target.runId} is itself a health check, so it is not health-checked again.`,
-    };
-  }
-  const inFlight = runningHealthCheckFor(target.runId);
-  if (inFlight) return { ok: true, rec: inFlight };
-  // Synchronous in-flight guard: prevents two concurrent callers from both
-  // proceeding to spawnRun before either has registered in the map.
-  if (healthCheckInFlight.has(target.runId)) {
-    return { ok: true };
-  }
-  healthCheckInFlight.add(target.runId);
-  try {
-    const result = await spawnRun(
-      {
-        agent: "healthcheck",
-        cwd: target.cwd,
-        task: buildHealthCheckTask(target, dirFor(target.runId), trigger),
-        healthCheckOf: target.runId,
-      },
-      target.cwd,
-    );
-    healthCheckInFlight.delete(target.runId);
-    return result;
-  } catch (e) {
-    healthCheckInFlight.delete(target.runId);
-    throw e;
-  }
+  return spawnRun(
+    {
+      agent: "healthcheck",
+      cwd: target.cwd,
+      task: buildHealthCheckTask(target, dirFor(target.runId), trigger),
+      healthCheckOf: target.runId,
+    },
+    target.cwd,
+  );
 }
 
 /**
@@ -1005,64 +841,6 @@ async function renderResultBlock(
 }
 
 /**
- * Terminal results already read, so one transcript is not read twice between a
- * liveness tick and the compose it triggers (they can be 1 MB).
- *
- * Each entry is keyed to the record's `finishedAt` as well as its id. Every
- * lifecycle transition stamps a fresh `finishedAt`, so a result cached before a
- * later one — a `failed` run revived to `done` by a late `<result>` — can never
- * be served for it: staleness is impossible by construction rather than by
- * every writer remembering to refresh.
- */
-export interface TerminalResultCache {
-  /** The cached result, or undefined when absent or cached for an earlier transition. */
-  get(rec: RunRecord): RunResult | undefined;
-  set(rec: RunRecord, result: RunResult): void;
-  delete(runId: string): void;
-  readonly size: number;
-}
-
-export function createTerminalResultCache(): TerminalResultCache {
-  const entries = new Map<string, { finishedAt: number | undefined; result: RunResult }>();
-  return {
-    get(rec) {
-      const e = entries.get(rec.runId);
-      return e && e.finishedAt === rec.finishedAt ? e.result : undefined;
-    },
-    set(rec, result) {
-      entries.set(rec.runId, { finishedAt: rec.finishedAt, result });
-    },
-    delete(runId) {
-      entries.delete(runId);
-    },
-    get size() {
-      return entries.size;
-    },
-  };
-}
-
-/**
- * A briefing and the run ids its blocks covered.
- *
- * The set is the dedup contract: `flushNotices` is the only place that marks
- * a run as briefed, and it marks exactly these ids — a run whose block was
- * withheld (deferred behind a health check) must not be marked, or its
- * release would be swallowed as a duplicate.
- */
-interface ComposedBriefing {
-  text: string;
-  briefedRunIds: Set<string>;
-  /**
-   * The health-check ids whose target block degraded in this compose (the
-   * target's result read threw). Neither id of such a pair is marked briefed,
-   * so the liveness tick's stranded-release scan re-drives the release — and
-   * the factory counts those re-drives (`degradedReleaseAttempts`) to bound a
-   * persistently unreadable target.
-   */
-  degradedRunIds: Set<string>;
-}
-
-/**
  * Renders one completed run's block as a single string (joined with "\n").
  * Used by the wake briefing where each block is an independent paragraph.
  */
@@ -1073,261 +851,19 @@ async function doneBlock(rec: RunRecord, result?: RunResult): Promise<string> {
 }
 
 /**
- * The user message a batch of notices becomes.
- *
- * Written as an instruction to the orchestrator, not as a log line, because it
- * *is* the turn's prompt: this text is the whole reason the orchestrator woke
- * up, so it has to say what happened, carry what the child produced, and be
- * explicit that ending the turn again is the correct move when other children
- * are still running. Otherwise a woken orchestrator reaches for a wait that no
- * longer exists.
- *
- * A `done` notice inlines the child's answer, so the common case costs no
- * follow-up tool call. A `report` is reconciled first: if the child has
- * finished by flush time, it renders as a full result block rather than a
- * stale "still working" line. A `stalled` notice is the child watchdog's
- * one-shot stall signal: it is consumed — the health check that spawns from
- * it is what briefs — and only a health check that cannot launch leaves a
- * block behind.
- *
- * A finished target that ended without a readable answer is held back behind
- * a health check (see `spawnHealthCheck`); the health check's completion
- * (done, failed, or cancelled) releases it, and this same function is what
- * renders both blocks. A health check is never health-checked, so its own
- * completion releases its target without spawning anything.
- *
- * Deferral is derived from the runs map, not a persistent set: a target is
- * deferred iff a health-check record for it is currently running. The release
- * is carried by a done notice for the health check itself — enqueued by the
- * liveness tick when the tick first finds the check terminal, and by the
- * `cancel` action when the orchestrator cancels it — because a notice is what
- * wakes the orchestrator: a terminal check whose notice never lands releases
- * nothing. `briefedFinishedRunIds` (the factory's dedup set) is consulted in
- * the release guard so a target that already briefed while its check ran is
- * not rendered a second time.
- *
- * @param batch - Notices from the closed coalesce window, in arrival order.
- * @param swept - Observations of runs that finished since the last wake, found
- *   by the flush-time lifecycle sweep. Rendered after the batch blocks.
- * @param briefedFinishedRunIds - The factory's dedup set of run ids already
- *   delivered in a completed briefing; a release never re-renders one.
- * @param isOwned - The autonomous-work boundary for the "Still running" tail:
- *   the tail names only runs this process owns, because a foreign session's
- *   running children are not this orchestrator's to report on (direct batch
- *   notices are unfiltered — a notice addressed to this pane is evidence of
- *   ownership).
- * @param results - The factory's cache of results already extracted for
- *   terminal runs (by the liveness tick or an earlier compose), so a block is
- *   not re-read; filled here for every terminal run a block is rendered from.
- *   Entries are keyed to the run's `finishedAt`, so one cached before a later
- *   transition is never served. The factory drops an entry when its run is
- *   marked briefed.
+ * A released target's block when its result read threw: the real header —
+ * so the block stays discoverable by the `=== sub-xxxx` header every release
+ * assertion pins — plus a pointer to `subagent_tasks`. `readReports` never
+ * throws, so the mid-run reports ride the degraded block too.
  */
-async function composeBriefing(
-  batch: readonly Notice[],
-  swept: readonly RunObservation[],
-  briefedFinishedRunIds: ReadonlySet<string>,
-  isOwned: (rec: RunRecord) => boolean,
-  results: TerminalResultCache,
-): Promise<ComposedBriefing> {
-  const blocks: string[] = [];
-  const briefed = new Set<string>();
-  const degraded = new Set<string>();
-
-  /**
-   * One finished run's block, with the no-answer gate applied to ordinary
-   * targets.
-   *
-   * Deferral is derived from the runs map, not a persistent set: a target is
-   * deferred iff a health-check record for it is currently running. The
-   * release rides the health check's own done notice (the liveness tick and
-   * the `cancel` action both enqueue one), so when a terminal check renders
-   * here its target is no longer deferred and the target's block joins this
-   * same briefing — unless the target already briefed, in which case
-   * `briefedFinishedRunIds` keeps it from rendering twice.
-   */
-  const renderFinished = async (observation: RunObservation): Promise<void> => {
-    const rec = observation.run;
-    if (briefed.has(rec.runId) || briefedFinishedRunIds.has(rec.runId)) return;
-    /** This run's result: cached, or read once through its observation. */
-    const resultOfRun = async (): Promise<RunResult> => {
-      // A run that transitioned in this observation (a late completion, say)
-      // has fresher evidence than anything cached before it.
-      const cached = observation.transition ? undefined : results.get(rec);
-      if (cached) return cached;
-      const result = await observation.result();
-      // Only terminal results are cached: a running record's answer may still change.
-      if (rec.status !== "running") results.set(rec, result);
-      return result;
-    };
-
-    const healthCheckOf = healthCheckOfId(rec);
-    if (healthCheckOf) {
-      // A terminal health check releases its target: the target's block joins
-      // this same briefing, even when the health check itself has no answer
-      // (a health check is never health-checked, so nothing spawns). The target
-      // is released unconditionally here — not gated on a deferral set — so a
-      // cancelled health check releases its target the same way a completed
-      // one does.
-      const target = runs.get(healthCheckOf);
-      const releasable =
-        target !== undefined &&
-        !briefed.has(target.runId) &&
-        !briefedFinishedRunIds.has(target.runId) &&
-        target.status !== "running";
-      let targetBlock: string | undefined;
-      let targetDegraded = false;
-      if (releasable && target) {
-        try {
-          // A release target is not necessarily part of this sweep, so it
-          // falls back to its own direct read when nothing is cached.
-          const targetResult =
-            results.get(target) ?? (await extractRunResult(dirFor(target.runId), target.runId));
-          targetBlock = await doneBlock(target, targetResult);
-        } catch {
-          // The target's block is degraded, not dropped: the check's block is
-          // still delivered below, and neither id is marked briefed — the
-          // liveness tick's stranded-release scan re-drives the release on the
-          // next tick, where the target is tried again.
-          // The real header, not a hand-rolled one: the block stays
-          // discoverable by the `=== sub-xxxx` header every release
-          // assertion pins. `readReports` never throws, so the mid-run
-          // reports ride the degraded block too.
-          const out: string[] = [
-            formatResultHeader(target),
-            `result block unavailable; read it with subagent_tasks (action "result", ids ["${target.runId}"])`,
-          ];
-          await pushReports(target, out);
-          targetBlock = out.join("\n");
-          targetDegraded = true;
-          // The scan re-drives this release; the factory counts the re-drives.
-          degraded.add(rec.runId);
-        }
-      }
-
-      // Atomic mark: both blocks are pushed before either id is added to
-      // `briefed`, and the check id and its target id are always marked
-      // briefed together, so "check briefed" implies "target released" — a
-      // flush can never mark the pair delivered while a block is undelivered.
-      // A degraded target block marks neither: the pair stays unbriefed so
-      // the backstop re-drives it.
-      blocks.push(await doneBlock(rec, await resultOfRun()));
-      if (targetBlock !== undefined) blocks.push(targetBlock);
-      if (!targetDegraded) briefed.add(rec.runId);
-      if (targetBlock !== undefined && target !== undefined && !targetDegraded)
-        briefed.add(target.runId);
-      return;
-    }
-
-    const result = await resultOfRun();
-    if (result.answered) {
-      blocks.push(await doneBlock(rec, result));
-      briefed.add(rec.runId);
-      return;
-    }
-
-    // No answer: a cancelled run is terminal and was deliberately killed —
-    // render it immediately without a health check.
-    if (rec.status === "cancelled") {
-      blocks.push(await doneBlock(rec, result));
-      briefed.add(rec.runId);
-      return;
-    }
-
-    // No answer: hold the no-answer block behind a health check, which has
-    // the context budget to look at the transcript. A health check that
-    // cannot be launched must not hold the block either — render it now,
-    // exactly as before this feature existed. A *terminal* check for this
-    // target does not block the spawn: the stall and no-answer triggers ask
-    // different questions, so a fresh check diagnoses the no-answer ending.
-    const hc = await spawnHealthCheck(rec, { kind: "ended-without-result" });
-    if (hc.ok) {
-      return;
-    }
-    blocks.push(await doneBlock(rec, result));
-    briefed.add(rec.runId);
-  };
-
-  for (const notice of batch) {
-    const rec = runs.get(notice.runId);
-    if (!rec) {
-      // A notice for a run this process never registered (the parent restarted
-      // and the meta file was lost). Still worth surfacing verbatim.
-      blocks.push(
-        `--- ${notice.runId} (${notice.agent}) ${notice.kind} ---\n${
-          notice.text || "(no message)"
-        }\n(This task is not in my registry — it may predate a restart.)`,
-      );
-      continue;
-    }
-
-    // Read before deciding: a report notice may have arrived while the child
-    // was still working, but by flush time the child may have finished.
-    const observation = await lifecycle.read(rec);
-
-    if (rec.status === "running") {
-      if (notice.kind === "stalled") {
-        // The watchdog's one-shot stall signal. It is not an orchestrator
-        // briefing: the health check that spawns from it is what briefs, so on
-        // success the raw notice is consumed. A health check that cannot launch
-        // is the one case where the stall has to be surfaced here.
-        const hc = await spawnHealthCheck(rec, { kind: "stalled", detail: notice.text });
-        if (!hc.ok) {
-          blocks.push(
-            `--- ${rec.runId} (${rec.agent}) stalled ---\n${notice.text || "(no detail)"}\n` +
-            `The automatic health check could not launch: ${hc.error}. ` +
-            `Look at it with subagent_tasks (action "result", ids ["${rec.runId}"]), or interrupt/cancel it.`,
-          );
-        }
-        continue;
-      }
-      blocks.push(
-        `--- ${rec.runId} (${notice.agent}) ${notice.kind === "report" ? "sent a mid-run report" : "sent a notice"} ---\n${notice.text || "(no message)"}\n` +
-        `It is still working. Reply with subagent_tasks (action "message", ids ["${rec.runId}"]) if it needs an answer or a correction.`,
-      );
-      continue;
-    }
-
-    // Finished (done, failed, or cancelled): the full result block, with the
-    // no-answer gate.
-    await renderFinished(observation);
-  }
-
-  // Append swept runs (finished since last wake, not in the batch).
-  for (const observation of swept) {
-    await renderFinished(observation);
-  }
-
-  const stillRunning = [...runs.values()].filter((r) => r.status === "running" && isOwned(r));
-  const tail =
-    stillRunning.length > 0
-      ? `\n\nStill running: ${stillRunning
-          .map((r) => `${r.runId} (${r.agent})`)
-          .join(", ")}. Do not wait or poll for them — carry on with what you can do now, then end your turn; they will wake you the same way.`
-      : "\n\nNo subagent tasks are still running.";
-
-  const text =
-    blocks.length > 0
-      ? `[subagent update — delivered automatically, not typed by the user]\n\n${blocks.join("\n\n")}${tail}`
-      : "";
-
-  return { text, briefedRunIds: briefed, degradedRunIds: degraded };
+async function degradedBlock(rec: RunRecord): Promise<string> {
+  const out: string[] = [
+    formatResultHeader(rec),
+    `result block unavailable; read it with subagent_tasks (action "result", ids ["${rec.runId}"])`,
+  ];
+  await pushReports(rec, out);
+  return out.join("\n");
 }
-
-/**
- * A target whose release a failed compose for its health check carried.
- *
- * "Unregistered" is its own case rather than a record with a missing `agent`: a
- * target id with no runs-map entry (a `meta.json` that failed to parse at
- * `loadRegistry`, or a `healthCheckOf` pointing at a run this process never
- * registered) has no record to name, and the liveness tick's stranded-release
- * scan — which loops over the targets *in* the registry — can never re-drive
- * it. The bare id in the briefing text is therefore the only release the
- * orchestrator will ever get for such a pair.
- */
-type ReleasedTarget =
-  | { kind: "registered"; runId: string; agent: string; status: RunRecord["status"] }
-  | { kind: "unregistered"; runId: string };
 
 /**
  * Minimal briefing used when composing the full one threw.
@@ -1384,30 +920,13 @@ function fallbackBriefing(
  * The per-session hooks the factory returns.
  *
  * pi ignores a factory's return value; this exists so a test can drive one
- * liveness tick on demand instead of waiting for the 60-second interval.
+ * liveness tick on demand instead of waiting for the 60-second interval. All
+ * wake policy is tested through `createReleaseLedger` (release-ledger.test.ts).
  */
+// Transitional: the fake-timer migration of wake.test.ts removes runLivenessTick (and this interface's last member).
 export interface SubagentHerdrHooks {
-  /** Runs one liveness reconciliation tick now. */
+  /** Runs one liveness reconciliation tick now, arming the flush it produces. */
   runLivenessTick(): Promise<void>;
-  /**
-   * Test-only seam: the dedup set of run ids already delivered in a completed
-   * briefing. Exposed so a test can plant an id in the set while its record is
-   * still `running` — a state the natural flush flow never produces — and
-   * assert the liveness tick's exclude set honours it.
-   */
-  readonly briefedFinishedRunIds: Set<string>;
-  /**
-   * Test-only seam: the module's health-check spawn, exposed so a test can
-   * drive two concurrent entrants for the same target without letting the
-   * first register — the state the synchronous in-flight marker exists for.
-   */
-  spawnHealthCheck(target: RunRecord, trigger: HealthCheckTrigger): Promise<SpawnOutcome>;
-  /**
-   * Test-only seam: how many terminal results are cached. Exposed so a test
-   * can assert every briefed-mark retires its entry (the degraded-bound path
-   * once leaked one per pair).
-   */
-  terminalResultCount(): number;
 }
 
 export default function (pi: ExtensionAPI): SubagentHerdrHooks {
@@ -1540,55 +1059,22 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
   // The wake path: a child's notice arrives here as ordinary input
   // -------------------------------------------------------------------------
 
-  /** Notices seen since the last briefing was dispatched. */
-  let pending: Notice[] = [];
+  // The policy — coalescing, dedup, health-check pairing, ownership, the
+  // liveness tick — is the ledger's (release-ledger.ts). The factory keeps
+  // only what the ledger must not touch: the timers, the clock, and pi.
+  const ledger = createReleaseLedger({
+    records: () => [...runs.values()],
+    lifecycle,
+    ownerPane,
+    spawnHealthCheck: spawnHealthCheckRun,
+    extractRunResult: (rec) => extractRunResult(dirFor(rec.runId), rec.runId),
+    renderer: { done: doneBlock, degraded: degradedBlock, fallback: fallbackBriefing },
+  });
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Run ids already delivered in a completed briefing, so a later duplicate notice is swallowed. */
-  const briefedFinishedRunIds = new Set<string>();
-  /**
-   * Results already extracted for terminal runs, so the tick's gate read and
-   * the compose that follows it do not read the transcript twice. Only
-   * terminal results are cached (a running answer can still change), an entry
-   * is dropped once its run is marked briefed, and one cached before a later
-   * transition (a revival) is never served — see {@link createTerminalResultCache}.
-   *
-   * Bounded by the registry: an entry outlives its briefing only for a target
-   * deferred behind a health check, and that pair retires through
-   * `markBriefed` on every path (clean release, degraded bound, compose
-   * failure).
-   */
-  const terminalResults = createTerminalResultCache();
-  /** Marks a run briefed and retires its cached result. */
-  const markBriefed = (runId: string): void => {
-    briefedFinishedRunIds.add(runId);
-    terminalResults.delete(runId);
-  };
-  /**
-   * Degraded-release retry counter, keyed on the health-check run id.
-   *
-   * The liveness tick's stranded-release scan re-drives a release whose target
-   * block degraded (neither id of the pair was marked briefed), and
-   * `flushNotices` counts each such delivery here. The scan marks the pair
-   * briefed once the counter reaches `MAX_DEGRADED_RELEASE_ATTEMPTS`, so a
-   * persistently unreadable target cannot produce an unbounded 60-second wake
-   * storm. The entry is cleared on every path that retires the pair — a
-   * clean release, the bound burning, the compose-failure fallback, or the
-   * age-gate skip — so the map grows only from live degraded pairs. The one
-   * residual is a degraded check whose target is later briefed independently
-   * of it (the spawn-failure arm briefs the target alone), which strands at
-   * most one counter entry for the process lifetime.
-   */
-  const degradedReleaseAttempts = new Map<string, number>();
-  /** Serializes flush bodies so overlapping timers cannot race the dedup set. */
-  let flushChain: Promise<void> = Promise.resolve();
-  /** Set when the session goes away: timers must not enter a dead runtime. */
-  let sessionGone = false;
   let livenessTimer: ReturnType<typeof setInterval> | undefined;
-  /** Overlap guard: at most one liveness tick in flight. */
-  let backstopRunning = false;
 
   /**
-   * Turns the buffered notices into one user message and sends it.
+   * Delivers a composed briefing.
    *
    * `sendUserMessage` rather than a returned transform, because by the time the
    * window closes the original input event has long since been answered with
@@ -1596,379 +1082,91 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
    * entire mechanism: the orchestrator ended its turn after delegating, and this
    * is what wakes it back up.
    *
-   * When the orchestrator is *mid-turn* it is delivered as **steering**, which
-   * interrupts its tool-call chain at the next turn boundary. See the comment on
-   * the `sendUserMessage` call for why follow-up delivery made a finished child
-   * structurally unreachable until the turn had already ended.
-   *
    * Wrapped, and for the reason ralph-loop documents: `sendUserMessage` calls
    * `assertActive()` synchronously and throws once the runtime is invalidated
    * (`/reload`, a new session, a session switch). An uncaught throw from a timer
    * callback reaches pi's `uncaughtException` handler and exits the process — a
    * subagent finishing must never be able to kill the orchestrator.
-   *
-   * Before composing, the flush sweeps the registry for other runs that have
-   * finished since the last wake (sidecar on disk, pane gone) and folds them
-   * into the same briefing, so a fan-out that finishes together produces one
-   * response rather than one per child.
    */
-  const flushNotices = (): void => {
-    coalesceTimer = undefined;
-    const batch = pending;
-    pending = [];
-    if (batch.length === 0) return;
-
-    flushChain = flushChain.then(async () => {
-      // Suppress delayed duplicate notices for runs already briefed.
-      const fresh = batch.filter((n) => {
-        const rec = runs.get(n.runId);
-        return !(rec && rec.status !== "running" && briefedFinishedRunIds.has(n.runId));
-      });
-      if (fresh.length === 0) return;
-
-      // Sweep: find other runs that finished since the last wake.
-      const swept: RunObservation[] = [];
-      try {
-        const exclude = new Set([...fresh.map((n) => n.runId), ...briefedFinishedRunIds]);
-        // Only this pane's records are swept: the registry is global, and a
-        // foreign run's finished state is its owner's to deliver.
-        const sweep = await lifecycle.sweep([...runs.values()].filter((r) => isOwnedBy(r, ownerPane)), { exclude });
-        swept.push(...sweep.finished);
-      } catch {
-        // Best effort: the notice-driven briefing still goes out below.
-      }
-
-      let composed: ComposedBriefing;
-      try {
-        composed = await composeBriefing(fresh, swept, briefedFinishedRunIds, (rec) => isOwnedBy(rec, ownerPane), terminalResults);
-      } catch {
-        // Composing reads run dirs and probes herdr; if that fails the orchestrator
-        // must still be told something, or the event is silently lost. The degraded
-        // path marks what it delivered the old way — finished fresh notices and
-        // every swept run — so a delayed duplicate is still swallowed.
-        //
-        // A terminal health check in the batch carries its target's release.
-        // The compose marks a pair briefed together, so the catch marks the
-        // target briefed too — "HC briefed ⇒ target released" holds here
-        // exactly as on the bound-burning path — and the target id joins the
-        // briefing text: it is neither a fresh notice nor a swept record, so
-        // nothing else would surface it, and with the mark the
-        // stranded-release scan (which excludes briefed checks) can never
-        // re-drive the pair either.
-        //
-        // Only *terminal* checks release: a running check's notice in this
-        // batch (a mid-run report) is not a release at all, and marking its
-        // target briefed here would strand the target's real block behind a
-        // check that is still running. The target side is gated the same
-        // way: a terminal check whose target is still running retires the
-        // check only — the target is no longer deferred (deferral is derived
-        // from a running check), so its own done notice will carry its block,
-        // and marking it briefed here would suppress that real answer.
-        //
-        // Swept checks release the same way: the sweep is what makes a check
-        // that finished without a notice of its own visible here, and the
-        // invariant must hold for that path too.
-        //
-        // A target with no runs-map entry is named by its *bare* id: there is
-        // no record to mark or describe, and the scan loops over targets in
-        // the registry, so it could never re-drive that release either — the
-        // id in the text is the whole release.
-        const releasedTargets: ReleasedTarget[] = [];
-        const releaseTargetOf = (check: RunRecord): void => {
-          const targetId = healthCheckOfId(check);
-          if (!targetId) return;
-          // The pair retires on every path that reaches here — including the
-          // running-target early return below — so the degraded-retry counter
-          // is cleared unconditionally.
-          degradedReleaseAttempts.delete(check.runId);
-          const target = runs.get(targetId);
-          if (target) {
-            // A running target is not released: the check is terminal, so the
-            // target is no longer deferred, and its own done notice will carry
-            // its block. Marking it briefed here would suppress that real
-            // answer — the dedup set is never cleared for a running record.
-            if (target.status === "running") return;
-            markBriefed(target.runId);
-            releasedTargets.push({ kind: "registered", runId: target.runId, agent: target.agent, status: target.status });
-          } else {
-            // Unregistered target: there is no record to ask, so it cannot
-            // be status-gated the way the registered path is — the bare id
-            // is pushed unconditionally. The check is marked briefed, so the
-            // bare id has to carry the release on its own.
-            releasedTargets.push({ kind: "unregistered", runId: targetId });
-          }
-        };
-        for (const n of fresh) {
-          const rec = runs.get(n.runId);
-          if (!rec) continue;
-          if (rec.status !== "running") {
-            markBriefed(n.runId);
-            releaseTargetOf(rec);
-          }
-        }
-        for (const { run: r } of swept) {
-          // Swept records are terminal by construction: the sweep only
-          // collects records that stopped running this flush.
-          markBriefed(r.runId);
-          releaseTargetOf(r);
-        }
-        const briefing = fallbackBriefing(fresh, swept.map((o) => o.run), releasedTargets);
-        try {
-          pi.sendUserMessage(briefing, { deliverAs: "steer" });
-        } catch {
-          // The runtime went away under us (see the send below for why it can).
-        }
-        return;
-      }
-
-      // Record what we just briefed so later duplicate notices are swallowed —
-      // exactly the runs whose blocks were delivered, never a run whose block
-      // was deferred behind a health check.
-      for (const id of composed.briefedRunIds) {
-        markBriefed(id);
-        // A pair that delivered cleanly no longer needs its degraded-retry
-        // counter.
-        degradedReleaseAttempts.delete(id);
-      }
-      // Count the degraded releases: the scan re-drives each of them, and this
-      // counter is what bounds the re-drive (see MAX_DEGRADED_RELEASE_ATTEMPTS).
-      for (const id of composed.degradedRunIds) {
-        degradedReleaseAttempts.set(id, (degradedReleaseAttempts.get(id) ?? 0) + 1);
-      }
-
-      // Every notice was consumed (each stall spawned its health check) and the
-      // sweep found nothing: there is no briefing to send, and sending "" would
-      // wake the orchestrator for nothing.
-      if (!composed.text) return;
-
-      try {
-        // deliverAs "steer", not "followUp" — and the distinction is the whole
-        // reason a finished child used to be invisible until the orchestrator was
-        // completely done. pi's agent loop drains the two queues from
-        // structurally different places (`agent-loop.js`, measured against
-        // pi-agent-core 0.99.2):
-        //
-        //   inner loop, every turn:  pendingMessages = getSteeringMessages()
-        //   outer loop, after the inner `while` exits:  getFollowUpMessages()
-        //
-        // The inner loop runs `while (hasMoreToolCalls || pendingMessages.length)`.
-        // So a follow-up is only collected once the orchestrator has stopped
-        // calling tools altogether — i.e. when its turn is already over. An
-        // orchestrator that delegates and then keeps working (reads a file, greps,
-        // spawns a sibling) pauses for each tool result *inside* that inner loop,
-        // where the follow-up queue is never consulted, so the briefing sat there
-        // until the turn ended on its own. That is the bug: not a late wake, a
-        // structurally unreachable one.
-        //
-        // Steering is drained after the current assistant message's tool results
-        // are already in context and before the next LLM call, so it cuts into the
-        // tool-call chain at the first safe boundary without ever splitting a
-        // tool_call/tool_result pair. Cutting in is the point — a subagent's result
-        // is new information that should redirect the loop, not wait politely
-        // behind the work it invalidates.
-        //
-        // This does not change the idle path at all: `deliverAs` is only consulted
-        // when `isStreaming` is true (`agent-session.js` `prompt()`), and when the
-        // session is idle this still starts a fresh turn exactly as before.
-        //
-        // `steeringMode` is set to "all" in agent/settings.json, so if two
-        // briefings ever land in the steering queue simultaneously (e.g. the
-        // second flush fires while the orchestrator is still responding to the
-        // first), both drain into the same next turn as one consolidated response.
-        //
-        // `expandPromptTemplates` is deliberately omitted rather than passed as
-        // false: false is already the default. The briefing always starts with "[",
-        // so it could never be taken for a slash command anyway.
-        pi.sendUserMessage(composed.text, { deliverAs: "steer" });
-      } catch {
-        // The runtime went away under us. The run's state is on disk either way,
-        // so the next `status`/`result` still reports it correctly.
-      }
-    });
-  };
-
-  /**
-   * Buffers one notice into the coalesce window.
-   *
-   * Shared by the input hook (a child's typed notice) and the liveness
-   * backstop (a done notice the tick generated for a child whose own delivery
-   * was lost), so both wake the orchestrator through the exact same
-   * coalesced, deduped path.
-   *
-   * The window is deliberately re-armable: every notice re-arms the timer
-   * (`clearTimeout` + fresh `setTimeout`), so a steady drip of notices keeps
-   * coalescing into one briefing instead of waking per notice. The trade is
-   * that a notice can be lost — session shutdown clears `pending` before the
-   * timer fires, and `sessionGone` makes this a no-op afterwards. When the
-   * lost notice was a health check's release, the liveness tick's
-   * stranded-release scan is the backstop: it re-enqueues the release, so a
-   * deferred target is never stranded with no future tick to wake it.
-   */
-  const enqueueNotice = (notice: Notice): void => {
-    if (sessionGone) return;
-    pending.push(notice);
-    if (coalesceTimer) clearTimeout(coalesceTimer);
-    coalesceTimer = setTimeout(() => {
-      flushNotices();
-    }, NOTICE_COALESCE_MS);
-  };
-
-  /**
-   * One liveness tick: a single bounded reconciliation sweep.
-   *
-   * It acts only on records this tick changed from `running` to a terminal
-   * status, and it never blocks on a live child — a live pane costs one
-   * status probe and nothing else. For every newly finished record it
-   * enqueues the done notice the child's own delivery was supposed to carry:
-   *
-   * - an answered run wakes the orchestrator the normal way;
-   * - an unanswered ordinary run gets a health check, and its done notice is
-   *   enqueued only if that spawn fails (on success the run is deferred
-   *   behind the health check, whose completion is the wake);
-   * - a finished health check gets its done notice unconditionally, because
-   *   its completion is what releases a deferred target.
-   *
-   * After the sweep it runs a stranded-release scan: a terminal, non-briefed
-   * target whose release (the done notice for its terminal health check) was
-   * lost gets the release re-enqueued, gated by age (a terminal transition
-   * older than `6 * LIVENESS_BACKSTOP_MS` is not re-driven) and by attempts
-   * (`MAX_DEGRADED_RELEASE_ATTEMPTS` re-drives per degraded release, after
-   * which the pair is marked briefed and the last degraded block stands).
-   */
-  const runLivenessTick = async (): Promise<void> => {
-    if (backstopRunning || sessionGone) return;
-    backstopRunning = true;
+  const deliver = (text: string): void => {
     try {
-      // Only this pane's records are reconciled: a foreign or legacy record
-      // is owned by someone else (or no one, for legacy), and sweeping it
-      // here would close their pane, overwrite their meta, and brief their
-      // session's orchestrator through this one.
+      // deliverAs "steer", not "followUp" — and the distinction is the whole
+      // reason a finished child used to be invisible until the orchestrator was
+      // completely done. pi's agent loop drains the two queues from
+      // structurally different places (`agent-loop.js`, measured against
+      // pi-agent-core 0.99.2):
       //
-      // One lifecycle sweep reconciles running records and examines failed
-      // ones for a late completion — a late `<result>` or a sidecar written
-      // after the classification. Revival is bounded inside the lifecycle (six
-      // liveness intervals since the terminal transition, only when the
-      // session file changed since last examined, never a launch failure).
+      //   inner loop, every turn:  pendingMessages = getSteeringMessages()
+      //   outer loop, after the inner `while` exits:  getFollowUpMessages()
       //
-      // The exclude set is the dedup set restricted to running records: a
-      // terminal briefed record must stay a revival candidate, because a late
-      // answer is exactly what corrects an already-delivered false failure.
-      const owned = [...runs.values()].filter((r) => isOwnedBy(r, ownerPane));
-      const exclude = new Set(owned.filter((r) => r.status === "running" && briefedFinishedRunIds.has(r.runId)).map((r) => r.runId));
-      const sweep = await lifecycle.sweep(owned, { exclude });
-      for (const t of sweep.transitions) {
-        // Let the late answer correct an already-delivered false failure: the
-        // dedup set would otherwise suppress the corrective briefing.
-        if (t.cause === "late-completion") briefedFinishedRunIds.delete(t.run.runId);
-      }
-      // Release notices the finished loop enqueued this tick. The flush is
-      // ~1200 ms away, so a check classified done here is still
-      // terminal-and-unbriefed when the stranded-release scan below runs;
-      // without this set the scan would enqueue the same release a second
-      // time, and the compose's local dedup only catches it on the clean
-      // path (a degraded pair marks neither id, so it renders twice).
-      const enqueuedThisTick = new Set<string>();
-      for (const observation of sweep.finished) {
-        const rec = observation.run;
-        try {
-          if (healthCheckOfId(rec)) {
-            enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
-            enqueuedThisTick.add(rec.runId);
-            continue;
-          }
-          const result = await observation.result();
-          // The compose that this notice triggers reuses it instead of re-reading.
-          terminalResults.set(rec, result);
-          if (result.answered) {
-            enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
-            enqueuedThisTick.add(rec.runId);
-            continue;
-          }
-          const hc = await spawnHealthCheck(rec, { kind: "ended-without-result" });
-          if (hc.ok) {
-            // Deferred: the health check's completion (or cancellation) is the wake.
-          } else {
-            enqueueNotice({ runId: rec.runId, agent: rec.agent, kind: "done", text: "" });
-            enqueuedThisTick.add(rec.runId);
-          }
-        } catch {
-          // One bad record: the next tick retries.
-        }
-      }
-
-      // Stranded-release scan: the sweep only transitions records, never
-      // re-delivers one, so a terminal target whose release — the done notice for its
-      // terminal health check — was lost (session shutdown clears `pending`,
-      // `sessionGone` makes `enqueueNotice` a no-op) transitions again for no
-      // tick, and its deferred block would never be delivered. Re-enqueue the
-      // release for any terminal, non-briefed, non-health-check target that
-      // has a terminal, non-briefed check, subject to two gates:
+      // The inner loop runs `while (hasMoreToolCalls || pendingMessages.length)`.
+      // So a follow-up is only collected once the orchestrator has stopped
+      // calling tools altogether — i.e. when its turn is already over. An
+      // orchestrator that delegates and then keeps working (reads a file, greps,
+      // spawns a sibling) pauses for each tool result *inside* that inner loop,
+      // where the follow-up queue is never consulted, so the briefing sat there
+      // until the turn ended on its own. That is the bug: not a late wake, a
+      // structurally unreachable one.
       //
-      // - **Age.** A check whose terminal transition is older than
-      //   `6 * LIVENESS_BACKSTOP_MS` is not re-enqueued. After a restart
-      //   `briefedFinishedRunIds` is fresh, so every historical terminal pair
-      //   would otherwise be re-briefed on the first tick — a stale storm as
-      //   health checks accumulate. A genuinely stranded release is stranded
-      //   now, not hours ago.
-      // - **Attempts.** A release whose target block degraded (the result read
-      //   threw) is re-driven at most `MAX_DEGRADED_RELEASE_ATTEMPTS` times;
-      //   a persistently unreadable target would otherwise produce a
-      //   60-second wake storm of re-delivered health-check blocks. When the
-      //   bound is burned, BOTH ids are marked briefed and the last degraded
-      //   block stands as the final delivery — "HC briefed ⇒ target released"
-      //   stays true, because the degraded block is a release that points at
-      //   `subagent_tasks`.
+      // Steering is drained after the current assistant message's tool results
+      // are already in context and before the next LLM call, so it cuts into the
+      // tool-call chain at the first safe boundary without ever splitting a
+      // tool_call/tool_result pair. Cutting in is the point — a subagent's result
+      // is new information that should redirect the loop, not wait politely
+      // behind the work it invalidates.
       //
-      // A pair whose release has landed is quiet: the flush marked both ids
-      // briefed, and a terminal check that is already briefed never satisfies
-      // the scan, so a landed release is not re-enqueued on every 60 s tick.
-      // The `[...runs.values()]` snapshot matches the tick's collectFinished
-      // call above: the body is synchronous today, but a future `await` in it
-      // must not let a concurrent spawn's `runs.set` feed new records into the
-      // loop.
-      // The scan's exclude set: the briefed ids, plus the checks whose release
-      // the finished loop above already enqueued this tick.
-      const releaseExcludes = new Set<string>([...briefedFinishedRunIds, ...enqueuedThisTick]);
-      for (const target of [...runs.values()]) {
-        // Ownership is the sweep's boundary, not the query's: only this
-        // pane's targets are re-driven here.
-        if (!isOwnedBy(target, ownerPane)) continue;
-        if (target.status === "running") continue;
-        if (healthCheckOfId(target)) continue;
-        if (briefedFinishedRunIds.has(target.runId)) continue;
-        // A check the finished loop enqueued this tick is not stranded: its
-        // release is already in the coalesce window, and the flush has not
-        // marked it briefed yet, so the briefed set alone would not exclude it.
-        // The check must be owned too: a foreign check's release is its
-        // owner's to drive, not ours.
-        const check = terminalHealthCheckFor(target.runId, (rec) => isOwnedBy(rec, ownerPane), releaseExcludes);
-        if (!check) continue;
-        // Age gate: a release stranded hours ago is not a release to re-drive.
-        // A record with neither finishedAt nor startedAt fails OPEN here (the
-        // NaN comparison is false) by deliberate choice: a record malformed
-        // enough to have no timestamps is rare, and re-driving its release is
-        // the cheaper outcome than leaving it stranded forever.
-        if (Date.now() - (check.finishedAt ?? check.startedAt) > 6 * LIVENESS_BACKSTOP_MS) {
-          // The pair retires without a briefed mark; its counter retires with it.
-          degradedReleaseAttempts.delete(check.runId);
-          continue;
-        }
-        // Bound: the degraded re-drive is bounded; past it, the last degraded
-        // block stands and the pair goes quiet.
-        if ((degradedReleaseAttempts.get(check.runId) ?? 0) >= MAX_DEGRADED_RELEASE_ATTEMPTS) {
-          // Through markBriefed, like every other briefed-mark: it also
-          // retires the target's cached result, which would otherwise leak.
-          markBriefed(check.runId);
-          markBriefed(target.runId);
-          degradedReleaseAttempts.delete(check.runId);
-          continue;
-        }
-        enqueueNotice({ runId: check.runId, agent: check.agent, kind: "done", text: "" });
-      }
-    } finally {
-      backstopRunning = false;
+      // This does not change the idle path at all: `deliverAs` is only consulted
+      // when `isStreaming` is true (`agent-session.js` `prompt()`), and when the
+      // session is idle this still starts a fresh turn exactly as before.
+      //
+      // `steeringMode` is set to "all" in agent/settings.json, so if two
+      // briefings ever land in the steering queue simultaneously (e.g. the
+      // second flush fires while the orchestrator is still responding to the
+      // first), both drain into the same next turn as one consolidated response.
+      //
+      // `expandPromptTemplates` is deliberately omitted rather than passed as
+      // false: false is already the default. The briefing always starts with "[",
+      // so it could never be taken for a slash command anyway.
+      pi.sendUserMessage(text, { deliverAs: "steer" });
+    } catch {
+      // The runtime went away under us. The run's state is on disk either way,
+      // so the next `status`/`result` still reports it correctly.
     }
   };
+
+  /**
+   * (Re-)arms the one coalesce timer for a deadline the ledger returned.
+   *
+   * Every caller that can make the ledger enqueue — the input hook, the
+   * liveness tick, the `cancel` dispatch — passes its returned deadline
+   * through here, so the window is re-armed the same way whatever produced the
+   * notice. `undefined` (shutdown, or a tick that enqueued nothing) leaves the
+   * current timer alone. Never a wait and never a poll: one timer, one flush.
+   */
+  const armFlush = (deadline: number | undefined): void => {
+    if (deadline === undefined) return;
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    coalesceTimer = setTimeout(() => {
+      coalesceTimer = undefined;
+      // The timer was armed for exactly this deadline, so the batch is due —
+      // even when the timer fires a millisecond early by the clock.
+      ledger
+        .flush(Math.max(Date.now(), deadline))
+        .then((text) => {
+          if (text) deliver(text);
+        })
+        .catch(() => {
+          // A flush that rejected outright has nothing to deliver; the run
+          // state is on disk, and the next notice or tick re-drives it.
+        });
+    }, Math.max(0, deadline - Date.now()));
+  };
+
+  /** Buffers a notice through the ledger and arms the flush it calls for. */
+  const enqueueNotice = (notice: Notice): void => armFlush(ledger.enqueue(notice, Date.now()));
+
+  /** One liveness tick through the ledger, arming the flush its notices call for. */
+  const runLivenessTick = async (): Promise<void> => armFlush(await ledger.tick(Date.now()));
 
   /**
    * Recognises a child's notice in this session's input and swallows it.
@@ -1992,14 +1190,14 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
 
   // A session that goes away mid-window must not fire a timer into a dead
   // runtime; the notices are on disk (reports.jsonl, the sidecar) regardless.
+  // The handles are cleared first, then the ledger drops its batch and turns
+  // every later call (an in-flight tick or flush finishing) into a no-op.
   pi.on("session_shutdown", () => {
-    sessionGone = true;
     if (coalesceTimer) clearTimeout(coalesceTimer);
     coalesceTimer = undefined;
     if (livenessTimer) clearInterval(livenessTimer);
     livenessTimer = undefined;
-    backstopRunning = false;
-    pending = [];
+    ledger.shutdown();
   });
 
   // The parent-side liveness backstop: one bounded reconciliation tick per
@@ -2022,7 +1220,7 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
     livenessTimer.unref?.();
   }
 
-  return { runLivenessTick, briefedFinishedRunIds, spawnHealthCheck, terminalResultCount: () => terminalResults.size };
+  return { runLivenessTick };
 }
 
 // ---------------------------------------------------------------------------
