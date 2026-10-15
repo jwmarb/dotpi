@@ -108,7 +108,7 @@ if ! { [ -n "$pi_cli" ] && [ "$pi_mods" != "$pi_cli" ] && [ -d "$pi_mods/typebox
 		case " $seen " in *" $agent_dir "*) continue ;; esac
 		seen="$seen $agent_dir"
 		version=
-		IFS= read -r version 2>/dev/null < "$agent_dir/install/current-version" || [ -n "$version" ] || continue
+		IFS= read -r version 2>/dev/null < "$agent_dir/install/current-version" || continue
 		# Same validation as pi's launcher: a single safe path segment.
 		case "$version" in
 		"" | . | .. | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*) continue ;;
@@ -130,7 +130,7 @@ if [ -n "$pi_mods" ]; then
 		echo "setup-deps: ./node_modules exists and is not a link; leaving it" >&2
 	fi
 else
-	echo "setup-deps: could not locate pi's global node_modules; tests importing pi packages will fail" >&2
+	echo "setup-deps: could not locate pi's node_modules (bun global tree or managed install); tests importing pi packages will fail" >&2
 	status=1
 fi
 
