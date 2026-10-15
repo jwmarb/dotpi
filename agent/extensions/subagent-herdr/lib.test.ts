@@ -36,7 +36,7 @@ import {
   TODO_TOOL_NAME,
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
-import { classifyExecFailure, errorPayload, paneRectFrom, splitArgs, waitArgs } from "./herdr.js";
+import { classifyExecFailure, errorPayload, paneRectFrom, probeFromCall, splitArgs, waitArgs, type HerdrCall } from "./herdr.js";
 import { interruptRun, launchAttempt, type Launcher } from "./index.js";
 import {
   exitPath,
@@ -1749,6 +1749,66 @@ describe("classifyExecFailure", () => {
   test("always preserves raw stderr for diagnosis", () => {
     expect(classifyExecFailure({ code: 1, stderr: "boom" }).stderr).toBe("boom");
     expect(classifyExecFailure({ code: 1 }).stderr).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// probeFromCall — only `agent_not_found` proves a pane is gone
+// ---------------------------------------------------------------------------
+
+describe("probeFromCall", () => {
+  const failed = (error: string | null, data: Record<string, unknown> | null = null): HerdrCall => ({
+    ok: false,
+    data,
+    error,
+    stderr: "",
+  });
+  const reply = (agent: unknown): HerdrCall => ({ ok: true, data: { id: "cli:agent:get", result: { agent } }, error: null, stderr: "" });
+
+  // Measured, herdr 0.9.1: the exact refusal for a missing pane.
+  test("agent_not_found is the one proof of absence", () => {
+    const call = classifyExecFailure({
+      code: 1,
+      stderr: JSON.stringify({ error: { code: "agent_not_found", message: "agent target w99:p99 not found" }, id: "cli:agent:get" }),
+    });
+    expect(probeFromCall(call)).toEqual({ kind: "gone" });
+  });
+
+  test("timeouts, crashes, ENOENT, malformed replies and other codes are unreachable, carrying the error", () => {
+    expect(probeFromCall(failed("herdr exited 1"))).toEqual({ kind: "unreachable", error: "herdr exited 1" });
+    expect(probeFromCall(classifyExecFailure({ code: "ENOENT", message: "spawn herdr ENOENT" }))).toEqual({
+      kind: "unreachable",
+      error: "herdr exited ENOENT",
+    });
+    expect(probeFromCall(classifyExecFailure({ message: "Command failed: timed out" }))).toEqual({
+      kind: "unreachable",
+      error: "Command failed: timed out",
+    });
+    expect(probeFromCall(failed("server_unavailable", { error: { code: "server_unavailable" } }))).toEqual({
+      kind: "unreachable",
+      error: "server_unavailable",
+    });
+    // Successful exit, but no usable document.
+    expect(probeFromCall({ ok: true, data: null, error: null, stderr: "" }).kind).toBe("unreachable");
+    expect(probeFromCall({ ok: true, data: { result: {} }, error: null, stderr: "" }).kind).toBe("unreachable");
+    expect(probeFromCall({ ok: true, data: { result: "x" }, error: null, stderr: "" }).kind).toBe("unreachable");
+    expect(probeFromCall(reply(null)).kind).toBe("unreachable");
+  });
+
+  test("a live reply preserves its status and optional name", () => {
+    for (const status of ["idle", "working", "blocked", "done"] as const) {
+      expect(probeFromCall(reply({ agent_status: status, name: "worker-sub-ab12" }))).toEqual({
+        kind: "state",
+        status,
+        name: "worker-sub-ab12",
+      });
+    }
+    expect(probeFromCall(reply({ agent_status: "working" }))).toEqual({ kind: "state", status: "working", name: undefined });
+  });
+
+  test("an unrecognised status on a successful reply normalises to unknown", () => {
+    expect(probeFromCall(reply({ agent_status: "hibernating" }))).toEqual({ kind: "state", status: "unknown", name: undefined });
+    expect(probeFromCall(reply({}))).toEqual({ kind: "state", status: "unknown", name: undefined });
   });
 });
 

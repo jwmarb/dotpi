@@ -166,8 +166,8 @@ import {
 import {
   closePane,
   createChildPane,
-  getAgent,
   paneLabel,
+  probeAgent,
   promptAgent,
   readAgent,
   renamePane,
@@ -915,11 +915,17 @@ async function finishRun(rec: RunRecord): Promise<RunResult> {
   return result;
 }
 
-/** Live herdr status for a record, null when the pane is gone. */
+/**
+ * Live herdr status for a record, null when the pane is gone. An unreachable
+ * herdr is named as such — never rendered as a missing pane, because absence
+ * was not proven.
+ */
 async function liveStatus(rec: RunRecord): Promise<string | null> {
   if (!rec.paneId) return null;
-  const a = await getAgent(rec.paneId);
-  return a ? a.status : null;
+  const a = await probeAgent(rec.paneId);
+  if (a.kind === "state") return a.status;
+  if (a.kind === "unreachable") return `unreachable (${a.error ?? "unknown"})`;
+  return null;
 }
 
 /**
@@ -944,13 +950,17 @@ async function reconcile(rec: RunRecord): Promise<boolean> {
     await finishRun(rec);
     return false;
   }
-  const live = await getAgent(rec.paneId);
-  // Pane gone: herdr reaps it after the child exits, so the child is not coming
-  // back. Classify from disk now.
-  if (!live) {
+  const probe = await probeAgent(rec.paneId);
+  // Pane gone (herdr answered `agent_not_found`, the only proof of absence):
+  // the child is not coming back. Classify from disk now.
+  if (probe.kind === "gone") {
     await finishRun(rec);
     return false;
   }
+  // herdr could not be asked, or answered something else: that says nothing
+  // about the child, so the run stays running and the next read retries.
+  if (probe.kind === "unreachable") return true;
+  const live = probe;
   // A live pane reporting `done` is NOT proof the run finished. In herdr
   // `done` means "ready for input", and a pi child moves in and out of that
   // state between turns while it is still working. Only a real completion

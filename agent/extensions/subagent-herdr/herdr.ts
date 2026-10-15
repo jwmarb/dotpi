@@ -41,6 +41,13 @@
  *    distinguishes them by server-side seen-state, so a pane that finished
  *    just before the Escape may answer `done` to `--until idle` (callers that
  *    need to tell the two apart reconcile afterwards).
+ * 6. A missing pane is reported by one structured code (measured, herdr
+ *    0.9.1): `herdr agent get w99:p99` exits 1 and prints
+ *    `{"error":{"code":"agent_not_found","message":"agent target w99:p99 not found"},"id":"cli:agent:get"}`
+ *    on stderr. **Only that code proves absence** (`probeFromCall`). A
+ *    timeout, a spawn/exit failure, a malformed or empty reply, and every
+ *    other herdr code say nothing about the pane — they are reachability
+ *    failures, and a run must not be classified from one.
  *
  * (`agent wait --until done` was used until the parent stopped blocking on
  * children; `waitAgentWorking` keeps the `--until working` form, which is still
@@ -367,22 +374,60 @@ export async function waitAgentIdle(paneId: string, timeoutMs: number): Promise<
 /** The agent states herdr reports for a pane. */
 export type AgentState = "idle" | "working" | "blocked" | "done" | "unknown";
 
+const AGENT_STATES: readonly AgentState[] = ["idle", "working", "blocked", "done", "unknown"];
+
 /**
- * One-shot state probe. Resolves null when the pane is gone (herdr answers
- * with an error) so callers can distinguish "running" from "gone".
+ * What one `agent get` round-trip proved about a pane.
+ *
+ * Three-way on purpose: `gone` (herdr said `agent_not_found` — the pane is not
+ * there) and `unreachable` (herdr could not be asked, or answered something
+ * else) used to collapse into one `null`, so a herdr hiccup read as a dead
+ * child and a still-working run was classified `failed`.
+ */
+export type AgentProbe =
+  | { kind: "gone" }
+  | { kind: "unreachable"; error: string | null }
+  | { kind: "state"; status: AgentState; name: string | undefined };
+
+/**
+ * Classifies one `agent get` reply. Pure and exported so the absence rule is
+ * pinned by tests: `gone` only on `agent_not_found` (measured behaviour 6),
+ * `unreachable` for every other failure or malformed reply, and an unknown
+ * `agent_status` on a successful reply normalised to `"unknown"`.
+ */
+export function probeFromCall(call: HerdrCall): AgentProbe {
+  if (call.error === "agent_not_found") return { kind: "gone" };
+  if (!call.ok || !call.data) {
+    return { kind: "unreachable", error: call.error ?? "no reply from herdr" };
+  }
+  const result = call.data.result;
+  const agent =
+    typeof result === "object" && result !== null
+      ? (result as { agent?: unknown }).agent
+      : undefined;
+  if (typeof agent !== "object" || agent === null) {
+    return { kind: "unreachable", error: "malformed agent get reply" };
+  }
+  const a = agent as { agent_status?: unknown; name?: unknown };
+  const status = AGENT_STATES.includes(a.agent_status as AgentState)
+    ? (a.agent_status as AgentState)
+    : "unknown";
+  return { kind: "state", status, name: typeof a.name === "string" ? a.name : undefined };
+}
+
+/** One-shot three-way state probe (see {@link AgentProbe}). Never throws. */
+export async function probeAgent(paneId: string): Promise<AgentProbe> {
+  return probeFromCall(await herdr(["agent", "get", paneId]));
+}
+
+/**
+ * Compatibility shape of {@link probeAgent}: the state, or null for both
+ * `gone` and `unreachable`. Do not infer absence from its `null` — lifecycle
+ * and status paths use `probeAgent`, which keeps the two apart.
  */
 export async function getAgent(paneId: string): Promise<{ status: AgentState; name: string | undefined } | null> {
-  const r = await herdr(["agent", "get", paneId]);
-  if (!r.ok || !r.data) return null;
-  const agent = (r.data.result as { agent?: { agent_status?: string; name?: string } } | undefined)?.agent;
-  if (!agent) return null;
-  const status = agent.agent_status ?? "unknown";
-  return {
-    status: (["idle", "working", "blocked", "done", "unknown"] as const).includes(status as AgentState)
-      ? (status as AgentState)
-      : "unknown",
-    name: agent.name,
-  };
+  const p = await probeAgent(paneId);
+  return p.kind === "state" ? { status: p.status, name: p.name } : null;
 }
 
 /**

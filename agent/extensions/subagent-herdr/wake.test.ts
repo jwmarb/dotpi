@@ -51,8 +51,13 @@ import type { SubagentHerdrHooks } from "./index.js";
  * Mutable herdr behaviours for the tests. The mocked module delegates to these
  * at call time, so reassigning a function mid-test takes effect immediately.
  * Defaults: spawns succeed, every pane probe reports the pane as gone
- * (records are then classified from disk).
+ * (`probeAgent` → `{kind:"gone"}`; records are then classified from disk).
  */
+/** A probe proving the pane is gone (herdr's `agent_not_found`). */
+const GONE: realHerdr.AgentProbe = { kind: "gone" };
+/** A probe of a live pane in the given herdr state. */
+const live = (status: realHerdr.AgentState): realHerdr.AgentProbe => ({ kind: "state", status, name: undefined });
+
 const herdrState = {
   createChildPane: async (): Promise<{ paneId: string; tabId: string } | null> => ({
     paneId: "w9:pHC",
@@ -64,7 +69,7 @@ const herdrState = {
   sendKeys: async (): Promise<boolean> => true,
   waitAgentWorking: async (): Promise<boolean> => true,
   closePane: async (): Promise<boolean> => true,
-  getAgent: async (): Promise<{ status: string; name?: string } | null> => null,
+  probeAgent: async (_paneId: string): Promise<realHerdr.AgentProbe> => GONE,
   paneLabel: async (): Promise<string | undefined> => undefined,
   readAgent: async (): Promise<string | null> => null,
 };
@@ -81,7 +86,12 @@ mock.module("./herdr.js", () => ({
   waitAgentWorking: (paneId: string, timeoutMs: number) =>
     herdrState.waitAgentWorking(paneId, timeoutMs),
   closePane: (paneId: string, timeoutMs?: number) => herdrState.closePane(paneId, timeoutMs),
-  getAgent: (paneId: string) => herdrState.getAgent(paneId),
+  // Production never asks getAgent (its null cannot tell gone from
+  // unreachable); a regression back to it must fail loudly, not pass on null.
+  getAgent: async () => {
+    throw new Error("getAgent is compatibility-only: production must use probeAgent");
+  },
+  probeAgent: (paneId: string) => herdrState.probeAgent(paneId),
   paneLabel: (paneId: string, timeoutMs?: number) => herdrState.paneLabel(paneId, timeoutMs),
   readAgent: (paneId: string, lines?: number) => herdrState.readAgent(paneId, lines),
 }));
@@ -266,7 +276,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 beforeEach(() => {
   herdrState.createChildPane = async () => ({ paneId: "w9:pHC", tabId: "w9:tHC" });
-  herdrState.getAgent = async () => null;
+  herdrState.probeAgent = async () => GONE;
   herdrState.paneLabel = async () => undefined;
   herdrState.readAgent = async () => null;
 });
@@ -472,7 +482,7 @@ describe("wake path (extension factory)", () => {
       ]);
       // The spawned health check's pane must stay "alive" so the sweep does not
       // classify it dead within the same flush.
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -504,7 +514,7 @@ describe("wake path (extension factory)", () => {
       const createExtension = await freshExtension([
         { runId: "sub-eeee", agent: "explorer", hasSession: false, hasSidecar: false, paneId: "w9:pT" },
       ]);
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -531,7 +541,7 @@ describe("wake path (extension factory)", () => {
       const createExtension = await freshExtension([
         { runId: "sub-eeee", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "done" },
       ]);
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -570,8 +580,8 @@ describe("wake path (extension factory)", () => {
         },
       ]);
       // The target's pane is gone (it's done); the HC's pane is still alive.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       createExtension(pi);
 
@@ -583,7 +593,7 @@ describe("wake path (extension factory)", () => {
 
       // The health check finishes: its pane is now gone, so reconcile will
       // classify it done, and one wake carries both blocks.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-ffff", "healthcheck", "done") });
       await sleep(1500);
 
@@ -615,8 +625,8 @@ describe("wake path (extension factory)", () => {
       ]);
       // sub-eeee's pane is gone; sub-9999's pane and any spawned health-check
       // pane are alive.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pR" || paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pR" || paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -637,7 +647,7 @@ describe("wake path (extension factory)", () => {
 
       // The unrelated child finishes now: its done notice rides the same
       // coalesce window the cancel's release notice opened, driving the flush.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-9999", "librarian", "done") });
       await sleep(1500);
 
@@ -672,8 +682,8 @@ describe("wake path (extension factory)", () => {
       // Both panes are alive at first: the target is working (its pane only
       // dies when its own done notice arrives), and the health check's pane is
       // alive while the check runs.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pT" || paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pT" || paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -686,8 +696,8 @@ describe("wake path (extension factory)", () => {
 
       // The target has now finished (with an answer); only the health check's
       // pane is still alive.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
       // The target recovers and finishes WITH an answer: rendered and marked
       // in the factory's dedup set.
       handler({ text: formatNotice("sub-eeee", "worker", "done") });
@@ -698,7 +708,7 @@ describe("wake path (extension factory)", () => {
 
       // The health check finishes afterwards: its block is briefed, but the
       // target must not be rendered a second time.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       const tasks = await listTasks({ pi, sent, getInputHandler, getShutdownHandler, getTool } as any);
       const hcs = tasks.filter((t) => t.agent === "healthcheck" && t.status === "running");
       expect(hcs.length).toBe(1);
@@ -723,8 +733,8 @@ describe("wake path (extension factory)", () => {
       ]);
       // Both panes are alive at first: the target is working, and the spawned
       // health check's pane stays up while the check runs.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pT" || paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pT" || paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -736,8 +746,8 @@ describe("wake path (extension factory)", () => {
       expect(sent.length).toBe(0);
 
       // The first check's pane is gone; the target is still working.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pT" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pT" ? live("working") : GONE;
       const tasks = await listTasks({ pi, sent, getInputHandler, getShutdownHandler, getTool } as any);
       const hcs = tasks.filter((t) => t.agent === "healthcheck" && t.status === "running");
       expect(hcs.length).toBe(1);
@@ -753,7 +763,7 @@ describe("wake path (extension factory)", () => {
       // The target then ends WITHOUT an answer: a fresh health check is
       // spawned for the no-answer ending — not an immediate render, and not a
       // reuse of the terminal first check.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-eeee", "worker", "done") });
       await sleep(3000);
       expect(sent.length).toBe(1); // the target's block is held behind the new check
@@ -814,8 +824,8 @@ describe("wake path (extension factory)", () => {
         },
       ]);
       // The target's pane is gone (it's done); the HC's pane is still alive.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -825,7 +835,7 @@ describe("wake path (extension factory)", () => {
       await sleep(3000);
       expect(sent.length).toBe(0);
 
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-ffff", "healthcheck", "done") });
       await sleep(1500);
 
@@ -859,8 +869,8 @@ describe("wake path (extension factory)", () => {
         { runId: "sub-cccc", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "running", paneId: "w9:pC" },
       ]);
       // sub-bbbb's pane and any spawned health-check pane are live; sub-aaaa and sub-cccc are gone.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pB" || paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pB" || paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       const hooks = createExtension(pi);
@@ -925,8 +935,8 @@ describe("wake path (extension factory)", () => {
         { runId: "sub-d00d", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "running", paneId: "w9:pD" },
       ]);
       // The target's pane is gone (dead); any spawned health-check pane stays alive.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       const hooks = createExtension(pi);
@@ -943,7 +953,7 @@ describe("wake path (extension factory)", () => {
       expect(hcs[0].healthCheckOf).toBe("sub-d00d");
 
       // The health check's pane is now gone too: its done notice will classify it.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
 
       // Feed the health check's done notice through the input hook.
       const hcId = hcs[0].task;
@@ -993,15 +1003,15 @@ describe("wake path (extension factory)", () => {
           paneId: "w9:pHC",
         },
       ]);
-      const savedGetAgent = herdrState.getAgent;
+      const savedProbeAgent = herdrState.probeAgent;
       const agentDirOnDisk = process.env.PI_CODING_AGENT_DIR;
       // Hoisted out of the `try` so the `finally` can clear the real 60 s
       // setInterval even on a failing assertion.
       const stub = stubPi();
       try {
         // The target's pane is gone; the health check's pane is alive.
-        herdrState.getAgent = async (paneId: string) =>
-          paneId === "w9:pHC" ? { status: "working" } : null;
+        herdrState.probeAgent = async (paneId: string) =>
+          paneId === "w9:pHC" ? live("working") : GONE;
 
         createExtension(stub.pi);
 
@@ -1026,7 +1036,7 @@ describe("wake path (extension factory)", () => {
         // In the `finally` so the real 60 s setInterval is cleared even on a
         // failing assertion.
         stub.getShutdownHandler()();
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       // The orchestrator restarts from DISK: a fresh module instance (so the
       // top-level `loadRegistry` re-runs) pointed at the same temp agent dir,
@@ -1040,7 +1050,7 @@ describe("wake path (extension factory)", () => {
       const hooks = restartedFactory(restarted.pi);
       try {
         // All panes are gone: the restarted registry's records are terminal.
-        herdrState.getAgent = async () => null;
+        herdrState.probeAgent = async () => GONE;
         void restarted.getInputHandler();
 
         // The tick's stranded-release scan re-enqueues the lost release.
@@ -1056,7 +1066,7 @@ describe("wake path (extension factory)", () => {
         expect(restarted.sent[0].text).toContain("(no final answer in transcript)");
         restarted.getShutdownHandler()();
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
     },
     20000,
@@ -1389,9 +1399,9 @@ describe("wake path (extension factory)", () => {
         },
       ]);
       // The running check's pane is alive; everything else is gone.
-      const savedGetAgent = herdrState.getAgent;
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
 
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
@@ -1428,7 +1438,7 @@ describe("wake path (extension factory)", () => {
         // The next successful flush delivers the target's real block: the
         // check finishes (pane gone) and its done notice releases the target.
         herdrState.readAgent = savedReadAgent;
-        herdrState.getAgent = async () => null;
+        herdrState.probeAgent = async () => GONE;
         getInputHandler()({ text: formatNotice("sub-ffff", "healthcheck", "done") });
         await sleep(1500);
 
@@ -1441,7 +1451,7 @@ describe("wake path (extension factory)", () => {
       } finally {
         herdrState.readAgent = savedReadAgent;
         herdrState.paneLabel = savedPaneLabel;
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       getShutdownHandler()();
     },
@@ -1479,13 +1489,13 @@ describe("wake path (extension factory)", () => {
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
       const hooks = createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
-      const savedGetAgent = herdrState.getAgent;
+      const savedProbeAgent = herdrState.probeAgent;
       const savedPaneLabel = herdrState.paneLabel;
       try {
         // The target's pane is alive (it is genuinely still running); the
         // check is terminal, so the sweep never probes it.
-        herdrState.getAgent = async (paneId: string) =>
-          paneId === "w9:pT" ? { status: "working" } : null;
+        herdrState.probeAgent = async (paneId: string) =>
+          paneId === "w9:pT" ? live("working") : GONE;
         herdrState.paneLabel = async (paneId: string) =>
           paneId === "w9:pHC" ? "healthcheck sub-1a02" : undefined;
         herdrState.readAgent = async () => {
@@ -1509,7 +1519,7 @@ describe("wake path (extension factory)", () => {
         // The target then finishes: its pane goes and its done notice
         // arrives. The flush classifies it and delivers the full block.
         herdrState.readAgent = savedReadAgent;
-        herdrState.getAgent = async () => null;
+        herdrState.probeAgent = async () => GONE;
         getInputHandler()({ text: formatNotice("sub-1a01", "worker", "done") });
         await sleep(1500);
 
@@ -1519,7 +1529,7 @@ describe("wake path (extension factory)", () => {
         expect(hooks.briefedFinishedRunIds.has("sub-1a01")).toBe(true);
       } finally {
         herdrState.readAgent = savedReadAgent;
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
         herdrState.paneLabel = savedPaneLabel;
       }
       getShutdownHandler()();
@@ -1687,7 +1697,7 @@ describe("wake path (extension factory)", () => {
     async () => {
       const createExtension = await freshExtension([]);
       // Every pane stays alive so nothing reconciles the spawned check away.
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getShutdownHandler, getTool } = stubPi();
       const hooks = createExtension(pi);
@@ -1732,7 +1742,7 @@ describe("wake path (extension factory)", () => {
         { runId: "sub-e1e1", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "running", paneId: "w9:pE1" },
       ]);
       // The pane is gone (reconcile would classify the run from its sidecar).
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
 
       const { pi, sent, getShutdownHandler, getTool } = stubPi();
       const hooks = createExtension(pi);
@@ -1785,7 +1795,7 @@ describe("wake path (extension factory)", () => {
       hooks.briefedFinishedRunIds.add("sub-aaaa");
 
       // The record then finishes; its notice drives the second compose.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-aaaa", "worker", "done") });
       await sleep(1500);
 
@@ -1805,7 +1815,7 @@ describe("wake path (extension factory)", () => {
       const createExtension = await freshExtension([
         { runId: "sub-b0b2", agent: "worker", hasSession: false, hasSidecar: false, paneId: "w9:pB2", rawMeta: { healthCheckOf: 42 } },
       ]);
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getInputHandler, getShutdownHandler, getTool } = stubPi();
       createExtension(pi);
@@ -1831,7 +1841,7 @@ describe("wake path (extension factory)", () => {
         { runId: "sub-eeee", agent: "worker", hasSession: false, hasSidecar: false, status: "running", paneId: "w9:pT" },
       ]);
       // The pane is alive: nothing else classifies the run away.
-      herdrState.getAgent = async () => ({ status: "working" });
+      herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getShutdownHandler, getTool } = stubPi();
       const hooks = createExtension(pi);
@@ -1873,10 +1883,10 @@ describe("run ownership (cross-process sweep)", () => {
       ]);
 
       const probed: string[] = [];
-      const savedGetAgent = herdrState.getAgent;
-      herdrState.getAgent = async (paneId: string) => {
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) => {
         probed.push(paneId);
-        return null; // both panes are gone
+        return GONE; // both panes are gone
       };
 
       const stub = stubPi();
@@ -1896,7 +1906,7 @@ describe("run ownership (cross-process sweep)", () => {
         const tasks = await listTasks(stub as any);
         expect(tasks.find((t) => t.task === "sub-bbbb")?.status).toBe("running");
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       stub.getShutdownHandler()();
     },
@@ -1913,10 +1923,10 @@ describe("run ownership (cross-process sweep)", () => {
       ]);
 
       const probed: string[] = [];
-      const savedGetAgent = herdrState.getAgent;
-      herdrState.getAgent = async (paneId: string) => {
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) => {
         probed.push(paneId);
-        return null;
+        return GONE;
       };
 
       const stub = stubPi();
@@ -1931,7 +1941,7 @@ describe("run ownership (cross-process sweep)", () => {
         const tasks = await listTasks(stub as any);
         expect(tasks.find((t) => t.task === "sub-cccc")?.status).toBe("running");
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       stub.getShutdownHandler()();
     },
@@ -2028,9 +2038,9 @@ describe("run ownership (cross-process sweep)", () => {
       ]);
 
       // The driver's pane is gone (it finishes); the others are alive.
-      const savedGetAgent = herdrState.getAgent;
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pA1" ? null : { status: "working" };
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pA1" ? GONE : live("working");
 
       const stub = stubPi();
       createExtension(stub.pi);
@@ -2045,7 +2055,7 @@ describe("run ownership (cross-process sweep)", () => {
         expect(tail).not.toContain("sub-c3c3");
         expect(tail).not.toContain("sub-d4d4");
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       stub.getShutdownHandler()();
     },
@@ -2331,11 +2341,11 @@ describe("run ownership (cross-process sweep)", () => {
 
       const probed: string[] = [];
       const closed: string[] = [];
-      const savedGetAgent = herdrState.getAgent;
+      const savedProbeAgent = herdrState.probeAgent;
       const savedClosePane = herdrState.closePane;
-      herdrState.getAgent = async (paneId: string) => {
+      herdrState.probeAgent = async (paneId: string) => {
         probed.push(paneId);
-        return null; // pane gone: a probe here would classify the record
+        return GONE; // pane gone: a probe here would classify the record
       };
       herdrState.closePane = async (paneId: string) => {
         closed.push(paneId);
@@ -2365,7 +2375,7 @@ describe("run ownership (cross-process sweep)", () => {
         expect(meta.status).toBe("running");
         expect(closed).not.toContain("w9:pF");
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
         herdrState.closePane = savedClosePane;
       }
       stub.getShutdownHandler()();
@@ -2384,10 +2394,10 @@ describe("run ownership (cross-process sweep)", () => {
       createExtension(stub.pi);
 
       const probed: string[] = [];
-      const savedGetAgent = herdrState.getAgent;
-      herdrState.getAgent = async (paneId: string) => {
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) => {
         probed.push(paneId);
-        return null; // pane gone: a probe here would classify the record
+        return GONE; // pane gone: a probe here would classify the record
       };
 
       try {
@@ -2412,7 +2422,7 @@ describe("run ownership (cross-process sweep)", () => {
         ) as Record<string, unknown>;
         expect(meta.status).toBe("running");
       } finally {
-        herdrState.getAgent = savedGetAgent;
+        herdrState.probeAgent = savedProbeAgent;
       }
       stub.getShutdownHandler()();
     },
@@ -2445,7 +2455,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
         { runId: "sub-h00d", agent: "worker", hasSession: false, hasSidecar: false, status: "running", paneId: "w9:pH" },
       ]);
       // The pane is live and reports `done` (ready for input) — not a finish.
-      herdrState.getAgent = async () => ({ status: "done" });
+      herdrState.probeAgent = async () => live("done");
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
@@ -2464,6 +2474,50 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
   );
 
   test(
+    "an unreachable herdr leaves a running record untouched: not failed, not closed, not persisted terminal",
+    async () => {
+      // THE defect: every herdr failure used to read as "pane gone", so a
+      // timeout or a crashed CLI classified a still-working child `failed`.
+      const { factory, dir } = await freshExtensionWithDir([
+        { runId: "sub-0a0b", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "running", paneId: "w9:pU" },
+      ]);
+      herdrState.probeAgent = async () => ({ kind: "unreachable", error: "herdr exited 1" });
+      const closedPanes: string[] = [];
+      const savedClosePane = herdrState.closePane;
+      herdrState.closePane = async (id: string) => { closedPanes.push(id); return true; };
+      try {
+        const stub = stubPi();
+        const hooks = factory(stub.pi);
+        await hooks.runLivenessTick();
+        await sleep(1500);
+
+        const tasks = await listTasks(stub as any);
+        expect(tasks.find((t) => t.task === "sub-0a0b")?.status).toBe("running");
+        expect(closedPanes).toEqual([]);
+        expect(stub.sent.length).toBe(0);
+        expect(tasks.filter((t) => t.agent === "healthcheck").length).toBe(0);
+        const onDisk = JSON.parse(readFileSync(join(dir, "subagent-runs", "sub-0a0b", "meta.json"), "utf-8"));
+        expect(onDisk.status).toBe("running");
+        expect(onDisk.finishedAt).toBeUndefined();
+
+        // The query paths must not dress an unreachable herdr up as a missing pane.
+        const tasks2 = stub.getTool("subagent_tasks");
+        const status = (await tasks2.execute("t1", { action: "status", ids: ["sub-0a0b"] }, undefined, () => {}, {})) as { content: { text: string }[] };
+        expect(status.content[0].text).toContain("sub-0a0b (worker): running");
+        expect(status.content[0].text).toContain("unreachable (herdr exited 1)");
+        const result = (await tasks2.execute("t1", { action: "result", ids: ["sub-0a0b"] }, undefined, () => {}, {})) as { content: { text: string }[] };
+        expect(result.content[0].text).toContain("still running");
+        expect(result.content[0].text).toContain("unreachable (herdr exited 1)");
+        expect(result.content[0].text).not.toContain("[pane gone]");
+        stub.getShutdownHandler()();
+      } finally {
+        herdrState.closePane = savedClosePane;
+      }
+    },
+    20000,
+  );
+
+  test(
     "a done pane with a qualifying <result> answer finishes and delivers the report",
     async () => {
       const { factory } = await freshExtensionWithDir([
@@ -2473,7 +2527,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
           status: "running", paneId: "w9:p2",
         },
       ]);
-      herdrState.getAgent = async () => ({ status: "done" });
+      herdrState.probeAgent = async () => live("done");
 
       const closedPanes: string[] = [];
       herdrState.closePane = async (id: string) => { closedPanes.push(id); };
@@ -2509,8 +2563,8 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
         { runId: "sub-s1d3", agent: "worker", hasSession: true, hasSidecar: true, visibleAnswer: false, status: "running", paneId: "w9:p3" },
       ]);
       // The target's pane reports `done`; a spawned health-check pane stays live.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : { status: "done" };
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : live("done");
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
@@ -2541,7 +2595,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
           status: "running", paneId: "w9:pF",
         },
       ]);
-      herdrState.getAgent = async () => ({ status: "done" });
+      herdrState.probeAgent = async () => live("done");
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
@@ -2566,7 +2620,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       const { factory, dir } = await freshExtensionWithDir([
         { runId: "sub-r3v1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pR", rawMeta: { finishedAt: Date.now() - 10000 } },
       ]);
-      herdrState.getAgent = async () => null; // pane gone
+      herdrState.probeAgent = async () => GONE; // pane gone
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
@@ -2598,8 +2652,8 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
         { runId: "sub-c0r4", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "running", paneId: "w9:pC4" },
       ]);
       // Target pane gone; a spawned health-check pane stays live until we end it.
-      herdrState.getAgent = async (paneId: string) =>
-        paneId === "w9:pHC" ? { status: "working" } : null;
+      herdrState.probeAgent = async (paneId: string) =>
+        paneId === "w9:pHC" ? live("working") : GONE;
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
@@ -2616,7 +2670,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
 
       // Complete the health check: the target's no-answer briefing is delivered,
       // so the run is now in the briefed dedup set.
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
       const hcId = hcs[0].task;
       handler({ text: formatNotice(hcId, "healthcheck", "done") });
       await sleep(1500);
@@ -2648,7 +2702,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       const { factory } = await freshExtensionWithDir([
         { runId: "sub-q1u1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pQ", rawMeta: { finishedAt: Date.now() - 10000 } },
       ]);
-      herdrState.getAgent = async () => null;
+      herdrState.probeAgent = async () => GONE;
 
       const stub = stubPi();
       const hooks = factory(stub.pi);
