@@ -188,7 +188,7 @@ scripts, so every command below comes from the repo root).
 cd subagent-herdr && npm install   # the one dir with npm dependencies (dev-only: tsc 5.9.3, @types/node 22)
 ```
 
-There are **five** `tsc -p` scopes: `subagent-herdr`'s five sources (`rundir.ts` was
+There are **five** `tsc -p` scopes: `subagent-herdr`'s seven sources (including `run-lifecycle.ts` and `release-ledger.ts`; `rundir.ts` was
 reached transitively for a while but not *declared*, which left the module owning a
 cross-process grammar outside the stated scope),
 `model-fallback`'s three, `ralph-loop`'s six, `kanban`'s four (`board.ts` included), and the top-level `agent/extensions` scope

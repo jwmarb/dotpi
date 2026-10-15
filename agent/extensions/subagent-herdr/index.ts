@@ -772,35 +772,6 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Sweep: find runs that finished since the last wake
-// ---------------------------------------------------------------------------
-
-/**
- * Finds runs in the registry that have finished since the last wake.
- *
- * This is the sweep that makes "multiple subagents finishing at once" produce
- * one response: a notice is a prompt to look, not the evidence. When any notice
- * triggers a flush, every other run that has also finished (sidecar on disk,
- * pane gone) is folded into the same briefing, so a fan-out that finishes
- * together wakes the orchestrator once, not once per child.
- *
- * A thin adapter over {@link RunLifecycle.sweep}, which owns the concurrency,
- * isolation and ordering; kept as an export for callers and tests.
- *
- * @param recs - Snapshot of all registry records.
- * @param exclude - Run ids already covered by the current batch or previously briefed.
- * @param owner - The lifecycle that sweeps; the production one by default.
- * @returns Observations of the runs that finished, in registry order.
- */
-export async function collectFinished(
-  recs: readonly RunRecord[],
-  exclude: ReadonlySet<string>,
-  owner: Pick<RunLifecycle, "sweep"> = lifecycle,
-): Promise<RunObservation[]> {
-  return (await owner.sweep(recs, { exclude })).finished;
-}
-
-// ---------------------------------------------------------------------------
 // Briefings (the text a notice becomes)
 // ---------------------------------------------------------------------------
 

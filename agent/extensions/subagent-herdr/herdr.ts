@@ -421,16 +421,6 @@ export async function probeAgent(paneId: string): Promise<AgentProbe> {
 }
 
 /**
- * Compatibility shape of {@link probeAgent}: the state, or null for both
- * `gone` and `unreachable`. Do not infer absence from its `null` — lifecycle
- * and status paths use `probeAgent`, which keeps the two apart.
- */
-export async function getAgent(paneId: string): Promise<{ status: AgentState; name: string | undefined } | null> {
-  const p = await probeAgent(paneId);
-  return p.kind === "state" ? { status: p.status, name: p.name } : null;
-}
-
-/**
  * Raw terminal text from a pane (works after the process exited — herdr keeps
  * the pane until it is closed). Null when herdr refuses.
  */

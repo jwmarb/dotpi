@@ -476,7 +476,7 @@ export interface RegistrationPlan {
  * 3. **Disabled and no env chain registers nothing.** The switch governs
  *    exactly the sessions that got no chain from a parent.
  * 4. **Registration is source-dependent** — {@link shouldRegisterRouter} owns
- *    both halves. The parent committed this process to the router (an env
+ *    the threshold for both sources. The parent committed this process to the router (an env
  *    chain registers whenever it is non-empty), while a settings chain has
  *    committed nothing (a settings singleton without a pin needs no router;
  *    see {@link isRoutable}).

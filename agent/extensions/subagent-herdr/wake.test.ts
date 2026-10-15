@@ -1,7 +1,7 @@
 /**
  * Factory-wiring and integration tests for subagent-herdr: the `input` hook
- * and steering delivery, the `collectFinished` adapter, the liveness interval
- * guard, the spawn and query paths, and end-to-end smoke of the release paths
+ * and steering delivery, the liveness interval guard, the spawn and query
+ * paths, and end-to-end smoke of the release paths
  * (cancel, stranded re-drive, degraded bound, compose-failure fallback) and
  * late-completion revival through the real factory. Release *policy* is pinned
  * with explicit time in `release-ledger.test.ts`.
@@ -57,7 +57,6 @@ import * as realHerdr from "./herdr.js";
 import { formatExitSidecar, formatNotice, systemPromptPath, type RunRecord } from "./rundir.js";
 import type { PROMPT_SETTLE_MS as PromptSettleMs } from "./index.js";
 import { LIVENESS_BACKSTOP_MS, NOTICE_COALESCE_MS } from "./release-ledger.js";
-import type { RunObservation } from "./run-lifecycle.js";
 // ---------------------------------------------------------------------------
 // herdr CLI mock
 // ---------------------------------------------------------------------------
@@ -101,11 +100,6 @@ mock.module("./herdr.js", () => ({
   waitAgentWorking: (paneId: string, timeoutMs: number) =>
     herdrState.waitAgentWorking(paneId, timeoutMs),
   closePane: (paneId: string, timeoutMs?: number) => herdrState.closePane(paneId, timeoutMs),
-  // Production never asks getAgent (its null cannot tell gone from
-  // unreachable); a regression back to it must fail loudly, not pass on null.
-  getAgent: async () => {
-    throw new Error("getAgent is compatibility-only: production must use probeAgent");
-  },
   probeAgent: (paneId: string) => herdrState.probeAgent(paneId),
   paneLabel: (paneId: string, timeoutMs?: number) => herdrState.paneLabel(paneId, timeoutMs),
   readAgent: (paneId: string, lines?: number) => herdrState.readAgent(paneId, lines),
@@ -372,58 +366,6 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// collectFinished unit tests
-// ---------------------------------------------------------------------------
-
-describe("collectFinished", () => {
-  // A thin adapter over the lifecycle's sweep: it passes the records and the
-  // exclude set through and returns the sweep's finished observations as-is.
-  // Concurrency, isolation and ordering are the lifecycle's own contract,
-  // pinned in run-lifecycle.test.ts.
-  const observation = (rec: RunRecord): RunObservation => ({
-    run: rec,
-    pane: { kind: "gone" },
-    result: async () => ({ found: false, answered: false, text: "" }),
-  });
-
-  test("returns the sweep's finished observations, in their order, and forwards the exclude set", async () => {
-    const { collectFinished } = await import("./index.js?collect=1");
-
-    const recs: RunRecord[] = [
-      { runId: "sub-0001", agent: "a", task: "t", cwd: "/", status: "running", startedAt: 1 },
-      { runId: "sub-0002", agent: "b", task: "t", cwd: "/", status: "running", startedAt: 2 },
-      { runId: "sub-0003", agent: "c", task: "t", cwd: "/", status: "done", startedAt: 3 },
-      { runId: "sub-0004", agent: "d", task: "t", cwd: "/", status: "running", startedAt: 4 },
-    ];
-    const exclude = new Set(["sub-0002"]);
-    let seen: { recs: readonly RunRecord[]; exclude?: ReadonlySet<string> } | undefined;
-    const owner = {
-      sweep: async (r: readonly RunRecord[], opts?: { exclude?: ReadonlySet<string> }) => {
-        seen = { recs: r, exclude: opts?.exclude };
-        const finished = [observation(r[0]), observation(r[3])];
-        return { transitions: [], finished };
-      },
-    };
-
-    const result = await collectFinished(recs, exclude, owner);
-    expect(result.map((o) => o.run.runId)).toEqual(["sub-0001", "sub-0004"]);
-    expect(seen?.recs).toBe(recs);
-    expect(seen?.exclude).toBe(exclude);
-  });
-
-  test("returns empty when the sweep finishes nothing", async () => {
-    const { collectFinished } = await import("./index.js?collect=3");
-
-    const recs: RunRecord[] = [
-      { runId: "sub-cccc", agent: "z", task: "t", cwd: "/", status: "done", startedAt: 1 },
-    ];
-
-    const result = await collectFinished(recs, new Set(), { sweep: async () => ({ transitions: [], finished: [] }) });
-    expect(result).toHaveLength(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Extension factory wake-path tests
 // ---------------------------------------------------------------------------
 
@@ -680,7 +622,7 @@ describe("wake path (extension factory)", () => {
       // where the metas the first half wrote are the on-disk contract this
       // half pins — terminal target, terminal check, no briefed mark. Both
       // records are terminal and nothing is running, so no tick's
-      // collectFinished ever sees them again; only the stranded-release scan
+      // lifecycle sweep ever sees them again; only the stranded-release scan
       // can re-drive the release.
       const restartedFactory = await loadExtensionInDir(agentDirOnDisk!);
       const restarted = stubPi();
