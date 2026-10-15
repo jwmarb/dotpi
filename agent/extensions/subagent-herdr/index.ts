@@ -220,7 +220,7 @@ const RESULT_MAX_CHARS = 20_000;
  * stall-detecting prompt (see herdr.ts) makes the loss of a submission Enter
  * rare, and the recovery path makes it harmless.
  */
-const PROMPT_SETTLE_MS = 1500;
+export const PROMPT_SETTLE_MS = 1500;
 
 /** How long to wait for a turn to start after a recovery Enter. */
 const PROMPT_RECOVERY_MS = 15_000;
@@ -916,20 +916,7 @@ function fallbackBriefing(
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-/**
- * The per-session hooks the factory returns.
- *
- * pi ignores a factory's return value; this exists so a test can drive one
- * liveness tick on demand instead of waiting for the 60-second interval. All
- * wake policy is tested through `createReleaseLedger` (release-ledger.test.ts).
- */
-// Transitional: the fake-timer migration of wake.test.ts removes runLivenessTick (and this interface's last member).
-export interface SubagentHerdrHooks {
-  /** Runs one liveness reconciliation tick now, arming the flush it produces. */
-  runLivenessTick(): Promise<void>;
-}
-
-export default function (pi: ExtensionAPI): SubagentHerdrHooks {
+export default function (pi: ExtensionAPI): void {
   // This process's herdr pane, captured once at factory time: ownership is
   // stamped at spawn and compared at sweep time, and the env is the one fact
   // a restarted process can trust to identify itself. `undefined` (no herdr
@@ -1219,8 +1206,6 @@ export default function (pi: ExtensionAPI): SubagentHerdrHooks {
     }, LIVENESS_BACKSTOP_MS);
     livenessTimer.unref?.();
   }
-
-  return { runLivenessTick };
 }
 
 // ---------------------------------------------------------------------------

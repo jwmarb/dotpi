@@ -15,8 +15,9 @@
  *
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/wake.test.ts`
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,7 +36,17 @@ const TEST_OWN_PANE = "w9:pOwn";
 const originalPaneId = process.env.HERDR_PANE_ID;
 process.env.HERDR_PANE_ID = TEST_OWN_PANE;
 
+// The suite plays the orchestrator, whose factory registers the liveness
+// interval the tests drive with fake time. A delegated agent running this
+// suite has PI_SUBAGENT_RUN_ID set, which would suppress that interval (the
+// child guard), so clear it for the file and restore it once. The child-guard
+// test sets it explicitly itself.
+const originalRunId = process.env.PI_SUBAGENT_RUN_ID;
+delete process.env.PI_SUBAGENT_RUN_ID;
+
 afterAll(() => {
+  if (originalRunId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
+  else process.env.PI_SUBAGENT_RUN_ID = originalRunId;
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   if (originalPaneId === undefined) delete process.env.HERDR_PANE_ID;
@@ -44,7 +55,8 @@ afterAll(() => {
 
 import * as realHerdr from "./herdr.js";
 import { formatExitSidecar, formatNotice, systemPromptPath, type RunRecord } from "./rundir.js";
-import type { SubagentHerdrHooks } from "./index.js";
+import type { PROMPT_SETTLE_MS as PromptSettleMs } from "./index.js";
+import { LIVENESS_BACKSTOP_MS, NOTICE_COALESCE_MS } from "./release-ledger.js";
 import type { RunObservation } from "./run-lifecycle.js";
 // ---------------------------------------------------------------------------
 // herdr CLI mock
@@ -148,7 +160,7 @@ let importCounter = 0;
  */
 async function loadExtensionInDir(
   dir: string,
-): Promise<(pi: any) => SubagentHerdrHooks> {
+): Promise<(pi: any) => void> {
   process.env.PI_CODING_AGENT_DIR = dir;
   const mod = await import(`./index.js?wake=${++importCounter}`);
   return mod.default;
@@ -263,6 +275,21 @@ function stubPi() {
   };
 }
 
+/**
+ * Runs the `subagent` tool through a successful launch: spawnRun waits out
+ * PROMPT_SETTLE_MS on a (fake) timer before prompting, so the call is started,
+ * that settle is advanced past, and only then is the result awaited.
+ */
+async function spawnThroughTool(
+  stub: ReturnType<typeof stubPi>,
+  id: string,
+  params: Record<string, unknown>,
+): Promise<any> {
+  const pending = stub.getTool("subagent").execute(id, params, undefined, () => {}, {});
+  await advance(PROMPT_SETTLE_MS);
+  return pending;
+}
+
 /** The `subagent_tasks` list action, used to inspect the in-memory registry. */
 async function listTasks(stub: ReturnType<typeof stubPi>): Promise<Array<Record<string, any>>> {
   const out = (await stub.getTool("subagent_tasks").execute(
@@ -275,13 +302,73 @@ async function listTasks(stub: ReturnType<typeof stubPi>): Promise<Array<Record<
   return out.details.tasks;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ---------------------------------------------------------------------------
+// Fake time
+// ---------------------------------------------------------------------------
+
+/**
+ * spawnRun's settle between `agent start` and the first prompt. Mirrors the
+ * exported `PROMPT_SETTLE_MS` in index.ts (the type pins the literal, so a
+ * change there fails to typecheck here); a value import would load a module
+ * instance outside the per-test query-string bust.
+ */
+const PROMPT_SETTLE_MS: typeof PromptSettleMs = 1500;
+
+/**
+ * Lets real I/O settle while timers are faked.
+ *
+ * Bun 1.4.2: jest.useFakeTimers() fakes setTimeout/setInterval/Bun.sleep but
+ * NOT setImmediate (probed); a drain of N `await new Promise(r =>
+ * setImmediate(r))` lets real fs/import work settle. Each setImmediate is a
+ * real event-loop turn, so the poll phase runs and completes pending
+ * `node:fs/promises` reads and dynamic `import()`s. Probed and rejected:
+ * `process.nextTick` loops (microtasks only — a real readFile never
+ * completes), `Bun.sleep` (faked), and toggling to real timers around a
+ * `setTimeout(0)` (drops the pending fake timers).
+ *
+ * The drain is a fixed bound, not a poll: every clock (`Date.now`,
+ * `performance.now`, `process.hrtime`, `Bun.nanoseconds`) is frozen under fake
+ * timers, so it cannot wait on real elapsed time. Each turn also awaits a real
+ * `fs.stat`, which queues behind the threadpool work the code under test
+ * started, so a turn waits for real I/O rather than spinning past it. Bare
+ * setImmediate turns (100, then 5 000) flaked when 28 copies of this file ran
+ * at once; 1 000 stat-paced turns passed 56/56 under that load.
+ */
+const DRAIN_TURNS = 1_000;
+async function drain(): Promise<void> {
+  for (let i = 0; i < DRAIN_TURNS; i++) {
+    await new Promise<void>((r) => setImmediate(r));
+    await stat(tmpdir());
+  }
+}
+
+/** Advances fake time by exactly `ms`, then lets the work it fired settle. */
+async function advance(ms: number): Promise<void> {
+  await drain();
+  jest.advanceTimersByTime(ms);
+  await drain();
+}
+
+/** The coalesce window closes: the armed flush fires and completes. */
+const flushWindow = () => advance(NOTICE_COALESCE_MS);
+
+/** One liveness interval elapses: the real setInterval fires one tick. */
+const livenessInterval = () => advance(LIVENESS_BACKSTOP_MS);
 
 beforeEach(() => {
+  // Before any factory is constructed, so its interval and every coalesce
+  // timer are fake.
+  jest.useFakeTimers();
   herdrState.createChildPane = async () => ({ paneId: "w9:pHC", tabId: "w9:tHC" });
   herdrState.probeAgent = async () => GONE;
   herdrState.paneLabel = async () => undefined;
   herdrState.readAgent = async () => null;
+});
+
+afterEach(() => {
+  // A failed test must not leak its factory's interval into a sibling.
+  jest.clearAllTimers();
+  jest.useRealTimers();
 });
 
 // ---------------------------------------------------------------------------
@@ -352,10 +439,15 @@ describe("wake path (extension factory)", () => {
     createExtension(pi);
 
     const handler = getInputHandler();
+    // The window slides: each notice re-arms it for a full NOTICE_COALESCE_MS,
+    // so nothing is sent until the window closes after the *last* notice.
     handler({ text: formatNotice("sub-aaaa", "explorer", "done") });
+    await advance(NOTICE_COALESCE_MS - 1);
+    expect(sent.length).toBe(0);
     handler({ text: formatNotice("sub-bbbb", "librarian", "done") });
-
-    await sleep(1500);
+    await advance(NOTICE_COALESCE_MS - 1);
+    expect(sent.length).toBe(0);
+    await advance(1);
 
     expect(sent.length).toBe(1);
     expect(sent[0].options?.deliverAs).toBe("steer");
@@ -376,7 +468,7 @@ describe("wake path (extension factory)", () => {
     // Submit a report notice (child reported mid-run, but finished before flush)
     handler({ text: formatNotice("sub-5555", "librarian", "report", "interim update") });
 
-    await sleep(1500);
+    await flushWindow();
 
     expect(sent.length).toBe(1);
     // Should contain the result header and answer, not a stale "still working" line
@@ -396,7 +488,7 @@ describe("wake path (extension factory)", () => {
     const result = handler({ text: "hello human" });
     expect(result.action).toBe("continue");
 
-    await sleep(1500);
+    await flushWindow();
     expect(sent.length).toBe(0);
     getShutdownHandler()();
   });
@@ -423,7 +515,9 @@ describe("wake path (extension factory)", () => {
         text: formatNotice("sub-eeee", "explorer", "stalled", "phase=tool elapsedMs=600000 tool=bash"),
       });
 
-      await sleep(3000);
+      // The flush spawns the health check, which waits out spawnRun's settle.
+      await flushWindow();
+      await advance(PROMPT_SETTLE_MS);
 
       // The raw stall was consumed: no briefing, no raw notice text.
       expect(sent.length).toBe(0);
@@ -436,7 +530,6 @@ describe("wake path (extension factory)", () => {
       expect(hcs[0].healthCheckOf).toBe("sub-eeee");
       getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -459,7 +552,9 @@ describe("wake path (extension factory)", () => {
       const handler = getInputHandler();
       // The target ends without an answer: deferred behind its health check, no wake.
       handler({ text: formatNotice("sub-eeee", "worker", "done") });
-      await sleep(3000);
+      // The flush spawns the health check, which waits out spawnRun's settle.
+      await flushWindow();
+      await advance(PROMPT_SETTLE_MS);
       expect(sent.length).toBe(0);
 
       // Cancel the health check through the real dispatch: the cancel action
@@ -474,7 +569,7 @@ describe("wake path (extension factory)", () => {
       // coalesce window the cancel's release notice opened, driving the flush.
       herdrState.probeAgent = async () => GONE;
       handler({ text: formatNotice("sub-9999", "librarian", "done") });
-      await sleep(1500);
+      await flushWindow();
 
       // One steering wake carrying the health check's block, the released
       // target's no-answer block, and the unrelated result — no hand-fed
@@ -490,11 +585,10 @@ describe("wake path (extension factory)", () => {
       const tasks2 = await listTasks({ pi, sent, getInputHandler, getShutdownHandler, getTool } as any);
       expect(tasks2.filter((t) => t.agent === "healthcheck" && t.status === "running")).toHaveLength(0);
       handler({ text: formatNotice("sub-eeee", "worker", "done") });
-      await sleep(1500);
+      await flushWindow();
       expect(sent.length).toBe(1);
       getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -511,7 +605,7 @@ describe("wake path (extension factory)", () => {
       const handler = getInputHandler();
       handler({ text: formatNotice("sub-eeee", "worker", "done") });
 
-      await sleep(1500);
+      await flushWindow();
 
       expect(sent.length).toBe(1);
       expect(sent[0].text).toContain("=== sub-eeee");
@@ -519,7 +613,6 @@ describe("wake path (extension factory)", () => {
       expect(sent[0].text).not.toContain("health check of sub-eeee");
       getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -549,7 +642,7 @@ describe("wake path (extension factory)", () => {
       ]);
       const savedProbeAgent = herdrState.probeAgent;
       const agentDirOnDisk = process.env.PI_CODING_AGENT_DIR;
-      // Hoisted out of the `try` so the `finally` can clear the real 60 s
+      // Hoisted out of the `try` so the `finally` can clear the 60 s
       // setInterval even on a failing assertion.
       const stub = stubPi();
       try {
@@ -563,7 +656,7 @@ describe("wake path (extension factory)", () => {
         // The target ends without an answer: deferred behind the running health
         // check (reused, not spawned), no wake.
         handler({ text: formatNotice("sub-eeee", "worker", "done") });
-        await sleep(3000);
+        await flushWindow();
         expect(stub.sent.length).toBe(0);
 
         // Cancel the health check through the production path: the cancel
@@ -577,7 +670,7 @@ describe("wake path (extension factory)", () => {
         // The release notice is lost: the session goes away before the coalesce
         // window fires, clearing `pending`.
       } finally {
-        // In the `finally` so the real 60 s setInterval is cleared even on a
+        // In the `finally` so the 60 s setInterval is cleared even on a
         // failing assertion.
         stub.getShutdownHandler()();
         herdrState.probeAgent = savedProbeAgent;
@@ -591,15 +684,15 @@ describe("wake path (extension factory)", () => {
       // can re-drive the release.
       const restartedFactory = await loadExtensionInDir(agentDirOnDisk!);
       const restarted = stubPi();
-      const hooks = restartedFactory(restarted.pi);
+      restartedFactory(restarted.pi);
       try {
         // All panes are gone: the restarted registry's records are terminal.
         herdrState.probeAgent = async () => GONE;
         void restarted.getInputHandler();
 
         // The tick's stranded-release scan re-enqueues the lost release.
-        await hooks.runLivenessTick();
-        await sleep(3000);
+        await livenessInterval();
+        await flushWindow();
 
         // One steering wake carrying the health check's block and the released
         // target's no-answer block.
@@ -613,7 +706,6 @@ describe("wake path (extension factory)", () => {
         herdrState.probeAgent = savedProbeAgent;
       }
     },
-    20000,
   );
   test(
     "a degraded target block is delivered, re-driven by the scan, and bounded by MAX_DEGRADED_RELEASE_ATTEMPTS",
@@ -642,10 +734,15 @@ describe("wake path (extension factory)", () => {
           paneId: "w9:pHC",
         },
       ]);
-      const { pi, sent, getShutdownHandler } = stubPi();
-      const hooks = createExtension(pi);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
       const savedPaneLabel = herdrState.paneLabel;
+      // Time budget: each tick + flush moves the fake clock ~61.2 s, so tick 5
+      // runs at ~300 s — inside the stranded-release age gate (6 × 60 s, from
+      // the fixture's startedAt). The bound, not the age gate, must be what
+      // quiets ticks 4 and 5; the duplicate-notice check below proves it.
+      const startedAt = Date.now();
       try {
         // The seam the tests use for herdr reads: the target's block degrades
         // when the pane probe throws.
@@ -657,8 +754,8 @@ describe("wake path (extension factory)", () => {
         // Tick 1: the scan re-enqueues the release; the flush delivers the
         // check's block plus the degraded target block (pointing at
         // subagent_tasks), and marks NEITHER id briefed.
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
 
         expect(sent.length).toBe(1);
         expect(sent[0].options?.deliverAs).toBe("steer");
@@ -670,32 +767,40 @@ describe("wake path (extension factory)", () => {
 
         // Ticks 2 and 3: the scan re-drives the degraded release — two more
         // deliveries (attempts 2 and 3).
-        await hooks.runLivenessTick();
-        await sleep(1500);
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
+        await livenessInterval();
+        await flushWindow();
         expect(sent.length).toBe(3);
         expect(sent[2].text).toContain("result block unavailable");
 
         // Tick 4: the bound is burned — the scan marks both ids briefed and the
         // last degraded block stands as the final delivery. No re-enqueue.
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
         expect(sent.length).toBe(3);
 
         // Tick 5: the pair is quiet (briefed) — no further re-enqueue.
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
         expect(sent.length).toBe(3);
-        // The briefed marks and the retired cache entries (the d8523d8 leak
-        // regression) are pinned on the ledger itself in release-ledger.test.ts.
+        expect(Date.now() - startedAt).toBeLessThan(6 * LIVENESS_BACKSTOP_MS);
+
+        // Only the bound marks the pair briefed (the age gate retires it
+        // unmarked), so a late explicit done notice for the check is now
+        // swallowed as a duplicate rather than delivered again.
+        getInputHandler()({ text: formatNotice("sub-ffff", "healthcheck", "done") });
+        await flushWindow();
+        expect(sent.length).toBe(3);
+        // The retired cache entries (the "centralize run lifecycle" leak
+        // regression) are pinned on
+        // the ledger itself in release-ledger.test.ts.
         getShutdownHandler()();
       } finally {
         herdrState.readAgent = savedReadAgent;
         herdrState.paneLabel = savedPaneLabel;
       }
     },
-    30000,
   );
 
   test(
@@ -727,7 +832,7 @@ describe("wake path (extension factory)", () => {
       ]);
 
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
-      const hooks = createExtension(pi);
+      createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
       const savedPaneLabel = herdrState.paneLabel;
       try {
@@ -740,7 +845,7 @@ describe("wake path (extension factory)", () => {
         // The check's done notice drives the flush; the compose throws on the
         // check's own block, so the fallback briefing is what goes out.
         getInputHandler()({ text: formatNotice("sub-ffff", "healthcheck", "done") });
-        await sleep(1500);
+        await flushWindow();
 
         expect(sent.length).toBe(1);
         // BOTH ids are in the fallback text. The target is neither a fresh
@@ -751,8 +856,8 @@ describe("wake path (extension factory)", () => {
         expect(sent[0].text).toContain("release carried by the failed health check's briefing");
 
         // The pair is marked briefed, so the next tick's scan is quiet.
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
         expect(sent.length).toBe(1);
       } finally {
         herdrState.readAgent = savedReadAgent;
@@ -760,7 +865,6 @@ describe("wake path (extension factory)", () => {
       }
       getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -784,7 +888,7 @@ describe("wake path (extension factory)", () => {
       ]);
 
       const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
-      const hooks = createExtension(pi);
+      createExtension(pi);
       const savedReadAgent = herdrState.readAgent;
       const savedPaneLabel = herdrState.paneLabel;
       try {
@@ -795,7 +899,7 @@ describe("wake path (extension factory)", () => {
         };
 
         getInputHandler()({ text: formatNotice("sub-ffff", "healthcheck", "done") });
-        await sleep(1500);
+        await flushWindow();
 
         expect(sent.length).toBe(1);
         // The check id arrives as the fresh notice; the target — neither a
@@ -807,8 +911,8 @@ describe("wake path (extension factory)", () => {
 
         // The next tick's scan is quiet: it loops over targets in the
         // registry, and there is none for this pair.
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        await livenessInterval();
+        await flushWindow();
         expect(sent.length).toBe(1);
       } finally {
         herdrState.readAgent = savedReadAgent;
@@ -816,7 +920,6 @@ describe("wake path (extension factory)", () => {
       }
       getShutdownHandler()();
     },
-    20000,
   );
   test(
     "a child process (PI_SUBAGENT_RUN_ID set) registers no liveness interval",
@@ -858,7 +961,6 @@ describe("wake path (extension factory)", () => {
         (globalThis as Record<string, unknown>).clearInterval = realClearInterval;
       }
     },
-    20000,
   );
 
   test(
@@ -871,7 +973,7 @@ describe("wake path (extension factory)", () => {
       herdrState.probeAgent = async () => live("working");
 
       const { pi, sent, getShutdownHandler, getTool } = stubPi();
-      const hooks = createExtension(pi);
+      createExtension(pi);
 
       // Cancel through the real dispatch.
       await getTool("subagent_tasks").execute("t1", { action: "cancel", ids: ["sub-eeee"] }, undefined, () => {}, {});
@@ -882,12 +984,11 @@ describe("wake path (extension factory)", () => {
       // enqueued by the cancel, nothing is composed and nothing is sent — a
       // cancelled ordinary run is not a wake (only a cancelled health check
       // is, because its done notice carries the deferred target's release).
-      await hooks.runLivenessTick();
-      await sleep(1500);
+      await livenessInterval();
+      await flushWindow();
       expect(sent.length).toBe(0);
       getShutdownHandler()();
     },
-    20000,
   );
 });
 
@@ -906,9 +1007,7 @@ describe("run ownership (cross-process sweep)", () => {
       const stub = stubPi();
       createExtension(stub.pi);
 
-      const out = (await stub
-        .getTool("subagent")
-        .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+      const out = (await spawnThroughTool(stub, "t1", { agent: "healthcheck", task: "a self-contained task" })) as {
         details: { ok: boolean; task: string };
       };
       expect(out.details.ok).toBe(true);
@@ -922,7 +1021,6 @@ describe("run ownership (cross-process sweep)", () => {
       expect(meta.ownerPane).toBe(process.env.HERDR_PANE_ID);
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -973,7 +1071,6 @@ describe("run ownership (cross-process sweep)", () => {
       }
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -997,9 +1094,7 @@ describe("run ownership (cross-process sweep)", () => {
           ) as Record<string, unknown>;
 
         // No `model` on the call: the agent's declared model is the chain.
-        const out1 = (await stub
-          .getTool("subagent")
-          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+        const out1 = (await spawnThroughTool(stub, "t1", { agent: "healthcheck", task: "a self-contained task" })) as {
           details: { ok: boolean; task: string };
         };
         expect(out1.details.ok).toBe(true);
@@ -1010,15 +1105,11 @@ describe("run ownership (cross-process sweep)", () => {
 
         // A pinned explicit model: a one-entry chain with the pin, and the
         // record's `model` is the head ref the pin was stripped from.
-        const out2 = (await stub
-          .getTool("subagent")
-          .execute(
-            "t2",
-            { agent: "healthcheck", task: "a self-contained task", model: "openai/x|high" },
-            undefined,
-            () => {},
-            {},
-          )) as { details: { ok: boolean; task: string } };
+        const out2 = (await spawnThroughTool(stub, "t2", {
+          agent: "healthcheck",
+          task: "a self-contained task",
+          model: "openai/x|high",
+        })) as { details: { ok: boolean; task: string } };
         expect(out2.details.ok).toBe(true);
         expect(seenEnv?.PI_FALLBACK_CHAIN).toBe("openai/x|high");
         const meta2 = readMeta(out2.details.task);
@@ -1029,7 +1120,6 @@ describe("run ownership (cross-process sweep)", () => {
       }
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -1071,7 +1161,7 @@ describe("run ownership (cross-process sweep)", () => {
 
         stub.getInputHandler()({ text: formatNotice("sub-c1c1", "healthcheck", "done") });
         stub.getInputHandler()({ text: formatNotice("sub-d2d2", "healthcheck", "done") });
-        await sleep(1500);
+        await flushWindow();
 
         expect(stub.sent.length).toBe(1);
         const text = stub.sent[0].text;
@@ -1085,7 +1175,6 @@ describe("run ownership (cross-process sweep)", () => {
       }
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -1134,7 +1223,6 @@ describe("run ownership (cross-process sweep)", () => {
       expect(existsSync(runsDir) ? readdirSync(runsDir) : []).toEqual([]);
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
   test(
@@ -1163,7 +1251,6 @@ describe("run ownership (cross-process sweep)", () => {
       expect(result.content[0].text).toContain("legacy result");
       stub.getShutdownHandler()();
     },
-    20000,
   );
   test(
     "a status/result query for a foreign-owned running record neither probes nor mutates it",
@@ -1217,7 +1304,6 @@ describe("run ownership (cross-process sweep)", () => {
       }
       stub.getShutdownHandler()();
     },
-    20000,
   );
   test(
     "a status/result query for a legacy running record (no ownerPane) neither probes nor mutates it",
@@ -1263,7 +1349,6 @@ describe("run ownership (cross-process sweep)", () => {
       }
       stub.getShutdownHandler()();
     },
-    20000,
   );
 });
 
@@ -1305,9 +1390,9 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       herdrState.closePane = async (id: string) => { closedPanes.push(id); return true; };
       try {
         const stub = stubPi();
-        const hooks = factory(stub.pi);
-        await hooks.runLivenessTick();
-        await sleep(1500);
+        factory(stub.pi);
+        await livenessInterval();
+        await flushWindow();
 
         const tasks = await listTasks(stub as any);
         expect(tasks.find((t) => t.task === "sub-0a0b")?.status).toBe("running");
@@ -1332,7 +1417,6 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
         herdrState.closePane = savedClosePane;
       }
     },
-    20000,
   );
 
   test(
@@ -1343,12 +1427,11 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       ]);
       herdrState.probeAgent = async () => GONE;
       const stub = stubPi();
-      const hooks = factory(stub.pi);
+      factory(stub.pi);
 
       // First tick examines it (no signal); the second sees the same stamp.
-      await hooks.runLivenessTick();
-      await hooks.runLivenessTick();
-      await sleep(300);
+      await livenessInterval();
+      await livenessInterval();
       expect(stub.sent.length).toBe(0);
 
       // The late report rewrites the session file: size and mtime move.
@@ -1356,15 +1439,14 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
       writeResultTranscript(runDir, "sub-s7a1", "<result>The late report for sub-s7a1.</result>");
 
-      await hooks.runLivenessTick();
-      await sleep(1500);
+      await livenessInterval();
+      await flushWindow();
       const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-s7a1");
       expect(rec?.status).toBe("done");
       expect(stub.sent.length).toBe(1);
       expect(stub.sent[0].text).toContain("late report for sub-s7a1");
       stub.getShutdownHandler()();
     },
-    20000,
   );
 
 });
