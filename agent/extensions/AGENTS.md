@@ -34,7 +34,7 @@ scripts, so every command below comes from the repo root).
 | `lib/skill-tree.ts` | Where skills live on disk (`findSkills`, `categoryFromPath`, `SkillLocation`) — the single walker of `skills/<category>/<skill>/`, mirroring pi's rule that a dir holding `SKILL.md` is a skill root. The three readers below it each did their own one-level `readdir` once, and nesting broke all three *silently* |
 | `lib/skill-categories.ts` | Which category a skill belongs to (`groupByCategory`, `categoryFor`, `CATEGORY_ORDER`, `PACKAGE_SKILL_CATEGORIES`) — path wins for a local skill, a name-keyed map covers the vendored package skills, and an unmapped one degrades to `other` rather than vanishing |
 | `lib/skill-activation.ts` | Which skills are live this session (`SkillActivation`, `skillsInPrompt`, `isSkillLoad`, `gateTools`, `parseOwnedTools`, `skillDirFromPath`, `loadSkillToolOwners`) — the inference behind skill-gated tools and agents |
-| `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot. Also owns `demotedBy` (the item a `start` silently knocked back to pending), and `unfinished`/`nudgeFor`/`progressSignature`, a settle-time reminder and its dedupe key that `todo.ts` no longer installs (subagent-only now; the orchestrator's guard is `kanban/lib.ts`) |
+| `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot. Also owns `demotedBy` (the item a `start` silently knocked back to pending) — the module's one drift-catcher. It has no settle guard (subagent-only; the orchestrator's guard is `kanban/lib.ts`) |
 | `lib/trade-journal-store.ts` | The single journal markdown grammar (`parseDay`, `renderDay`, `recordObservations`, `mergeObservations`, `findDuplicates`, `summarize`) — same format the journal agents hand-edit |
 | `lib/widget.ts` | `fitLines`, `fittedWidget`, `row`, `frame`, `cachedByWidth` — the measuring seam |
 
@@ -233,6 +233,9 @@ that measures it — `paths` governs **bun's runtime resolution too**, not just 
   owning is the **porcelain grammar**, and only `changed-files.ts` has one —
   `gate.ts` keeps `git status --porcelain` deliberately opaque as baseline evidence, so it
   is not a second parser.
+- Re-adding a settle guard to `todo.ts`/`lib/todo.ts`. A child's completion handshake fires
+  on `agent_end` first, so the guard either dies with the pane or keeps editing after the
+  parent was told it finished. The orchestrator's guard is `kanban/`.
 
 (The repo-wide rules those imply — one parser per format, widgets measure through
 `lib/widget.ts` — are in the root CONVENTIONS.)
