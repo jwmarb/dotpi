@@ -33,27 +33,27 @@
 
   "model": {
     "provider": "litellm",
-    "id": "accio-lab/occamy-1.0",
+    "id": "liquidai/lfm2.5-24b-a2b",
     "thinking": "low",
-    "contextWindow": 262144
+    "contextWindow": 131072
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "accio-lab/occamy-1.0",
+    "id": "liquidai/lfm2.5-24b-a2b",
     "thinking": "low",
-    "contextWindow": 262144
+    "contextWindow": 131072
   },
   "reflectorModel": {
     "provider": "litellm",
-    "id": "accio-lab/occamy-1.0",
+    "id": "liquidai/lfm2.5-24b-a2b",
     "thinking": "xhigh",
-    "contextWindow": 262144
+    "contextWindow": 131072
   },
   "dropperModel": {
     "provider": "litellm",
-    "id": "accio-lab/occamy-1.0",
+    "id": "liquidai/lfm2.5-24b-a2b",
     "thinking": "low",
-    "contextWindow": 262144
+    "contextWindow": 131072
   },
 
   "debug": false,
