@@ -2,6 +2,7 @@
 name: journal-reflector
 description: Reads the trading journal across many days and returns patterns for a ticker or strategy — repeat behaviors, level reliability, what has and has not worked. Use before a trade to recall accumulated history on a name.
 tools: read, ffgrep, fffind, grep, find, ls
+callable_by: orchestrator
 model: deepseek/deepseek-v4-flash
 fallback_models: anthropic/claude-opus-5, openai/gpt-5.6-sol
 ---

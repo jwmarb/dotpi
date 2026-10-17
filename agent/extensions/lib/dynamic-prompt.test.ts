@@ -125,6 +125,15 @@ describe("the quality pass is gated on the grading agents existing", () => {
   const agent = (name: string) =>
     ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
 
+  test("withheld from a subagent, whose own body carries its grading contract", () => {
+    const inv = [agent("reviewer"), agent("verifier"), agent("planner")];
+    const p = build({ agentInventory: inv, isSubagent: true });
+    expect(p).not.toContain("## Quality Pass");
+    expect(p).not.toContain("## Plan Before You Implement");
+    expect(p).toContain("## Available Agents");
+    expect(build({ agentInventory: inv })).toContain("## Quality Pass");
+  });
+
   test("absent when neither grader is in the inventory", () => {
     const p = build({ agentInventory: [agent("worker"), agent("explorer")] });
     expect(p).not.toContain("## Quality Pass");

@@ -9,8 +9,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { discoverAgents, parseAgentFile } from "../lib/agents.js";
-import { agentsDir } from "../lib/layout.js";
+import { discoverAgents, discoverSkillAgents, parseAgentFile } from "../lib/agents.js";
+import { agentsDir, skillsDir } from "../lib/layout.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
   appendSkillCatalogue,
@@ -27,6 +27,7 @@ import {
   formatLineage,
   discoverSkills,
   lineageRejection,
+  spawnableAgents,
   parseLineage,
   readReports,
   REPORT_TOOL_NAME,
@@ -2179,18 +2180,32 @@ describe("lineageRejection: cycles", () => {
 
   test("the intended chains are allowed", () => {
     // worker -> librarian (ask a research question)
-    expect(lineageRejection("librarian", undefined, ["worker"])).toBeUndefined();
+    expect(lineageRejection("librarian", ["worker"], ["worker"])).toBeUndefined();
     // librarian -> spiker (confirm external code really behaves as documented)
-    expect(lineageRejection("spiker", undefined, ["worker", "librarian"])).toBeUndefined();
+    expect(lineageRejection("spiker", ["librarian"], ["worker", "librarian"])).toBeUndefined();
     // librarian -> summarizer (condense a huge page)
     expect(lineageRejection("summarizer", ["librarian"], ["worker", "librarian"])).toBeUndefined();
   });
 });
 
 describe("lineageRejection: callable_by", () => {
-  test("an agent with no callable_by is public", () => {
-    expect(lineageRejection("worker", undefined, ["oracle"])).toBeUndefined();
-    expect(lineageRejection("worker", [], ["oracle"])).toBeUndefined();
+  test("an agent with no callable_by is orchestrator-only, never implicitly public", () => {
+    expect(lineageRejection("worker", undefined, ["oracle"])).toBeDefined();
+    expect(lineageRejection("worker", [], ["oracle"])).toBeDefined();
+    expect(lineageRejection("worker", undefined, [])).toBeUndefined();
+    expect(lineageRejection("worker", undefined, ["oracle"])).toContain("orchestrator");
+  });
+
+  test("`any` is the explicit public declaration", () => {
+    expect(lineageRejection("x", ["any"], ["oracle"])).toBeUndefined();
+    expect(lineageRejection("x", ["any"], ["worker", "librarian"])).toBeUndefined();
+    // `any` does not override the cycle rule.
+    expect(lineageRejection("x", ["any"], ["x"])).toBeDefined();
+  });
+
+  test("`orchestrator` names the human's orchestrator, not a caller agents can claim", () => {
+    expect(lineageRejection("x", ["orchestrator"], [])).toBeUndefined();
+    expect(lineageRejection("x", ["orchestrator"], ["worker"])).toBeDefined();
   });
 
   test("a private helper refuses a caller not on its list", () => {
@@ -2229,6 +2244,76 @@ describe("lineageRejection: callable_by", () => {
   });
 });
 
+describe("the fleet delegation graph (agents/*.md callable_by)", () => {
+  // The designed graph, written out once. Every edge here is backed by a
+  // `subagent(agent: ...)` instruction in the caller's prompt body; an edge
+  // that is not here is refused at spawn and absent from the caller's roster.
+  // Changing an agent's callers is a deliberate edit to BOTH this table and the
+  // agent file.
+  const EXPECTED: Record<string, string[]> = {
+    explorer: ["orchestrator", "librarian"],
+    healthcheck: ["orchestrator"],
+    librarian: ["orchestrator", "oracle", "reviewer", "spiker", "verifier", "worker"],
+    oracle: ["orchestrator"],
+    planner: ["orchestrator"],
+    reviewer: ["orchestrator", "worker"],
+    spiker: ["orchestrator", "librarian"],
+    summarizer: ["librarian"],
+    verifier: ["orchestrator", "worker"],
+    worker: ["orchestrator"],
+  };
+
+  test("a system spawn (health check) skips callable_by but not the cycle rule", () => {
+    expect(lineageRejection("healthcheck", ["orchestrator"], ["worker"])).toBeDefined();
+    expect(
+      lineageRejection("healthcheck", ["orchestrator"], ["worker"], { system: true }),
+    ).toBeUndefined();
+    expect(
+      lineageRejection("healthcheck", ["orchestrator"], ["healthcheck"], { system: true }),
+    ).toBeDefined();
+  });
+
+  test("every skill-shipped agent declares callable_by too", async () => {
+    const skillAgents = await discoverSkillAgents(skillsDir());
+    expect(skillAgents.length).toBeGreaterThan(0);
+    for (const a of skillAgents) expect(a.callableBy?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("every agent file declares callable_by, matching the designed graph", async () => {
+    const agents = await discoverAgents(agentsDir());
+    const actual = Object.fromEntries(agents.map((a) => [a.name, a.callableBy]));
+    expect(actual).toEqual(EXPECTED);
+  });
+
+  test("every named caller is a real agent, `orchestrator`, or `any`", async () => {
+    const agents = await discoverAgents(agentsDir());
+    const names = new Set([...agents.map((a) => a.name), "orchestrator", "any"]);
+    for (const a of [...agents, ...(await discoverSkillAgents(skillsDir()))]) for (const c of a.callableBy ?? []) expect(names.has(c)).toBe(true);
+  });
+
+  test("a caller only ever names callees it has the `subagent` tool to reach", async () => {
+    const agents = await discoverAgents(agentsDir());
+    const byName = new Map(agents.map((a) => [a.name, a]));
+    for (const a of agents)
+      for (const c of a.callableBy ?? []) {
+        const caller = byName.get(c);
+        if (caller) expect(caller.tools ?? ["subagent"]).toContain("subagent");
+      }
+  });
+
+  test("the effective rosters, as each lineage sees them", async () => {
+    const agents = await discoverAgents(agentsDir());
+    const roster = (lineage: string[]) => spawnableAgents(agents, lineage).map((a) => a.name).sort();
+    expect(roster([])).toEqual(Object.keys(EXPECTED).sort());
+    expect(roster(["worker"])).toEqual(["librarian", "reviewer", "verifier"]);
+    expect(roster(["worker", "reviewer"])).toEqual(["librarian"]);
+    expect(roster(["worker", "reviewer", "librarian"])).toEqual(["explorer", "spiker", "summarizer"]);
+    expect(roster(["librarian", "spiker"])).toEqual([]);
+    expect(roster(["oracle"])).toEqual(["librarian"]);
+    expect(roster(["explorer"])).toEqual([]);
+  });
+});
+
 describe("buildChildEnv lineage stamping", () => {
   const rec = { runId: "sub-1234", agent: "librarian" };
 
@@ -2247,18 +2332,18 @@ describe("buildChildEnv lineage stamping", () => {
     // the guard refuses the repeat. No arithmetic, no tuning.
     const stamped = buildChildEnv(rec, undefined, "/run", ["worker", "librarian"]);
     const asChildSees = parseLineage(stamped["PI_SUBAGENT_LINEAGE"]);
-    expect(lineageRejection("librarian", undefined, asChildSees)).toBeDefined();
-    expect(lineageRejection("spiker", undefined, asChildSees)).toBeUndefined();
+    expect(lineageRejection("librarian", ["any"], asChildSees)).toBeDefined();
+    expect(lineageRejection("spiker", ["librarian"], asChildSees)).toBeUndefined();
   });
 });
 
 describe("parseAgentFile callable_by key", () => {
-  test("reads both spellings; absent means public", () => {
+  test("reads both spellings; absent means orchestrator-only", () => {
     const mk = (fm: string) => parseAgentFile(`---\nname: a\n${fm}\n---\nbody`, "a.md");
     expect(mk("callable_by: librarian")?.callableBy).toEqual(["librarian"]);
     expect(mk("callable_by: librarian, oracle")?.callableBy).toEqual(["librarian", "oracle"]);
     expect(mk("callable_by:\n  - librarian")?.callableBy).toEqual(["librarian"]);
-    // Absent must stay undefined — that is what "public" means to the guard.
+    // Absent must stay undefined — the guard reads that as orchestrator-only.
     expect(mk("model: x")?.callableBy).toBeUndefined();
   });
 

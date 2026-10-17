@@ -13,6 +13,9 @@ import {
   discoverAgents,
   discoverSkillAgents,
   mergeAgents,
+  LINEAGE_ENV,
+  parseLineage,
+  spawnableAgents,
   type AgentInfo,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
@@ -139,9 +142,17 @@ export default function (pi: ExtensionAPI) {
     // --- Discover agents: global roster + agents shipped by ACTIVE skills ---
     // A skill's agents become delegable once its skill is loaded, so an
     // unrelated session is never advertised journal or research agents.
-    const agentInventory = mergeAgents(
-      await discoverAgents(agentsDir()),
-      await discoverSkillAgents(skillsDir(), activation.list()),
+    // Filtered to what THIS process may spawn: a subagent gets this prompt too,
+    // and advertising an agent its `subagent` call would refuse (a cycle, or a
+    // `callable_by` that does not name it) turns one delegation into a refusal
+    // plus a retry. Same rule as the spawn guard, via `spawnableAgents`.
+    const lineage = parseLineage(process.env[LINEAGE_ENV]);
+    const agentInventory = spawnableAgents(
+      mergeAgents(
+        await discoverAgents(agentsDir()),
+        await discoverSkillAgents(skillsDir(), activation.list()),
+      ),
+      lineage,
     );
 
     // --- Build tool inventory ---
@@ -203,6 +214,7 @@ export default function (pi: ExtensionAPI) {
       guidelines,
       hasQuestionnaire,
       hasSubagent,
+      isSubagent: lineage.length > 0,
       customPrompt: opts.customPrompt,
       appendSystemPrompt: opts.appendSystemPrompt,
       cwd: opts.cwd,
@@ -343,6 +355,13 @@ export function buildOrchestratorPrompt(opts: {
    * order a delegation the session has no tool to perform.
    */
   hasSubagent: boolean;
+  /**
+   * True when this process is itself a delegated subagent (non-empty
+   * lineage). The planning and Quality Pass sections are written for the
+   * human's orchestrator; a subagent's own body carries its grading contract
+   * (`worker.md`), so they are withheld rather than duplicated in the wrong voice.
+   */
+  isSubagent?: boolean;
   customPrompt?: string;
   appendSystemPrompt?: string;
   cwd: string;
@@ -440,7 +459,7 @@ The loop works like this:
   // install does not have is an instruction the model cannot obey.
   // The `subagent` conjunct is what makes a roster actionable: without the spawn
   // tool these sections would order a delegation the session cannot perform.
-  const graders = (opts.hasSubagent ? (['reviewer', 'verifier'] as const) : []).filter((g) =>
+  const graders = (opts.hasSubagent && !opts.isSubagent ? (['reviewer', 'verifier'] as const) : []).filter((g) =>
     opts.agentInventory.some((a) => a.name === g),
   );
   // Every phrase that mentions a grader is derived from this one filtered roster,
@@ -486,7 +505,7 @@ The loop works like this:
   // to these graders, so re-grading it would buy a duplicate pass and nothing
   // else.
   const hasPlanner =
-    opts.hasSubagent && opts.agentInventory.some((a) => a.name === 'planner');
+    opts.hasSubagent && !opts.isSubagent && opts.agentInventory.some((a) => a.name === 'planner');
   const planningSection = hasPlanner
     ? `
 ## Plan Before You Implement

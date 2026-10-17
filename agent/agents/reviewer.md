@@ -2,6 +2,7 @@
 name: reviewer
 description: Read-only code review. Audits a diff or set of files for correctness, security, and convention breaks, and reports findings by severity.
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
+callable_by: orchestrator, worker
 skills: scrape-web-as-markdown, security-hardening, code-review, requesting-code-review
 model: qwen/qwen3.8-27b|xhigh
 fallback_models: anthropic/claude-opus-5.5|low

@@ -2,6 +2,7 @@
 name: spiker
 description: Proves an API actually behaves as documented by running a throwaway executable spike in a scratch sandbox. Use when correctness depends on real library behavior, not on what the docs claim.
 tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
+callable_by: orchestrator, librarian
 skills: scrape-web-as-markdown, test-driven-development, verification-before-completion
 model: qwen/qwen3.8-27b|low
 fallback_models: anthropic/claude-opus-5.5|off

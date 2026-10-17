@@ -62,17 +62,19 @@ export interface AgentInfo {
    */
   fallbackModels?: string[];
   /**
-   * Agent names allowed to spawn this one, from the file's `callable_by` key
+   * Who may spawn this agent, from the file's `callable_by` key
    * (**snake_case** — a camelCase key silently never matches).
    *
-   * Absent means public: anything may spawn it, which is every agent that
-   * existed before this key did. Naming callers makes the agent a *private
-   * helper* — `callable_by: librarian` is a research sub-agent only the
-   * librarian may fan out to, so it never clutters another agent's options and
-   * cannot be mistaken for a general-purpose worker.
+   * The grammar (see {@link lineageRejection}, which enforces it):
+   * - agent names — only those agents may spawn it as their *direct* child;
+   * - `orchestrator` — the human's orchestrator (the empty lineage). It is
+   *   always allowed, so writing it is documentation, not a grant;
+   * - `any` ({@link ANY_CALLER}) — public: every agent may spawn it.
    *
-   * The human's orchestrator is always allowed: it has an empty lineage, which
-   * an agent cannot forge because the lineage is written by the parent process.
+   * **Absent means orchestrator-only, never public.** Public must be declared,
+   * so no delegation edge exists merely because nothing forbids it. Every file
+   * in `agents/` declares the key anyway, and `subagent-herdr/lib.test.ts` pins
+   * the resulting fleet graph.
    */
   callableBy?: string[];
   /**
@@ -293,4 +295,114 @@ export function extractStringList(yaml: string, key: string): string[] {
  */
 export function frontmatterOf(content: string): string | undefined {
   return content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
+}
+
+// ---------------------------------------------------------------------------
+// Delegation lineage and the `callable_by` guard
+//
+// Lives here, beside the key it enforces, so the spawn path (`subagent-herdr`)
+// and the advertised roster (`dynamic-prompt.ts`) apply one rule — an agent is
+// never told about a delegation its `subagent` call would have refused.
+// ---------------------------------------------------------------------------
+
+/**
+ * The env var a parent stamps into every child with the child's ancestry
+ * (oldest first, the child included). Unset in the human's orchestrator.
+ */
+export const LINEAGE_ENV = "PI_SUBAGENT_LINEAGE";
+
+/** The `callable_by` sentinel that makes an agent public. */
+export const ANY_CALLER = "any";
+
+/**
+ * The `callable_by` name for the human's orchestrator (the empty lineage). It
+ * names no agent file and is always allowed; writing it documents intent.
+ */
+export const ORCHESTRATOR_CALLER = "orchestrator";
+
+/**
+ * Parses a delegation lineage out of a raw env value (`PI_SUBAGENT_LINEAGE`).
+ *
+ * The lineage is the chain of agent names from the human's orchestrator down to
+ * this process, comma-separated — `worker,librarian` means a worker spawned the
+ * librarian this code is running inside. Absent or empty means "nothing above
+ * me": the human's orchestrator.
+ *
+ * @param raw - The env var's value, or undefined when unset.
+ */
+export function parseLineage(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Renders a lineage for the env var the child reads back. */
+export function formatLineage(lineage: string[]): string {
+  return lineage.join(",");
+}
+
+/**
+ * Why `callee` may not be spawned from this lineage, or undefined to allow it.
+ *
+ * Two rules, in the order they are reported:
+ *
+ * 1. **No cycles.** An agent already in its own ancestry may not be spawned
+ *    again. This is what makes `librarian → librarian` structurally impossible
+ *    rather than merely discouraged, and it bounds the tree without an arbitrary
+ *    depth number: every generation must introduce a *new* agent, and the roster
+ *    is finite. `lib/dotenv.ts` records a fork bomb in this repo's history; a
+ *    self-spawning agent is exactly that shape.
+ * 2. **`callable_by` is honoured.** The human's orchestrator (empty lineage,
+ *    which an agent cannot forge — the parent process writes it) may spawn
+ *    anything. Any other caller must be named in the callee's `callable_by`,
+ *    or the callee must declare `any`. An absent or empty `callable_by` admits
+ *    the orchestrator alone: public is a declaration, not a default.
+ *
+ * Both refusals name the rule and the fix, because a bare denial reads as a
+ * broken tool and invites a retry loop.
+ *
+ * @param callee - The agent being spawned.
+ * @param calleeCallableBy - Its `callable_by` frontmatter (undefined = orchestrator-only).
+ * @param lineage - Ancestry of the spawning process, oldest first.
+ * @param opts.system - The spawn is the extension's own (a health check), not a
+ *   model's delegation: `callable_by` restricts which *agents* may delegate, so
+ *   it is skipped, but the cycle rule still applies.
+ */
+export function lineageRejection(
+  callee: string,
+  calleeCallableBy: string[] | undefined,
+  lineage: string[],
+  opts: { system?: boolean } = {},
+): string | undefined {
+  if (lineage.includes(callee)) {
+    const chain = [...lineage, callee].join(" → ");
+    return (
+      `"${callee}" is already in this delegation's ancestry (${chain}), so spawning it ` +
+      `again would be a cycle. Do this part with your own tools, or report what you ` +
+      `need so the agent above you can take it from here.`
+    );
+  }
+
+  const caller = lineage.at(-1);
+  if (caller === undefined || opts.system) return undefined;
+  const allowed = calleeCallableBy ?? [];
+  if (allowed.includes(ANY_CALLER) || allowed.includes(caller)) return undefined;
+
+  const named = allowed.length > 0 ? allowed.join(", ") : ORCHESTRATOR_CALLER;
+  return (
+    `"${callee}" can only be spawned by: ${named}. ` +
+    `You are "${caller}", so this delegation was refused. Do this part with your own ` +
+    `tools, or report what you need so the agent above you can delegate it.`
+  );
+}
+
+/**
+ * The agents a process with this lineage may actually spawn — the same rule
+ * {@link lineageRejection} enforces, applied to a roster. Used for the
+ * advertised inventory and the "Available agents" error list alike.
+ */
+export function spawnableAgents<T extends Pick<AgentInfo, "name" | "callableBy">>(
+  agents: readonly T[],
+  lineage: string[],
+): T[] {
+  return agents.filter((a) => !lineageRejection(a.name, a.callableBy, lineage));
 }

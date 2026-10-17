@@ -2,6 +2,7 @@
 name: worker
 description: Implements a single well-specified change end to end — edits files, runs tests, then has its own work graded by reviewer and verifier and fixes what they find before reporting. Use when the task is already decided.
 tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
+callable_by: orchestrator
 skills: scrape-web-as-markdown, test-driven-development, verification-before-completion, typescript-style, python-style, rust-style
 model: qwen/qwen3.8-27b
 fallback_models: anthropic/claude-opus-5.5|off, anthropic/claude-opus-5|off, openai/gpt-5.6-sol

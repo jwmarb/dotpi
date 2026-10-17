@@ -2,6 +2,7 @@
 name: explorer
 description: Read-only codebase recon. Locates the code relevant to a task and returns a compressed map with exact file:line references.
 tools: read, ffgrep, fffind, grep, find, ls, bash
+callable_by: orchestrator, librarian
 model: liquidai/lfm-2.5-24b-a2b
 fallback_models: deepseek/deepseek-v4-flash, openai/gpt-5.6-terra
 ---

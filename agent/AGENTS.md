@@ -26,8 +26,8 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 - **`agents/*.md` frontmatter draws on a seven-key vocabulary**, parsed only by
   `extensions/lib/agents.ts`: `name`, `description`, `tools` (comma-separated; omit for
   all), `model`, `fallback_models`, and the two optional keys `skills` and `callable_by`.
-  Only the first five are required, so no file carries all seven — `explorer.md` has five,
-  `summarizer.md` (`callable_by: librarian`) and `healthcheck.md` (`callable_by: orchestrator`) are the two users of `callable_by`. Multi-word keys are
+  Only `name` is strictly required by the parser, but every file in `agents/` (and every
+  skill-shipped agent) declares `callable_by` — see the delegation-graph bullet below. Multi-word keys are
   **snake_case** — a camelCase key silently never matches, which `parseAgentFile`'s tests
   pin both ways. Body after the closing `---` is the child's system prompt, verbatim
   except for the appended skills catalogue.
@@ -60,11 +60,23 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   in the path, the identity is the leaf. Finding a skill in that tree belongs to
   `extensions/lib/skill-tree.ts` alone — three readers once each did their own one-level
   `readdir`, and nesting broke all three *silently*.
-- **`callable_by` makes an agent a private helper.** Absent means public. `callable_by:
-  librarian` on `summarizer` means only the librarian may spawn it; the human's
-  orchestrator is always allowed, which is how you debug one by hand. Unspawnable agents
-  are filtered out of the "Available agents" error list too, so a caller is never
-  advertised what it cannot use.
+- **`callable_by` declares the delegation graph; nothing is public by default.** Grammar:
+  a comma list of agent names (who may spawn it as their *direct* child), plus two
+  sentinels — `orchestrator` (the human's orchestrator, i.e. the empty lineage; always
+  allowed, so writing it is documentation) and `any` (public: every agent may spawn it).
+  **Absent means orchestrator-only.** Every file declares the key anyway. The current graph,
+  each edge backed by a `subagent(agent: …)` instruction in the caller's body:
+  `worker → reviewer, verifier, librarian`; `reviewer, verifier, spiker, oracle → librarian`;
+  `librarian → summarizer, spiker, explorer`; everything else (`oracle`, `planner`,
+  `healthcheck`, `worker`, the `technical-analysis` journal agents) is orchestrator-only.
+  No agent uses `any` today. Adding an edge means editing the callee's `callable_by`,
+  the caller's prompt body, and the `EXPECTED` table in `subagent-herdr/lib.test.ts`
+  ("the fleet delegation graph"), which fails on drift. Enforcement is `lineageRejection`
+  in `extensions/lib/agents.ts` (cycle first, then `callable_by`); the same rule, via
+  `spawnableAgents`, filters both the `## Available Agents` roster `dynamic-prompt.ts`
+  shows each process (read from its `PI_SUBAGENT_LINEAGE`) and the "Available agents"
+  error list — so what an agent is told it can delegate to is exactly what it can. A subagent's prompt also omits the orchestrator-voiced Plan/Quality Pass sections (`isSubagent`); `worker.md` carries its own. The one non-model spawn — a health check — bypasses `callable_by` (not the cycle rule) via `{ system: true }`. No
+  depth bound beyond that: the cycle rule plus a finite roster terminates every chain.
 - **Every agent declares `fallback_models`** (all 10 do), and the list feeds the **router**.
   `childFallbackChain` in `extensions/subagent-herdr/lib.ts` builds a non-empty deduped
   canonical chain from the agent's `model` and `fallback_models`; that chain crosses as

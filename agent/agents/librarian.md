@@ -2,6 +2,7 @@
 name: librarian
 description: Read-only external research. Looks up library/API documentation on the web, and when the docs are thin or wrong, reads the dependency's own source or proves its behaviour by running it. Returns verified signatures and caveats.
 tools: bash, read_skill, subagent, subagent_tasks
+callable_by: orchestrator, oracle, reviewer, spiker, verifier, worker
 skills: scrape-web-as-markdown
 model: liquidai/lfm-2.5-24b-a2b
 fallback_models: anthropic/claude-sonnet-5.5|off, deepseek/deepseek-v4-flash, openai/gpt-5.6-sol

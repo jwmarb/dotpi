@@ -421,78 +421,11 @@ function extractSkillString(frontmatter: string, key: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-/**
- * Parses a delegation lineage out of a raw env value.
- *
- * The lineage is the chain of agent names from the human's orchestrator down to
- * this process, comma-separated — `worker,librarian` means a worker spawned the
- * librarian this code is running inside. Absent or empty means "nothing above
- * me": the human's orchestrator.
- *
- * @param raw - The env var's value, or undefined when unset.
- */
-export function parseLineage(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-/** Renders a lineage for the env var the child reads back. */
-export function formatLineage(lineage: string[]): string {
-  return lineage.join(",");
-}
-
-/**
- * Why `callee` may not be spawned from this lineage, or undefined to allow it.
- *
- * Two rules, in the order they are reported:
- *
- * 1. **No cycles.** An agent already in its own ancestry may not be spawned
- *    again. This is what makes `librarian → librarian` structurally impossible
- *    rather than merely discouraged, and it bounds the tree without an arbitrary
- *    depth number: every generation must introduce a *new* agent, and the roster
- *    is finite. `lib/dotenv.ts` records a fork bomb in this repo's history; a
- *    self-spawning agent is exactly that shape.
- * 2. **`callable_by` is honoured.** An agent that declares callers may only be
- *    spawned by one of them (or by the human's orchestrator, which has an empty
- *    lineage and is never something an agent can forge). This is what makes a
- *    helper agent private to the one agent that owns it.
- *
- * Both refusals name the rule and the fix, because a bare denial reads as a
- * broken tool and invites a retry loop.
- *
- * @param callee - The agent being spawned.
- * @param calleeCallableBy - Its `callable_by` frontmatter, or undefined for public.
- * @param lineage - Ancestry of the spawning process, oldest first.
- */
-export function lineageRejection(
-  callee: string,
-  calleeCallableBy: string[] | undefined,
-  lineage: string[],
-): string | undefined {
-  if (lineage.includes(callee)) {
-    const chain = [...lineage, callee].join(" → ");
-    return (
-      `"${callee}" is already in this delegation's ancestry (${chain}), so spawning it ` +
-      `again would be a cycle. Do this part with your own tools, or report what you ` +
-      `need so the agent above you can take it from here.`
-    );
-  }
-
-  if (calleeCallableBy && calleeCallableBy.length > 0) {
-    // An empty lineage is the human's orchestrator: it may spawn anything, and
-    // an agent cannot fake it (the value is written by the parent process).
-    const caller = lineage.at(-1);
-    if (caller !== undefined && !calleeCallableBy.includes(caller)) {
-      return (
-        `"${callee}" can only be spawned by: ${calleeCallableBy.join(", ")}. ` +
-        `You are "${caller}", so this delegation was refused. It is a helper owned by ` +
-        `another agent, not a general-purpose one.`
-      );
-    }
-  }
-
-  return undefined;
-}
+// The lineage grammar and the spawn guard live in `../lib/agents.ts`, beside
+// the `callable_by` key they enforce, so `dynamic-prompt.ts` can advertise
+// exactly the roster this guard permits without importing this module's deps.
+import { formatLineage, lineageRejection, parseLineage, spawnableAgents } from "../lib/agents.js";
+export { formatLineage, lineageRejection, parseLineage, spawnableAgents };
 
 /**
  * Where an answer was found, when it was not where it should have been.

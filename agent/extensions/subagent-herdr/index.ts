@@ -123,6 +123,8 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { LINEAGE_ENV as SHARED_LINEAGE_ENV } from "../lib/agents.js";
+
 import {
   appendSkillCatalogue,
   buildChildArgv,
@@ -137,6 +139,7 @@ import {
   makeRunId,
   parseLineage,
   readReports,
+  spawnableAgents,
   type HealthCheckTrigger,
   type RunResult,
   selectSkills,
@@ -261,7 +264,7 @@ const READING_TOOLS = new Set(["read", "read_skill"]);
  * itself. `librarian → librarian` is impossible by construction rather than by
  * arithmetic.
  */
-const LINEAGE_ENV = "PI_SUBAGENT_LINEAGE";
+const LINEAGE_ENV = SHARED_LINEAGE_ENV;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -558,15 +561,20 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     // List only what this caller could actually spawn. Advertising a private
     // helper it may not use turns one refusal into two round trips.
     const available =
-      agents
-        .filter((a) => !lineageRejection(a.name, a.callableBy, lineage))
+      spawnableAgents(agents, lineage)
         .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
         .join(", ") || "none";
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
   }
 
   // Refuse before spending anything: no run dir, no registry entry, no pane.
-  const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage);
+  // A health check is the extension's own spawn, not a delegation the model
+  // chose, so it must work from any depth: a worker whose reviewer stalls gets
+  // its diagnosis like the orchestrator does. `callable_by: orchestrator` on
+  // `healthcheck` still keeps every agent from delegating to it by hand.
+  const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage, {
+    system: params.healthCheckOf !== undefined,
+  });
   if (lineageProblem) return { ok: false, error: lineageProblem };
 
   // The child's model chain, in its only role now: the router it launches on.
@@ -1010,7 +1018,11 @@ export default function (pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const out = await spawnRun(params, ctx.cwd);
+      // Only the public schema's fields cross: `healthCheckOf` is internal and
+      // relaxes the `callable_by` guard, so a model must not be able to smuggle
+      // it in as an extra property.
+      const { agent, task, cwd, model } = params;
+      const out = await spawnRun({ agent, task, cwd, model }, ctx.cwd);
       if (!out.ok || !out.rec) {
         return {
           content: [{ type: "text", text: `Error: ${out.error}` }],
