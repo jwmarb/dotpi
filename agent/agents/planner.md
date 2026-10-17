@@ -4,6 +4,7 @@ description: Read-only implementation planner. Turns a goal into an ordered, fil
 tools: read, ffgrep, fffind, grep, find, ls, read_skill
 skills: writing-plans
 model: openai/gpt-5.6-sol
+callable_by: orchestrator
 fallback_models: anthropic/claude-opus-5.5|high, anthropic/claude-opus-5|high, qwen/qwen3.8-27b|xhigh, qwen/qwen3.8-flash-next
 ---
 
