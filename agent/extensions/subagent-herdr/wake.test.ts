@@ -1393,3 +1393,279 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
 
 });
 
+describe("the launch window (registered, pane not yet attached)", () => {
+  // spawnRun registers the record before its pane exists, so the record is
+  // statusable and cancellable mid-launch. These pin that nothing autonomous
+  // classifies it in that gap — the bug was a liveness sweep failing four live
+  // explorers as `no-pane` ~1 s after spawn and health-checking each — and
+  // that a cancel which wins the gap is not overwritten by the launch's tail.
+
+  /** A promise the test resolves by hand. */
+  function gate<T>() {
+    let open!: (v: T) => void;
+    const promise = new Promise<T>((r) => {
+      open = r;
+    });
+    return { promise, open };
+  }
+
+  const readMetaOf = (runId: string) =>
+    JSON.parse(
+      readFileSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", runId, "meta.json"), "utf-8"),
+    ) as Record<string, unknown>;
+
+  /** Run the `subagent` tool without awaiting it; return the pending result and the registered id. */
+  async function startSpawn(stub: ReturnType<typeof stubPi>) {
+    const pending = stub
+      .getTool("subagent")
+      .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {}) as Promise<{
+      content: Array<{ text: string }>;
+      details: { ok: boolean };
+    }>;
+    await drain();
+    const tasks = await listTasks(stub);
+    expect(tasks.length).toBe(1);
+    return { pending, runId: tasks[0]!.task as string };
+  }
+
+  test(
+    "a liveness tick and a status query during launch leave the run running and spawn no health check",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const prompt = gate<{ ok: boolean; error: string | null }>();
+      const realPrompt = herdrState.promptAgent;
+      herdrState.promptAgent = () => prompt.promise;
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS); // past the settle; now held in promptAgent
+
+        // The reconciliation that used to fail it: one full liveness tick.
+        await livenessInterval();
+        await flushWindow();
+        let tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "running"]]);
+        expect(tasks.some((t) => t.agent === "healthcheck" && t.healthCheckOf === runId)).toBe(false);
+        expect(stub.sent).toEqual([]);
+        // Nothing persisted: a launching record's first meta.json is the
+        // spawn's own (in the incident, the first one was the false failure).
+        expect(existsSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", runId, "meta.json"))).toBe(false);
+
+        // A query reads it as launching, not as a gone pane.
+        const status = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "status", ids: [runId] }, undefined, () => {}, {})) as {
+          details: Record<string, unknown>;
+        };
+        expect(status.details[runId]).toEqual({ status: "running", herdr: "launching", owned: true });
+
+        prompt.open({ ok: true, error: null });
+        const out = await pending;
+        expect(out.details.ok).toBe(true);
+        tasks = await listTasks(stub);
+        expect(tasks).toEqual([
+          expect.objectContaining({ task: runId, status: "running", paneId: "w9:pHC", tabId: "w9:tHC" }),
+        ]);
+        expect(readMetaOf(runId)).toMatchObject({ status: "running", paneId: "w9:pHC" });
+        expect(readMetaOf(runId).finishedAt).toBeUndefined();
+      } finally {
+        herdrState.promptAgent = realPrompt;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a cancel during launch wins: the late pane is closed, nothing is overwritten, and the spawn is not ok",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const closed: string[] = [];
+      const realClose = herdrState.closePane;
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      const prompt = gate<{ ok: boolean; error: string | null }>();
+      const realPrompt = herdrState.promptAgent;
+      herdrState.promptAgent = () => prompt.promise;
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+
+        await stub.getTool("subagent_tasks").execute("t1", { action: "cancel", ids: [runId] }, undefined, () => {}, {});
+        // Persisted before anything else, and with no pane yet there was nothing to close.
+        const cancelled = readMetaOf(runId);
+        expect(cancelled.status).toBe("cancelled");
+        expect(typeof cancelled.finishedAt).toBe("number");
+        expect(closed).toEqual([]);
+
+        prompt.open({ ok: true, error: null });
+        const out = await pending;
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0]!.text).toContain("cancelled while it was launching");
+        // The launch's own pane is the one closed — once — and never attached.
+        expect(closed).toEqual(["w9:pHC"]);
+        const after = readMetaOf(runId);
+        expect(after).toEqual(cancelled);
+        expect(after.paneId).toBeUndefined();
+
+        // A cancelled ordinary run is neither health-checked nor briefed.
+        await livenessInterval();
+        await flushWindow();
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "cancelled"]]);
+        expect(stub.sent).toEqual([]);
+      } finally {
+        herdrState.promptAgent = realPrompt;
+        herdrState.closePane = realClose;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a failed launch that lost to a cancel does not throw, records no attempt, and closes its pane",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const closed: string[] = [];
+      const realClose = herdrState.closePane;
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      const start = gate<{ ok: boolean; error: string | null }>();
+      const realStart = herdrState.startAgent;
+      herdrState.startAgent = () => start.promise;
+      try {
+        const { pending, runId } = await startSpawn(stub);
+
+        await stub.getTool("subagent_tasks").execute("t1", { action: "cancel", ids: [runId] }, undefined, () => {}, {});
+        start.open({ ok: false, error: null }); // a genuine launch failure, but too late
+
+        const out = await pending;
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0]!.text).toContain("cancelled while it was launching");
+        expect(closed).toEqual(["w9:pHC"]);
+        const meta = readMetaOf(runId);
+        expect(meta.status).toBe("cancelled");
+        expect(meta.failedAttempts).toBeUndefined();
+        expect(meta.paneId).toBeUndefined();
+      } finally {
+        herdrState.startAgent = realStart;
+        herdrState.closePane = realClose;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "message and interrupt during launch say the run is still launching",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const prompt = gate<{ ok: boolean; error: string | null }>();
+      const realPrompt = herdrState.promptAgent;
+      herdrState.promptAgent = () => prompt.promise;
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+
+        const tasksTool = stub.getTool("subagent_tasks");
+        const msg = (await tasksTool.execute("t1", { action: "message", ids: [runId], text: "hi" }, undefined, () => {}, {})) as {
+          content: Array<{ text: string }>;
+        };
+        expect(msg.content[0]!.text).toContain(`${runId} (healthcheck): still launching — message not delivered`);
+        const intr = (await tasksTool.execute("t1", { action: "interrupt", ids: [runId], text: "redo" }, undefined, () => {}, {})) as {
+          content: Array<{ text: string }>;
+        };
+        expect(intr.content[0]!.text).toContain("interrupt not sent — still launching");
+        // Neither query classified it.
+        expect((await listTasks(stub)).map((t) => t.status)).toEqual(["running"]);
+
+        prompt.open({ ok: true, error: null });
+        expect((await pending).details.ok).toBe(true);
+      } finally {
+        herdrState.promptAgent = realPrompt;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a system-prompt write failure is recorded as a launch failure, never health-checked",
+    async () => {
+      const { factory: createExtension, dir } = await freshExtensionWithDir([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      // Pin the run id, and make its system-prompt path a directory so the
+      // write throws (EISDIR). No meta.json, so the registry ignores the dir.
+      const random = jest.spyOn(Math, "random").mockReturnValue(0.5);
+      const runId = "sub-7fff"; // floor(0.5 * 0xffff) = 0x7fff
+      mkdirSync(systemPromptPath(join(dir, "subagent-runs", runId)), { recursive: true });
+      let created = 0;
+      const realCreate = herdrState.createChildPane;
+      herdrState.createChildPane = async (...args) => {
+        created++;
+        return realCreate(...args);
+      };
+      try {
+        const out = (await stub
+          .getTool("subagent")
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+          content: Array<{ text: string }>;
+          details: { ok: boolean };
+        };
+        random.mockRestore();
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0]!.text).toContain("Could not write the child's system prompt");
+        expect(created).toBe(0);
+        const meta = readMetaOf(runId);
+        expect(meta.status).toBe("failed");
+        expect(meta.failedAttempts).toEqual([
+          { model: "fallback/auto", error: expect.stringContaining("Could not write the child's system prompt") },
+        ]);
+
+        // A launch failure is terminal and never revived, so nothing diagnoses it.
+        await livenessInterval();
+        await flushWindow();
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "failed"]]);
+        expect(stub.sent).toEqual([]);
+      } finally {
+        random.mockRestore();
+        herdrState.createChildPane = realCreate;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a paneless running record loaded from disk (a crash mid-spawn) still fails as no-pane",
+    async () => {
+      // Not launching in *this* process: the marker is process-local, so a
+      // restarted orchestrator classifies the stranded record from disk.
+      const createExtension = await freshExtension([{ runId: "sub-c4a5", agent: "worker", hasSession: false, hasSidecar: false }]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-c4a5"] }, undefined, () => {}, {})) as {
+        details: Record<string, { status: string }>;
+      };
+      expect(status.details["sub-c4a5"]!.status).toBe("failed");
+      stub.getShutdownHandler()();
+    },
+  );
+});

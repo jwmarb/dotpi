@@ -268,6 +268,15 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 const runs = new Map<string, RunRecord>();
 
 /**
+ * Run ids `spawnRun` is launching right now: registered in `runs`, pane not yet
+ * attached. The lifecycle's `isLaunching` reads it so a sweep or query in the
+ * launch window observes the run instead of failing it as `no-pane`.
+ * Process-local and never persisted: after a restart nothing is in flight, so a
+ * paneless record left by a crash mid-spawn still settles.
+ */
+const launchingRunIds = new Set<string>();
+
+/**
  * pi's resolved skill catalogue for this session, captured from the most recent
  * `before_agent_start`.
  *
@@ -347,6 +356,7 @@ const lifecycle: RunLifecycle = createRunLifecycle({
   runDirOf: dirFor,
   now: Date.now,
   delay: sleep,
+  isLaunching: (runId) => launchingRunIds.has(runId),
 });
 
 // ---------------------------------------------------------------------------
@@ -607,9 +617,51 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   const dir = dirFor(runId);
   mkdirSync(dir, { recursive: true });
   // Register in-memory now, not only on disk: subagent_tasks resolves ids
-  // from this map, and a fresh spawn must be statusable/waitable within the
-  // same process (the disk registry is what a *restarted* parent rebuilds).
+  // from this map, and a fresh spawn must be statusable — and cancellable —
+  // within the same process before its pane exists (the disk registry is what
+  // a *restarted* parent rebuilds). The launch marker goes in first and comes
+  // out only once the launch has settled, so no sweep in between reads the
+  // pane-less record as evidence.
+  launchingRunIds.add(rec.runId);
   runs.set(rec.runId, rec);
+  try {
+    return await launchRegisteredRun(agent, rec, dir, params.task, chain);
+  } finally {
+    launchingRunIds.delete(rec.runId);
+  }
+}
+
+/**
+ * The launch half of {@link spawnRun}, for a record already registered and
+ * marked as launching: system prompt, pane, pi, task prompt.
+ *
+ * A terminal transition during the launch wins. The only one possible is a
+ * `subagent_tasks` cancel (sweeps and reads leave an in-flight launch alone),
+ * and it finds no pane to close — so after every await this checks the record
+ * again, and a superseded launch closes whatever pane it got, records nothing,
+ * and reports an error. Never `launchFailed` (which rejects a non-running
+ * record), never a stale `saveMeta` over the cancellation, never `ok`.
+ */
+async function launchRegisteredRun(
+  agent: AgentInfo,
+  rec: RunRecord,
+  dir: string,
+  task: string,
+  chain: readonly string[],
+): Promise<SpawnOutcome> {
+  // A closure, not an inline comparison: TypeScript keeps `rec.status`
+  // narrowed across awaits, and the cancel that changes it happens elsewhere.
+  const superseded = (): boolean => rec.status !== "running";
+  const abandon = async (paneId: string | undefined): Promise<SpawnOutcome> => {
+    // The run is already terminal and durable; this pane belongs to no one.
+    if (paneId) await closePane(paneId);
+    return {
+      ok: false,
+      error: `Run ${rec.runId} was ${rec.status} while it was launching${
+        paneId ? `; its pane ${paneId} was closed` : ""
+      }.`,
+    };
+  };
 
   // The child's system prompt. Its body is the agent definition verbatim, plus
   // a skills catalogue when the agent declared one: pi builds `## Available
@@ -627,10 +679,16 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
       agent.tools.some((t) => READING_TOOLS.has(t));
     promptBody = appendSkillCatalogue(promptBody, selected, canRead);
   }
+  if (superseded()) return abandon(undefined);
   try {
     writeFileSync(promptPath, promptBody);
   } catch {
-    return { ok: false, error: `Could not write the child's system prompt to ${promptPath}.` };
+    // A launch failure like any other, recorded through the lifecycle: left
+    // `running` with no pane, the next sweep would fail it as `no-pane` and
+    // health-check a run that never started. Synchronous since the check above.
+    const error = `Could not write the child's system prompt to ${promptPath}.`;
+    lifecycle.launchFailed(rec, { model: FALLBACK_MODEL_REF, error });
+    return { ok: false, error };
   }
 
   // One attempt: open the pane, get pi interactive on the router, and get the
@@ -638,6 +696,9 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // model check: with a non-empty chain the router registers and pi starts,
   // so an unservable chain fails at the first request, after the prompt is in.
   const attempt = await launchAttempt(agent, rec, dir, promptPath, realLauncher, chain);
+  // Cancelled mid-launch: the cancel closed nothing, so a pane opened since —
+  // even a failed attempt's, normally kept as evidence — is closed here.
+  if (superseded()) return abandon(attempt.paneId);
   if (!attempt.ok) {
     // Link the record to the kept pane so a reader of meta.json can find the
     // failure's scrollback; a name refusal closed its pane, so it reports none.
@@ -653,7 +714,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // Deliver the task and verify the turn actually started (see promptAgent in
   // herdr.ts for why the plain form is not enough).
   await sleep(PROMPT_SETTLE_MS);
-  const prompted = await promptAgent(attempt.paneId!, params.task);
+  if (superseded()) return abandon(attempt.paneId);
+  const prompted = await promptAgent(attempt.paneId!, task);
   let turnStarted = prompted.ok;
   if (!turnStarted) {
     // herdr typed the text but the turn never started — most likely the
@@ -662,6 +724,7 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     await sendKeys(attempt.paneId!, "enter");
     turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
   }
+  if (superseded()) return abandon(attempt.paneId);
   if (!turnStarted) {
     const error = `task prompt not accepted in pane ${attempt.paneId} (herdr said: ${prompted.error ?? "unknown"})`;
     // The pane is kept, so link the record to it like the launch-failure path.
@@ -669,6 +732,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     return { ok: false, error };
   }
 
+  // Synchronous from the check above to the return: nothing can cancel the
+  // run between the status guard and publishing its pane.
   rec.paneId = attempt.paneId;
   rec.tabId = attempt.tabId;
   saveMeta(rec);
@@ -707,13 +772,15 @@ async function spawnHealthCheckRun(
 
 /**
  * How a pane observation reads in `status`/`result` output: the herdr state for
- * a live pane, a named reachability failure for an unreachable herdr, and
- * null for a gone (or never-probed) pane. Unreachable is never shown as gone —
- * absence was not proven.
+ * a live pane, a named reachability failure for an unreachable herdr,
+ * `launching` for a spawn still attaching its pane, and null for a gone (or
+ * never-probed) pane. Unreachable is never shown as gone — absence was not
+ * proven.
  */
 function paneStateLabel(pane: PaneObservation): string | null {
   if (pane.kind === "state") return pane.status;
   if (pane.kind === "unreachable") return `unreachable (${pane.error ?? "unknown"})`;
+  if (pane.kind === "launching") return "launching";
   return null;
 }
 
@@ -1357,7 +1424,13 @@ async function dispatchTasks(
       const details: Record<string, unknown> = {};
       for (const rec of recs) {
         if (rec.status !== "running" || !rec.paneId) {
-          lines.push(`${rec.runId} (${rec.agent}): not running (${rec.status}) — message not delivered`);
+          const why =
+            rec.status !== "running"
+              ? `not running (${rec.status})`
+              : launchingRunIds.has(rec.runId)
+                ? "still launching"
+                : "no pane recorded";
+          lines.push(`${rec.runId} (${rec.agent}): ${why} — message not delivered`);
           details[rec.runId] = { delivered: false, status: rec.status };
           continue;
         }
@@ -1454,7 +1527,13 @@ async function dispatchTasks(
         if (!r.interrupted) {
           const why =
             r.error ??
-            (r.status !== "running" ? `not running (${r.status})` : !rec.paneId ? "no pane recorded" : "unknown");
+            (r.status !== "running"
+              ? `not running (${r.status})`
+              : !rec.paneId
+                ? launchingRunIds.has(rec.runId)
+                  ? "still launching"
+                  : "no pane recorded"
+                : "unknown");
           out.push(`${rec.runId} (${rec.agent}): interrupt not sent — ${why}`);
         } else if (r.delivered) {
           out.push(`${rec.runId} (${rec.agent}): interrupted; replacement prompt delivered to pane ${rec.paneId}`);

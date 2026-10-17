@@ -20,6 +20,11 @@
  *   previous one, so a concurrent read and cancel produce exactly one
  *   transition.
  *
+ * - **An in-flight launch is not evidence.** A record this process is still
+ *   launching (registered, no pane attached yet) is observed as `launching`
+ *   and never classified; only a paneless record *not* in flight — one left
+ *   by a crash mid-spawn — settles as `no-pane`.
+ *
  * It never polls and never waits for a run to finish: a read is one pane probe
  * plus, only when the pane is gone or absent, a short bounded settle (two
  * {@link SETTLE_DELAY_MS} re-reads) for the sidecar write that races herdr's
@@ -70,10 +75,19 @@ export interface RunLifecycleEffects {
   runDirOf(runId: string): string;
   now(): number;
   delay(ms: number): Promise<void>;
+  /**
+   * Is this process still launching the run (registered, pane not yet
+   * attached)? Process-local and never persisted, so a record recovered after
+   * a crash mid-spawn is not in flight and still settles as `no-pane`.
+   */
+  isLaunching(runId: string): boolean;
 }
 
-/** What a read learned about the pane; `none` when there was no pane to probe or no probe was needed. */
-export type PaneObservation = AgentProbe | { kind: "none" };
+/**
+ * What a read learned about the pane: `none` when there was no pane to probe or
+ * no probe was needed, `launching` when the spawn has not attached one yet.
+ */
+export type PaneObservation = AgentProbe | { kind: "none" } | { kind: "launching" };
 
 /** Why a transition happened. */
 export type LifecycleCause =
@@ -245,6 +259,10 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
 
   const readNow = async (rec: RunRecord): Promise<RunObservation> => {
     if (rec.status !== "running") return observe(rec, { kind: "none" });
+    // Still launching in this process: no pane yet is the spawn's own gap, not
+    // evidence of anything — classifying it here is what failed live runs and
+    // health-checked them before their first turn.
+    if (!rec.paneId && effects.isLaunching(rec.runId)) return observe(rec, { kind: "launching" });
     // No pane was ever recorded: nothing will ever report, so classify from disk.
     if (!rec.paneId) return settle(rec, { kind: "none" }, "no-pane");
     const pane = await effects.probe(rec.paneId);

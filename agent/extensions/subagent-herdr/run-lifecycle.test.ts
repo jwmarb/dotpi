@@ -48,6 +48,8 @@ function world() {
   let closeImpl: (paneId: string) => Promise<boolean> = async () => true;
   let probeImpl: ((paneId: string) => Promise<AgentProbe>) | undefined;
   let extractImpl: ((runId: string) => Promise<RunResult>) | undefined;
+  /** Run ids this process is still launching (default: none). */
+  const launching = new Set<string>();
 
   const next = <T>(m: Map<string, T[]>, key: string, fallback: T): T => {
     const q = m.get(key);
@@ -83,6 +85,7 @@ function world() {
     delay: async (ms) => {
       log.push(`delay ${ms}`);
     },
+    isLaunching: (runId) => launching.has(runId),
   };
 
   return {
@@ -91,6 +94,7 @@ function world() {
     log,
     probes,
     results,
+    launching,
     sidecars,
     stamps,
     saved,
@@ -299,6 +303,28 @@ describe("run lifecycle: reading a running record", () => {
     w.results.set("sub-0001", [CLEAN]);
     const o = await w.lifecycle.read(rec({ paneId: undefined }));
     expect(o.transition).toMatchObject({ to: "done", cause: "completion-signal" });
+  });
+
+  test("a paneless record this process is still launching is observed, never classified", async () => {
+    const w = world();
+    // Evidence that would otherwise finish it either way: neither may be read.
+    w.results.set("sub-0001", [CLEAN]);
+    w.sidecars.add("sub-0001");
+    w.launching.add("sub-0001");
+    const r = rec({ paneId: undefined });
+    const o = await w.lifecycle.read(r);
+    expect(r.status).toBe("running");
+    expect(r.finishedAt).toBeUndefined();
+    expect(o.transition).toBeUndefined();
+    expect(o.pane).toEqual({ kind: "launching" });
+    expect(w.log).toEqual([]); // no probe, extract, delay, save, or close
+  });
+
+  test("a launching marker does not shield a record that already has its pane", async () => {
+    const w = world();
+    w.launching.add("sub-0001");
+    const o = await w.lifecycle.read(rec());
+    expect(o.transition).toMatchObject({ to: "failed", cause: "pane-gone" });
   });
 });
 
@@ -563,6 +589,20 @@ describe("run lifecycle: sweep", () => {
     w.probes.set("w1:p1", [live("working")]);
     const s = await w.lifecycle.sweep([rec()]);
     expect(s.finished).toEqual([]);
+  });
+
+  test("a sweep leaves an in-flight launch alone and still fails a crashed paneless record", async () => {
+    const w = world();
+    w.launching.add("sub-000a");
+    const launchingRec = rec({ runId: "sub-000a", paneId: undefined });
+    const crashed = rec({ runId: "sub-000b", paneId: undefined });
+    const s = await w.lifecycle.sweep([launchingRec, crashed]);
+    expect(launchingRec.status).toBe("running");
+    expect(launchingRec.finishedAt).toBeUndefined();
+    expect(s.finished.map((o) => o.run.runId)).toEqual(["sub-000b"]);
+    expect(s.transitions).toMatchObject([{ run: { runId: "sub-000b" }, to: "failed", cause: "no-pane" }]);
+    expect(w.log.filter((l) => l.includes("sub-000a"))).toEqual([]);
+    expect(w.saved.map((x) => x.runId)).toEqual(["sub-000b"]);
   });
 });
 
