@@ -40,13 +40,19 @@ process.env.HERDR_PANE_ID = TEST_OWN_PANE;
 // interval the tests drive with fake time. A delegated agent running this
 // suite has PI_SUBAGENT_RUN_ID set, which would suppress that interval (the
 // child guard), so clear it for the file and restore it once. The child-guard
-// test sets it explicitly itself.
+// test sets it explicitly itself. PI_SUBAGENT_LINEAGE is cleared for the same
+// reason: an inherited lineage makes spawnRun's admission refuse the spawns
+// these tests expect to succeed.
 const originalRunId = process.env.PI_SUBAGENT_RUN_ID;
 delete process.env.PI_SUBAGENT_RUN_ID;
+const originalLineage = process.env.PI_SUBAGENT_LINEAGE;
+delete process.env.PI_SUBAGENT_LINEAGE;
 
 afterAll(() => {
   if (originalRunId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
   else process.env.PI_SUBAGENT_RUN_ID = originalRunId;
+  if (originalLineage === undefined) delete process.env.PI_SUBAGENT_LINEAGE;
+  else process.env.PI_SUBAGENT_LINEAGE = originalLineage;
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   if (originalPaneId === undefined) delete process.env.HERDR_PANE_ID;
