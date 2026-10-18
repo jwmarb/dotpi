@@ -30,7 +30,7 @@ scripts, so every command below comes from the repo root).
 | `trade-journal/` | `trade_journal` tool — journal in `~/.agentic-trading/journal/` (`AGENTIC_TRADING_JOURNAL` overrides). Modes `record`/`read`/`stats`/`dupes`. Mechanics only — judgment belongs to the `technical-analysis` skill's agents, and the tool is gated on that skill being active |
 | `lib/dotenv.ts` | The single `agent/.env` parser; `requireEnv(name, purpose)` throws *named* |
 | `lib/layout.ts` | Resolves the agent dir, plus the named paths with more than one caller. **Never throws** — falls back to `~/.pi/agent`. Single-owner segments live with their owner, not here (`subagent-runs/` → `subagent-herdr/rundir.ts`; `docker/`, `verify-images/` → `ralph-loop/image.ts`) |
-| `lib/agents.ts` | The single agent-frontmatter parser (`discoverAgents`, `discoverSkillAgents`, `mergeAgents`, `parseAgentFile`) — reads both `agents/*.md` and `skills/<category>/<skill>/agents/*.md`. Also owns the frontmatter *list* grammar (`extractStringList`, `frontmatterOf`), which `skill-activation.ts` imports rather than re-implementing |
+| `lib/agents.ts` | The single agent-frontmatter parser (`discoverAgents`, `discoverSkillAgents`, `mergeAgents`, `parseAgentFile`) — reads both `agents/*.md` and `skills/<category>/<skill>/agents/*.md`. `delegationRoster` is the one composition of those plus `spawnableAgents` that both agent consumers call: `.all` (merged, global wins) and `.spawnable` (what this lineage may spawn). Also owns the frontmatter *list* grammar (`extractStringList`, `frontmatterOf`), which `skill-activation.ts` imports rather than re-implementing |
 | `lib/skill-tree.ts` | Where skills live on disk (`findSkills`, `categoryFromPath`, `SkillLocation`) — the single walker of `skills/<category>/<skill>/`, mirroring pi's rule that a dir holding `SKILL.md` is a skill root. The three readers below it each did their own one-level `readdir` once, and nesting broke all three *silently* |
 | `lib/skill-categories.ts` | Which category a skill belongs to (`groupByCategory`, `categoryFor`, `CATEGORY_ORDER`, `PACKAGE_SKILL_CATEGORIES`) — path wins for a local skill, a name-keyed map covers the vendored package skills, and an unmapped one degrades to `other` rather than vanishing |
 | `lib/skill-activation.ts` | Which skills are live this session (`SkillActivation`, `skillsInPrompt`, `isSkillLoad`, `gateTools`, `parseOwnedTools`, `skillDirFromPath`, `loadSkillToolOwners`) — the inference behind skill-gated tools and agents |
@@ -68,9 +68,11 @@ scripts, so every command below comes from the repo root).
   its tools must not vanish next turn. `session_start` also fires with reason `reload` and
   `fork`, which keep the same transcript, so the handler resets on `new`/`resume` only. A
   tool lingering is better than one disappearing mid-task.
-- **The two agent consumers gate differently on purpose.** `dynamic-prompt.ts` advertises a
-  skill's agents only while the skill is active. The spawn path in `subagent-herdr/index.ts`
-  deliberately does **not** gate: it runs with no session context, so a skill loaded
+- **The two agent consumers gate differently on purpose.** Both read the roster through
+  `lib/agents.ts`'s `delegationRoster`, and differ only in its `activeSkills` option.
+  `dynamic-prompt.ts` passes the active set, so it advertises a skill's agents only while the
+  skill is active. The spawn path in `subagent-herdr/index.ts` omits it, so it deliberately
+  does **not** gate: it runs with no session context, so a skill loaded
   mid-session would otherwise be invisible and fail a delegation the model was just told to
   make. A global `agents/*.md` name always wins a collision, so a skill cannot silently
   redirect `worker`. Skill identity is the **directory** name — frontmatter `name` may differ.

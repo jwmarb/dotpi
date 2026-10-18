@@ -139,7 +139,6 @@ import {
   makeRunId,
   parseLineage,
   readReports,
-  spawnableAgents,
   type HealthCheckTrigger,
   type RunResult,
   selectSkills,
@@ -150,9 +149,7 @@ import {
 import { FALLBACK_MODEL_REF, parseChainItem } from "../model-fallback/lib.js";
 import {
   type AgentInfo,
-  discoverAgents,
-  discoverSkillAgents,
-  mergeAgents,
+  delegationRoster,
 } from "../lib/agents.js";
 import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
 import {
@@ -547,21 +544,20 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   // prompt inventory this does not gate on the loaded set: spawning happens with
   // no session context, and a skill loaded mid-session would otherwise be
   // invisible here and fail a delegation the agent was just told to make.
-  const agents = mergeAgents(
-    await discoverAgents(agentsDir()),
-    await discoverSkillAgents(skillsDir()),
-  );
   // This process's ancestry, written by whoever spawned us. Drives both the
   // cycle check and `callable_by`, and is the one input here a model cannot
   // influence.
   const lineage = parseLineage(process.env[LINEAGE_ENV]);
+  const roster = await delegationRoster({ agentsDir: agentsDir(), skillsDir: skillsDir(), lineage });
 
-  const agent = agents.find((a) => a.name === params.agent);
+  // Looked up in `.all`, not `.spawnable`: a known agent this caller may not
+  // spawn must get lineageRejection's specific refusal, not "Unknown agent".
+  const agent = roster.all.find((a) => a.name === params.agent);
   if (!agent) {
     // List only what this caller could actually spawn. Advertising a private
     // helper it may not use turns one refusal into two round trips.
     const available =
-      spawnableAgents(agents, lineage)
+      roster.spawnable
         .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
         .join(", ") || "none";
     return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };

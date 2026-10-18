@@ -406,3 +406,44 @@ export function spawnableAgents<T extends Pick<AgentInfo, "name" | "callableBy">
 ): T[] {
   return agents.filter((a) => !lineageRejection(a.name, a.callableBy, lineage));
 }
+
+/** Inputs to {@link delegationRoster}. */
+export interface DelegationRosterOptions {
+  /** Absolute path to the global `agent/agents/` directory. */
+  agentsDir: string;
+  /** Absolute path to the skills library. */
+  skillsDir: string;
+  /** Ancestry of the asking process, oldest first (`PI_SUBAGENT_LINEAGE`). */
+  lineage: string[];
+  /**
+   * Skill **directory** names whose agents to include — exactly
+   * {@link discoverSkillAgents}' `only`. Omit to include every skill's agents.
+   */
+  activeSkills?: Iterable<string>;
+}
+
+/** The merged agent roster, and the part of it this lineage may spawn. */
+export interface DelegationRoster {
+  /** Global agents plus skill agents, global winning a name collision, sorted by name. */
+  all: AgentInfo[];
+  /** `all` filtered by {@link spawnableAgents} for the given lineage. */
+  spawnable: AgentInfo[];
+}
+
+/**
+ * Discovers the delegation roster: the one composition of
+ * {@link discoverAgents}, {@link discoverSkillAgents}, {@link mergeAgents} and
+ * {@link spawnableAgents} that both the prompt inventory and the spawn path use,
+ * so what a process is told it can delegate to is what it can.
+ *
+ * The two callers differ only in `activeSkills`: the prompt passes the loaded
+ * set, the spawn path omits it (it has no session context, and a skill loaded
+ * mid-session must not be invisible to the spawn it just advertised).
+ */
+export async function delegationRoster(opts: DelegationRosterOptions): Promise<DelegationRoster> {
+  const all = mergeAgents(
+    await discoverAgents(opts.agentsDir),
+    await discoverSkillAgents(opts.skillsDir, opts.activeSkills),
+  );
+  return { all, spawnable: spawnableAgents(all, opts.lineage) };
+}

@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  delegationRoster,
   discoverAgents,
   discoverSkillAgents,
   mergeAgents,
@@ -279,5 +280,95 @@ describe("mergeAgents", () => {
     expect(mergeAgents([], [mk("observer", "ta")]).map((a) => a.name)).toEqual(["observer"]);
     expect(mergeAgents([mk("worker")], []).map((a) => a.name)).toEqual(["worker"]);
     expect(mergeAgents([], [])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// delegationRoster
+// ---------------------------------------------------------------------------
+
+/** A global `agents/` dir holding the given `file -> content` entries. */
+function agentsFixture(label: string, files: Record<string, string>): string {
+  const dir = join(tmpdir(), `agents-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  for (const [file, body] of Object.entries(files)) writeFileSync(join(dir, file), body);
+  return dir;
+}
+
+describe("delegationRoster", () => {
+  test("merges global and skill agents, sorted by name", async () => {
+    const agentsDir = agentsFixture("merge", {
+      "worker.md": def("worker"),
+      "explorer.md": def("explorer"),
+    });
+    const skillsDir = skillsFixture("roster-merge", {
+      "technical-analysis": { "observer.md": def("observer") },
+    });
+    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    expect(roster.all.map((a) => `${a.name}:${a.skill ?? "global"}`)).toEqual([
+      "explorer:global",
+      "observer:technical-analysis",
+      "worker:global",
+    ]);
+    // The empty lineage is the orchestrator, which may spawn anything.
+    expect(roster.spawnable.map((a) => a.name)).toEqual(["explorer", "observer", "worker"]);
+  });
+
+  test("a global agent wins over a same-named skill agent", async () => {
+    const agentsDir = agentsFixture("collide", { "worker.md": def("worker") });
+    const skillsDir = skillsFixture("roster-collide", {
+      research: { "worker.md": def("worker"), "digger.md": def("digger") },
+    });
+    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    expect(roster.all.map((a) => `${a.name}:${a.skill ?? "global"}`)).toEqual([
+      "digger:research",
+      "worker:global",
+    ]);
+  });
+
+  test("omitting activeSkills includes every skill's agents", async () => {
+    const agentsDir = agentsFixture("all-skills", {});
+    const skillsDir = skillsFixture("roster-all", {
+      "technical-analysis": { "observer.md": def("observer") },
+      research: { "digger.md": def("digger") },
+    });
+    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    expect(roster.all.map((a) => a.name)).toEqual(["digger", "observer"]);
+  });
+
+  test("activeSkills restricts to those skill directory names", async () => {
+    const agentsDir = agentsFixture("some-skills", { "worker.md": def("worker") });
+    const skillsDir = skillsFixture("roster-some", {
+      "technical-analysis": { "observer.md": def("observer") },
+      research: { "digger.md": def("digger") },
+    });
+    // Matched on the skill's directory name, not its category path (`cat-research`).
+    const roster = await delegationRoster({
+      agentsDir,
+      skillsDir,
+      lineage: [],
+      activeSkills: ["technical-analysis"],
+    });
+    expect(roster.all.map((a) => a.name)).toEqual(["observer", "worker"]);
+    const byCategory = await delegationRoster({
+      agentsDir,
+      skillsDir,
+      lineage: [],
+      activeSkills: ["cat-research"],
+    });
+    expect(byCategory.all.map((a) => a.name)).toEqual(["worker"]);
+  });
+
+  test("an agent the lineage rejects is in .all but not in .spawnable", async () => {
+    const agentsDir = agentsFixture("lineage", {
+      "worker.md": def("worker", "callable_by: orchestrator\n"),
+      "reviewer.md": def("reviewer", "callable_by: worker\n"),
+      "oracle.md": def("oracle", "callable_by: orchestrator\n"),
+    });
+    const skillsDir = skillsFixture("roster-lineage", {});
+    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: ["worker"] });
+    expect(roster.all.map((a) => a.name)).toEqual(["oracle", "reviewer", "worker"]);
+    // worker is a cycle and oracle is orchestrator-only; reviewer names worker.
+    expect(roster.spawnable.map((a) => a.name)).toEqual(["reviewer"]);
   });
 });

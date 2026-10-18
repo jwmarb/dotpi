@@ -10,12 +10,9 @@
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
-  discoverAgents,
-  discoverSkillAgents,
-  mergeAgents,
+  delegationRoster,
   LINEAGE_ENV,
   parseLineage,
-  spawnableAgents,
   type AgentInfo,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
@@ -145,15 +142,16 @@ export default function (pi: ExtensionAPI) {
     // Filtered to what THIS process may spawn: a subagent gets this prompt too,
     // and advertising an agent its `subagent` call would refuse (a cycle, or a
     // `callable_by` that does not name it) turns one delegation into a refusal
-    // plus a retry. Same rule as the spawn guard, via `spawnableAgents`.
+    // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
     const lineage = parseLineage(process.env[LINEAGE_ENV]);
-    const agentInventory = spawnableAgents(
-      mergeAgents(
-        await discoverAgents(agentsDir()),
-        await discoverSkillAgents(skillsDir(), activation.list()),
-      ),
-      lineage,
-    );
+    const agentInventory = (
+      await delegationRoster({
+        agentsDir: agentsDir(),
+        skillsDir: skillsDir(),
+        lineage,
+        activeSkills: activation.list(),
+      })
+    ).spawnable;
 
     // --- Build tool inventory ---
     // Only include tools that have a snippet available; fallback to empty description
