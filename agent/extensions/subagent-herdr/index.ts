@@ -126,16 +126,15 @@ import { Type } from "typebox";
 import { LINEAGE_ENV as SHARED_LINEAGE_ENV } from "../lib/agents.js";
 
 import {
+  admitSpawn,
   appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
   buildHealthCheckTask,
-  childFallbackChain,
   childNameRejection,
   discoverSkills,
   extractRunResult,
   herdrAgentName,
-  lineageRejection,
   makeRunId,
   parseLineage,
   readReports,
@@ -144,6 +143,7 @@ import {
   selectSkills,
   type SkillEntry,
   skillEntriesFromPi,
+  type SpawnOrigin,
 } from "./lib.js";
 // The router model id, owned by the extension that registers it.
 import { FALLBACK_MODEL_REF, parseChainItem } from "../model-fallback/lib.js";
@@ -369,10 +369,11 @@ interface SpawnParams {
   cwd?: string;
   model?: string;
   /**
-   * Set when this spawn is a health check of another run: the target's run id.
-   * Internal — it is not part of the public `subagent` schema.
+   * Who is asking: a model's tool delegation, or the extension's own health
+   * check of `targetRunId`. Internal — it is not part of the public `subagent`
+   * schema, and only the system origin relaxes `callable_by`.
    */
-  healthCheckOf?: string;
+  origin: SpawnOrigin;
 }
 
 export interface SpawnOutcome {
@@ -540,56 +541,31 @@ export async function launchAttempt(
  * not a reflex here.
  */
 async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
-  // Resolve against the global roster PLUS every skill's agents. Unlike the
-  // prompt inventory this does not gate on the loaded set: spawning happens with
-  // no session context, and a skill loaded mid-session would otherwise be
-  // invisible here and fail a delegation the agent was just told to make.
   // This process's ancestry, written by whoever spawned us. Drives both the
   // cycle check and `callable_by`, and is the one input here a model cannot
   // influence.
   const lineage = parseLineage(process.env[LINEAGE_ENV]);
+  // Resolve against the global roster PLUS every skill's agents. Unlike the
+  // prompt inventory this does not gate on the loaded set: spawning happens with
+  // no session context, and a skill loaded mid-session would otherwise be
+  // invisible here and fail a delegation the agent was just told to make.
   const roster = await delegationRoster({ agentsDir: agentsDir(), skillsDir: skillsDir(), lineage });
 
-  // Looked up in `.all`, not `.spawnable`: a known agent this caller may not
-  // spawn must get lineageRejection's specific refusal, not "Unknown agent".
-  const agent = roster.all.find((a) => a.name === params.agent);
-  if (!agent) {
-    // List only what this caller could actually spawn. Advertising a private
-    // helper it may not use turns one refusal into two round trips.
-    const available =
-      roster.spawnable
-        .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
-        .join(", ") || "none";
-    return { ok: false, error: `Unknown agent "${params.agent}". Available agents: ${available}.` };
-  }
-
   // Refuse before spending anything: no run dir, no registry entry, no pane.
-  // A health check is the extension's own spawn, not a delegation the model
-  // chose, so it must work from any depth: a worker whose reviewer stalls gets
-  // its diagnosis like the orchestrator does. `callable_by: orchestrator` on
-  // `healthcheck` still keeps every agent from delegating to it by hand.
-  const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage, {
-    system: params.healthCheckOf !== undefined,
-  });
-  if (lineageProblem) return { ok: false, error: lineageProblem };
+  const admission = admitSpawn(
+    {
+      agent: params.agent,
+      task: params.task,
+      cwd: params.cwd ?? baseCwd,
+      model: params.model,
+      origin: params.origin,
+    },
+    roster.all,
+    lineage,
+  );
+  if (!admission.ok) return { ok: false, error: admission.error };
+  const { agent, chain } = admission;
 
-  // The child's model chain, in its only role now: the router it launches on.
-  // A child is started on `fallback/auto` with this chain in its env, so a
-  // declaration with no syntactically usable reference is a launch refusal, not
-  // a fallback to pi's default — refuse it before any run dir, registry entry,
-  // or pane. The two messages split on who is at fault: a bad `model` on the
-  // delegation call is the caller's to fix; an empty declaration is the agent
-  // file's.
-  const chain = childFallbackChain(params.model, agent);
-  if (!chain) {
-    // A whitespace-only `model` is no request (the chain rule normalises it to
-    // nothing), so it is the agent file's declaration that failed, not the
-    // caller's.
-    const error = params.model?.trim()
-      ? `Requested model "${params.model}" is not usable. The accepted grammar is \`provider/id\` or \`provider/id|level\` (level: off|minimal|low|medium|high|xhigh|max); a pi-style \`ref:level\` is translated only when the ref is itself a plain \`provider/id\`, and \`fallback/auto\` is not accepted — the router cannot route to itself. Pass a valid model, or omit \`model\` to use the agent's declaration.`
-      : `Agent "${agent.name}" declares no usable model: its model/fallback_models contains no reference the router can serve. Fix the agent definition — children launch on fallback/auto, which needs at least one entry.`;
-    return { ok: false, error };
-  }
   const runId = makeRunId();
 
   // Validate the name herdr will actually receive, not the definition name:
@@ -602,8 +578,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   const rec: RunRecord = {
     runId,
     agent: agent.name,
-    task: params.task,
-    cwd: params.cwd ?? baseCwd,
+    task: admission.task,
+    cwd: admission.cwd,
     // The parsed head ref, for diagnostics only: the child runs on the router,
     // and which physical model answers is up to it.
     model: parseChainItem(chain[0]!)!.ref,
@@ -612,7 +588,7 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     // The chain handed to the router, recorded so a reader of a finished run
     // can see what the child could hop between.
     fallbackChain: [...chain],
-    ...(params.healthCheckOf ? { healthCheckOf: params.healthCheckOf } : {}),
+    ...(admission.healthCheckOf ? { healthCheckOf: admission.healthCheckOf } : {}),
     // The spawning parent's pane, stamped before the record is registered:
     // only this pane's process may autonomously sweep the run (see
     // isOwnedBy). Absent when the process has no pane of its own.
@@ -629,7 +605,7 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   launchingRunIds.add(rec.runId);
   runs.set(rec.runId, rec);
   try {
-    return await launchRegisteredRun(agent, rec, dir, params.task, chain);
+    return await launchRegisteredRun(agent, rec, dir, admission.task, chain);
   } finally {
     launchingRunIds.delete(rec.runId);
   }
@@ -768,7 +744,7 @@ async function spawnHealthCheckRun(
       agent: "healthcheck",
       cwd: target.cwd,
       task: buildHealthCheckTask(target, dirFor(target.runId), trigger),
-      healthCheckOf: target.runId,
+      origin: { kind: "system-health-check", targetRunId: target.runId },
     },
     target.cwd,
   );
@@ -1014,11 +990,14 @@ export default function (pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      // Only the public schema's fields cross: `healthCheckOf` is internal and
-      // relaxes the `callable_by` guard, so a model must not be able to smuggle
-      // it in as an extra property.
+      // Only the public schema's fields cross: `origin` is internal and a system
+      // origin relaxes the `callable_by` guard, so a model must not be able to
+      // smuggle one in as an extra property. Never spread `params`.
       const { agent, task, cwd, model } = params;
-      const out = await spawnRun({ agent, task, cwd, model }, ctx.cwd);
+      const out = await spawnRun(
+        { agent, task, cwd, model, origin: { kind: "tool-delegation" } },
+        ctx.cwd,
+      );
       if (!out.ok || !out.rec) {
         return {
           content: [{ type: "text", text: `Error: ${out.error}` }],

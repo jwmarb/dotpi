@@ -12,7 +12,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-import { frontmatterOf } from "../lib/agents.js";
+import { type AgentInfo, frontmatterOf } from "../lib/agents.js";
 import { findSkills } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
@@ -854,6 +854,117 @@ export function childFallbackChain(
     chain.push(entry);
   }
   return chain.length > 0 ? chain.map(formatChainItem) : undefined;
+}
+
+/**
+ * Who is asking for a spawn. A model's `subagent` call is a tool delegation;
+ * a health check is the extension's own spawn of a diagnosis for `targetRunId`,
+ * which bypasses `callable_by` (never the cycle rule) — see {@link admitSpawn}.
+ */
+export type SpawnOrigin =
+  | { kind: "tool-delegation" }
+  | { kind: "system-health-check"; targetRunId: string };
+
+/** One spawn request, as {@link admitSpawn} judges it. */
+export interface SpawnAdmissionRequest {
+  /** The agent definition name asked for. */
+  agent: string;
+  task: string;
+  /** The child's working directory, already resolved against the caller's. */
+  cwd: string;
+  /** An explicit model on the delegation call, if any. */
+  model?: string;
+  origin: SpawnOrigin;
+}
+
+/**
+ * The verdict on a spawn request: the resolved agent and its router chain, or
+ * the exact refusal to hand back to the caller.
+ */
+export type SpawnAdmission =
+  | {
+      ok: true;
+      agent: AgentInfo;
+      /** Chain items for `PI_FALLBACK_CHAIN`, non-empty, in priority order. */
+      chain: string[];
+      task: string;
+      cwd: string;
+      /** The diagnosed run's id, set only for a `system-health-check` origin. */
+      healthCheckOf?: string;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Decides whether a spawn may proceed, before anything is spent: no run dir,
+ * no registry entry, no pane. Pure — the roster and lineage come in.
+ *
+ * Three checks, in this order: the agent must exist in `rosterAll` (the
+ * refusal lists what this lineage may spawn under normal rules), then
+ * {@link lineageRejection} (with `{ system: true }` only for a health check),
+ * then {@link childFallbackChain} must yield a chain. The herdr name check is
+ * not here: it depends on the run id, which only the caller allocates.
+ *
+ * @param request - What was asked for, and by whom.
+ * @param rosterAll - Every known agent (`delegationRoster(...).all`).
+ * @param lineage - The spawning process's ancestry, oldest first.
+ */
+export function admitSpawn(
+  request: SpawnAdmissionRequest,
+  rosterAll: readonly AgentInfo[],
+  lineage: string[],
+): SpawnAdmission {
+  // Looked up in the whole roster, not the spawnable part: a known agent this
+  // caller may not spawn must get lineageRejection's specific refusal, not
+  // "Unknown agent".
+  const agent = rosterAll.find((a) => a.name === request.agent);
+  if (!agent) {
+    // List only what this caller could actually spawn. Advertising a private
+    // helper it may not use turns one refusal into two round trips. Normal
+    // (non-system) lineage rules, whatever the origin.
+    const available =
+      spawnableAgents(rosterAll, lineage)
+        .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
+        .join(", ") || "none";
+    return { ok: false, error: `Unknown agent "${request.agent}". Available agents: ${available}.` };
+  }
+
+  // A health check is the extension's own spawn, not a delegation the model
+  // chose, so it must work from any depth: a worker whose reviewer stalls gets
+  // its diagnosis like the orchestrator does. `callable_by: orchestrator` on
+  // `healthcheck` still keeps every agent from delegating to it by hand.
+  const lineageProblem = lineageRejection(agent.name, agent.callableBy, lineage, {
+    system: request.origin.kind === "system-health-check",
+  });
+  if (lineageProblem) return { ok: false, error: lineageProblem };
+
+  // The child's model chain, in its only role now: the router it launches on.
+  // A child is started on `fallback/auto` with this chain in its env, so a
+  // declaration with no syntactically usable reference is a launch refusal, not
+  // a fallback to pi's default — refuse it before any run dir, registry entry,
+  // or pane. The two messages split on who is at fault: a bad `model` on the
+  // delegation call is the caller's to fix; an empty declaration is the agent
+  // file's.
+  const chain = childFallbackChain(request.model, agent);
+  if (!chain) {
+    // A whitespace-only `model` is no request (the chain rule normalises it to
+    // nothing), so it is the agent file's declaration that failed, not the
+    // caller's.
+    const error = request.model?.trim()
+      ? `Requested model "${request.model}" is not usable. The accepted grammar is \`provider/id\` or \`provider/id|level\` (level: off|minimal|low|medium|high|xhigh|max); a pi-style \`ref:level\` is translated only when the ref is itself a plain \`provider/id\`, and \`fallback/auto\` is not accepted — the router cannot route to itself. Pass a valid model, or omit \`model\` to use the agent's declaration.`
+      : `Agent "${agent.name}" declares no usable model: its model/fallback_models contains no reference the router can serve. Fix the agent definition — children launch on fallback/auto, which needs at least one entry.`;
+    return { ok: false, error };
+  }
+
+  return {
+    ok: true,
+    agent,
+    chain,
+    task: request.task,
+    cwd: request.cwd,
+    ...(request.origin.kind === "system-health-check"
+      ? { healthCheckOf: request.origin.targetRunId }
+      : {}),
+  };
 }
 
 /**

@@ -75,7 +75,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   in `extensions/lib/agents.ts` (cycle first, then `callable_by`); the same rule is applied
   once, in `delegationRoster` (same file), whose `.spawnable` is both the `## Available Agents`
   roster `dynamic-prompt.ts` shows each process (read from its `PI_SUBAGENT_LINEAGE`) and the
-  "Available agents" error list — so what an agent is told it can delegate to is exactly what it can. A subagent's prompt also omits the orchestrator-voiced Plan/Quality Pass sections (`isSubagent`); `worker.md` carries its own. The one non-model spawn — a health check — bypasses `callable_by` (not the cycle rule) via `{ system: true }`. No
+  "Available agents" error list — so what an agent is told it can delegate to is exactly what it can. A subagent's prompt also omits the orchestrator-voiced Plan/Quality Pass sections (`isSubagent`); `worker.md` carries its own. The one non-model spawn — a health check, `SpawnOrigin` `system-health-check` in `subagent-herdr/lib.ts`'s `admitSpawn` — bypasses `callable_by` (not the cycle rule) via `{ system: true }`. No
   depth bound beyond that: the cycle rule plus a finite roster terminates every chain.
 - **Every agent declares `fallback_models`** (all 10 do), and the list feeds the **router**.
   `childFallbackChain` in `extensions/subagent-herdr/lib.ts` builds a non-empty deduped

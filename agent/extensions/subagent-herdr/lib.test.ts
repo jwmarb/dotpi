@@ -9,10 +9,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { discoverAgents, discoverSkillAgents, parseAgentFile } from "../lib/agents.js";
+import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
 import { agentsDir, skillsDir } from "../lib/layout.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import {
+  admitSpawn,
   appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
@@ -2241,6 +2242,136 @@ describe("lineageRejection: callable_by", () => {
     // "you may not call yourself" is more useful than a permissions list.
     const msg = lineageRejection("librarian", ["librarian"], ["librarian"]) ?? "";
     expect(msg).toContain("ancestry");
+  });
+});
+
+describe("admitSpawn", () => {
+  const mk = (name: string, extra: Partial<AgentInfo> = {}): AgentInfo => ({
+    name,
+    description: `${name} agent`,
+    promptBody: `Body for ${name}.`,
+    filePath: `${name}.md`,
+    model: "openai/gpt-5.6-sol",
+    ...extra,
+  });
+  // An in-memory roster shaped like the fleet: worker → reviewer, a private
+  // librarian helper, an orchestrator-only healthcheck, and a skill agent.
+  const roster: AgentInfo[] = [
+    // Sorted by name, as `delegationRoster(...).all` is.
+    mk("healthcheck", { callableBy: ["orchestrator"], fallbackModels: ["qwen/qwen3.8-27b"] }),
+    mk("modelless", { callableBy: ["any"], model: undefined }),
+    mk("observer", { callableBy: ["any"], skill: "technical-analysis" }),
+    mk("reviewer", { callableBy: ["worker"] }),
+    mk("summarizer", { callableBy: ["librarian"] }),
+    mk("worker", { callableBy: ["orchestrator"] }),
+  ];
+  const tool = { kind: "tool-delegation" } as const;
+  const health = { kind: "system-health-check", targetRunId: "sub-1a2b" } as const;
+  const req = (agent: string, origin: typeof tool | typeof health = tool, model?: string) => ({
+    agent,
+    task: "do the thing",
+    cwd: "/work",
+    ...(model !== undefined ? { model } : {}),
+    origin,
+  });
+
+  test("an unknown agent lists exactly what this lineage may spawn", () => {
+    expect(admitSpawn(req("nobody"), roster, ["worker"])).toEqual({
+      ok: false,
+      error:
+        'Unknown agent "nobody". Available agents: modelless, observer (skill: technical-analysis), reviewer.',
+    });
+  });
+
+  test("the unknown-agent list uses normal lineage rules even for a health check", () => {
+    // healthcheck is orchestrator-only; a system origin must not advertise it.
+    expect(admitSpawn(req("nobody", health), roster, ["worker"])).toEqual({
+      ok: false,
+      error:
+        'Unknown agent "nobody". Available agents: modelless, observer (skill: technical-analysis), reviewer.',
+    });
+  });
+
+  test("an unknown agent with nothing spawnable says none", () => {
+    expect(admitSpawn(req("nobody"), [mk("worker")], ["worker"])).toEqual({
+      ok: false,
+      error: 'Unknown agent "nobody". Available agents: none.',
+    });
+  });
+
+  test("a cycle is refused", () => {
+    expect(admitSpawn(req("reviewer"), roster, ["worker", "reviewer"])).toEqual({
+      ok: false,
+      error:
+        '"reviewer" is already in this delegation\'s ancestry (worker → reviewer → reviewer), so spawning it ' +
+        "again would be a cycle. Do this part with your own tools, or report what you " +
+        "need so the agent above you can take it from here.",
+    });
+  });
+
+  test("callable_by refuses a tool delegation from a caller it does not name", () => {
+    expect(admitSpawn(req("summarizer"), roster, ["worker"])).toEqual({
+      ok: false,
+      error:
+        '"summarizer" can only be spawned by: librarian. ' +
+        'You are "worker", so this delegation was refused. Do this part with your own ' +
+        "tools, or report what you need so the agent above you can delegate it.",
+    });
+  });
+
+  test("an unusable explicit model is the caller's to fix", () => {
+    expect(admitSpawn(req("reviewer", tool, "fallback/auto"), roster, ["worker"])).toEqual({
+      ok: false,
+      error:
+        'Requested model "fallback/auto" is not usable. The accepted grammar is `provider/id` or `provider/id|level` (level: off|minimal|low|medium|high|xhigh|max); a pi-style `ref:level` is translated only when the ref is itself a plain `provider/id`, and `fallback/auto` is not accepted — the router cannot route to itself. Pass a valid model, or omit `model` to use the agent\'s declaration.',
+    });
+  });
+
+  test("a declaration with no usable chain is the agent file's to fix", () => {
+    expect(admitSpawn(req("modelless"), roster, [])).toEqual({
+      ok: false,
+      error:
+        'Agent "modelless" declares no usable model: its model/fallback_models contains no reference the router can serve. Fix the agent definition — children launch on fallback/auto, which needs at least one entry.',
+    });
+  });
+
+  test("a tool delegation is admitted with its chain and no healthCheckOf", () => {
+    const out = admitSpawn(req("reviewer"), roster, ["worker"]);
+    expect(out).toEqual({
+      ok: true,
+      agent: roster.find((a) => a.name === "reviewer")!,
+      chain: ["openai/gpt-5.6-sol"],
+      task: "do the thing",
+      cwd: "/work",
+    });
+    expect("healthCheckOf" in out).toBe(false);
+  });
+
+  test("a health check bypasses callable_by", () => {
+    // The same lineage is refused for a tool delegation of healthcheck.
+    expect(admitSpawn(req("healthcheck"), roster, ["worker"]).ok).toBe(false);
+    expect(admitSpawn(req("healthcheck", health), roster, ["worker"]).ok).toBe(true);
+  });
+
+  test("a health check is still refused for a cycle", () => {
+    expect(admitSpawn(req("healthcheck", health), roster, ["healthcheck"])).toEqual({
+      ok: false,
+      error:
+        '"healthcheck" is already in this delegation\'s ancestry (healthcheck → healthcheck), so spawning it ' +
+        "again would be a cycle. Do this part with your own tools, or report what you " +
+        "need so the agent above you can take it from here.",
+    });
+  });
+
+  test("an admitted health check carries targetRunId as healthCheckOf", () => {
+    expect(admitSpawn(req("healthcheck", health), roster, ["worker", "reviewer"])).toEqual({
+      ok: true,
+      agent: roster.find((a) => a.name === "healthcheck")!,
+      chain: ["openai/gpt-5.6-sol", "qwen/qwen3.8-27b"],
+      task: "do the thing",
+      cwd: "/work",
+      healthCheckOf: "sub-1a2b",
+    });
   });
 });
 
