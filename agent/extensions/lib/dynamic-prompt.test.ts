@@ -10,8 +10,9 @@
  * `lib/` may import. `lib/sessions.test.ts` had been importing `../sessions.js`
  * all along.
  *
- * So these assertions cross the module's real seam: the single exported
- * `buildOrchestratorPrompt`. Its section builders stay private, and that is
+ * So these assertions cross the module's real seams: `buildOrchestratorPrompt`,
+ * and `promptInputs`, the pure assembly that turns the handler's loaded inputs
+ * into the builder's parameter object. Its section builders stay private, and that is
  * deliberate — a test that reached them would pin the implementation and would
  * not be able to pin section *ordering*, which is the thing most likely to break
  * silently when a section is added.
@@ -24,9 +25,9 @@
  */
 import { describe, expect, test, afterAll, beforeAll } from "bun:test";
 
-import { buildOrchestratorPrompt } from "../dynamic-prompt.js";
+import { buildOrchestratorPrompt, promptInputs, type PromptInputsOptions } from "../dynamic-prompt.js";
 import { agentsDir } from "./layout.js";
-import { discoverAgents } from "./agents.js";
+import { discoverAgents, type AgentInfo } from "./agents.js";
 import { fileURLToPath } from "node:url";
 /** A minimal valid call; each test overrides only what it is about. */
 function build(overrides: Partial<Parameters<typeof buildOrchestratorPrompt>[0]> = {}) {
@@ -747,5 +748,131 @@ describe("healthcheck agent visibility in the inventory", () => {
   afterAll(() => {
     if (originalEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalEnv;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// promptInputs — the pure assembly between the handler's loads and the builder
+// ---------------------------------------------------------------------------
+
+describe("promptInputs", () => {
+  const agent = (name: string): AgentInfo => ({
+    name,
+    description: `${name} agent`,
+    promptBody: "",
+    filePath: `${name}.md`,
+  });
+  const LIB = "/home/u/.pi/agent/skills";
+  /** A minimal call; each test overrides only what it is about. */
+  function inputs(overrides: Partial<PromptInputsOptions> = {}) {
+    return promptInputs({
+      systemPromptOptions: { cwd: "/work/repo" },
+      lineage: [],
+      roster: { all: [], spawnable: [] },
+      owners: new Map(),
+      isActive: () => false,
+      skillsLibrary: LIB,
+      ...overrides,
+    });
+  }
+
+  test("a non-empty lineage marks a subagent and advertises only .spawnable", () => {
+    const roster = { all: [agent("reviewer"), agent("worker")], spawnable: [agent("reviewer")] };
+    const sub = inputs({ lineage: ["worker"], roster });
+    expect(sub.buildOptions.isSubagent).toBe(true);
+    expect(sub.buildOptions.agentInventory.map((a) => a.name)).toEqual(["reviewer"]);
+
+    const top = inputs({ lineage: [], roster });
+    expect(top.buildOptions.isSubagent).toBe(false);
+  });
+
+  test("hasSubagent and hasQuestionnaire come from selectedTools even without a snippet", () => {
+    const out = inputs({
+      systemPromptOptions: { cwd: "/w", selectedTools: ["read", "subagent", "questionnaire"] },
+    });
+    expect(out.buildOptions.toolInventory).toEqual([]);
+    expect(out.buildOptions.hasSubagent).toBe(true);
+    expect(out.buildOptions.hasQuestionnaire).toBe(true);
+
+    const none = inputs({ systemPromptOptions: { cwd: "/w", selectedTools: ["read"] } });
+    expect(none.buildOptions.hasSubagent).toBe(false);
+    expect(none.buildOptions.hasQuestionnaire).toBe(false);
+  });
+
+  test("gating drops only the inactive skill-owned tool, keeps order, and copies", () => {
+    const selected = ["read", "trade_journal", "subagent", "web_probe", "bash"];
+    const snapshot = [...selected];
+    const out = inputs({
+      systemPromptOptions: {
+        cwd: "/w",
+        selectedTools: selected,
+        toolSnippets: { trade_journal: "journal", subagent: "delegate", web_probe: "probe" },
+      },
+      owners: new Map([
+        ["trade_journal", "technical-analysis"],
+        ["web_probe", "research"],
+      ]),
+      isActive: (d) => d === "research",
+    });
+    expect(out.selectedTools).toEqual(["read", "subagent", "web_probe", "bash"]);
+    expect(out.selectedTools).not.toBe(selected);
+    expect(selected).toEqual(snapshot);
+    // The inventory and the subagent flag are computed after gating.
+    expect(out.buildOptions.toolInventory.map((t) => t.name)).toEqual(["subagent", "web_probe"]);
+    expect(out.buildOptions.hasSubagent).toBe(true);
+  });
+
+  test("a gated-out subagent tool turns hasSubagent off", () => {
+    const out = inputs({
+      systemPromptOptions: { cwd: "/w", selectedTools: ["subagent"], toolSnippets: { subagent: "x" } },
+      owners: new Map([["subagent", "some-skill"]]),
+    });
+    expect(out.selectedTools).toEqual([]);
+    expect(out.buildOptions.hasSubagent).toBe(false);
+  });
+
+  test("empty guidelines are dropped and context files map to {path}", () => {
+    // pi hands over each file's content too; the inventory must not carry it.
+    const contextFiles = [
+      { path: "/w/AGENTS.md", content: "secret body" },
+      { path: "/w/agent/AGENTS.md", content: "more" },
+    ];
+    const out = inputs({
+      systemPromptOptions: {
+        cwd: "/w",
+        promptGuidelines: ["Keep it short.", "", "   ", "\n\t", "Cite sources."],
+        contextFiles,
+      },
+    });
+    expect(out.buildOptions.guidelines).toEqual(["Keep it short.", "Cite sources."]);
+    expect(out.buildOptions.contextInventory).toEqual([
+      { path: "/w/AGENTS.md" },
+      { path: "/w/agent/AGENTS.md" },
+    ]);
+  });
+
+  test("skills carry their path category and pass-through fields cross verbatim", () => {
+    const out = inputs({
+      systemPromptOptions: {
+        cwd: "/work/repo",
+        customPrompt: "custom",
+        appendSystemPrompt: "appended",
+        skills: [
+          { name: "triage", description: "d", filePath: `${LIB}/review-and-verification/triage/SKILL.md` },
+        ],
+      },
+    });
+    expect(out.buildOptions.skillInventory).toEqual([
+      {
+        name: "triage",
+        description: "d",
+        filePath: `${LIB}/review-and-verification/triage/SKILL.md`,
+        pathCategory: "review-and-verification",
+      },
+    ]);
+    expect(out.buildOptions.customPrompt).toBe("custom");
+    expect(out.buildOptions.appendSystemPrompt).toBe("appended");
+    expect(out.buildOptions.cwd).toBe("/work/repo");
+    expect(out.buildOptions.skillsLibrary).toBe(LIB);
   });
 });

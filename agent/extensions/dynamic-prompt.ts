@@ -14,6 +14,7 @@ import {
   LINEAGE_ENV,
   parseLineage,
   type AgentInfo,
+  type DelegationRoster,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
 import { groupByCategory } from './lib/skill-categories.js';
@@ -126,85 +127,157 @@ export default function (pi: ExtensionAPI) {
     // is a user/custom discriminated union); a custom-triggered turn has none to scan.
     activation.notePrompt(event.messageType === 'user' ? event.prompt : '');
 
-    // --- Gate skill-owned tools on their skill being active ---
+    // Everything that touches disk or env is loaded here; promptInputs is pure.
+    // The roster carries agents shipped by ACTIVE skills only, so an unrelated
+    // session is never advertised journal or research agents.
+    const library = skillsDir();
+    const owners = await loadSkillToolOwners(library);
+    const lineage = parseLineage(process.env[LINEAGE_ENV]);
+    const roster = await delegationRoster({
+      agentsDir: agentsDir(),
+      skillsDir: library,
+      lineage,
+      activeSkills: activation.list(),
+    });
+
+    const inputs = promptInputs({
+      systemPromptOptions: opts,
+      lineage,
+      roster,
+      owners,
+      isActive: (d) => activation.has(d),
+      skillsLibrary: library,
+    });
+
+    // --- Apply the gate to this run ---
     // selectedTools is mutable here and is what the model is offered for this run.
     // There is no unregisterTool, and setActiveTools is absent from this event's
-    // `ctx` (it lives on the `pi` object — see refreshActiveTools above).
-    const owners = await loadSkillToolOwners(skillsDir());
+    // `ctx` (it lives on the `pi` object — see refreshActiveTools above). Assigned
+    // under the same condition gating always ran under, so a session with no
+    // skill-owned tools leaves pi's array untouched.
     if (owners.size > 0 && Array.isArray(opts.selectedTools)) {
-      const { kept } = gateTools(opts.selectedTools, owners, (d) => activation.has(d));
-      opts.selectedTools = kept;
+      opts.selectedTools = inputs.selectedTools;
     }
 
-    // --- Discover agents: global roster + agents shipped by ACTIVE skills ---
-    // A skill's agents become delegable once its skill is loaded, so an
-    // unrelated session is never advertised journal or research agents.
-    // Filtered to what THIS process may spawn: a subagent gets this prompt too,
-    // and advertising an agent its `subagent` call would refuse (a cycle, or a
-    // `callable_by` that does not name it) turns one delegation into a refusal
-    // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
-    const lineage = parseLineage(process.env[LINEAGE_ENV]);
-    const agentInventory = (
-      await delegationRoster({
-        agentsDir: agentsDir(),
-        skillsDir: skillsDir(),
-        lineage,
-        activeSkills: activation.list(),
-      })
-    ).spawnable;
+    const orchestratorPrompt = buildOrchestratorPrompt(inputs.buildOptions);
 
-    // --- Build tool inventory ---
-    // Only include tools that have a snippet available; fallback to empty description
-    const toolInventory =
-      opts.selectedTools
-        ?.filter((name) => opts.toolSnippets?.[name])
-        .map((name) => ({
-          name,
-          description: opts.toolSnippets?.[name] ?? '',
-        })) ?? [];
+    // Replace the default prompt entirely with the orchestrator prompt
+    return { systemPrompt: orchestratorPrompt };
+  });
+}
 
-    // --- Build skill inventory ---
-    // The category comes from the skill's own path when it has one, so the tree
-    // on disk is the source of truth and refiling a skill needs no code edit.
-    // `skillsDir()` is this repo's library; a package or project-local skill
-    // lies outside it and falls through to the name-keyed map instead.
-    const library = skillsDir();
-    const skillInventory = (opts.skills ?? []).map((skill) => ({
-      name: skill.name,
-      description: skill.description,
-      filePath: skill.filePath,
-      pathCategory: categoryFromPath(library, skill.filePath),
+// ---------------------------------------------------------------------------
+// Prompt input assembly
+// ---------------------------------------------------------------------------
+
+/** Inputs to {@link promptInputs}: everything the handler has already loaded. */
+export interface PromptInputsOptions {
+  /**
+   * The event's `systemPromptOptions` — only the fields read here, so pi's
+   * normalized options satisfy it and a test can pass a minimal literal.
+   */
+  systemPromptOptions: {
+    selectedTools?: readonly string[];
+    toolSnippets?: Readonly<Record<string, string>>;
+    promptGuidelines?: readonly string[];
+    skills?: ReadonlyArray<{ name: string; description: string; filePath: string }>;
+    contextFiles?: ReadonlyArray<{ path: string }>;
+    customPrompt?: string;
+    appendSystemPrompt?: string;
+    cwd: string;
+  };
+  /** This process's ancestry, oldest first; empty for the human's orchestrator. */
+  lineage: readonly string[];
+  /** The delegation roster; only `.spawnable` is advertised. */
+  roster: DelegationRoster;
+  /** Tool name → the skill directory that must be active for it to be offered. */
+  owners: ReadonlyMap<string, string>;
+  /** Whether a skill directory is active this session. */
+  isActive: (skillDir: string) => boolean;
+  /** Absolute path to this repo's skills library. */
+  skillsLibrary: string;
+}
+
+/** What {@link promptInputs} assembles. */
+export interface PromptInputsResult {
+  /** The offered tools after skill gating — a new array, input order kept. */
+  selectedTools: string[];
+  /** Exactly the parameter object {@link buildOrchestratorPrompt} takes. */
+  buildOptions: Parameters<typeof buildOrchestratorPrompt>[0];
+}
+
+/**
+ * Assembles the orchestrator prompt's inputs from what the handler loaded:
+ * gates skill-owned tools, builds the tool/skill/context inventories, and
+ * derives the capability flags. Pure and synchronous — no disk, no env, and
+ * the input `selectedTools` is never mutated (the handler assigns the result).
+ */
+export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
+  const spo = opts.systemPromptOptions;
+
+  // --- Gate skill-owned tools on their skill being active ---
+  const { kept: selectedTools } = gateTools(spo.selectedTools ?? [], opts.owners, opts.isActive);
+
+  // --- Agents ---
+  // A skill's agents become delegable once its skill is loaded (the roster was
+  // discovered for the active set), and only what THIS process may spawn is
+  // advertised: an agent its `subagent` call would refuse (a cycle, or a
+  // `callable_by` that does not name it) turns one delegation into a refusal
+  // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
+  const agentInventory = opts.roster.spawnable;
+
+  // --- Build tool inventory ---
+  // Only include tools that have a snippet available; fallback to empty description
+  const toolInventory = selectedTools
+    .filter((name) => spo.toolSnippets?.[name])
+    .map((name) => ({
+      name,
+      description: spo.toolSnippets?.[name] ?? '',
     }));
 
-    // --- Build context file inventory ---
-    const contextInventory = (opts.contextFiles ?? []).map((f) => ({
-      path: f.path,
-    }));
+  // --- Build skill inventory ---
+  // The category comes from the skill's own path when it has one, so the tree
+  // on disk is the source of truth and refiling a skill needs no code edit.
+  // `skillsLibrary` is this repo's library; a package or project-local skill
+  // lies outside it and falls through to the name-keyed map instead.
+  const library = opts.skillsLibrary;
+  const skillInventory = (spo.skills ?? []).map((skill) => ({
+    name: skill.name,
+    description: skill.description,
+    filePath: skill.filePath,
+    pathCategory: categoryFromPath(library, skill.filePath),
+  }));
 
-    // --- Filter out empty guideline entries ---
-    const guidelines = (opts.promptGuidelines ?? []).filter((g) => g.trim().length > 0);
+  // --- Build context file inventory ---
+  const contextInventory = (spo.contextFiles ?? []).map((f) => ({
+    path: f.path,
+  }));
 
-    // --- Detect the ask-user extension ---
-    // ask-user.ts registers a tool named `questionnaire`. If it is loaded we
-    // instruct the orchestrator to ask the user through it.
-    const hasQuestionnaire =
-      (opts.selectedTools ?? []).includes(QUESTIONNAIRE_TOOL) ||
-      toolInventory.some((t) => t.name === QUESTIONNAIRE_TOOL);
+  // --- Filter out empty guideline entries ---
+  const guidelines = (spo.promptGuidelines ?? []).filter((g) => g.trim().length > 0);
 
-    // --- Detect the subagent-herdr extension ---
-    // `agentInventory` is read off `agents/*.md` on disk, which says nothing about
-    // whether the extension that can *spawn* them loaded. subagent-herdr imports
-    // `../model-fallback/lib.js` and typebox, and the documented failure mode when
-    // that resolution breaks is a silent load failure — leaving a prompt that
-    // mandates delegation while offering no tool to delegate with. Same rule as the
-    // questionnaire gate, one level up: an agent roster is only actionable if the
-    // tool that spawns it exists.
-    const hasSubagent =
-      (opts.selectedTools ?? []).includes(SUBAGENT_TOOL) ||
-      toolInventory.some((t) => t.name === SUBAGENT_TOOL);
+  // --- Detect the ask-user extension ---
+  // ask-user.ts registers a tool named `questionnaire`. If it is loaded we
+  // instruct the orchestrator to ask the user through it.
+  const hasQuestionnaire =
+    selectedTools.includes(QUESTIONNAIRE_TOOL) ||
+    toolInventory.some((t) => t.name === QUESTIONNAIRE_TOOL);
 
-    // --- Build the orchestrator system prompt ---
-    const orchestratorPrompt = buildOrchestratorPrompt({
+  // --- Detect the subagent-herdr extension ---
+  // `agentInventory` is read off `agents/*.md` on disk, which says nothing about
+  // whether the extension that can *spawn* them loaded. subagent-herdr imports
+  // `../model-fallback/lib.js` and typebox, and the documented failure mode when
+  // that resolution breaks is a silent load failure — leaving a prompt that
+  // mandates delegation while offering no tool to delegate with. Same rule as the
+  // questionnaire gate, one level up: an agent roster is only actionable if the
+  // tool that spawns it exists. Computed after gating, like the inventory.
+  const hasSubagent =
+    selectedTools.includes(SUBAGENT_TOOL) ||
+    toolInventory.some((t) => t.name === SUBAGENT_TOOL);
+
+  return {
+    selectedTools,
+    buildOptions: {
       agentInventory,
       toolInventory,
       skillInventory,
@@ -212,16 +285,13 @@ export default function (pi: ExtensionAPI) {
       guidelines,
       hasQuestionnaire,
       hasSubagent,
-      isSubagent: lineage.length > 0,
-      customPrompt: opts.customPrompt,
-      appendSystemPrompt: opts.appendSystemPrompt,
-      cwd: opts.cwd,
+      isSubagent: opts.lineage.length > 0,
+      customPrompt: spo.customPrompt,
+      appendSystemPrompt: spo.appendSystemPrompt,
+      cwd: spo.cwd,
       skillsLibrary: library,
-    });
-
-    // Replace the default prompt entirely with the orchestrator prompt
-    return { systemPrompt: orchestratorPrompt };
-  });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

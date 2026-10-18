@@ -15,7 +15,7 @@ scripts, so every command below comes from the repo root).
 | `ask-user.ts` | `questionnaire` tool — TUI option list + free-text fallback, `executionMode: "sequential"` so two questions cannot open at once |
 | `changed-files.ts` | `/changed-files`, `/diff` — session change widget; tracks `write`/`edit` inputs *and* `git status --porcelain` on turn end |
 | `display-file.ts` | `display_file` tool — spawns the platform opener detached, then checks for a non-zero exit instead of faking success |
-| `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context |
+| `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context. The handler only loads (skill activation, tool owners, `delegationRoster`, lineage) and applies the gated `selectedTools`; the pure, synchronous `promptInputs` does the gating and assembles `buildOrchestratorPrompt`'s parameter object, and both are tested from `lib/dynamic-prompt.test.ts` |
 | `firecrawl-cli.ts` | No tool, no command. Loads `agent/.env` so `FIRECRAWL_API_URL` reaches the real `process.env`, where the `firecrawl` CLI (run via `bash`) can see it — the librarian's research path. Also sets `FIRECRAWL_NO_UPDATE_CHECK`/`_NO_TELEMETRY` when unset, so a registry banner cannot land inside an agent's `<result>`. Reports a missing URL and returns rather than throwing: pi must start without the research stack |
 | `git-hooks.ts` | No tool. Self-arms `core.hooksPath` and runs `scripts/setup-deps.sh` at startup; swallows every failure |
 | `herdr-agent-state.ts` | **Not in git** — herdr installs and overwrites this file itself (`.gitignore` excludes it); auto-loaded like every top-level `*.ts`, a fresh clone's first copy arrives from herdr's next start |
@@ -63,7 +63,9 @@ scripts, so every command below comes from the repo root).
   pi snapshots the tool set once per run. Without a `pi.setActiveTools` refresh the model
   reads a `SKILL.md` telling it to call a tool that stays invisible for the rest of the
   run. `dynamic-prompt.ts` does that refresh **additively** — it only ever *adds* ungated
-  tools, so it cannot withdraw one another extension relies on.
+  tools, so it cannot withdraw one another extension relies on. The gate itself is computed
+  by the pure `promptInputs` (which returns a gated *copy*); the handler is what assigns it
+  back to `event.systemPromptOptions.selectedTools`, and only when some skill owns a tool.
 - **Activation is sticky for the session.** A loaded skill's guidance stays in context, so
   its tools must not vanish next turn. `session_start` also fires with reason `reload` and
   `fork`, which keep the same transcript, so the handler resets on `new`/`resume` only. A
