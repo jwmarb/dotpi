@@ -363,6 +363,9 @@ beforeEach(() => {
   herdrState.probeAgent = async () => GONE;
   herdrState.paneLabel = async () => undefined;
   herdrState.readAgent = async () => null;
+  herdrState.promptAgent = async () => ({ ok: true, error: null });
+  herdrState.sendKeys = async () => true;
+  herdrState.waitAgentWorking = async () => true;
 });
 
 afterEach(() => {
@@ -1674,4 +1677,226 @@ describe("the launch window (registered, pane not yet attached)", () => {
       stub.getShutdownHandler()();
     },
   );
+  test(
+    "a stalled launch is recovered when a retry Enter starts the turn",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const entered: string[][] = [];
+      const waits: Array<[string, number]> = [];
+      const realKeys = herdrState.sendKeys;
+      const realWait = herdrState.waitAgentWorking;
+      let waitN = 0;
+      herdrState.promptAgent = async () => ({ ok: false, error: "agent_prompt_stalled" });
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return true;
+      };
+      herdrState.waitAgentWorking = async (paneId: string, timeoutMs: number) => {
+        waits.push([paneId, timeoutMs]);
+        return waitN++ > 0; // the first Enter is lost, the second one lands
+      };
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+        const out = await pending;
+        expect(out.details.ok).toBe(true);
+        expect(entered).toEqual([["w9:pHC", "enter"], ["w9:pHC", "enter"]]);
+        expect(waits).toEqual([["w9:pHC", 5_000], ["w9:pHC", 5_000]]);
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "running"]]);
+      } finally {
+        herdrState.sendKeys = realKeys;
+        herdrState.waitAgentWorking = realWait;
+        stub.getShutdownHandler()();
+      }
+    },
+  );
+
+  test(
+    "a stalled launch fails after every recovery Enter is spent",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const entered: string[][] = [];
+      const waits: Array<[string, number]> = [];
+      const closed: string[] = [];
+      const realKeys = herdrState.sendKeys;
+      const realWait = herdrState.waitAgentWorking;
+      const realClose = herdrState.closePane;
+      herdrState.promptAgent = async () => ({ ok: false, error: "agent_prompt_stalled" });
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return true;
+      };
+      herdrState.waitAgentWorking = async (paneId: string, timeoutMs: number) => {
+        waits.push([paneId, timeoutMs]);
+        return false;
+      };
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+        const out = await pending;
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0]!.text).toContain(
+          "task prompt not accepted in pane w9:pHC (herdr said: agent_prompt_stalled)",
+        );
+        expect(entered).toHaveLength(3);
+        expect(entered.every((e) => e[0] === "w9:pHC" && e[1] === "enter")).toBe(true);
+        expect(waits).toHaveLength(3);
+        expect(waits.every((w) => w[0] === "w9:pHC" && w[1] === 5_000)).toBe(true);
+        // The pane is kept as evidence: never closed, and the record links to it.
+        expect(closed).toEqual([]);
+        const meta = readMetaOf(runId);
+        expect(meta.status).toBe("failed");
+        expect(meta.paneId).toBe("w9:pHC");
+        expect(meta.failedAttempts).toEqual([
+          {
+            model: "fallback/auto",
+            error: "task prompt not accepted in pane w9:pHC (herdr said: agent_prompt_stalled)",
+          },
+        ]);
+      } finally {
+        herdrState.sendKeys = realKeys;
+        herdrState.waitAgentWorking = realWait;
+        herdrState.closePane = realClose;
+        stub.getShutdownHandler()();
+      }
+    },
+  );
+
+  test(
+    "a prompt that starts cleanly bypasses the recovery loop entirely",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      let keyCalls = 0;
+      let waitCalls = 0;
+      const realKeys = herdrState.sendKeys;
+      const realWait = herdrState.waitAgentWorking;
+      herdrState.sendKeys = async () => {
+        keyCalls += 1;
+        return true;
+      };
+      herdrState.waitAgentWorking = async () => {
+        waitCalls += 1;
+        return true;
+      };
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+        const out = await pending;
+        expect(out.details.ok).toBe(true);
+        expect(keyCalls).toBe(0);
+        expect(waitCalls).toBe(0);
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "running"]]);
+      } finally {
+        herdrState.sendKeys = realKeys;
+        herdrState.waitAgentWorking = realWait;
+        stub.getShutdownHandler()();
+      }
+    },
+  );
+  test(
+    "a failing sendKeys does not short-circuit the recovery loop — the observation is the arbiter",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const entered: string[][] = [];
+      const realKeys = herdrState.sendKeys;
+      const realWait = herdrState.waitAgentWorking;
+      herdrState.promptAgent = async () => ({ ok: false, error: "agent_prompt_stalled" });
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return false; // the Enter send itself reports failure
+      };
+      herdrState.waitAgentWorking = async () => true; // …but the turn is observed working
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+        const out = await pending;
+        expect(out.details.ok).toBe(true);
+        // The loop did not bail on the failed sendKeys: exactly one attempt,
+        // and the launch succeeded on the observation.
+        expect(entered).toEqual([["w9:pHC", "enter"]]);
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([[runId, "running"]]);
+      } finally {
+        herdrState.sendKeys = realKeys;
+        herdrState.waitAgentWorking = realWait;
+        stub.getShutdownHandler()();
+      }
+    },
+  );
+
+
+  test(
+    "cancellation during a recovery wait stops further Enter attempts and closes the pane once",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const entered: string[][] = [];
+      const closed: string[] = [];
+      const realKeys = herdrState.sendKeys;
+      const realWait = herdrState.waitAgentWorking;
+      const realClose = herdrState.closePane;
+      const wait = gate<boolean>();
+      herdrState.promptAgent = async () => ({ ok: false, error: "agent_prompt_stalled" });
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return true;
+      };
+      herdrState.waitAgentWorking = async () => {
+        // The first (and only) recovery wait is held until the test cancels.
+        return wait.promise;
+      };
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      try {
+        const { pending, runId } = await startSpawn(stub);
+        await advance(PROMPT_SETTLE_MS);
+        await drain(); // settle through promptAgent + the first sendKeys into the gated wait
+
+        await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "cancel", ids: [runId] }, undefined, () => {}, {});
+        wait.open(false);
+        const out = await pending;
+
+        expect(out.details.ok).toBe(false);
+        expect(out.content[0]!.text).toContain("cancelled while it was launching");
+        // Only one recovery Enter was sent; the cancel cut off further retries.
+        expect(entered).toEqual([["w9:pHC", "enter"]]);
+        // The launch's own pane is closed exactly once and never attached.
+        expect(closed).toEqual(["w9:pHC"]);
+        const meta = readMetaOf(runId);
+        expect(meta.status).toBe("cancelled");
+        expect(meta.failedAttempts).toBeUndefined();
+        expect(meta.paneId).toBeUndefined();
+      } finally {
+        herdrState.sendKeys = realKeys;
+        herdrState.waitAgentWorking = realWait;
+        herdrState.closePane = realClose;
+        stub.getShutdownHandler()();
+      }
+    },
+  );
+
 });

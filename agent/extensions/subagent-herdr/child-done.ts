@@ -51,6 +51,11 @@
  *   child that can never finish is a worse failure than one that finishes badly.
  * - A clean `agent_end` without an answer gets **one** nudge asking for it,
  *   then completes as before if the next end is still silent.
+ * - A response **truncated by the output token limit** (`stopReason: "length"`) is
+ *   continued, not finished: nothing in pi's agent loop tells the model to go on
+ *   after a length stop, so the child asks it to pick up where it stopped, up to
+ *   {@link MAX_CONTINUATIONS} times, and only then completes with whatever the
+ *   transcript carries — a run that would otherwise sit idle and never settle.
  *
  * ## What the sidecar deliberately does not contain
  *
@@ -197,6 +202,13 @@ export function endedCleanly(messages: readonly MessageLike[]): boolean {
   return false;
 }
 
+/** The last assistant message in the turn, if any. */
+function lastAssistantOf(messages: readonly MessageLike[]): MessageLike | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") return messages[i];
+  }
+  return undefined;
+}
 /**
  * Did this run produce an answer the orchestrator can use?
  *
@@ -265,6 +277,33 @@ export function nudgeMessage(requiresResult: boolean): string {
   ].join("\n");
 }
 
+/**
+ * How many times a child may be asked to continue a response that the output
+ * token limit cut off mid-message, before the run is allowed to finish.
+ *
+ * The bound exists for the same reason as {@link MAX_REFUSED_COMPLETIONS}: a
+ * model that keeps hitting the limit (a report longer than its output budget)
+ * would otherwise be continued forever. Three extra full output budgets is
+ * plenty to finish a report; a run that ends after them finishes with what the
+ * transcript carries, which the parent labels salvage rather than a clean
+ * answer.
+ */
+export const MAX_CONTINUATIONS = 3;
+
+/** What the child is told when its response was truncated by the output token limit. */
+export function continuationMessage(requiresResult: boolean): string {
+  const contract = requiresResult
+    ? `Continue and finish the report. Your visible answer must contain one complete \`<result>…</result>\` element in a single message — if the previous one was cut off, re-emit the whole report inside it.`
+    : `Continue from exactly where you stopped, without repeating what you have already written. Your visible answer is your final assistant message.`;
+  return [
+    `Your previous response was truncated before completion: the model reached its output token limit mid-message.`,
+    ``,
+    contract,
+    ``,
+    `Then call \`subagent_done\`.`,
+  ].join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -273,8 +312,9 @@ export function nudgeMessage(requiresResult: boolean): string {
  * Create the child-done handshake with injected effects.
  *
  * Holds the deduplication and gate state: `signalled` (the sidecar is written
- * at most once), the count of refused completions, and whether the one
- * agent-end nudge has been spent. The methods encode the exact ordering:
+ * at most once), the count of refused completions, the count of spent
+ * truncation continuations, and whether the one agent-end nudge has been spent.
+ * The methods encode the exact ordering:
  * sidecar write → notice → pane close → shutdown.
  *
  * ## The answer gate
@@ -318,6 +358,12 @@ export function createChildDoneHandshake(
   let refusedCompletions = 0;
   /** Spent at most once per run: an ignored nudge must not loop the session. */
   let nudged = false;
+  /**
+   * Truncation continuations sent so far, capped by `MAX_CONTINUATIONS`: a
+   * response cut off by the output token limit is continued, not finished,
+   * while the bound lasts and no qualifying answer exists yet.
+   */
+  let continuations = 0;
 
   function complete(
     sessionFile: string | undefined,
@@ -405,8 +451,29 @@ export function createChildDoneHandshake(
     systemPrompt?: string,
   ): void {
     if (signalled) return;
-    if (!endedCleanly(messages)) return;
     if (!sessionFile) return;
+
+    // A response cut off by the output token limit is not a finish: the model
+    // stopped mid-answer because its output budget ran out, and nothing in pi's
+    // agent loop tells it to go on — the run would sit idle in its pane. For a
+    // result-contract child truncated mid-`<result>` it is worse than idle: the
+    // parent's completion predicate demands a clean, unsalvaged answer, so the
+    // run could never settle. Ask the model to continue, bounded by
+    // MAX_CONTINUATIONS; when the bound is spent (or an answer already exists)
+    // finish the run the same way a clean end does, so the parent reads
+    // whatever the transcript carries and labels a short answer as salvage.
+    const lastAssistant = lastAssistantOf(messages);
+    if (lastAssistant?.stopReason === "length") {
+      if (continuations < MAX_CONTINUATIONS && !hasQualifyingAnswer({ messages, systemPrompt })) {
+        continuations++;
+        effects.sendAnswerNudge(continuationMessage(requiresResultBlock(systemPrompt)));
+        return;
+      }
+      finishRun(sessionFile, shutdown);
+      return;
+    }
+
+    if (!endedCleanly(messages)) return;
 
     // A clean end with nothing visible to report: ask once, then let it go.
     //
@@ -422,6 +489,17 @@ export function createChildDoneHandshake(
       return;
     }
 
+    finishRun(sessionFile, shutdown);
+  }
+
+  /**
+   * The one finish path: sidecar → notice → pane close → shutdown.
+   *
+   * Shared by the clean-end and truncated-end completions so the ordering —
+   * and the `signalled` dedup that makes the sidecar at-most-once — is
+   * spelled exactly once.
+   */
+  function finishRun(sessionFile: string, shutdown: () => void): void {
     signalled = effects.writeExitSidecar(
       exitPath(sessionFile),
       formatExitSidecar(),

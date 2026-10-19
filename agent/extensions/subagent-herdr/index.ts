@@ -222,8 +222,17 @@ const RESULT_MAX_CHARS = 20_000;
  */
 export const PROMPT_SETTLE_MS = 1500;
 
-/** How long to wait for a turn to start after a recovery Enter. */
-const PROMPT_RECOVERY_MS = 15_000;
+/**
+ * Bounded launch recovery for a stalled first prompt. When the submitting
+ * Enter is lost to the TUI (the text sits in the editor and herdr answers
+ * `agent_prompt_stalled`), re-send the Enter and observe the state, up to
+ * {@link PROMPT_RECOVERY_ATTEMPTS} times. Each observation waits
+ * {@link PROMPT_RECOVERY_WAIT_MS} — three 5 s observations keep the existing
+ * 15 s maximum recovery budget while allowing repeated Enter delivery, and a
+ * launch that cannot start still fails (pane kept as evidence).
+ */
+const PROMPT_RECOVERY_ATTEMPTS = 3;
+const PROMPT_RECOVERY_WAIT_MS = 5_000;
 
 /**
  * Bounded patience for the interrupt handshake: how long to wait for a pane to
@@ -698,11 +707,23 @@ async function launchRegisteredRun(
   const prompted = await promptAgent(attempt.paneId!, task);
   let turnStarted = prompted.ok;
   if (!turnStarted) {
-    // herdr typed the text but the turn never started — most likely the
-    // submitting Enter was lost to the TUI, with the task text sitting in the
-    // editor. One recovery Enter fixes exactly that.
-    await sendKeys(attempt.paneId!, "enter");
-    turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_MS);
+    // herdr typed the text but the turn never started — the submitting Enter
+    // was lost to the TUI, with the task text sitting in the editor. Re-send
+    // the Enter and observe, bounded: a single recovery Enter can itself be
+    // lost or consumed by a transient TUI state (measured: 5 runs stalled
+    // exactly this way), so retry up to PROMPT_RECOVERY_ATTEMPTS times. Success
+    // exits immediately; a launch that cannot start still fails below with the
+    // pane kept as evidence.
+    // The observation watches `working` only (herdr's stall criterion also
+    // accepts `blocked`); a turn that reaches `blocked` without ever reporting
+    // `working` fails the launch — a pre-existing edge of `waitAgentWorking`,
+    // not of this loop.
+    for (let i = 0; i < PROMPT_RECOVERY_ATTEMPTS && !turnStarted; i++) {
+      await sendKeys(attempt.paneId!, "enter");
+      if (superseded()) return abandon(attempt.paneId);
+      turnStarted = await waitAgentWorking(attempt.paneId!, PROMPT_RECOVERY_WAIT_MS);
+      if (superseded()) return abandon(attempt.paneId);
+    }
   }
   if (superseded()) return abandon(attempt.paneId);
   if (!turnStarted) {

@@ -1,5 +1,5 @@
 /**
- * Thin CLI wrapper around the herdr 0.9.0 CLI (herdr 0.9.0, verified).
+ * Thin CLI wrapper around the herdr CLI (measured baseline 0.9.0, re-verified on 0.9.3).
  *
  * Every herdr CLI command prints a single JSON document: a `{"id", "result"}`
  * reply on stdout with exit 0 on success, and — measured against 0.9.0 — a
@@ -48,6 +48,13 @@
  *    timeout, a spawn/exit failure, a malformed or empty reply, and every
  *    other herdr code say nothing about the pane — they are reachability
  *    failures, and a run must not be classified from one.
+ * 7. `agent prompt <pane> <text> --wait --until working` (measured, herdr
+ *    0.9.3 `agent prompt --help`): when an accepted submission starts from a
+ *    non-working state, herdr requires an observed `working` or `blocked`
+ *    state within 5,000 ms, otherwise it returns `agent_prompt_stalled`.
+ *    That code is the only structured signal that the submitting Enter was
+ *    lost to the TUI (task text sitting in the editor), so `index.ts`
+ *    recovers with bounded repeated Enters (`PROMPT_RECOVERY_ATTEMPTS`).
  *
  * (`agent wait --until done` was used until the parent stopped blocking on
  * children; `waitAgentWorking` keeps the `--until working` form, which is still
@@ -288,8 +295,10 @@ export async function startAgent(
 
 /**
  * Patience for the post-prompt "turn started" observation window. herdr
- * itself reports `agent_prompt_stalled` after 5 s; we give it a bit more so a
- * slow first model hop is not mistaken for a lost keypress.
+ * 0.9.3 reports `agent_prompt_stalled` after its own 5 s accepted-submission
+ * window, so the requested 15 s timeout mostly covers the CLI round-trip;
+ * the caller (`index.ts`) layers the bounded Enter-retry recovery on top of
+ * a stall.
  */
 const PROMPT_START_TIMEOUT_MS = 15_000;
 
@@ -301,7 +310,7 @@ const PROMPT_START_TIMEOUT_MS = 15_000;
  * that submits the prompt can be lost, leaving the task text sitting in the
  * editor and the run idle forever. `--wait --until working` makes herdr
  * itself detect that (it answers `agent_prompt_stalled`), so the caller can
- * recover with a re-sent Enter instead of discovering it at wait-time.
+ * recover with bounded repeated Enters (`PROMPT_RECOVERY_ATTEMPTS` in `index.ts`).
  *
  * @returns ok=true when the turn is running; on failure, `error` carries the
  *          herdr error code (e.g. `agent_prompt_stalled`, `timeout`).

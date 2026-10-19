@@ -5,7 +5,8 @@
  * Uses recording effects stubs to verify the exact ordering of side effects:
  * sidecar write → notice → pane close → shutdown, the deduplication
  * invariant that the sidecar is written at most once, the answer gate and
- * one-shot nudge, and the watchdog's one-shot stall notices — streaming and
+ * one-shot nudge, the truncation continuation, and the watchdog's one-shot
+ * stall notices — streaming and
  * tool phases, nested/parallel tool-call isolation, and the tick wiring.
  */
 import { describe, expect, mock, test } from "bun:test";
@@ -16,6 +17,8 @@ import childDone, {
   type MessageLike,
   createChildDoneHandshake,
   createChildWatchdog,
+  continuationMessage,
+  MAX_CONTINUATIONS,
   STREAMING_STALL_MS,
   TOOL_STALL_MS,
   WATCHDOG_TICK_MS,
@@ -472,6 +475,288 @@ describe("agent_end answer nudge", () => {
     const notice = calls.find((c) => c.name === "sendNotice");
     expect(notice?.args[1]).toBe(formatNotice("run-789", "worker", "done", ""));
   });
+});
+
+// ---------------------------------------------------------------------------
+// agent_end: a response truncated by the output token limit is continued
+// ---------------------------------------------------------------------------
+
+/** An assistant message cut off by the output token limit. */
+const truncatedText = (text: string) => withText(text, "length");
+
+describe("agent_end truncation continuation", () => {
+  test("a truncated end with no answer is continued, not completed", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    handshake.onAgentEnd(
+      [truncatedText("## Map\n- a.ts:1 — the first finding, cut off mid-sent")],
+      "/tmp/s.jsonl",
+      () => {
+        shutdownCalled = true;
+      },
+      RESULT_PROMPT,
+    );
+
+    expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+    expect(shutdownCalled).toBe(false);
+    const message = String(calls[0].args[0]);
+    expect(message).toContain("truncated before completion");
+    expect(message).toContain("token limit");
+    // The continuation must point at the answer contract, not repeat the
+    // forgotten-answer nudge.
+    expect(message).toContain("<result>");
+  });
+
+  test("the continuation is bounded: after MAX_CONTINUATIONS the run completes", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    const truncated = [truncatedText("still writing the report…")];
+    for (let i = 0; i < MAX_CONTINUATIONS; i++) {
+      handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {}, RESULT_PROMPT);
+    }
+    expect(calls.filter((c) => c.name === "sendAnswerNudge")).toHaveLength(MAX_CONTINUATIONS);
+    expect(calls.filter((c) => c.name === "writeExitSidecar")).toHaveLength(0);
+    expect(shutdownCalled).toBe(false);
+
+    // One more truncated end: the bound is spent, so the run finishes with
+    // whatever the transcript carries — the parent reads it as salvage.
+    handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {
+      shutdownCalled = true;
+    }, RESULT_PROMPT);
+    expect(calls.map((c) => c.name)).toEqual([
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "writeExitSidecar",
+      "sendNotice",
+      "closePane",
+    ]);
+    expect(shutdownCalled).toBe(true);
+  });
+
+  test("a truncated end that already carries a qualifying answer completes without continuing", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    // The report finished in an earlier turn; the model then truncated while
+    // adding commentary. The answer exists, so the run finishes.
+    handshake.onAgentEnd(
+      [
+        withText("<result>\nthe report\n</result>"),
+        truncatedText("Some closing commentary that ran out of room."),
+      ],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+
+    expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
+  });
+
+  test("a continuation turn that ends cleanly with the answer completes the run", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    // First turn: truncated mid-report, no complete <result>.
+    handshake.onAgentEnd(
+      [truncatedText("## Map\n- a.ts:1 — cut off inside the report")],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+    expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+
+    // Second turn (the continuation): the model finishes the report.
+    handshake.onAgentEnd(
+      [withText("<result>\n## Map\n- a.ts:1 — the complete report\n</result>")],
+      "/tmp/s.jsonl",
+      () => {
+        shutdownCalled = true;
+      },
+      RESULT_PROMPT,
+    );
+
+    expect(calls.map((c) => c.name)).toEqual([
+      "sendAnswerNudge",
+      "writeExitSidecar",
+      "sendNotice",
+      "closePane",
+    ]);
+    expect(shutdownCalled).toBe(true);
+  });
+
+  test("a truncated end for a plain-contract agent completes: visible text already qualifies", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    handshake.onAgentEnd(
+      [truncatedText("part of the observation…")],
+      "/tmp/s.jsonl",
+      () => {},
+      PLAIN_PROMPT,
+    );
+
+    // Plain contract: any visible text qualifies as an answer, so the run
+    // finishes now rather than spending a continuation on it.
+    expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
+  });
+
+  test("a truncated end with no visible text at all is still continued", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    // The whole output budget went to thinking: nothing visible, no answer.
+    handshake.onAgentEnd(
+      [{ role: "assistant", stopReason: "length", content: [{ type: "thinking", thinking: "…" }] }],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+
+    expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+  });
+
+  test("a truncated end after explicit completion performs nothing", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    handshake.complete("/tmp/s.jsonl", () => {}, {
+      messages: [withText("<result>done</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+    });
+    handshake.onAgentEnd([truncatedText("more")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT);
+
+    expect(calls.filter((c) => c.name === "writeExitSidecar").length).toBe(1);
+    expect(calls.filter((c) => c.name === "sendAnswerNudge").length).toBe(0);
+  });
+
+  test("the continuation prompt names the contract for a result agent and not for a plain one", () => {
+    expect(continuationMessage(true)).toContain("<result>");
+    expect(continuationMessage(true)).toContain("subagent_done");
+    expect(continuationMessage(false)).not.toContain("<result>");
+    expect(continuationMessage(false)).toContain("subagent_done");
+  });
+  test("a bound-spent finish whose sidecar write fails performs no terminal effects, and the next end retries", () => {
+    const { effects, calls } = makeRecordingEffects({ writeExitSidecar: () => false });
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    const truncated = [truncatedText("still writing the report…")];
+    for (let i = 0; i < MAX_CONTINUATIONS; i++) {
+      handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {}, RESULT_PROMPT);
+    }
+    // Bound spent: the run tries to finish, but the write fails.
+    handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {
+      shutdownCalled = true;
+    }, RESULT_PROMPT);
+
+    expect(calls.filter((c) => c.name === "sendAnswerNudge")).toHaveLength(MAX_CONTINUATIONS);
+    expect(calls.filter((c) => c.name === "writeExitSidecar")).toHaveLength(1);
+    // signalled stayed false: no terminal effects at all.
+    expect(calls.filter((c) => c.name === "sendNotice")).toHaveLength(0);
+    expect(calls.filter((c) => c.name === "closePane")).toHaveLength(0);
+    expect(shutdownCalled).toBe(false);
+
+    // The next truncated end retries the write through the same shared path.
+    handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {}, RESULT_PROMPT);
+    expect(calls.filter((c) => c.name === "writeExitSidecar")).toHaveLength(2);
+    expect(calls.filter((c) => c.name === "sendNotice")).toHaveLength(0);
+  });
+
+  test("continuations and the one-shot answer nudge are independent counters across ends", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    // End 1: truncated, no answer → continuation nudge.
+    handshake.onAgentEnd(
+      [truncatedText("## Map\n- a.ts:1 — cut off")],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+    // End 2: clean, still no visible answer → the one-shot answer nudge.
+    handshake.onAgentEnd(
+      [thinkingOnly("more reasoning, no visible text")],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+    // End 3: clean, with the answer → the run finishes.
+    handshake.onAgentEnd(
+      [withText("<result>\n## Map\n- a.ts:1 — the complete report\n</result>")],
+      "/tmp/s.jsonl",
+      () => {
+        shutdownCalled = true;
+      },
+      RESULT_PROMPT,
+    );
+
+    const nudges = calls.filter((c) => c.name === "sendAnswerNudge");
+    expect(nudges).toHaveLength(2);
+    expect(String(nudges[0].args[0])).toContain("truncated before completion");
+    expect(String(nudges[1].args[0])).toContain("stopped without leaving an answer");
+    expect(calls.map((c) => c.name)).toEqual([
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "writeExitSidecar",
+      "sendNotice",
+      "closePane",
+    ]);
+    expect(shutdownCalled).toBe(true);
+  });
+
+  test("a bound-spent run still gets the one-shot answer nudge on a later clean end without an answer", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    let shutdownCalled = false;
+
+    const truncated = [truncatedText("still writing the report…")];
+    for (let i = 0; i < MAX_CONTINUATIONS; i++) {
+      handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {}, RESULT_PROMPT);
+    }
+    // The bound is spent, but the model recovered with a clean turn that has
+    // no visible answer. The one-shot answer nudge is independent of the
+    // spent continuation bound.
+    handshake.onAgentEnd(
+      [thinkingOnly("recovered, but only reasoning")],
+      "/tmp/s.jsonl",
+      () => {},
+      RESULT_PROMPT,
+    );
+    expect(calls.map((c) => c.name)).toEqual([
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+    ]);
+
+    // The next clean end completes as before.
+    handshake.onAgentEnd(
+      [thinkingOnly("still only reasoning")],
+      "/tmp/s.jsonl",
+      () => {
+        shutdownCalled = true;
+      },
+      RESULT_PROMPT,
+    );
+    expect(calls.map((c) => c.name)).toEqual([
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "sendAnswerNudge",
+      "writeExitSidecar",
+      "sendNotice",
+      "closePane",
+    ]);
+    expect(shutdownCalled).toBe(true);
+  });
+
 });
 
 // ---------------------------------------------------------------------------
