@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Vaccine Drill — a silent SVG explainer (skill example)</title>
+<!-- Pinned GSAP: the only animation system in this file -->
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<style>
+  /* CSS = layout only. NO CSS animations: every motion beat lives in the
+     per-scene GSAP timelines so any frame is seekable and freezable. */
+  :root { --gold:#ffd166; --ink:#f4f7ff; --muted:#9aa5c9; }
+  * { box-sizing:border-box; }
+  html,body{margin:0;height:100%;overflow:hidden;background:#04060f;
+    font-family:"Segoe UI",system-ui,sans-serif;}
+  #stage{position:absolute;left:50%;top:50%;width:1920px;height:1080px;
+    transform:translate(-50%,-50%) scale(var(--s,1));}
+  #art{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  #art text{font-family:"Segoe UI",system-ui,sans-serif;}
+  .scene{opacity:0;} /* controller shows exactly one scene */
+  .plate{fill:rgba(9,14,36,0.78);stroke:rgba(255,255,255,0.16);stroke-width:1.5;}
+  .hud{position:absolute;left:50%;bottom:34px;transform:translateX(-50%);
+    display:flex;align-items:center;gap:26px;}
+  .pill{border:none;cursor:pointer;font-family:inherit;font-size:25px;font-weight:700;
+    padding:13px 34px;border-radius:999px;}
+  .pill.primary{background:var(--gold);color:#182450;}
+  .pill.ghost{background:rgba(255,255,255,0.10);color:var(--ink);}
+  #sceneLabel{color:var(--muted);font-size:22px;font-weight:600;min-width:150px;text-align:center;}
+  .dots{display:flex;gap:10px;}
+  .dot{width:14px;height:14px;border-radius:7px;border:none;padding:0;
+    background:rgba(255,255,255,0.28);cursor:pointer;}
+  .dot.active{width:36px;background:var(--gold);}
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;}
+</style>
+</head>
+<body>
+<div id="stage">
+  <svg id="art" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid meet"
+       xmlns="http://www.w3.org/2000/svg" role="img"
+       aria-label="Silent explainer in five scenes: how a vaccine trains the immune system">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#0b1030"/>
+        <stop offset="1" stop-color="#05070f"/>
+      </linearGradient>
+      <marker id="ah" viewBox="0 0 10 10" refX="7.5" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 Z" fill="#ffd166"/>
+      </marker>
+
+      <!-- Invader: coral hexagon, crown spikes, angular eyes (centered at 0,0) -->
+      <g id="invader">
+        <polygon points="0,-44 38,-22 38,22 0,44 -38,22 -38,-22" fill="#ff5d73"/>
+        <polygon points="-24,-42 -16,-64 -8,-44" fill="#ff5d73"/>
+        <polygon points="-4,-44 4,-68 12,-44" fill="#ff5d73"/>
+        <polygon points="14,-44 22,-62 30,-42" fill="#ff5d73"/>
+        <rect x="-20" y="-14" width="15" height="9" fill="#fff"/>
+        <rect x="5" y="-14" width="15" height="9" fill="#fff"/>
+        <polygon points="-14,12 14,12 0,26" fill="#5b1220"/>
+      </g>
+
+      <!-- Scout: mint five-point star with a dark core (centered at 0,0) -->
+      <g id="scout">
+        <polygon points="0,-46 11,-15 44,-15 17,4 28,36 0,17 -28,36 -17,4 -44,-15 -11,-15"
+                 fill="#3ddc97"/>
+        <circle r="13" fill="#0b3a2a"/>
+      </g>
+
+      <!-- Antigen badge: gold ID card (centered at 0,0) -->
+      <g id="badge">
+        <rect x="-20" y="-24" width="40" height="48" rx="8" fill="#ffd166"/>
+        <rect x="-12" y="-13" width="24" height="5" rx="2.5" fill="#7a5b00"/>
+        <rect x="-12" y="-3" width="24" height="5" rx="2.5" fill="#7a5b00"/>
+        <rect x="-12" y="7" width="16" height="5" rx="2.5" fill="#7a5b00"/>
+      </g>
+
+
+      <!-- Memory cell: blue circle with a friendly face (centered at 0,0) -->
+      <g id="memory">
+        <circle r="42" fill="#4895ef"/>
+        <circle cx="-13" cy="-8" r="6" fill="#0b2545"/>
+        <circle cx="13" cy="-8" r="6" fill="#0b2545"/>
+        <path d="M-12,10 Q0,20 12,10" stroke="#0b2545" stroke-width="4" fill="none" stroke-linecap="round"/>
+      </g>
+
+    </defs>
+
+    <!-- Shared static background (never animated) -->
+    <rect width="1920" height="1080" fill="url(#bg)"/>
+    <g fill="rgba(140,170,255,0.14)">
+      <circle cx="180" cy="180" r="5"/><circle cx="420" cy="880" r="4"/>
+      <circle cx="700" cy="140" r="6"/><circle cx="980" cy="940" r="4"/>
+      <circle cx="1240" cy="120" r="5"/><circle cx="1520" cy="860" r="6"/>
+      <circle cx="1760" cy="200" r="4"/><circle cx="300" cy="560" r="4"/>
+      <circle cx="1700" cy="540" r="5"/><circle cx="860" cy="720" r="3"/>
+    </g>
+    <text x="1840" y="112" text-anchor="end" font-size="22" fill="rgba(248,249,255,0.4)">→ / ← keys work too</text>
+
+    <!-- ============ SCENE 1: The invader arrives ============ -->
+    <g class="scene" id="s1">
+      <g id="s1-bg">
+        <g transform="translate(600,470)">
+          <circle r="110" fill="#2fa37c"/>
+          <circle cx="-32" cy="-18" r="12" fill="#0b3a2a"/>
+          <circle cx="32" cy="-18" r="12" fill="#0b3a2a"/>
+          <path d="M-30,26 Q0,48 30,26" stroke="#0b3a2a" stroke-width="7" fill="none" stroke-linecap="round"/>
+        </g>
+      </g>
+      <g id="s1-subject">
+        <!-- wrapper = static placement; inner group = animated -->
+        <g transform="translate(1350,430) scale(1.7)">
+          <g id="s1-invader"><use href="#invader"/></g>
+        </g>
+        <path id="s1-arrow" d="M1210,430 C1050,370 860,390 750,440" fill="none"
+              stroke="#ffd166" stroke-width="6" stroke-dasharray="16 14" marker-end="url(#ah)"/>
+      </g>
+      <g id="s1-annotation">
+        <g id="s1-title">
+          <rect x="90" y="56" width="12" height="58" rx="6" fill="#ffd166"/>
+          <text x="122" y="104" font-size="46" font-weight="800" fill="#f4f7ff">The invader arrives</text>
+        </g>
+        <g id="s1-cap">
+          <text x="960" y="930" text-anchor="middle" font-size="30" fill="#dfe6ff"
+                data-plate>Every day, tiny invaders try to get inside you. Your body fights them with a cellular army — but it must first learn who to target.</text>
+        </g>
+      </g>
+    </g>
+
+    <!-- ============ SCENE 2: A scout captures the badge ============ -->
+    <g class="scene" id="s2">
+      <g id="s2-subject">
+        <g transform="translate(1480,380) scale(1.2)"><g id="s2-invader"><use href="#invader"/></g></g>
+        <g transform="translate(880,440)"><g id="s2-scout"><use href="#scout"/></g></g>
+        <g transform="translate(1408,332) scale(1.15)"><g id="s2-badge"><use href="#badge"/></g></g>
+        <g transform="translate(940,400)"><circle id="s2-ring" r="46" fill="none" stroke="#ffd166" stroke-width="5"/></g>
+      </g>
+      <g id="s2-annotation">
+        <g id="s2-title">
+          <rect x="90" y="56" width="12" height="58" rx="6" fill="#ffd166"/>
+          <text x="122" y="104" font-size="46" font-weight="800" fill="#f4f7ff">A scout captures the badge</text>
+        </g>
+        <g id="s2-cap">
+          <text x="960" y="930" text-anchor="middle" font-size="30" fill="#dfe6ff"
+                data-plate>Patrol scouts capture a fragment of the invader — a unique antigen badge that identifies it.</text>
+        </g>
+      </g>
+    </g>
+
+    <!-- ============ SCENE 3: The alarm goes off ============ -->
+    <g class="scene" id="s3">
+      <g id="s3-bg">
+        <ellipse cx="960" cy="470" rx="430" ry="255" fill="rgba(122,162,247,0.07)"
+                 stroke="rgba(122,162,247,0.4)" stroke-width="3" stroke-dasharray="18 14"/>
+        <text x="960" y="770" text-anchor="middle" font-size="24" fill="#9aa5c9">lymph node</text>
+      </g>
+      <g id="s3-subject">
+        <g transform="translate(1250,318) scale(0.7)"><g id="s3-badge"><use href="#badge"/></g></g>
+        <g transform="translate(1250,430) scale(1.5)">
+          <g id="s3-tcell">
+            <circle r="40" fill="#4cc9f0"/>
+            <circle cx="-13" cy="-8" r="6" fill="#06303f"/><circle cx="13" cy="-8" r="6" fill="#06303f"/>
+            <path d="M-12,10 Q0,20 12,10" stroke="#06303f" stroke-width="4" fill="none" stroke-linecap="round"/>
+          </g>
+        </g>
+        <g transform="translate(1360,272)"><text id="s3-bang" font-size="84" font-weight="800" fill="#ffd166" text-anchor="middle">!</text></g>
+        <g transform="translate(1250,430)"><circle id="s3-ring" r="95" fill="none" stroke="#4cc9f0" stroke-width="5"/></g>
+        <g transform="translate(700,340) scale(1.1)"><g id="s3-t1"><use href="#memory"/></g></g>
+        <g transform="translate(880,580) scale(1.1)"><g id="s3-t2"><use href="#memory"/></g></g>
+        <g transform="translate(1080,280) scale(1.1)"><g id="s3-t3"><use href="#memory"/></g></g>
+      </g>
+      <g id="s3-annotation">
+        <g id="s3-title">
+          <rect x="90" y="56" width="12" height="58" rx="6" fill="#ffd166"/>
+          <text x="122" y="104" font-size="46" font-weight="800" fill="#f4f7ff">The alarm goes off</text>
+        </g>
+        <g id="s3-cap">
+          <text x="960" y="930" text-anchor="middle" font-size="30" fill="#dfe6ff"
+                data-plate>In a lymph node, the badge raises the alarm and recruits the right defenders.</text>
+        </g>
+      </g>
+    </g>
+
+    <!-- ============ SCENE 4: The antibody factory ============ -->
+    <g class="scene" id="s4">
+      <g id="s4-subject">
+        <g transform="translate(480,430) scale(1.5)">
+          <g id="s4-bcell">
+            <circle r="40" fill="#3ddc97"/>
+            <circle cx="-13" cy="-8" r="6" fill="#0b3a2a"/><circle cx="13" cy="-8" r="6" fill="#0b3a2a"/>
+            <path d="M-12,10 Q0,20 12,10" stroke="#0b3a2a" stroke-width="4" fill="none" stroke-linecap="round"/>
+          </g>
+        </g>
+        <g transform="translate(700,320) scale(1.15)"><g id="s4-c1"><use href="#memory"/></g></g>
+        <g transform="translate(700,540) scale(1.15)"><g id="s4-c2"><use href="#memory"/></g></g>
+        <g transform="translate(880,430)"><g id="s4-abg1"><path id="s4-ab1" d="M-15,-16 L0,0 L15,-16 M0,0 L0,20" stroke="#4cc9f0" stroke-width="7" stroke-linecap="round" fill="none" data-draw/></g></g>
+        <g transform="translate(960,430)"><g id="s4-abg2"><path id="s4-ab2" d="M-15,-16 L0,0 L15,-16 M0,0 L0,20" stroke="#4cc9f0" stroke-width="7" stroke-linecap="round" fill="none" data-draw/></g></g>
+        <g transform="translate(1040,430)"><g id="s4-abg3"><path id="s4-ab3" d="M-15,-16 L0,0 L15,-16 M0,0 L0,20" stroke="#4cc9f0" stroke-width="7" stroke-linecap="round" fill="none" data-draw/></g></g>
+        <g transform="translate(1120,430)"><g id="s4-abg4"><path id="s4-ab4" d="M-15,-16 L0,0 L15,-16 M0,0 L0,20" stroke="#4cc9f0" stroke-width="7" stroke-linecap="round" fill="none" data-draw/></g></g>
+        <g transform="translate(1200,430)"><g id="s4-abg5"><path id="s4-ab5" d="M-15,-16 L0,0 L15,-16 M0,0 L0,20" stroke="#4cc9f0" stroke-width="7" stroke-linecap="round" fill="none" data-draw/></g></g>
+        <g transform="translate(1400,460) scale(1.7)"><g id="s4-invader"><use href="#invader"/></g></g>
+        <g transform="translate(1400,460) scale(1.7)"><g id="s4-xg"><path id="s4-x"
+             d="M-34,-34 L34,34 M34,-34 L-34,34" stroke="#fff" stroke-width="12"
+             stroke-linecap="round" fill="none" data-draw/></g></g>
+      </g>
+      <g id="s4-annotation">
+        <g id="s4-title">
+          <rect x="90" y="56" width="12" height="58" rx="6" fill="#ffd166"/>
+          <text x="122" y="104" font-size="46" font-weight="800" fill="#f4f7ff">The antibody factory</text>
+        </g>
+        <g id="s4-cap">
+          <text x="960" y="930" text-anchor="middle" font-size="30" fill="#dfe6ff"
+                data-plate>Defenders multiply into an antibody army that tags the invader for clean-up.</text>
+        </g>
+      </g>
+    </g>
+
+    <!-- ============ SCENE 5: Memory keeps watch (stable final frame) ============ -->
+    <g class="scene" id="s5">
+      <g id="s5-subject">
+        <g transform="translate(680,430) scale(1.6)"><g id="s5-m1"><use href="#memory"/></g></g>
+        <g transform="translate(1240,430) scale(1.6)"><g id="s5-m2"><use href="#memory"/></g></g>
+        <g transform="translate(420,220) scale(1.4)"><path id="s5-sp1" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#ffd166"/></g>
+        <g transform="translate(1500,200) scale(1.6)"><path id="s5-sp2" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#7fd8ff"/></g>
+        <g transform="translate(280,500) scale(1.2)"><path id="s5-sp3" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#80ed99"/></g>
+        <g transform="translate(1650,500) scale(1.4)"><path id="s5-sp4" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#ffd166"/></g>
+        <g transform="translate(700,180) scale(1.1)"><path id="s5-sp5" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#7fd8ff"/></g>
+        <g transform="translate(1220,170) scale(1.2)"><path id="s5-sp6" d="M0,-14 L4,-4 L14,0 L4,4 L0,14 L-4,4 L-14,0 L-4,-4 Z" fill="#80ed99"/></g>
+        <g transform="translate(960,320) scale(1.8)">
+          <path id="s5-shield" d="M0,-60 L44,-40 C44,4 30,36 0,54 C-30,36 -44,4 -44,-40 Z"
+                fill="rgba(61,220,151,0.10)" stroke="#3ddc97" stroke-width="8" data-draw/>
+          <path id="s5-check" d="M-22,4 L-6,22 L24,-14" fill="none" stroke="#3ddc97"
+                stroke-width="10" stroke-linecap="round" stroke-linejoin="round" data-draw/>
+        </g>
+      </g>
+      <g id="s5-annotation">
+        <g id="s5-title">
+          <rect x="90" y="56" width="12" height="58" rx="6" fill="#ffd166"/>
+          <text x="122" y="104" font-size="46" font-weight="800" fill="#f4f7ff">Memory keeps watch</text>
+        </g>
+        <g id="s5-cap">
+          <text x="960" y="930" text-anchor="middle" font-size="30" fill="#dfe6ff"
+                data-plate>Memory cells stay on watch, so the next real attack is handled in hours, not weeks.</text>
+        </g>
+        <g id="s5-chips">
+          <g id="s5-chip1"><text x="460" y="700" text-anchor="middle" font-size="28" fill="#f4f7ff" data-plate>Practice round, not the real fight</text></g>
+          <g id="s5-chip2"><text x="960" y="700" text-anchor="middle" font-size="28" fill="#f4f7ff" data-plate>Memory cells stay ready</text></g>
+          <g id="s5-chip3"><text x="1460" y="700" text-anchor="middle" font-size="28" fill="#f4f7ff" data-plate>Real infection handled in hours</text></g>
+        </g>
+      </g>
+    </g>
+  </svg>
+
+  <!-- HUD: back / progress / next -->
+  <div class="hud">
+    <button id="backBtn" class="pill ghost" title="Previous scene (←)" aria-label="Previous scene">◂ Back</button>
+    <div id="dots" class="dots" aria-label="Scene progress"></div>
+    <span id="sceneLabel">Scene 1 / 5</span>
+    <button id="nextBtn" class="pill primary" title="Next scene (→)" aria-label="Next scene">Next ▸</button>
+  </div>
+  <!-- Screen readers get each scene's title + explanation as it appears -->
+  <div id="sr" class="sr" aria-live="polite"></div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const NS = "http://www.w3.org/2000/svg";
+  const stage = $("#stage");
+  const scenes = Array.from(document.querySelectorAll(".scene"));
+  const N = scenes.length;
+  const mq = matchMedia("(prefers-reduced-motion: reduce)");
+  let reduced = mq.matches;
+
+  /* Fit the fixed 1920x1080 stage to the viewport */
+  const fit = () => stage.style.setProperty("--s",
+    String(Math.min(innerWidth / 1920, innerHeight / 1080)));
+  addEventListener("resize", fit); fit();
+
+  /* SVG <text> never wraps: split into <tspan> lines at a max width, then
+     size each plate from getBBox — never a fixed-pixel box that can clip.
+     Lines grow upward so a 2-line caption never hits the HUD. */
+  function wrap(t, max) {
+    const x = t.getAttribute("x");
+    const words = t.textContent.trim().split(/\s+/);
+    t.textContent = "";
+    let ts = null, lines = 0;
+    for (const w of words) {
+      if (ts) {
+        const prev = ts.textContent;
+        ts.textContent = prev + " " + w;
+        if (ts.getComputedTextLength() <= max) continue;
+        ts.textContent = prev;
+      }
+      ts = document.createElementNS(NS, "tspan");
+      ts.setAttribute("x", x);
+      ts.setAttribute("dy", lines++ ? "1.3em" : "0");
+      ts.textContent = w;
+      t.appendChild(ts);
+    }
+    const size = parseFloat(t.getAttribute("font-size"));
+    t.setAttribute("y", parseFloat(t.getAttribute("y")) - (lines - 1) * 1.3 * size);
+  }
+  function layoutText() {
+   document.querySelectorAll("text[data-plate]").forEach((t) => {
+    wrap(t, Number(t.dataset.max || 1400));
+    const b = t.getBBox();
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("class", "plate");
+    r.setAttribute("x", b.x - 30); r.setAttribute("y", b.y - 14);
+    r.setAttribute("width", b.width + 60); r.setAttribute("height", b.height + 28);
+    r.setAttribute("rx", 18);
+    t.parentNode.insertBefore(r, t);
+   });
+  }
+
+  function setInitialState() {
+    gsap.set(".scene", { opacity: 0 });
+    gsap.set("[id$='-title'], [id$='-cap']", { opacity: 0, y: 14 });
+    gsap.set("#s1-invader", { x: -1450 });
+    gsap.set("#s1-arrow", { opacity: 0 });
+    gsap.set("#s2-scout", { x: -950 });
+    gsap.set("#s2-ring", { scale: 0.4, opacity: 0 });
+    gsap.set("#s3-badge", { x: -520 });
+    gsap.set("#s3-bang", { opacity: 0, scale: 0.5 });
+    gsap.set("#s3-ring", { scale: 0.6, opacity: 0 });
+    gsap.set(["#s3-tcell", "#s3-t1", "#s3-t2", "#s3-t3"], { scale: 0.6 });
+    gsap.set("#s4-bcell", { scale: 0.6 });
+    gsap.set("#s4-c1", { x: -220, y: 110, scale: 0.5 });
+    gsap.set("#s4-c2", { x: -220, y: -110, scale: 0.5 });
+    gsap.set("#s4-xg", { opacity: 0 });
+    gsap.set(["#s5-m1", "#s5-m2"], { scale: 0.6 });
+    gsap.set("#s5-shield", { fillOpacity: 0 });
+    gsap.set("#s5-sp1, #s5-sp2, #s5-sp3, #s5-sp4, #s5-sp5, #s5-sp6",
+             { scale: 0.4, opacity: 0 });
+    gsap.set(["#s5-chip1", "#s5-chip2", "#s5-chip3"], { opacity: 0, y: 14 });
+    document.querySelectorAll("[data-draw]").forEach((el) => {
+      const L = el.getTotalLength();
+      el.style.strokeDasharray = L;
+      el.style.strokeDashoffset = L;
+    });
+  }
+
+  const story = [];   // finite, labeled: the script
+  const ambient = []; // infinite loops: separate so story stays seekable
+
+  function buildTimelines() {
+    // S1 — invader slides in; arrow fades in; text follows its hero
+    {
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#s1-invader", { x: 0, duration: 1.2, ease: "power3.out" }, 0)
+        .to("#s1-title", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.35)
+        .to("#s1-cap", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.6)
+        .to("#s1-arrow", { opacity: 0.9, duration: 0.5 }, 1.3);
+      story[0] = tl;
+      const amb = gsap.timeline({ paused: true });
+      amb.to("#s1-invader", { y: -16, duration: 2.4, ease: "sine.inOut", yoyo: true, repeat: -1 }, 0)
+         .to("#s1-arrow", { strokeDashoffset: -60, duration: 1.2, ease: "none", repeat: -1 }, 0);
+      ambient[0] = amb;
+    }
+    // S2 — scout arrives, badge slides from invader to scout (causal), ring confirms
+    {
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#s2-scout", { x: 0, duration: 0.9, ease: "power3.out" }, 0)
+        .to("#s2-title", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.3)
+        .to("#s2-cap", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.55)
+        .to("#s2-badge", { x: -468, y: 68, duration: 0.8, ease: "power2.inOut" }, 1.15)
+        .to("#s2-ring", { scale: 1, opacity: 1, duration: 0.45, ease: "back.out(1.7)" }, 2.0);
+      story[1] = tl;
+      ambient[1] = gsap.timeline({ paused: true })
+        .to("#s2-invader", { y: -12, duration: 2.2, ease: "sine.inOut", yoyo: true, repeat: -1 }, 0)
+        .to("#s2-scout", { y: -10, duration: 2.6, ease: "sine.inOut", yoyo: true, repeat: -1 }, 0);
+    }
+    // S3 — T cell pops, badge slides in, alarm ring flashes x3, defenders stagger in
+    {
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#s3-title", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.25)
+        .to("#s3-cap", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.5)
+        .to("#s3-tcell", { scale: 1, duration: 0.45, ease: "back.out(1.7)" }, 0.1)
+        .to("#s3-ring", { scale: 1.6, opacity: 0, duration: 0.9, ease: "power1.out",
+             repeat: 2, repeatDelay: 0.15 }, 0.3)
+        .to("#s3-badge", { x: 0, duration: 0.7, ease: "power2.inOut" }, 0.5)
+        .to("#s3-bang", { opacity: 1, scale: 1, duration: 0.4, ease: "back.out(2)" }, 0.7)
+        .to(["#s3-t1", "#s3-t2", "#s3-t3"],
+             { scale: 1, duration: 0.45, ease: "back.out(1.7)", stagger: 0.12 }, 0.9);
+      story[2] = tl;
+      ambient[2] = gsap.timeline({ paused: true })
+        .to(["#s3-t1", "#s3-t2", "#s3-t3"],
+             { y: -8, duration: 2.0, ease: "sine.inOut", yoyo: true, repeat: -1, stagger: 0.3 }, 0);
+    }
+    // S4 — B cell divides, antibodies draw in then travel to the invader, X seals it
+    {
+      const abs = ["#s4-ab1", "#s4-ab2", "#s4-ab3", "#s4-ab4", "#s4-ab5"];
+      const dest = [[420, -70], [570, -80], [475, 20], [370, 140], [105, 135]]; // ring the invader
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#s4-bcell", { scale: 1, duration: 0.45, ease: "back.out(1.7)" }, 0)
+        .to("#s4-title", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.25)
+        .to("#s4-cap", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.5)
+        .to("#s4-c1", { x: 0, y: 0, scale: 1, duration: 0.6, ease: "power3.out" }, 0.7)
+        .to("#s4-c2", { x: 0, y: 0, scale: 1, duration: 0.6, ease: "power3.out" }, 0.85)
+        .to(abs, { strokeDashoffset: 0, duration: 0.8, ease: "power2.out", stagger: 0.15 }, 1.2);
+      dest.forEach(([dx, dy], i) =>
+        tl.to(abs[i], { x: dx, y: dy, duration: 0.55, ease: "power2.inOut" }, 2.2 + i * 0.08));
+      tl.to("#s4-invader", { scale: 0.85, opacity: 0.35, rotation: -8,
+             duration: 0.5, ease: "power2.inOut" }, 2.9)
+        .to("#s4-xg", { opacity: 1, duration: 0.2 }, 2.95)
+        .to("#s4-x", { strokeDashoffset: 0, duration: 0.5, ease: "power2.out" }, 3.0);
+      story[3] = tl;
+      ambient[3] = gsap.timeline({ paused: true })
+        .to("#s4-invader", { y: -10, duration: 2.2, ease: "sine.inOut", yoyo: true, repeat: -1 }, 0);
+    }
+    // S5 — memory cells pop, shield + check draw in, chips stagger up. Stable end.
+    {
+      const tl = gsap.timeline({ paused: true });
+      tl.to(["#s5-m1", "#s5-m2"], { scale: 1, duration: 0.45, ease: "back.out(1.7)",
+             stagger: 0.15 }, 0.1)
+        .to("#s5-title", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.3)
+        .to("#s5-cap", { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.55)
+        .to("#s5-sp1, #s5-sp2, #s5-sp3, #s5-sp4, #s5-sp5, #s5-sp6",
+             { scale: 1, opacity: 1, duration: 0.4, ease: "back.out(1.7)", stagger: 0.08 }, 0.5)
+        .to("#s5-shield", { strokeDashoffset: 0, duration: 0.9, ease: "power2.out" }, 0.7)
+        .to("#s5-shield", { fillOpacity: 1, duration: 0.5, ease: "power2.out" }, 1.2)
+        .to("#s5-check", { strokeDashoffset: 0, duration: 0.45, ease: "power2.out" }, 1.6)
+        .to(["#s5-chip1", "#s5-chip2", "#s5-chip3"],
+             { opacity: 1, y: 0, duration: 0.45, ease: "power2.out", stagger: 0.12 }, 1.9);
+      story[4] = tl;
+      ambient[4] = gsap.timeline({ paused: true }); // final frame must be stable
+    }
+  }
+
+  /* ---------- Interaction contract ---------- */
+  const label = $("#sceneLabel");
+  const nextBtn = $("#nextBtn");
+  const backBtn = $("#backBtn");
+  const dotsWrap = $("#dots");
+  const dots = [];
+  const sr = $("#sr");
+  for (let i = 0; i < N; i++) {
+    const d = document.createElement("button");
+    d.className = "dot";
+    d.setAttribute("aria-label", "Go to scene " + (i + 1));
+    d.addEventListener("click", () => show(i));
+    dotsWrap.appendChild(d);
+    dots.push(d);
+  }
+
+  let current = -1;
+  function show(i, at) {
+    if (i < 0 || i >= N) return;
+    if (i !== current) {
+      if (current >= 0) {
+        scenes[current].style.opacity = 0;
+        story[current].pause(0);
+        ambient[current].pause(0);
+      }
+      current = i;
+      scenes[i].style.opacity = 1;
+      label.textContent = "Scene " + (i + 1) + " / " + N;
+      if (i === 0 && document.activeElement === backBtn) nextBtn.focus(); // keep focus
+      backBtn.style.visibility = i === 0 ? "hidden" : "visible";
+      nextBtn.textContent = i === N - 1 ? "Replay ↻" : "Next ▸";
+      dots.forEach((d, j) => {
+        d.classList.toggle("active", j === i);
+        if (j === i) d.setAttribute("aria-current", "step"); else d.removeAttribute("aria-current");
+      });
+      scenes.forEach((sc, j) => sc.setAttribute("aria-hidden", String(j !== i)));
+      sr.textContent = "Scene " + (i + 1) + " of " + N + ". " +
+        $("#s" + (i + 1) + "-title").textContent.trim() + ". " +
+        $("#s" + (i + 1) + "-cap").textContent.trim();
+    }
+    if (reduced || at !== undefined) {
+      // deterministic frame: story parked at t (reduced motion: final frame), ambient frozen
+      const end = story[i].duration();
+      story[i].pause(at === undefined ? end : Math.min(at, end));
+      ambient[i].pause(0);
+    } else {
+      story[i].play(0);
+      ambient[i].play(0);
+    }
+  }
+  const next = () => show(current === N - 1 ? 0 : current + 1);
+  const prev = () => { if (current > 0) show(current - 1); };
+
+  nextBtn.addEventListener("click", next);
+  backBtn.addEventListener("click", prev);
+  addEventListener("keydown", (e) => {
+    if (e.repeat) return;
+    if ((e.key === " " || e.key === "Enter") && e.target.closest("button")) return; // let the focused button act
+    if (["ArrowRight", " ", "Enter", "n", "N"].includes(e.key)) { e.preventDefault(); next(); }
+    else if (["ArrowLeft", "p", "P"].includes(e.key)) { e.preventDefault(); prev(); }
+  });
+
+  /* ---------- Inspection contract (required) ---------- */
+  // seek(i)    -> scene i, final frame (what verification screenshots)
+  // seek(i, t) -> scene i, t seconds into its story
+  const api = {
+    get scenes() { return N; },
+    get current() { return current; },
+    seek: (i, t) => show(i, t === undefined ? Infinity : t),
+    play: () => { story[current].play(); if (!reduced) ambient[current].play(); },
+    pause: () => { story[current].pause(); ambient[current].pause(); },
+    duration: (i = current) => story[i].duration(),
+  };
+
+  mq.addEventListener("change", (e) => { reduced = e.matches; show(current); });
+
+  // Measure text only after fonts load; expose the API last, so
+  // `window.infographic` existing means "ready to seek".
+  document.fonts.ready.then(() => {
+    layoutText();
+    setInitialState();
+    buildTimelines();
+    show(0);
+    window.infographic = api;
+  });
+})();
+</script>
+</body>
+</html>
