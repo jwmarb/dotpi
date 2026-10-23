@@ -134,3 +134,11 @@ agent/git/
 *~
 .idea/
 .vscode/
+
+# ---- Startup-panel images ---------------------------------------------------
+# agent/images/ is the user's picture folder for startup-fetch.ts (which one
+# shows: settings.json startupFetch.mode/image). Personal and usually
+# third-party art, so the pictures stay local; only the README is tracked so
+# a fresh clone has the folder. The cycle/random state file is machine state.
+agent/images/*
+!agent/images/README.md

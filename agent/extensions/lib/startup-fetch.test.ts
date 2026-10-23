@@ -1,0 +1,233 @@
+import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import { basename, join } from "node:path";
+import { setCapabilities, resetCapabilitiesCache, visibleWidth } from "@earendil-works/pi-tui";
+import { type Art, cleanCatimg, layoutRows, warnOnce, firstFrame, MAX_IMAGE_COLS, parseStyle, pickImage, readConfig, renderArt, writeSetting } from "../startup-fetch.ts";
+import { chooseImage, listImages } from "./startup-images.ts";
+import { LOGO_KEYS, pickLogo, renderLogo, truecolor } from "./distro-logos.ts";
+
+const settings = (obj: unknown) => {
+	const dir = mkdtempSync(join(os.tmpdir(), "sf-"));
+	const f = join(dir, "settings.json");
+	writeFileSync(f, JSON.stringify(obj));
+	return f;
+};
+
+describe("readConfig", () => {
+	test("mode, image, ~ expansion", () => {
+		const c = readConfig(settings({ startupFetch: { mode: "cycle", image: "~/a.png" } }));
+		expect(c.mode).toBe("cycle");
+		expect(c.image).toBe(join(os.homedir(), "a.png"));
+		expect(readConfig(settings({ startupFetch: { mode: "bogus", image: "duck.png" } }))).toMatchObject({ mode: "fixed", image: "duck.png" });
+	});
+	test("height bounds and defaults", () => {
+		expect(readConfig(settings({ startupFetch: { height: 20 } })).height).toBe(20);
+		expect(readConfig(settings({ startupFetch: { height: 2 } })).height).toBe(13);
+		expect(readConfig(settings({ startupFetch: { height: "x" } })).height).toBe(13);
+		expect(readConfig(settings({})).image).toBeUndefined();
+		expect(readConfig("/nonexistent/settings.json")).toMatchObject({ mode: "fixed", height: 13 });
+	});
+});
+
+describe("pickImage (agent dir with images/)", () => {
+	const agent = () => {
+		const base = mkdtempSync(join(os.tmpdir(), "sf-agent-"));
+		mkdirSync(join(base, "images"));
+		for (const f of ["b.jpg", "a.png", "c.gif", "notes.txt", ".hidden.png"]) writeFileSync(join(base, "images", f), "");
+		mkdirSync(join(base, "images", "sub.png"));
+		return base;
+	};
+	const cfg = (o: object) => ({ mode: "fixed" as const, style: "half" as const, height: 13, ...o });
+	test("fixed: named, missing, default first, absolute", () => {
+		const base = agent();
+		expect(pickImage(cfg({ image: "c.gif" }), base).path).toBe(join(base, "images", "c.gif"));
+		expect(pickImage(cfg({ image: "zzz.png" }), base).problem).toContain("zzz.png");
+		expect(pickImage(cfg({}), base).path).toBe(join(base, "images", "a.png"));
+		expect(pickImage(cfg({ image: "/abs/x.png" }), base).path).toBe("/abs/x.png");
+	});
+	test("cycle advances across starts and wraps; state persists", () => {
+		const base = agent();
+		const seq = [1, 2, 3, 4].map(() => basename(pickImage(cfg({ mode: "cycle" }), base).path!));
+		expect(seq).toEqual(["a.png", "b.jpg", "c.gif", "a.png"]);
+	});
+	test("random never repeats back to back", () => {
+		const base = agent();
+		let prev = "";
+		for (let i = 0; i < 20; i++) {
+			const p = basename(pickImage(cfg({ mode: "random" }), base, () => 0).path!);
+			expect(p).not.toBe(prev);
+			prev = p;
+		}
+	});
+	test("off / empty folder", () => {
+		expect(pickImage(cfg({ mode: "off" }), agent())).toEqual({});
+		const empty = mkdtempSync(join(os.tmpdir(), "sf-empty-"));
+		expect(pickImage(cfg({ mode: "cycle" }), empty)).toEqual({}); // quiet ASCII fallback
+		expect(pickImage(cfg({ image: "duck.png" }), empty).problem).toContain("duck.png");
+	});
+	test("a broken symlink hides only itself; numeric sort", () => {
+		const base = agent();
+		symlinkSync("/nonexistent/x.png", join(base, "images", "broken.png"));
+		for (const f of ["img10.png", "img2.png"]) writeFileSync(join(base, "images", f), "");
+		expect(listImages(join(base, "images"))).toEqual(["a.png", "b.jpg", "c.gif", "img2.png", "img10.png"]);
+	});
+});
+
+describe("chooseImage edge cases", () => {
+	test("cycle resumes after the last-shown image was deleted", () => {
+		expect(chooseImage(["a.png", "c.png"], "cycle", { last: "b.png" }).image).toBe("c.png");
+		expect(chooseImage(["a.png", "c.png"], "cycle", { last: "z.png" }).image).toBe("a.png");
+	});
+	test("fixed is case-insensitive as a fallback; single-image random", () => {
+		expect(chooseImage(["Duck.PNG"], "fixed", { fixed: "duck.png" }).image).toBe("Duck.PNG");
+		expect(chooseImage(["only.png"], "random", { last: "only.png", rand: () => 0.9 }).image).toBe("only.png");
+	});
+});
+
+describe("cleanCatimg", () => {
+	test("strips cursor control, keeps SGR, resets each line, drops blanks", () => {
+		const raw = "\x1b[s\x1b[?25l\x1b[48;2;1;2;3m\x1b[38;2;4;5;6m▄\x1b[m\n\x1b[38;2;1;1;1m▀\x1b[m\n\x1b[?25h";
+		const out = cleanCatimg(raw);
+		expect(out).toHaveLength(2);
+		expect(out[0]).toBe("\x1b[48;2;1;2;3m\x1b[38;2;4;5;6m▄\x1b[m\x1b[0m");
+		expect(out.join("")).not.toMatch(/\x1b\[(s|\?25[lh])/);
+	});
+});
+
+describe("distro logos", () => {
+	test("pickLogo: id, derivative alias, ID_LIKE, fallback", () => {
+		expect(pickLogo(["arch"])).toBe("arch");
+		expect(pickLogo(["EndeavourOS"])).toBe("arch");
+		expect(pickLogo(["weirdos", "debian"])).toBe("debian");
+		expect(pickLogo(["nope", "linux"])).toBe("linux");
+		expect(pickLogo([])).toBe("linux");
+	});
+	test("every logo renders, width matches, colors reset per line", () => {
+		for (const k of LOGO_KEYS) {
+			const plain = renderLogo(k, false);
+			expect(Math.max(...plain.lines.map((l) => l.length))).toBe(plain.width);
+			for (const l of renderLogo(k, true, true).lines) expect(l.endsWith("\x1b[39m")).toBe(true);
+			expect(renderLogo(k, true, false).lines.join("")).not.toContain("38;2;");
+		}
+	});
+	test("truecolor detection", () => {
+		expect(truecolor({ COLORTERM: "truecolor" })).toBe(true);
+		expect(truecolor({ WT_SESSION: "x" })).toBe(true);
+		expect(truecolor({ TERM: "xterm-256color" })).toBe(false);
+	});
+});
+
+describe("style setting", () => {
+	test("parse, default, write keeps other keys", () => {
+		expect(parseStyle("sextant")).toBe("sextant");
+		expect(parseStyle("bogus")).toBe("half");
+		expect(readConfig(settings({ startupFetch: { style: "braille" } })).style).toBe("braille");
+		const f = settings({ other: 1, startupFetch: { mode: "cycle" } });
+		expect(writeSetting("style", "quad", f)).toBe(true);
+		expect(JSON.parse(readFileSync(f, "utf-8"))).toEqual({ other: 1, startupFetch: { mode: "cycle", style: "quad" } });
+	});
+});
+
+describe("renderArt (fake exec)", () => {
+	const img = () => {
+		const f = join(mkdtempSync(join(os.tmpdir(), "sf-img-")), "x.png");
+		writeFileSync(f, "");
+		return f;
+	};
+	const row = (n: number) => "\x1b[38;2;1;2;3m" + "▀".repeat(n);
+	test("animated catimg output keeps the first frame only", () => {
+		expect(firstFrame("A\nB\x1b[uC\nD\x1b[uE")).toBe("A\nB");
+	});
+	test("catimg: -r 2 doubles -H; wide output re-renders width-capped; killed = failure", async () => {
+		const calls: string[][] = [];
+		const exec = async (_b: string, a: string[]) => {
+			calls.push(a);
+			const wide = a.includes("-H");
+			return { stdout: Array(3).fill(row(wide ? 90 : MAX_IMAGE_COLS)).join("\n"), code: 0 };
+		};
+		const art = (await renderArt(exec, img(), "half", 13, () => {})) as Art;
+		expect(calls[0]).toContain("26");
+		expect(calls[1].slice(-3, -1)).toEqual(["-w", String(MAX_IMAGE_COLS * 2)]);
+		expect(art.width).toBe(MAX_IMAGE_COLS);
+		const killed = async () => ({ stdout: row(5), code: 0, killed: true });
+		expect(await renderArt(killed, img(), "block", 13, () => {})).toBeUndefined();
+	});
+	test("missing image warns; pixels without kitty falls back to half (named reason)", async () => {
+		const warns: string[] = [];
+		expect(await renderArt(async () => undefined, "/nope.png", "half", 13, (m) => warns.push(m))).toBeUndefined();
+		expect(warns[0]).toContain("not found");
+		const exec = async () => ({ stdout: row(4), code: 0 });
+		const base = { trueColor: true, hyperlinks: false };
+		try {
+			setCapabilities({ ...base, images: null });
+			expect((await renderArt(exec, img(), "pixels", 13, (m) => warns.push(m)))?.width).toBe(4);
+			expect(warns.at(-1)).toContain("no Kitty graphics");
+			setCapabilities({ ...base, images: "iterm2" });
+			await renderArt(exec, img(), "pixels", 13, (m) => warns.push(m));
+			expect(warns.at(-1)).toContain("iTerm2");
+			setCapabilities({ ...base, images: "kitty" });
+			const bmp = join(mkdtempSync(join(os.tmpdir(), "sf-img-")), "x.bmp");
+			writeFileSync(bmp, "");
+			await renderArt(exec, bmp, "pixels", 13, (m) => warns.push(m));
+			expect(warns.at(-1)).toContain(".bmp");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+	test("pixels on kitty: sequence alone on row 0, blank rows below", async () => {
+		// 1x1 red PNG
+		const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==", "base64");
+		const f = join(mkdtempSync(join(os.tmpdir(), "sf-img-")), "x.png");
+		writeFileSync(f, png);
+		try {
+			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: false });
+			const a = await renderArt(async () => undefined, f, "pixels", 4, () => {});
+			expect(a?.graphic).toBe(true);
+			expect(a!.lines[0].startsWith("\x1b_G")).toBe(true);
+			expect(a!.lines.slice(1).every((l) => l === "")).toBe(true);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+	test("chafa: args, failure and missing binary fall back to half with a warning", async () => {
+		const calls: [string, string[]][] = [];
+		const warns: string[] = [];
+		const exec = async (b: string, a: string[]) => {
+			calls.push([b, a]);
+			return b.endsWith("chafa") ? { stdout: "", code: 2 } : { stdout: row(6), code: 0 };
+		};
+		const a = await renderArt(exec, img(), "sextant", 13, (m) => warns.push(m));
+		const chafa = calls.find(([b]) => b.endsWith("chafa"));
+		if (chafa) {
+			expect(chafa[1]).toEqual(expect.arrayContaining(["-f", "symbols", "--symbols=block+border+sextant", `--size=${MAX_IMAGE_COLS}x13`, "--polite=on", "--animate=off"]));
+			expect(warns.at(-1)).toContain("chafa could not draw");
+		} else expect(warns.at(-1)).toContain("chafa is not installed");
+		expect(a?.width).toBe(6); // catimg half fallback
+	});
+});
+
+describe("layoutRows", () => {
+	test("text art: info beside art, truncated", () => {
+		const rows = layoutRows(["AA", "BB"], ["one", "two", "three"], 4, false, 80);
+		expect(rows).toEqual(["AA  one", "BB  two", "    three"]);
+		expect(layoutRows(["AA"], ["x".repeat(50)], 4, false, 10).every((r) => visibleWidth(r) <= 10)).toBe(true);
+	});
+	test("graphic: row 0 is the sequence only, info shifted down one row", () => {
+		const seq = "\x1b_Ga=T;AAAA\x1b\\";
+		const rows = layoutRows([seq, "", ""], ["title", "rule", "pi"], 5, true, 12);
+		expect(rows[0]).toBe(seq);
+		expect(rows.slice(1)).toEqual(["     title", "     rule", "     pi"]);
+	});
+});
+
+describe("warnOnce", () => {
+	test("each message once per pick; a new pick warns again", () => {
+		const seen: string[] = [];
+		const pick = { key: "k", warned: new Set<string>() };
+		for (const m of ["a", "a", "b"]) warnOnce(pick, (x) => seen.push(x), m);
+		expect(seen).toEqual(["a", "b"]);
+		warnOnce({ key: "k", warned: new Set() }, (x) => seen.push(x), "a");
+		expect(seen).toEqual(["a", "b", "a"]);
+	});
+});

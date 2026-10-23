@@ -17,6 +17,8 @@
 #   4. installs the one extension that has real npm dependencies
 #   5. installs the firecrawl CLI, which the librarian agent researches with
 #   5b. installs the agent-browser CLI, which the agent-browser skill drives
+#   5b2. builds catimg from source into ~/.local/bin (startup-panel image)
+#   5b3. builds chafa from source into ~/.local/bin (finer image styles)
 #   5c. offers to install the herdr CLI, which the subagent tool delegates through
 #   5d. adds ~/.bun/bin and ~/.local/bin to your shell rc PATH, when missing
 #   6. copies agent/.env.example to agent/.env for you to fill in
@@ -320,6 +322,44 @@ if command -v agent-browser >/dev/null 2>&1; then
 	else
 		warn "could not download the browser binaries; run: agent-browser install"
 	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5b2. catimg, built from source
+#
+# startup-fetch.ts draws the startup-panel image with catimg (truecolor
+# half-blocks). Optional: without it the panel shows the ASCII distro logo.
+# Built from a pinned commit by scripts/install-catimg.sh into ~/.local/bin —
+# no sudo, no distro package. Needs git, cmake and a C compiler; missing ones
+# are a warning, never fatal.
+# ---------------------------------------------------------------------------
+step "Building catimg from source"
+if ! command -v cmake >/dev/null 2>&1 || ! { command -v cc || command -v gcc || command -v clang; } >/dev/null 2>&1; then
+	warn "cmake and a C compiler are needed to build catimg; skipped."
+	warn "The startup panel falls back to ASCII art. Later: bash scripts/install-catimg.sh"
+elif out=$(bash scripts/install-catimg.sh 2>&1); then
+	ok "$(printf '%s' "$out" | tail -1)"
+else
+	warn "catimg build failed; the startup panel falls back to ASCII art."
+	printf '%s\n' "$out" | tail -5 | sed 's/^/    /' >&2
+	warn "retry: bash scripts/install-catimg.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# 5b3. chafa, built from source
+#
+# The finer startup-image styles (quad, sextant, octant, braille, ascii) use
+# chafa; without it they fall back to catimg half blocks. Static build into
+# ~/.local/bin by scripts/install-chafa.sh. Needs autotools and glib headers;
+# missing ones are a warning, never fatal.
+# ---------------------------------------------------------------------------
+step "Building chafa from source"
+if out=$(bash scripts/install-chafa.sh 2>&1); then
+	ok "$(printf '%s' "$out" | tail -1)"
+else
+	warn "chafa not built; the quad/sextant/octant/braille styles fall back to half blocks."
+	printf '%s\n' "$out" | tail -3 | sed 's/^/    /' >&2
+	warn "retry: bash scripts/install-chafa.sh"
 fi
 
 # ---------------------------------------------------------------------------

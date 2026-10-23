@@ -16,32 +16,14 @@ import { dirname, join } from "node:path";
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours between checks
 
-let lastCheckTime = 0;
 
 export default function (pi: ExtensionAPI) {
-	// Check for updates on session start
+	// Check for updates on session start (shares one memoised check with
+	// startup-fetch.ts, so a cold start runs `npm view` once).
 	pi.on("session_start", async (_event, ctx) => {
-		const now = Date.now();
-		if (now - lastCheckTime < CHECK_INTERVAL_MS) return;
-		lastCheckTime = now;
-
-		try {
-			const updateInfo = await checkForUpdate(pi);
-			if (!updateInfo) return;
-
-			const { currentVersion, latestVersion } = updateInfo;
-
-			ctx.ui.notify(
-				`pi update available: ${currentVersion} → ${latestVersion} (use /update to install)`,
-				"info",
-			);
-			ctx.ui.setStatus(
-				"auto-update",
-				`⬆ ${latestVersion} available`,
-			);
-		} catch {
-			// Silently ignore update check failures
-		}
+		const result = await getUpdateStatus(pi);
+		if (result.status !== "available") return;
+		ctx.ui.setStatus("auto-update", `⬆ ${result.latestVersion} available`);
 	});
 
 	// Command to perform the update
@@ -191,6 +173,48 @@ function getCurrentVersion(): string | null {
 		return null;
 	} catch {
 		return null;
+	}
+}
+
+export type UpdateStatus =
+	| { status: "current"; currentVersion: string }
+	| { status: "available"; currentVersion: string; latestVersion: string }
+	| { status: "error" };
+
+// On globalThis, not module scope: the extension loader re-imports modules on
+// /reload (moduleCache: false), which would otherwise reset the memo.
+const MEMO_KEY = Symbol.for("dotpi.auto-update.status");
+type Memo = { at: number; promise: Promise<UpdateStatus> };
+const memoStore = globalThis as unknown as Record<symbol, Memo | undefined>;
+
+/**
+ * Memoised, three-way update check. Unlike `checkForUpdate`, it tells
+ * "could not check" apart from "up to date". Results are reused for
+ * CHECK_INTERVAL_MS (errors are not cached); pass `force` to re-check.
+ */
+export function getUpdateStatus(pi: ExtensionAPI, force = false): Promise<UpdateStatus> {
+	const memo = memoStore[MEMO_KEY];
+	if (!force && memo && Date.now() - memo.at < CHECK_INTERVAL_MS) return memo.promise;
+	const promise = computeUpdateStatus(pi).then((r) => {
+		if (r.status === "error" && memoStore[MEMO_KEY]?.promise === promise) memoStore[MEMO_KEY] = undefined;
+		return r;
+	});
+	memoStore[MEMO_KEY] = { at: Date.now(), promise };
+	return promise;
+}
+
+async function computeUpdateStatus(pi: ExtensionAPI): Promise<UpdateStatus> {
+	try {
+		const currentVersion = getCurrentVersion();
+		if (!currentVersion) return { status: "error" };
+		const r = await pi.exec("npm", ["view", PACKAGE_NAME, "version"], { timeout: 15000 });
+		const latestVersion = r.stdout.trim();
+		if (r.code !== 0 || !latestVersion) return { status: "error" };
+		return compareSemver(latestVersion, currentVersion) > 0
+			? { status: "available", currentVersion, latestVersion }
+			: { status: "current", currentVersion };
+	} catch {
+		return { status: "error" };
 	}
 }
 
