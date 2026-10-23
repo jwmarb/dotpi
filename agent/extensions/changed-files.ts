@@ -2,6 +2,7 @@
  * Changed Files Widget Extension
  *
  * Tracks files modified during a conversation session and displays a widget
+ * (or, when the kanban side pane is open, a "Changed Files" section in it)
  * above the editor showing changed files with status indicators and
  * color-coded +/− line counts. The widget shows at most 5 files; a
  * "… N more — /diff" hint points to the full list.
@@ -568,6 +569,7 @@ function createDiffViewer(args: DiffViewerArgs): Component {
  * Register the changed-files extension with the pi agent.
  *
  * Tracks files modified during a conversation session and displays a widget
+ * (or, when the kanban side pane is open, a "Changed Files" section in it)
  * above the editor showing changed files with status indicators and color-coded
  * +/− line counts (at most 5 files). Registers the `/diff` command, which opens
  * a scrollable modal of all changed files with per-file diff views.
@@ -584,12 +586,38 @@ export default function (pi: ExtensionAPI) {
 	/** Widget key for setWidget. */
 	const WIDGET_KEY = "changed-files";
 
+	/**
+	 * Whether the kanban side pane is live. When it is, the list is shown there
+	 * (broadcast on `changed-files:update`) and the inline widget stays hidden.
+	 * Channel names mirror `kanban/lib.ts` (CHANGED_FILES_EVENT / KANBAN_PANE_EVENT).
+	 */
+	let kanbanPaneLive = false;
+	let lastCtx: HookContext | undefined;
+	// kanban asks for a resend when it (re)starts — it may load after this extension.
+	pi.events?.on("changed-files:query", () => {
+		const files = Array.from(toolTrackedFiles.values()).sort((a, b) => a.path.localeCompare(b.path));
+		pi.events?.emit("changed-files:update", files.map((f) => ({ ...f })));
+	});
+	pi.events?.on("kanban:pane", (data) => {
+		kanbanPaneLive = (data as { live?: unknown } | undefined)?.live === true;
+		if (lastCtx) {
+			try {
+				updateWidget(lastCtx);
+			} catch {
+				// stale context from a replaced session
+			}
+		}
+	});
+
 
 	/**
 	 * Update the widget with the current changed-files state.
 	 */
 	function updateWidget(ctx: HookContext) {
-		if (!ctx.hasUI || toolTrackedFiles.size === 0) {
+		lastCtx = ctx;
+		const sorted = Array.from(toolTrackedFiles.values()).sort((a, b) => a.path.localeCompare(b.path));
+		pi.events?.emit("changed-files:update", sorted.map((f) => ({ ...f })));
+		if (!ctx.hasUI || toolTrackedFiles.size === 0 || kanbanPaneLive) {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
@@ -648,6 +676,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// Reset state for new session
 		toolTrackedFiles = new Map();
+		pi.events?.emit("kanban:pane:query", undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 
 		// Initial git status check (for resumed sessions with pending changes)

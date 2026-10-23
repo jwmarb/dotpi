@@ -92,6 +92,10 @@ import {
 	type SessionEntryLike,
 	type Style,
 	type Tone,
+	CHANGED_FILES_EVENT,
+	type ChangedFileInfo,
+	KANBAN_PANE_EVENT,
+	parseChangedFiles,
 } from "./lib.js";
 import { readRunInfos } from "./runs.js";
 
@@ -291,6 +295,10 @@ export default function kanban(pi: ExtensionAPI) {
 	/** The widget stands in for the pane: plain terminal, tiny pane, no bun, failed launch. */
 	let widgetFallback = false;
 	let projectionFailureNotified = false;
+	/** Latest list from changed-files.ts, shown in the side pane. */
+	let changedFiles: ChangedFileInfo[] = [];
+	/** Last pane-live value broadcast, so changed-files is told only on change. */
+	let lastPaneLive: boolean | undefined;
 
 	const ownerPaneId = (): string | undefined =>
 		process.env.HERDR_ENV === "1" && process.env.HERDR_PANE_ID ? process.env.HERDR_PANE_ID : undefined;
@@ -324,6 +332,7 @@ export default function kanban(pi: ExtensionAPI) {
 			sessionName: ctx.sessionManager.getSessionName(),
 			leafId: ctx.sessionManager.getLeafId(),
 			state,
+			changedFiles,
 		});
 		// One fixed temp name: a single synchronous writer cannot collide with
 		// itself, and a crash between write and rename leaves one file, not one per seq.
@@ -350,6 +359,10 @@ export default function kanban(pi: ExtensionAPI) {
 	function refreshWidget(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
 		const live = record()?.paneId !== undefined && !widgetFallback;
+		if (live !== lastPaneLive) {
+			lastPaneLive = live;
+			pi.events?.emit(KANBAN_PANE_EVENT, { live });
+		}
 		const show = state.cards.length > 0 && (widgetFallback || (!live && !paneEligible(ctx)));
 		if (!show) {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
@@ -652,6 +665,21 @@ export default function kanban(pi: ExtensionAPI) {
 	// Lifecycle
 	// -------------------------------------------------------------------------
 
+	pi.events?.on(CHANGED_FILES_EVENT, (data) => {
+		changedFiles = parseChangedFiles(data) ?? [];
+		if (current) {
+			try {
+				publish(current);
+			} catch {
+				// a context from a replaced session; the next event republishes
+			}
+		}
+	});
+	// changed-files may ask (e.g. after a /reload) whether the pane is showing its list.
+	pi.events?.on(`${KANBAN_PANE_EVENT}:query`, () => {
+		if (lastPaneLive !== undefined) pi.events?.emit(KANBAN_PANE_EVENT, { live: lastPaneLive });
+	});
+
 	pi.on("session_start", async (event, ctx) => {
 		current = ctx;
 		reconstruct(ctx);
@@ -661,6 +689,8 @@ export default function kanban(pi: ExtensionAPI) {
 			return;
 		}
 		widgetFallback = false;
+		// changed-files may have broadcast before `current` was set; ask again.
+		pi.events?.emit(`${CHANGED_FILES_EVENT.split(":")[0]}:query`, undefined);
 		if (paneEligible(ctx)) {
 			// Fire and forget: herdr round-trips must not delay pi's first frame.
 			void ensureBoard(ctx, event.reason === "reload" ? "adopt" : "always").catch(() => fallBack(ctx, undefined));

@@ -13,7 +13,7 @@ scripts, so every command below comes from the repo root).
 | File | Registers / owns |
 |---|---|
 | `ask-user.ts` | `questionnaire` tool — TUI option list + free-text fallback, `executionMode: "sequential"` so two questions cannot open at once |
-| `changed-files.ts` | `/changed-files`, `/diff` — session change widget; tracks `write`/`edit` inputs *and* `git status --porcelain` on turn end |
+| `changed-files.ts` | `/changed-files`, `/diff` — session change widget (moves into the kanban side pane when that is open, via `pi.events` `changed-files:update` / `kanban:pane`); tracks `write`/`edit` inputs *and* `git status --porcelain` on turn end |
 | `display-file.ts` | `display_file` tool — spawns the platform opener detached, then checks for a non-zero exit instead of faking success |
 | `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context. The handler only loads (skill activation, tool owners, `delegationRoster`, lineage) and applies the gated `selectedTools`; the pure, synchronous `promptInputs` does the gating and assembles `buildOrchestratorPrompt`'s parameter object, and both are tested from `lib/dynamic-prompt.test.ts` |
 | `firecrawl-cli.ts` | No tool, no command. Loads `agent/.env` so `FIRECRAWL_API_URL` reaches the real `process.env`, where the `firecrawl` CLI (run via `bash`) can see it — the librarian's research path. Also sets `FIRECRAWL_NO_UPDATE_CHECK`/`_NO_TELEMETRY` when unset, so a registry banner cannot land inside an agent's `<result>`. Reports a missing URL and returns rather than throwing: pi must start without the research stack |

@@ -404,6 +404,42 @@ export interface KanbanProjection {
 	leafId: string | null;
 	generatedAt: string;
 	state: KanbanState;
+	/** Files changed this session, from `changed-files.ts` (via `pi.events`). */
+	changedFiles?: ChangedFileInfo[];
+}
+
+/** One changed file as `changed-files.ts` broadcasts it on {@link CHANGED_FILES_EVENT}. */
+export interface ChangedFileInfo {
+	path: string;
+	status: string;
+	/** -1 = unknown. */
+	added: number;
+	removed: number;
+	binary: boolean;
+}
+
+/** `pi.events` channel: changed-files → kanban, payload `ChangedFileInfo[]`. */
+export const CHANGED_FILES_EVENT = "changed-files:update";
+/** `pi.events` channel: kanban → changed-files, payload `{ live: boolean }` (side pane shown). */
+export const KANBAN_PANE_EVENT = "kanban:pane";
+
+/** Validate a changed-files list from an untrusted source; drops malformed entries. */
+export function parseChangedFiles(value: unknown): ChangedFileInfo[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const out: ChangedFileInfo[] = [];
+	for (const f of value) {
+		if (typeof f !== "object" || f === null) continue;
+		const v = f as Record<string, unknown>;
+		if (typeof v.path !== "string" || typeof v.status !== "string") continue;
+		out.push({
+			path: v.path,
+			status: v.status,
+			added: typeof v.added === "number" ? v.added : -1,
+			removed: typeof v.removed === "number" ? v.removed : -1,
+			binary: v.binary === true,
+		});
+	}
+	return out;
 }
 
 export function buildProjection(args: {
@@ -414,6 +450,7 @@ export function buildProjection(args: {
 	leafId: string | null;
 	state: KanbanState;
 	generatedAt?: string;
+	changedFiles?: readonly ChangedFileInfo[];
 }): KanbanProjection {
 	const p: KanbanProjection = {
 		schemaVersion: KANBAN_SCHEMA_VERSION,
@@ -425,6 +462,7 @@ export function buildProjection(args: {
 		state: cloneState(args.state),
 	};
 	if (args.sessionName) p.sessionName = args.sessionName;
+	if (args.changedFiles && args.changedFiles.length > 0) p.changedFiles = args.changedFiles.map((f) => ({ ...f }));
 	return p;
 }
 
@@ -448,6 +486,8 @@ export function parseProjection(value: unknown): KanbanProjection | undefined {
 		state,
 	};
 	if (v.sessionName) p.sessionName = v.sessionName as string;
+	const files = parseChangedFiles(v.changedFiles);
+	if (files && files.length > 0) p.changedFiles = files;
 	return p;
 }
 
@@ -790,6 +830,37 @@ export interface FrameInput {
 	banner?: string;
 	/** Shown in the title line (session name or id). */
 	label?: string;
+	/** Rendered as a section under the cards. */
+	changedFiles?: readonly ChangedFileInfo[];
+}
+
+const FILE_TONE: Record<string, Tone> = {
+	created: "success",
+	modified: "warning",
+	deleted: "error",
+	renamed: "muted",
+	copied: "muted",
+	untracked: "dim",
+};
+
+/** The "Changed Files" section of the board body. Empty when there are none. */
+export function changedFilesBody(files: readonly ChangedFileInfo[] | undefined, width: number, style: Style = PLAIN_STYLE): string[] {
+	if (!files || files.length === 0 || width <= 0) return [];
+	const lines = ["", fit(style.bold(style.fg("heading", "Changed Files")) + style.fg("dim", ` (${files.length})`), width)];
+	for (const f of files) {
+		const glyph = style.fg(FILE_TONE[f.status] ?? "warning", f.status === "untracked" ? "○" : "●");
+		const counts = f.binary
+			? style.fg("muted", "bin")
+			: f.added < 0 && f.removed < 0
+				? style.fg("dim", "+? -?")
+				: `${style.fg("success", `+${Math.max(f.added, 0)}`)} ${style.fg("error", `-${Math.max(f.removed, 0)}`)}`;
+		const tail = ` ${counts}`;
+		const room = Math.max(1, width - 2 - visibleWidth(tail));
+		const path = cleanText(f.path);
+		const shown = visibleWidth(path) > room ? `…${path.slice(-(room - 1))}` : path;
+		lines.push(fit(`${glyph} ${style.fg("text", shown)}${tail}`, width));
+	}
+	return lines;
 }
 
 export interface Frame {
@@ -819,7 +890,7 @@ export function renderFrame(input: FrameInput, style: Style = PLAIN_STYLE): Fram
 	if (input.banner) head.push(fit(style.fg("warning", `⚠ ${input.banner}`), width));
 	head.push(style.fg("dim", "─".repeat(width)));
 
-	const body = state ? renderBody(state, input.runs, width, style) : [fit(style.fg("dim", "Waiting for pi to publish the board…"), width)];
+	const body = state ? [...renderBody(state, input.runs, width, style), ...changedFilesBody(input.changedFiles, width, style)] : [fit(style.fg("dim", "Waiting for pi to publish the board…"), width)];
 	const footerRows = height - head.length >= 3 ? 1 : 0;
 	const room = Math.max(0, height - head.length - footerRows);
 	const maxScroll = Math.max(0, body.length - room);

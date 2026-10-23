@@ -121,7 +121,7 @@ function frameLines(): string[] {
 	const { width, height } = size();
 	const label = projection?.sessionName ?? projection?.sessionId.slice(0, 8);
 	const frame = renderFrame(
-		{ state: projection?.state, runs, width, height, scroll, ...(banner ? { banner } : {}), ...(label ? { label } : {}) },
+		{ state: projection?.state, runs, width, height, scroll, ...(banner ? { banner } : {}), ...(label ? { label } : {}), ...(projection?.changedFiles ? { changedFiles: projection.changedFiles } : {}) },
 		ANSI_STYLE,
 	);
 	scroll = frame.scroll;
