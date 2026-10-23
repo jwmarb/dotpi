@@ -17,7 +17,7 @@
   "theme": "tokyo-night",
   "retry": {
     "enabled": true,
-    "maxRetries": 30,
+    "maxRetries": 40,
     "baseDelayMs": 2000,
     "provider": {
       "maxRetries": 0,
