@@ -47,6 +47,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
 | List/resume previous sessions | `agent/extensions/sessions.ts` (`/sessions` modal) |
+| Pause and end the current agent turn | `agent/extensions/sleep.ts` (`sleep` tool — required timeout in seconds, max 3600; the terminating call must be alone in its tool batch) |
 | Loop the agent on a goal until it declares completion | `agent/extensions/ralph-loop/` (`/ralph-loop`, `/ulw-loop`, `/loop-stop`; `--verify[=static\|runtime\|both]`) |
 | Delegate work to a subagent | `agent/extensions/subagent-herdr/` (`subagent`, `subagent_tasks` tools incl. `interrupt`; event-driven — no blocking wait, the child wakes the parent; stalled or unanswered runs are auto-diagnosed by a read-only `healthcheck` child whose `healthCheckOf` tags the target, and the target's no-answer briefing is held until the health check completes) |
 | Review changed files (+/− counts) | `agent/extensions/changed-files.ts` (`/diff` modal, `/changed-files`) |

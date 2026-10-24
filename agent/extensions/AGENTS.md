@@ -23,6 +23,7 @@ scripts, so every command below comes from the repo root).
 | `litellm.ts` | `registerProvider("litellm")` — model catalog, per-token + cache costs, `contextWindow`, thinking-level maps |
 | `model-fallback/` | `registerVirtualModel("fallback/auto")` + `/fallback-chain` — on an error, route the retry to the **next** model in a chain, then hand the following request back to the original. One full lap of the chain is one logical retry. Consumed by the orchestrator (settings), delegated children (`PI_FALLBACK_CHAIN`) and both ralph-loop gates. Own AGENTS.md |
 | `sessions.ts` | `/sessions` — resumable session list from pi's own `SessionManager.list()`; no JSONL re-parsing |
+| `sleep.ts` | `sleep` tool — pauses for a required timeout in seconds (0 < timeout <= 3600), then returns `terminate: true` so the agent loop ends the current turn (no further model call until new input); abortable — an aborted wait settles promptly with `isError: true` and no `terminate`; `executionMode: "sequential"`; pure `validateTimeout` tested from `lib/sleep.test.ts` |
 | `thinking-indicator.ts` | No tool. Live spinner (alt+t) + `setHiddenThinkingLabel` transcript record |
 | `todo.ts` | `todo` tool + `/todos` — **a spawned subagent's** checklist as a `belowEditor` widget; the factory returns unless `PI_SUBAGENT_RUN_ID` is set, and `subagent-herdr` appends `todo` to every child's `--tools`. State is in memory, rebuilt from tool-result `details` on `session_start`/`session_tree` only (replaying per op lost parallel updates). No settle guard: a child's completion handshake fires on `agent_end`, before `agent_before_settle` could continue it |
 | `kanban/` | `kanban` tool + `/kanban` — **the orchestrator's** board, replacing `todo` for it. Columns backlog → in_progress → blocked → review → done; cards link subagent runs (advisory badges, never auto-moved). `index.ts` is the single writer (snapshots in tool-result `details` or `kanban-state` custom entries, in-memory authoritative, digest repair at `turn_end`/`agent_settled`) and holds the settle guard; `board.ts` (shebang, bun) is the read-only side-pane viewer of a projection in `$XDG_RUNTIME_DIR/pi-kanban/`; `lib.ts` is pure; `runs.ts` reads `meta.json` through `rundir.ts`. Opens a side pane on every non-reload session start inside herdr's TUI, widget fallback otherwise |
@@ -162,8 +163,8 @@ scripts, so every command below comes from the repo root).
   directory.** The constraint is where the file sits, not what it may reach: pi auto-loads
   every top-level `*.ts`, so a `*.test.ts` here imports `bun:test` and kills startup. A test
   in `lib/` is invisible to pi and can import `../<extension>.js` freely —
-  `lib/sessions.test.ts` has done exactly that all along, and all 12 top-level extensions
-  import cleanly from there (measured, 12/12 — including `herdr-agent-state.ts`, which is gitignored). Export the pure logic and test it in place.
+  `lib/sessions.test.ts` has done exactly that all along, and all 14 top-level extensions
+  import cleanly from there (measured, 14/14 — including `herdr-agent-state.ts`, which is gitignored). Export the pure logic and test it in place.
 - **Keep pure logic out of `index.ts`.** Every subdirectory extension splits `lib.ts` (pure,
   tested) from `index.ts` (session wiring). `trade-journal/` is the worked example. But
   become a directory when it improves the module's **interface** or **locality** — not
