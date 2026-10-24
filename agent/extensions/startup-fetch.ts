@@ -5,7 +5,8 @@
  * extensions).
  *
  * Shows: pi version + update status, cwd (+ git branch), OS, kernel, host,
- * uptime, shell, terminal, CPU, memory, model.
+ * uptime, shell, terminal, CPU, GPU(s), memory, disk usage, model, and an
+ * Updates block (pi + installed packages) in place of pi's boxed notices.
  *
  * The update check is auto-update's memoised `getUpdateStatus` (one shared
  * `npm view` per 4h, surviving /reload); it and the git-branch lookup run in
@@ -16,9 +17,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { convertToPng, resizeImage, VERSION } from "@earendil-works/pi-coding-agent";
+import { convertToPng, InteractiveMode, resizeImage, VERSION } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, getCellDimensions, getImageDimensions, renderImage, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { basename, extname, isAbsolute, join } from "node:path";
 import { agentDir, settingsFile } from "./lib/layout.js";
@@ -27,6 +28,130 @@ import { chooseImage, IMAGE_MODES, type ImageMode, listImages, parseMode, readSt
 import { getUpdateStatus, type UpdateStatus } from "./auto-update/index.js";
 
 type UpdateState = { kind: "checking" } | UpdateStatus;
+
+/** GPU names from the platform's own tool (lspci / system_profiler / CIM). */
+export function parseGpus(platform: NodeJS.Platform, stdout: string): string[] {
+	const out: string[] = [];
+	if (platform === "linux") {
+		for (const l of stdout.split("\n")) {
+			const m = l.match(/(?:VGA compatible controller|3D controller|Display controller)[^:]*:\s*(.+)$/);
+			if (m) out.push(shortVendor(m[1].replace(/\s*\(rev [0-9a-f]+\)$/i, "")));
+		}
+	} else if (platform === "darwin") {
+		for (const m of stdout.matchAll(/Chipset Model:\s*(.+)/g)) out.push(m[1].trim());
+	} else {
+		for (const l of stdout.split(/\r?\n/)) if (l.trim()) out.push(l.trim());
+	}
+	// Identical cards collapse to one row with a count ("… ×4").
+	const counts = new Map<string, number>();
+	for (const g of out) counts.set(g, (counts.get(g) ?? 0) + 1);
+	return [...counts].map(([g, n]) => (n > 1 ? `${g} ×${n}` : g));
+}
+
+/** lspci vendor strings → short names. */
+const VENDORS: [RegExp, string][] = [
+	[/^NVIDIA Corporation\s+/, "NVIDIA "],
+	[/^Advanced Micro Devices, Inc\. \[AMD\/ATI\]\s+/, "AMD "],
+	[/^Advanced Micro Devices, Inc\.\s+/, "AMD "],
+	[/^Intel Corporation\s+/, "Intel "],
+];
+const shortVendor = (s: string) => VENDORS.reduce((acc, [re, to]) => acc.replace(re, to), s.trim());
+
+// GPUs don't change while pi runs: one probe per process (survives /reload).
+const GPU_KEY = Symbol.for("dotpi.startup-fetch.gpus");
+const gpuStore = globalThis as unknown as Record<symbol, Promise<string[]> | undefined>;
+
+function gpus(pi: ExtensionAPI): Promise<string[]> {
+	return (gpuStore[GPU_KEY] ??= probeGpus(pi));
+}
+
+async function probeGpus(pi: ExtensionAPI): Promise<string[]> {
+	const p = process.platform;
+	const [bin, args]: [string | undefined, string[]] =
+		p === "linux" ? ["lspci", []]
+		: p === "darwin" ? ["system_profiler", ["SPDisplaysDataType"]]
+		: p === "win32" ? ["powershell", ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"]]
+		: [undefined, []];
+	if (!bin) return ["unavailable"];
+	try {
+		const r = await pi.exec(bin, args, { timeout: 4000 });
+		if (r.code !== 0) return [`unavailable (${bin} failed)`];
+		const g = parseGpus(p, r.stdout);
+		return g.length ? g : ["none detected"];
+	} catch {
+		return [`unavailable (no ${bin})`];
+	}
+}
+
+/** Used/total of the filesystem holding `path` (statfs; no subprocess). */
+export function diskUsage(path: string): string | undefined {
+	try {
+		const s = statfsSync(path);
+		const total = s.blocks * s.bsize;
+		const used = total - s.bfree * s.bsize;
+		if (!total) return undefined;
+		return `${size(used)} / ${size(total)} (${Math.round((used / total) * 100)}%)`;
+	} catch {
+		return undefined;
+	}
+}
+
+// pi's own startup notices (new pi release, package updates), captured
+// instead of drawn as separate boxes. pi calls each notifier at most once,
+// possibly before or after the header exists, so results are kept on
+// globalThis and listeners are woken. With no panel listening (e.g. after
+// /builtin-header) the original box is drawn as before.
+const NOTICE_KEY = Symbol.for("dotpi.startup-fetch.notices");
+export type PiRelease = { version: string; note?: string };
+export type Notices = { release?: PiRelease; packages?: string[] };
+type NoticeStore = { notices: Notices; listeners: Set<(n: Notices) => void>; patched: WeakSet<object> };
+const noticeStore = ((globalThis as unknown as Record<symbol, NoticeStore>)[NOTICE_KEY] ??= {
+	notices: {},
+	listeners: new Set(),
+	patched: new WeakSet(),
+});
+
+const NOTIFIERS = {
+	showNewVersionNotification: (arg: unknown): Notices => {
+		const r = arg as { version?: unknown; note?: unknown } | undefined;
+		return typeof r?.version === "string" ? { release: { version: r.version, note: typeof r.note === "string" ? r.note : undefined } } : {};
+	},
+	showPackageUpdateNotification: (arg: unknown): Notices => ({ packages: Array.isArray(arg) ? arg.map(String) : [] }),
+};
+
+/**
+ * Route pi's update notices into the panel. False when pi's internals moved
+ * (its boxes then stay). `store` is injectable for tests.
+ */
+export function captureNotices(
+	proto: Record<string, unknown> | undefined = (InteractiveMode as unknown as { prototype?: Record<string, unknown> } | undefined)?.prototype,
+	store: NoticeStore = noticeStore,
+): boolean {
+	if (!proto) return false;
+	if (store.patched.has(proto)) return true;
+	if (!Object.keys(NOTIFIERS).every((k) => typeof proto[k] === "function")) return false;
+	for (const [name, parse] of Object.entries(NOTIFIERS)) {
+		const orig = proto[name] as (this: unknown, a: unknown) => unknown;
+		proto[name] = function (this: unknown, arg: unknown) {
+			if (!store.listeners.size) return orig.call(this, arg);
+			store.notices = { ...store.notices, ...parse(arg) };
+			for (const l of store.listeners) l(store.notices);
+		};
+	}
+	store.patched.add(proto);
+	return true;
+}
+
+export function newNoticeStore(): NoticeStore {
+	return { notices: {}, listeners: new Set(), patched: new WeakSet() };
+}
+
+/** Subscribe to captured notices (replays what pi already reported). */
+export function onNotices(cb: (n: Notices) => void, store: NoticeStore = noticeStore): () => void {
+	if (store.notices.release || store.notices.packages) cb(store.notices);
+	store.listeners.add(cb);
+	return () => store.listeners.delete(cb);
+}
 
 function osName(): string {
 	try {
@@ -54,6 +179,8 @@ function fmtUptime(sec: number): string {
 }
 
 const gib = (b: number) => (b / 1024 ** 3).toFixed(1);
+/** GiB, or TiB from 1 TiB up. */
+export const size = (b: number) => (b >= 1024 ** 4 ? `${(b / 1024 ** 4).toFixed(2)} TiB` : `${gib(b)} GiB`);
 
 function homeRel(p: string): string {
 	const home = os.homedir();
@@ -150,10 +277,10 @@ const PICK_KEY = Symbol.for("dotpi.startup-fetch.pick");
 // `key` is the mode/image the pick was made for, so editing them + /reload
 // re-picks; `warned` holds notices already shown for this pick (no repeat on
 // every /new).
-export type Pick = { path?: string; problem?: string; key: string; warned: Set<string> };
-const pickStore = globalThis as unknown as Record<symbol, Pick | undefined>;
+export type ImagePick = { path?: string; problem?: string; key: string; warned: Set<string> };
+const pickStore = globalThis as unknown as Record<symbol, ImagePick | undefined>;
 
-function currentPick(advance: boolean): Pick {
+function currentPick(advance: boolean): ImagePick {
 	const cfg = readConfig();
 	const key = `${cfg.mode}\0${cfg.image ?? ""}`;
 	const cur = pickStore[PICK_KEY];
@@ -162,7 +289,7 @@ function currentPick(advance: boolean): Pick {
 }
 
 /** Notify once per pick. */
-export function warnOnce(pick: Pick, notify: (m: string) => void, msg: string): void {
+export function warnOnce(pick: ImagePick, notify: (m: string) => void, msg: string): void {
 	if (pick.warned.has(msg)) return;
 	pick.warned.add(msg);
 	notify(msg);
@@ -358,10 +485,14 @@ interface Snapshot {
 	terminal: string;
 	cpu: string;
 	memory: string;
+	gpus?: string[];
+	disks: [string, string][];
 	cwd: string;
 	model: string;
 	branch?: string;
 	update: UpdateState;
+	/** pi's own startup notices (release + package updates), as of startup. */
+	notices: Notices;
 }
 
 function snapshot(ctx: ExtensionContext): Snapshot {
@@ -378,10 +509,27 @@ function snapshot(ctx: ExtensionContext): Snapshot {
 		terminal: process.env.TERM_PROGRAM ?? process.env.TERM ?? "unknown",
 		cpu: cpus.length ? `${cpus[0].model.replace(/\s+/g, " ").trim()} (${cpus.length})` : os.arch(),
 		memory: `${gib(used)} GiB / ${gib(total)} GiB (${Math.round((used / total) * 100)}%)`,
+		disks: diskRows(ctx.cwd),
 		cwd: homeRel(ctx.cwd),
 		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none",
 		update: { kind: "checking" },
+		notices: {},
 	};
+}
+
+/** Disk rows: the root filesystem, plus the cwd's when it is a different one. */
+function diskRows(cwd: string): [string, string][] {
+	const root = process.platform === "win32" ? (process.env.SystemDrive ?? "C:") + "\\" : "/";
+	const rows: [string, string][] = [];
+	const r = diskUsage(root);
+	if (r) rows.push([`Disk (${root})`, r]);
+	try {
+		if (statSync(cwd).dev !== statSync(root).dev) {
+			const c = diskUsage(cwd);
+			if (c) rows.push([`Disk (${basename(cwd) || cwd})`, c]);
+		}
+	} catch {}
+	return rows;
 }
 
 function updateText(theme: Theme, u: UpdateState): string {
@@ -390,10 +538,32 @@ function updateText(theme: Theme, u: UpdateState): string {
 		case "current":
 			return theme.fg("success", "up to date");
 		case "available":
-			return theme.fg("warning", `⬆ ${u.latestVersion} available — /update`);
+			return theme.fg("warning", `⬆ ${u.latestVersion} available (see Updates)`);
 		case "error":
 			return theme.fg("dim", "unknown (check failed)");
 	}
+}
+
+/**
+ * The "Updates" block that replaces pi's own boxed update notices: a
+ * section header, then one row per pending update. The pi row comes from
+ * pi's own release check (with its release note), else from auto-update's
+ * npm check. Empty when nothing is pending (or still checking).
+ */
+export function updateLines(theme: Theme, s: Pick<Snapshot, "update" | "notices">): string[] {
+	const rows: string[] = [];
+	const bullet = theme.fg("warning", "⬆");
+	const cmd = (c: string) => `${theme.fg("dim", "· run")} ${theme.fg("accent", c)}`;
+	const latest = s.notices.release?.version ?? (!("kind" in s.update) && s.update.status === "available" ? s.update.latestVersion : undefined);
+	if (latest) {
+		rows.push(`${bullet} ${theme.bold("pi")} ${theme.fg("dim", `v${VERSION} →`)} ${theme.fg("warning", latest)} ${cmd("pi update")}`);
+		const note = s.notices.release?.note?.trim().split("\n")[0];
+		if (note) rows.push(`  ${theme.fg("dim", truncateToWidth(note, 60))}`);
+		rows.push(`  ${theme.fg("dim", "changelog: pi.dev/changelog")}`);
+	}
+	for (const p of s.notices.packages ?? []) rows.push(`${bullet} ${theme.bold(p)} ${cmd("pi update --extensions")}`);
+	if (!rows.length) return [];
+	return ["", `${theme.fg("warning", theme.bold("Updates"))} ${theme.fg("dim", "─".repeat(12))}`, ...rows];
 }
 
 function infoLines(theme: Theme, s: Snapshot): string[] {
@@ -410,9 +580,18 @@ function infoLines(theme: Theme, s: Snapshot): string[] {
 		["Shell", s.shell],
 		["Terminal", s.terminal],
 		["CPU", s.cpu],
+		...(s.gpus ?? [undefined]).map((g, i, a): [string, string] => [a.length > 1 ? `GPU ${i + 1}` : "GPU", g ?? theme.fg("dim", "detecting…")]),
 		["Memory", s.memory],
+		...s.disks,
 	];
-	return [title, rule, ...rows.map(([k, v]) => `${theme.fg("accent", theme.bold(k))}${theme.fg("dim", ":")} ${v}`)];
+	const swatch = [1, 2, 3, 4, 5, 6].map((c) => `\x1b[4${c}m   `).join("") + "\x1b[0m";
+	return [
+		title,
+		rule,
+		...rows.map(([k, v]) => `${theme.fg("accent", theme.bold(k))}${theme.fg("dim", ":")} ${v}`),
+		...updateLines(theme, s),
+		...(process.env.NO_COLOR ? [] : ["", swatch]),
+	];
 }
 
 
@@ -468,6 +647,14 @@ function setFetchHeader(pi: ExtensionAPI, ctx: ExtensionContext, force = false, 
 			snap.update = u;
 			refresh();
 		});
+		const offNotices = onNotices((n) => {
+			snap.notices = n;
+			refresh();
+		});
+		gpus(pi).then((g) => {
+			snap.gpus = g;
+			refresh();
+		});
 		gitBranch(pi, ctx.cwd).then((b) => {
 			if (!b) return;
 			snap.branch = b;
@@ -493,12 +680,17 @@ function setFetchHeader(pi: ExtensionAPI, ctx: ExtensionContext, force = false, 
 			},
 			dispose() {
 				disposed = true;
+				offNotices();
 			},
 		};
 	});
 }
 
 export default function (pi: ExtensionAPI) {
+	// pi's boxed "Update Available" / "Package Updates Available" notices are
+	// captured into the panel's Updates block. Patched at load time: pi starts
+	// those checks right after extensions load (InteractiveMode.run).
+	if (!process.env.PI_SUBAGENT_RUN_ID) captureNotices();
 	pi.on("session_start", async (_event, ctx) => {
 		// Subagent panes are fresh pi processes: they would advance the cycle and
 		// run catimg for a header nobody looks at.

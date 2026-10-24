@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from
 import os from "node:os";
 import { basename, join } from "node:path";
 import { setCapabilities, resetCapabilitiesCache, visibleWidth } from "@earendil-works/pi-tui";
-import { type Art, cleanCatimg, layoutRows, warnOnce, firstFrame, MAX_IMAGE_COLS, parseStyle, pickImage, readConfig, renderArt, writeSetting } from "../startup-fetch.ts";
+import { type Art, captureNotices, cleanCatimg, diskUsage, newNoticeStore, onNotices, parseGpus, size, updateLines, layoutRows, warnOnce, firstFrame, MAX_IMAGE_COLS, parseStyle, pickImage, readConfig, renderArt, writeSetting } from "../startup-fetch.ts";
 import { chooseImage, listImages } from "./startup-images.ts";
 import { LOGO_KEYS, pickLogo, renderLogo, truecolor } from "./distro-logos.ts";
 
@@ -229,5 +229,65 @@ describe("warnOnce", () => {
 		expect(seen).toEqual(["a", "b"]);
 		warnOnce({ key: "k", warned: new Set() }, (x) => seen.push(x), "a");
 		expect(seen).toEqual(["a", "b", "a"]);
+	});
+});
+
+describe("gpu / disk / updates", () => {
+	test("parseGpus per platform", () => {
+		const lspci = "00:02.0 VGA compatible controller: Intel Corporation UHD Graphics 630 (rev 02)\n01:00.0 3D controller: NVIDIA Corporation GA107M [GeForce RTX 3050 Mobile] (rev a1)\n00:1f.3 Audio device: Intel Corporation Foo";
+		expect(parseGpus("linux", lspci)).toEqual(["Intel UHD Graphics 630", "NVIDIA GA107M [GeForce RTX 3050 Mobile]"]);
+		expect(parseGpus("linux", "01:00.0 VGA compatible controller: NVIDIA Corporation X (rev a1)\n02:00.0 VGA compatible controller: NVIDIA Corporation X (rev a1)")).toEqual(["NVIDIA X ×2"]);
+		expect(parseGpus("darwin", "      Chipset Model: Apple M2\n")).toEqual(["Apple M2"]);
+		expect(parseGpus("win32", "NVIDIA GeForce RTX 4070\r\n\r\n")).toEqual(["NVIDIA GeForce RTX 4070"]);
+	});
+	test("diskUsage formats, bad path is undefined", () => {
+		expect(diskUsage("/")).toMatch(/^[\d.]+ GiB \/ [\d.]+ GiB \(\d+%\)$/);
+		expect(diskUsage("/definitely/not/here")).toBeUndefined();
+	});
+	test("size switches to TiB", () => {
+		expect(size(2 * 1024 ** 3)).toBe("2.0 GiB");
+		expect(size(4 * 1024 ** 4)).toBe("4.00 TiB");
+	});
+	test("AMD vendor shortened", () => {
+		expect(parseGpus("linux", "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 (rev c1)")).toEqual(["AMD Navi 21"]);
+	});
+	const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as never;
+	test("updateLines: empty while checking / current, rows when pending", () => {
+		expect(updateLines(theme, { update: { kind: "checking" }, notices: {} })).toEqual([]);
+		expect(updateLines(theme, { update: { status: "current", currentVersion: "1" }, notices: {} })).toEqual([]);
+		const l = updateLines(theme, { update: { kind: "checking" }, notices: { release: { version: "9.9.9", note: "Big release\nmore" }, packages: ["superpowers"] } });
+		const t = l.join("\n");
+		expect(l[1]).toStartWith("Updates");
+		expect(t).toContain("→ 9.9.9 · run pi update");
+		expect(t).toContain("Big release");
+		expect(t).not.toContain("more");
+		expect(t).toContain("superpowers · run pi update --extensions");
+	});
+	test("updateLines: packages only has no changelog; npm check fills pi row", () => {
+		expect(updateLines(theme, { update: { kind: "checking" }, notices: { packages: ["x"] } }).join("\n")).not.toContain("changelog");
+		expect(updateLines(theme, { update: { status: "available", currentVersion: "1", latestVersion: "2.0.0" }, notices: {} }).join("\n")).toContain("2.0.0");
+	});
+	test("captureNotices: captures with a listener, falls through without one", () => {
+		const drawn: unknown[] = [];
+		const proto: Record<string, unknown> = {
+			showNewVersionNotification(r: unknown) { drawn.push(["v", r]); },
+			showPackageUpdateNotification(p: unknown) { drawn.push(["p", p]); },
+		};
+		const store = newNoticeStore();
+		expect(captureNotices({}, store)).toBe(false);
+		expect(captureNotices(proto, store)).toBe(true);
+		expect(captureNotices(proto, store)).toBe(true); // idempotent
+		(proto.showPackageUpdateNotification as (p: unknown) => void)(["a"]);
+		expect(drawn).toEqual([["p", ["a"]]]);
+		const seen: unknown[] = [];
+		const off = onNotices((n) => seen.push(n), store);
+		(proto.showNewVersionNotification as (r: unknown) => void)({ version: "2.0.0", note: "n" });
+		(proto.showPackageUpdateNotification as (p: unknown) => void)(["b"]);
+		expect(drawn).toHaveLength(1);
+		expect(seen.at(-1)).toEqual({ release: { version: "2.0.0", note: "n" }, packages: ["b"] });
+		off();
+		const late: unknown[] = [];
+		onNotices((n) => late.push(n), store);
+		expect(late).toEqual([{ release: { version: "2.0.0", note: "n" }, packages: ["b"] }]);
 	});
 });
