@@ -15,9 +15,11 @@
 #   3. arms the git hooks (core.hooksPath -> .githooks)
 #   4. installs the one extension that has real npm dependencies
 #   5. installs the firecrawl CLI, which the librarian agent researches with
-#   5b. installs the agent-browser CLI, which the agent-browser skill drives
-#   5c. offers to install the herdr CLI, which the subagent tool delegates through
-#   5d. adds ~\.bun\bin to the user PATH, when missing
+#   5b. installs the catimg renderer, which startup-fetch uses for block/half
+#   5b2. installs the chafa renderer, which startup-fetch uses for quad/sextant
+#   5c. installs the agent-browser CLI, which the agent-browser skill drives
+#   5d. offers to install the herdr CLI, which the subagent tool delegates through
+#   5e. adds ~\.bun\bin to the user PATH, when missing
 #   6. copies agent\.env.example to agent\.env for you to fill in
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
@@ -397,6 +399,51 @@ if (Get-Cmd "firecrawl") {
 }
 
 # ---------------------------------------------------------------------------
+# 5b2. The catimg renderer
+#
+# startup-fetch.ts renders the startup-panel image through catimg. It is
+# optional: without it the panel falls back to chafa quadrants, then to the
+# ASCII distro logo. The installer is idempotent: it skips when the pinned
+# ref is already built, and it exits 0 (not 1) when no C++ toolchain is
+# available, so a machine without one is not blocked.
+# ---------------------------------------------------------------------------
+Step "Installing the catimg renderer"
+$catimgPs = Join-Path $PWD "scripts\install-catimg.ps1"
+if (Test-Path $catimgPs) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $catimgPs
+    if ($LASTEXITCODE -eq 0) {
+        Ok "catimg ready (or already installed)"
+    } else {
+        Warn "catimg install reported a failure; the panel will fall back to chafa/ASCII"
+        Warn "Re-run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-catimg.ps1"
+    }
+} else {
+    Warn "scripts\install-catimg.ps1 missing — unexpected; skipping"
+}
+
+# ---------------------------------------------------------------------------
+# 5b3. The chafa renderer
+#
+# startup-fetch.ts uses chafa for the finer character styles (quad, sextant,
+# octant, braille, ascii). Optional: without it those styles fall back to
+# catimg half-blocks, then to the ASCII logo. The installer tries the official
+# pinned archive first, then winget; it is idempotent and exits 0 when the
+# pinned version is already present.
+# ---------------------------------------------------------------------------
+Step "Installing the chafa renderer"
+$chafaPs = Join-Path $PWD "scripts\install-chafa.ps1"
+if (Test-Path $chafaPs) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $chafaPs
+    if ($LASTEXITCODE -eq 0) {
+        Ok "chafa ready (or already installed)"
+    } else {
+        Warn "chafa install reported a failure; the panel will fall back to catimg/ASCII"
+        Warn "Re-run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-chafa.ps1"
+    }
+} else {
+    Warn "scripts\install-chafa.ps1 missing — unexpected; skipping"
+}
+# ---------------------------------------------------------------------------
 # 5c. The agent-browser CLI
 #
 # The agent-browser skill drives browser automation through this CLI, and the
@@ -429,7 +476,7 @@ if (Get-Cmd "agent-browser") {
 }
 
 # ---------------------------------------------------------------------------
-# 5c. The herdr CLI
+# 5d. The herdr CLI
 #
 # The subagent/subagent_tasks tools delegate by opening a herdr tab and running
 # pi inside it, so without this binary that entire surface is inert. On Windows
@@ -473,7 +520,7 @@ if ($herdrBin) {
 }
 
 # ---------------------------------------------------------------------------
-# 5d. PATH — the ~\.bun\bin entry in the user registry
+# 5e. PATH — the ~\.bun\bin entry in the user registry
 #
 # pi lives in ~\.bun\bin, a directory a fresh machine often has not got on
 # PATH. herdr manages its own PATH entry on Windows, so the one thing this
