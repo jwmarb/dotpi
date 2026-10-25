@@ -25,7 +25,8 @@ import { basename, extname, isAbsolute, join } from "node:path";
 import { agentDir, settingsFile } from "./lib/layout.js";
 import { pickLogo, renderLogo, truecolor } from "./lib/distro-logos.js";
 import { chooseImage, IMAGE_MODES, type ImageMode, listImages, parseMode, readState, writeState } from "./lib/startup-images.js";
-import { getUpdateStatus, type UpdateStatus } from "./auto-update/index.js";
+import { getUpdateStatus, type UpdateStatus, updateCommand } from "./auto-update/index.js";
+import { runningCompiled } from "./lib/runtime.js";
 
 type UpdateState = { kind: "checking" } | UpdateStatus;
 
@@ -556,12 +557,16 @@ export function updateLines(theme: Theme, s: Pick<Snapshot, "update" | "notices"
 	const cmd = (c: string) => `${theme.fg("dim", "· run")} ${theme.fg("accent", c)}`;
 	const latest = s.notices.release?.version ?? (!("kind" in s.update) && s.update.status === "available" ? s.update.latestVersion : undefined);
 	if (latest) {
-		rows.push(`${bullet} ${theme.bold("pi")} ${theme.fg("dim", `v${VERSION} →`)} ${theme.fg("warning", latest)} ${cmd("pi update")}`);
+		// Under Pi-Bolt `latest` is a Pi-Bolt release and VERSION the Pi it is built on, so show auto-update's own current.
+		// Under Pi-Bolt it never falls back to VERSION (Pi's number, not Pi-Bolt's): the arrow is dropped instead.
+		const current = !("kind" in s.update) && s.update.status === "available" ? s.update.currentVersion : runningCompiled() ? undefined : VERSION;
+		const from = current ? `${theme.fg("dim", `v${current} →`)} ` : "";
+		rows.push(`${bullet} ${theme.bold("pi")} ${from}${theme.fg("warning", latest)} ${cmd(updateCommand().display)}`);
 		const note = s.notices.release?.note?.trim().split("\n")[0];
 		if (note) rows.push(`  ${theme.fg("dim", truncateToWidth(note, 60))}`);
 		rows.push(`  ${theme.fg("dim", "changelog: pi.dev/changelog")}`);
 	}
-	for (const p of s.notices.packages ?? []) rows.push(`${bullet} ${theme.bold(p)} ${cmd("pi update --extensions")}`);
+	for (const p of s.notices.packages ?? []) rows.push(`${bullet} ${theme.bold(p)} ${cmd(`${updateCommand().display} --extensions`)}`);
 	if (!rows.length) return [];
 	return ["", `${theme.fg("warning", theme.bold("Updates"))} ${theme.fg("dim", "─".repeat(12))}`, ...rows];
 }
