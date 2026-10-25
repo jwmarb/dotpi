@@ -241,7 +241,7 @@ describe("gpu / disk / updates", () => {
 		expect(parseGpus("win32", "NVIDIA GeForce RTX 4070\r\n\r\n")).toEqual(["NVIDIA GeForce RTX 4070"]);
 	});
 	test("diskUsage formats, bad path is undefined", () => {
-		expect(diskUsage("/")).toMatch(/^[\d.]+ GiB \/ [\d.]+ GiB \(\d+%\)$/);
+		expect(diskUsage("/")).toMatch(/^[\d.]+ [GT]iB \/ [\d.]+ [GT]iB \(\d+%\)$/);
 		expect(diskUsage("/definitely/not/here")).toBeUndefined();
 	});
 	test("size switches to TiB", () => {
