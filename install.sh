@@ -22,6 +22,8 @@
 #   5c. offers to install the herdr CLI, which the subagent tool delegates through
 #   5d. adds ~/.bun/bin and ~/.local/bin to your shell rc PATH, when missing
 #   6. copies agent/.env.example to agent/.env for you to fill in
+#   7. with --pi-bolt: sets up Pi-Bolt (the AOT-compiled pi) beside pi,
+#      via scripts/migrate-pi-bolt.sh; pi keeps working either way
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
 #
@@ -30,6 +32,7 @@
 #   --ref <ref>    branch or tag to check out (default: master)
 #   --yes          assume yes for the backup and herdr prompts (unattended installs)
 #   --no-pi        do not install pi even if it is missing
+#   --pi-bolt      also set up Pi-Bolt (scripts/migrate-pi-bolt.sh); pi stays the fallback
 #   --help
 #
 # Exit codes: 0 ok · 1 usage/precondition · 2 refused to touch an existing ~/.pi
@@ -41,6 +44,7 @@ CLONE_DIR=""
 REF="master"
 ASSUME_YES=0
 INSTALL_PI=1
+PI_BOLT=0
 
 # ---------------------------------------------------------------------------
 # Output. Colour only when stdout is a terminal, so a piped log stays readable.
@@ -68,6 +72,7 @@ while [ $# -gt 0 ]; do
 		--ref)   REF="${2:-}";       [ -n "$REF" ]       || die "--ref needs a ref";  shift 2 ;;
 		--yes|-y) ASSUME_YES=1; shift ;;
 		--no-pi) INSTALL_PI=0; shift ;;
+		--pi-bolt) PI_BOLT=1; shift ;;
 		--help|-h) usage ;;
 		*) die "unknown argument: $1 (try --help)" ;;
 	esac
@@ -524,6 +529,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7. Pi-Bolt (opt-in: --pi-bolt)
+#
+# Pi-Bolt installs beside pi and shares agent/, so this only adds: the
+# binary, two Pi-Bolt-only settings entries, opensec-pi-fff, and a compiled
+# build. Never fatal: a failure leaves pi exactly as it was.
+# ---------------------------------------------------------------------------
+if [ "$PI_BOLT" -eq 1 ]; then
+	step "Setting up Pi-Bolt"
+	if bash scripts/migrate-pi-bolt.sh; then
+		ok "Pi-Bolt ready: run pi-bolt (pi still works)"
+	else
+		warn "Pi-Bolt setup did not finish; pi is unaffected. Retry: bash scripts/migrate-pi-bolt.sh"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 printf '\n%sInstalled.%s  %s\n\n' "$GRN$B" "$R" "$TARGET"
@@ -548,7 +569,7 @@ if [ "$PATH_LINES_ADDED" -gt 0 ]; then
 	printf '  %sor just open a new terminal.%s\n\n' "$DIM" "$R"
 fi
 
-printf 'Then start it:\n\n    pi\n\n'
+if [ "$PI_BOLT" -eq 1 ]; then printf 'Then start it:\n\n    pi-bolt      %s# or pi; both share this config%s\n\n' "$DIM" "$R"; else printf 'Then start it:\n\n    pi\n\n'; printf '%sFaster: bash scripts/migrate-pi-bolt.sh sets up Pi-Bolt beside pi.%s\n\n' "$DIM" "$R"; fi
 printf '%sVerify it works:%s\n' "$B" "$R"
 printf '    pi /mcp            %s# are the MCP servers reachable with your keys?%s\n' "$DIM" "$R"
 printf '    pi /sessions       %s# extensions loaded (this one is an extension)%s\n\n' "$DIM" "$R"
