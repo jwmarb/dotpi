@@ -61,6 +61,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { agentDir } from "../lib/layout.js";
+import { BE_BUN_ENV, runningCompiled } from "../lib/runtime.js";
 import { cachedByWidth } from "../lib/widget.js";
 import { closePane, paneExists, paneLabel, paneRect, renamePane, runInPane, splitPaneOf } from "../subagent-herdr/herdr.js";
 import {
@@ -200,9 +201,14 @@ type KanbanParamsType = {
 	run_id?: string;
 };
 
-/** `bun` for the board process. pi normally runs under node, so search PATH; a bun-hosted pi can use its own binary. */
-function findBun(): string | undefined {
-	if (process.versions.bun) return process.execPath;
+/**
+ * `bun` for the board process, with any env it needs. pi normally runs under node, so search PATH; a bun-hosted pi
+ * can use its own binary. A compiled pi (Pi-Bolt) is also bun-hosted, but its executable is pi itself: it becomes
+ * the `bun` CLI only under `BUN_BE_BUN=1` — without it, it parses the board's flags as pi's and the pane dies.
+ */
+function findBun(): { bin: string; env: Record<string, string> } | undefined {
+	if (runningCompiled()) return { bin: process.execPath, env: { ...BE_BUN_ENV } };
+	if (process.versions.bun) return { bin: process.execPath, env: {} };
 	const executable = (p: string): boolean => {
 		try {
 			accessSync(p, constants.X_OK);
@@ -211,7 +217,8 @@ function findBun(): string | undefined {
 			return false;
 		}
 	};
-	return findOnPath("bun", process.env.PATH, executable, [join(homedir(), ".bun", "bin", "bun")]);
+	const found = findOnPath("bun", process.env.PATH, executable, [join(homedir(), ".bun", "bin", "bun")]);
+	return found ? { bin: found, env: {} } : undefined;
 }
 
 /** Is `pid` a live process? EPERM means it exists but is not ours: alive. */
@@ -475,7 +482,11 @@ export default function kanban(pi: ExtensionAPI) {
 		const paneId = await splitPaneOf(rec.ownerPaneId, split.kind, split.ratio, ctx.cwd);
 		if (!paneId) return fallBack(ctx, "herdr refused to split the pane");
 		await renamePane(paneId, BOARD_LABEL);
-		const command = paneCommand([bun, BOARD_SCRIPT, "--file", rec.projectionFile!, "--owner-pid", String(process.pid), "--agent-dir", agentDir()]);
+		const command = paneCommand(
+			[bun.bin, BOARD_SCRIPT, "--file", rec.projectionFile!, "--owner-pid", String(process.pid), "--agent-dir", agentDir()],
+			process.platform,
+			bun.env,
+		);
 		const ran = await runInPane(paneId, command);
 		if (!ran.ok) {
 			await closePane(paneId);

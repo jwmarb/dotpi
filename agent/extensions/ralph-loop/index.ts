@@ -59,6 +59,7 @@ import {
 import { type Baseline, captureBaseline, runGate } from "./gate.js";
 import { ensureImage } from "./image.js";
 import { runRuntimeGate } from "./runtime-gate.js";
+import { piExecutable } from "../lib/runtime.js";
 
 /** Footer status key. */
 const STATUS_KEY = "ralph-loop";
@@ -148,9 +149,10 @@ export default function activate(pi: ExtensionAPI): void {
 	 * `process.argv[1]` is the script pi was launched as, which is exactly the
 	 * binary that owns the extension alias map and the litellm provider. Resolving
 	 * `pi` off `PATH` instead would risk finding a different install (see the root
-	 * AGENTS.md note on the pre-rename `@mariozechner` copy).
+	 * AGENTS.md note on the pre-rename `@mariozechner` copy). Under a compiled pi
+	 * (Pi-Bolt) `argv[1]` is a virtual `/$bunfs` path, so the executable is used.
 	 */
-	const piBinaryPath = (): string => process.argv[1] ?? "pi";
+	const piBinaryPath = (): string => piExecutable();
 
 	/** Drop any queued continuation. */
 	const cancelPendingContinuation = (): void => {

@@ -118,6 +118,7 @@ agent/fff/
 agent/npm/
 agent/bin/
 agent/git/
+agent/cache/
 
 # Scratch materialisation of the git index by scripts/check.sh (CHECK_STAGED=1).
 .git-check/

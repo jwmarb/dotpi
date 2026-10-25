@@ -128,7 +128,7 @@ export async function captureBaseline(
 export interface GateRequest {
 	state: LoopState;
 	evidence: VerificationEvidence;
-	/** Absolute path of the running `pi` binary (`process.argv[1]`). */
+	/** Absolute path of the running `pi` binary (`piExecutable()`: `argv[1]`, or the executable under Pi-Bolt). */
 	piBinary: string;
 	/** Agent definition name, e.g. `oracle`. */
 	agent: string;

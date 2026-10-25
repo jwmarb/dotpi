@@ -172,12 +172,14 @@ import {
   promptAgent,
   readAgent,
   renamePane,
+  runInPane,
   sendKeys,
   sendPrompt,
   startAgent,
   waitAgentIdle,
   waitAgentWorking,
 } from "./herdr.js";
+import { piShimDir, prependPathCommand, runningCompiled } from "../lib/runtime.js";
 import {
   createRunLifecycle,
   type PaneObservation,
@@ -397,9 +399,31 @@ export interface Launcher {
   renamePane: typeof renamePane;
   startAgent: typeof startAgent;
   closePane: typeof closePane;
+  /**
+   * Readies the pane's shell before `startAgent` types `pi` into it. Optional:
+   * stubs omit it. The real one makes a compiled pi (Pi-Bolt) launch *itself*
+   * as the child (see {@link prepareChildShell}).
+   */
+  preparePane?: (paneId: string) => Promise<void>;
 }
 
-const realLauncher: Launcher = { createChildPane, renamePane, startAgent, closePane };
+/**
+ * Under a compiled pi (Pi-Bolt), `herdr agent start --kind pi` would type a
+ * bare `pi` that the pane's rc files resolve to the node install, so the child
+ * would silently run a different pi. Put a `pi` symlink to this executable
+ * first on the pane shell's PATH. Exported in the shell rather than passed as
+ * `--env PATH=`, which `~/.bashrc` re-prepends over. A no-op otherwise.
+ */
+async function prepareChildShell(paneId: string): Promise<void> {
+  if (!runningCompiled()) return;
+  const dir = piShimDir();
+  const ran = dir ? await runInPane(paneId, prependPathCommand(dir)) : { ok: false, error: "no private shim dir" };
+  // Not fatal (the child still starts, as the PATH's pi), but it is the exact
+  // silent mis-launch this exists to prevent, so say so.
+  if (!ran.ok) console.warn(`subagent-herdr: child may run a non-Pi-Bolt pi (shim: ${ran.error ?? "herdr refused"})`);
+}
+
+const realLauncher: Launcher = { createChildPane, renamePane, startAgent, closePane, preparePane: prepareChildShell };
 
 /** Outcome of the one launch attempt. */
 export interface AttemptOutcome {
@@ -463,6 +487,7 @@ export async function launchAttempt(
     };
   }
   await launcher.renamePane(pane.paneId, label);
+  await launcher.preparePane?.(pane.paneId);
 
   // The child always launches on the router: `fallback/auto` names the router,
   // and the chain in the env tells it what to route between (and applies any

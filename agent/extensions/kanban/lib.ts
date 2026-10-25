@@ -996,10 +996,24 @@ export function powershellQuote(value: string): string {
  * The command a pane runs to become `argv`, closing when it exits. POSIX
  * shells `exec`; on Windows the pane shell is PowerShell, which has no `exec`,
  * so call the program with `&` and exit with its status.
+ *
+ * `env` is set for the program only: through `env(1)` under POSIX, and as
+ * `$env:` assignments in the pane's own PowerShell (which the pane closes with).
+ * Pi-Bolt needs it: its compiled executable is the `bun` CLI only with
+ * `BUN_BE_BUN=1` (see `lib/runtime.ts`).
  */
-export function paneCommand(argv: readonly string[], platform: NodeJS.Platform = process.platform): string {
-	if (platform !== "win32") return shellJoin(["exec", ...argv]);
-	return `& ${argv.map(powershellQuote).join(" ")}; exit $LASTEXITCODE`;
+export function paneCommand(
+	argv: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+	env: Readonly<Record<string, string>> = {},
+): string {
+	const pairs = Object.entries(env);
+	if (platform !== "win32") {
+		const prefix = pairs.length > 0 ? ["env", ...pairs.map(([k, v]) => `${k}=${v}`)] : [];
+		return shellJoin(["exec", ...prefix, ...argv]);
+	}
+	const sets = pairs.map(([k, v]) => `$env:${k} = ${powershellQuote(v)}; `).join("");
+	return `${sets}& ${argv.map(powershellQuote).join(" ")}; exit $LASTEXITCODE`;
 }
 
 /**

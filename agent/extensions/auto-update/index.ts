@@ -12,8 +12,31 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { originalEntry, runningCompiled } from "../lib/runtime.js";
 
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+/** Pi-Bolt's npm package: its version is the one to compare when pi is compiled. */
+const PIBOLT_PACKAGE_NAME = "pi-bolt";
+
+/** The npm package whose releases update the running pi. */
+function updatePackage(): string {
+	return runningCompiled() ? PIBOLT_PACKAGE_NAME : PACKAGE_NAME;
+}
+
+/**
+ * The command that installs the update. Pi-Bolt updates itself (`pi-bolt
+ * update`: signature-checked, keeps the JIT/variant chosen, rollback-able); a
+ * bun-global `bun update` would not touch the compiled executable at all.
+ */
+export function updateCommand(compiled: boolean = runningCompiled()): { bin: string; args: string[]; display: string } {
+	if (compiled) return { bin: process.execPath, args: ["update", "--self", "--no-approve"], display: "pi-bolt update" };
+	return { bin: "bun", args: ["update", "--global", PACKAGE_NAME], display: "pi update" };
+}
+
+/** `pi-bolt --version` prints `1.4.0 (Pi-Bolt 1.0.2, linux-x64, JIT off)`. Exported for tests. */
+export function parsePiBoltVersion(stdout: string): string | null {
+	return /Pi-Bolt (\d+\.\d+\.\d+[^\s,)]*)/.exec(stdout)?.[1] ?? null;
+}
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours between checks
 
 
@@ -44,7 +67,7 @@ export default function (pi: ExtensionAPI) {
 
 				const confirmed = await ctx.ui.confirm(
 					"Update pi",
-					`Update from ${currentVersion} to ${latestVersion}?\n\nThis will update the global bun package and restart pi.`,
+					`Update from ${currentVersion} to ${latestVersion}?\n\nThis will run \`${updateCommand().display}\` and restart pi.`,
 				);
 
 				if (!confirmed) {
@@ -55,11 +78,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.setStatus("auto-update", `Updating to ${latestVersion}...`);
 				ctx.ui.notify("Updating pi... this may take a moment.", "info");
 
-				const result = await pi.exec(
-					"bun",
-					["update", "--global", PACKAGE_NAME],
-					{ timeout: 120000 },
-				);
+				const update = updateCommand();
+				const result = await pi.exec(update.bin, update.args, { timeout: 120000 });
 
 				if (result.code !== 0) {
 					ctx.ui.notify(
@@ -151,17 +171,26 @@ export default function (pi: ExtensionAPI) {
  * release against a version the user was not running and offered an update
  * they already had.
  *
- * `process.execPath` is the bun runtime, not pi, so the package is located by
+ * Under script pi `process.execPath` is the bun runtime, not pi, so the package is located by
  * resolving the `pi` symlink on PATH back to its own `package.json`.
  */
-function getCurrentVersion(): string | null {
+async function getCurrentVersion(pi: ExtensionAPI): Promise<string | null> {
+	if (runningCompiled()) {
+		// No package.json on disk: the executable reports its own version.
+		try {
+			const r = await pi.exec(process.execPath, ["--version"], { timeout: 5000 });
+			return r.code === 0 ? parsePiBoltVersion(r.stdout) : null;
+		} catch {
+			return null;
+		}
+	}
 	try {
 		// process.argv[1] is the `pi` entry script being run. Resolving the
 		// symlink lands inside the package that is actually executing, whatever
 		// its install layout (bun global, npm, a checkout). `import.meta.resolve`
 		// does not work here: jiti aliases the package for extensions, so it
 		// throws "Cannot find module" inside a running pi.
-		let dir = dirname(realpathSync(process.argv[1] ?? ""));
+		let dir = dirname(realpathSync(originalEntry() ?? ""));
 		for (let i = 0; i < 5; i++) {
 			const candidate = join(dir, "package.json");
 			if (existsSync(candidate)) {
@@ -205,9 +234,9 @@ export function getUpdateStatus(pi: ExtensionAPI, force = false): Promise<Update
 
 async function computeUpdateStatus(pi: ExtensionAPI): Promise<UpdateStatus> {
 	try {
-		const currentVersion = getCurrentVersion();
+		const currentVersion = await getCurrentVersion(pi);
 		if (!currentVersion) return { status: "error" };
-		const r = await pi.exec("npm", ["view", PACKAGE_NAME, "version"], { timeout: 15000 });
+		const r = await pi.exec("npm", ["view", updatePackage(), "version"], { timeout: 15000 });
 		const latestVersion = r.stdout.trim();
 		if (r.code !== 0 || !latestVersion) return { status: "error" };
 		return compareSemver(latestVersion, currentVersion) > 0
@@ -222,13 +251,13 @@ async function checkForUpdate(
 	pi: ExtensionAPI,
 ): Promise<{ currentVersion: string; latestVersion: string } | null> {
 	// Get current installed version
-	const currentVersion = getCurrentVersion();
+	const currentVersion = await getCurrentVersion(pi);
 	if (!currentVersion) return null;
 
 	// Get latest version from npm registry
 	const latestResult = await pi.exec(
 		"npm",
-		["view", PACKAGE_NAME, "version"],
+		["view", updatePackage(), "version"],
 		{ timeout: 15000 },
 	);
 

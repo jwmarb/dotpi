@@ -9,7 +9,8 @@
     "+builtin:mcp",
     "+builtin:codemode",
     "-builtin:llama.cpp",
-    "-builtin:tool-search"
+    "-builtin:tool-search",
+    "-builtin:herdr"
   ],
   "images": {
     "autoResize": true
@@ -59,5 +60,12 @@
     "mode": "cycle",
     "style": "pixels",
     "height": 13
+  },
+  "piBolt": {
+    "packages": [
+      "-npm:@ff-labs/pi-fff",
+      "npm:opensec-pi-fff@0.11.1"
+    ],
+    "packagesOverlay": true
   }
 }

@@ -1662,6 +1662,20 @@ describe("launchAttempt fallback chain handoff", () => {
     expect(argv[argv.indexOf("--model") + 1]).toBe("fallback/auto");
   });
 
+  test("preparePane runs after renamePane and before startAgent", async () => {
+    // The Pi-Bolt shim must be on the pane shell's PATH before herdr types `pi`.
+    const calls: string[] = [];
+    const r = recordingLauncher();
+    const launcher: Launcher = {
+      ...r.launcher,
+      renamePane: async () => (calls.push("rename"), true),
+      preparePane: async () => void calls.push("prepare"),
+      startAgent: async (...a) => (calls.push("start"), r.launcher.startAgent(...a)),
+    };
+    await launchAttempt(stubAgent, stubRec, "/tmp", "/tmp/p.md", launcher, chain);
+    expect(calls).toEqual(["rename", "prepare", "start"]);
+  });
+
   test("with no chain the child still launches on the router, and no chain var crosses", async () => {
     // `spawnRun` refuses a chain-less agent before any pane, so this is the
     // degenerate direct call: the model is always the router, and only a
