@@ -283,6 +283,19 @@ cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p
 - **Secrets live only in `agent/.env`.** `litellm.ts` reads `LITELLM_API_KEY` lazily and `firecrawl-cli.ts` loads `FIRECRAWL_API_URL` into the real `process.env`; a literal key in a tracked file defeats both.
 - **Commits follow Conventional Commits** per [`agent/prompts/git-commit.md`](agent/prompts/git-commit.md).
 
+## Pi-Bolt ⚡
+
+[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably.
+
+```sh
+bash scripts/migrate-pi-bolt.sh           # set it up (or: install.sh --pi-bolt)
+bash scripts/migrate-pi-bolt.sh --check   # what is set up; changes nothing
+bash scripts/migrate-pi-bolt.sh --undo    # back to plain pi only
+bash scripts/pi-bolt-compile.sh           # re-compile after editing an extension
+```
+
+The setup keeps the bun `pi`, which the kanban board and the tests still use. It adds two Pi-Bolt-only settings that plain pi ignores, swaps pi-fff for the JIT-free `opensec-pi-fff` under Pi-Bolt only, and compiles the extensions in (verified, with automatic rollback on failure). On Windows, subagent children still run the bun `pi`.
+
 ## OS Compatibility
 
 Linux, macOS, and Windows. The configuration itself is plain JSON/TypeScript/Markdown and platform-agnostic; the installer is the only OS-specific piece, and it comes in two twins — `install.sh` (bash, for Linux/macOS) and [install.ps1](install.ps1) (PowerShell, for Windows) — that do the same job in each OS's idiom:
