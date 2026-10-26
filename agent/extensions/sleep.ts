@@ -193,7 +193,7 @@ export const sleepTool = defineTool({
         }
         if (status === "woken") {
             return new Text(
-                theme.fg("success", `✓ woke early after ${details!.elapsed}s of ${details!.timeout}s — message queued`),
+                theme.fg("success", `✓ woke early after ${details!.elapsed}s of ${details!.timeout}s — new message arrived`),
                 0,
                 0,
             );
