@@ -14,5 +14,5 @@
       "@earendil-works/*": ["../../../../../.bun/install/global/node_modules/@earendil-works/*"]
     }
   },
-  "include": ["lib.ts", "index.ts", "settings.ts", "footer.ts"]
+  "include": ["lib.ts", "index.ts", "settings.ts", "footer.ts", "served.ts"]
 }

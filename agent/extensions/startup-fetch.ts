@@ -27,6 +27,20 @@ import { pickLogo, renderLogo, truecolor } from "./lib/distro-logos.js";
 import { chooseImage, IMAGE_MODES, type ImageMode, listImages, parseMode, readState, writeState } from "./lib/startup-images.js";
 import { getUpdateStatus, type UpdateStatus, updateCommand } from "./auto-update/index.js";
 import { runningCompiled } from "./lib/runtime.js";
+// The `Model` row resolves a `fallback/auto` selection through `computeDisplay`,
+// the footer's own resolver, against the chain the router *published* when it
+// registered (`model-fallback/served.ts`), not a fresh read of settings. Both
+// imports are load-safe: `lib.js` imports nothing, and `served.js` holds only
+// type imports and two accessors.
+import {
+	FALLBACK_MODEL_ID,
+	FALLBACK_MODEL_REF,
+	FALLBACK_PROVIDER,
+	type ChainEntry,
+	computeDisplay,
+	formatEntry,
+} from "./model-fallback/lib.js";
+import { servedRouter } from "./model-fallback/served.js";
 
 type UpdateState = { kind: "checking" } | UpdateStatus;
 
@@ -489,6 +503,7 @@ interface Snapshot {
 	gpus?: string[];
 	disks: [string, string][];
 	cwd: string;
+	/** The `Model` row's text — see {@link modelRowText}; built theme-free so `snapshot` needs no `Theme`. */
 	model: string;
 	branch?: string;
 	update: UpdateState;
@@ -512,7 +527,7 @@ function snapshot(ctx: ExtensionContext): Snapshot {
 		memory: `${gib(used)} GiB / ${gib(total)} GiB (${Math.round((used / total) * 100)}%)`,
 		disks: diskRows(ctx.cwd),
 		cwd: homeRel(ctx.cwd),
-		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none",
+		model: modelRow(ctx),
 		update: { kind: "checking" },
 		notices: {},
 	};
@@ -569,6 +584,95 @@ export function updateLines(theme: Theme, s: Pick<Snapshot, "update" | "notices"
 	for (const p of s.notices.packages ?? []) rows.push(`${bullet} ${theme.bold(p)} ${cmd(`${updateCommand().display} --extensions`)}`);
 	if (!rows.length) return [];
 	return ["", `${theme.fg("warning", theme.bold("Updates"))} ${theme.fg("dim", "─".repeat(12))}`, ...rows];
+}
+
+/**
+ * The `Model` row's value: the model that will serve the next user turn.
+ *
+ * "User turn" is exact, not loose wording. pi routes out-of-loop requests
+ * (summarization, compaction) with `reason: "direct"`, and `advance("direct")`
+ * goes to the router's probe `home`, which can be a later entry after a dead
+ * primary. Those requests are not the conversation, so the row does not name them.
+ *
+ * A `fallback/auto` selection names the *router*, not a model, so printing it
+ * verbatim — which is all this used to do — says nothing about the chain member
+ * that answers. Resolution is `computeDisplay`, the footer's own resolver
+ * (`model-fallback/footer.ts`), so the two surfaces apply the same rules.
+ *
+ * It is called with **no session entries**, deliberately. `computeDisplay` uses
+ * the stored router index to name the model that *last* answered, which fits
+ * the footer: it is redrawn after every response, so it is never wrong for long.
+ * This row is drawn once at startup, and on a user turn `advance("user")`
+ * (`model-fallback/lib.ts`) resets to the primary. So a
+ * resumed session whose last answer came from entry 2 would still start at the
+ * primary, and the stored index would name the wrong model until the next
+ * `/fetch`. With no entries the index is 0, and `isReachable` then walks it
+ * forward past entries this machine cannot reach, the same walk `route()` does.
+ *
+ * `chain` is the router's *published* chain (`model-fallback/served.ts`). It is
+ * empty when no router is registered in this process, and then nothing is
+ * resolved and the row prints the bare selection.
+ *
+ * The router case renders `fallback/auto → qwen/…`, not a bare entry ref. The
+ * primary is where the router *starts*: if it fails, the request moves down the
+ * chain, and a bare ref would read as "this is the model in use". Keeping the
+ * prefix says what is actually true: the router is selected, and it starts
+ * there. A chain entry's *pinned* thinking level is shown, via `formatEntry`.
+ * The effective level is not, which is why this takes no `thinkingLevel`: that
+ * is the live footer's job, and a value frozen into a startup panel would be
+ * the first thing to go stale.
+ */
+export function modelRowText(input: {
+	/** The current selection, from pi (`ctx.model`); undefined before one exists. */
+	selection?: { provider: string; modelId: string };
+	/** The chain the registered router serves; `[]` when no router is registered. */
+	chain: readonly ChainEntry[];
+	/** Whether a chain entry can serve on this machine — the router's own `resolve()`. */
+	isReachable?: (index: number) => boolean;
+}): string {
+	// No selection yet means pi has not picked a model, which a snapshot must not
+	// guess at. The footer can assume the router here because it is redrawn; this
+	// row is not.
+	if (!input.selection) return "none";
+	const display = computeDisplay({
+		entries: [],
+		chain: input.chain,
+		provider: FALLBACK_PROVIDER,
+		modelId: FALLBACK_MODEL_ID,
+		selection: input.selection,
+		isReachable: input.isReachable,
+	});
+	if (display.kind === "physical") return `${display.provider}/${display.modelId}`;
+	const entry = input.chain[display.index];
+	// Nothing at that index means no chain to resolve through: no router is
+	// registered in this process, but the selection still names it (a stale
+	// `/model` choice, or `enabled: false` after a reload). The selected ref is
+	// then the only true thing left to print.
+	if (!entry) return `${input.selection.provider}/${input.selection.modelId}`;
+	return `${FALLBACK_MODEL_REF} → ${formatEntry(entry)}`;
+}
+
+/**
+ * {@link modelRowText} for a live context, against the router's published chain.
+ *
+ * The try/catch keeps a display detail from costing the whole panel. This runs in
+ * the `setHeader` factory (through `snapshot`), and a throw there means pi
+ * reports an extension error and shows no fetch header at all. Reachability
+ * calls into pi's model registry, which this extension does not own. On any
+ * throw the row falls back to what it printed before this change: the bare
+ * selection.
+ */
+export function modelRow(ctx: ExtensionContext, router = servedRouter()): string {
+	const bare = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+	try {
+		return modelRowText({
+			selection: ctx.model ? { provider: ctx.model.provider, modelId: ctx.model.id } : undefined,
+			chain: router?.chain ?? [],
+			isReachable: router ? (index) => router.isReachable(ctx, index) : undefined,
+		});
+	} catch {
+		return bare;
+	}
 }
 
 function infoLines(theme: Theme, s: Snapshot): string[] {
@@ -629,6 +733,12 @@ function setFetchHeader(pi: ExtensionAPI, ctx: ExtensionContext, force = false, 
 		let art = ascii.lines;
 		let gutter = ascii.width + 3;
 		let graphic = false;
+		// Cached per width only, which stays correct here: every `setHeader` call builds
+		// a fresh closure with a fresh `cache` *and* a fresh snapshot, so a cached render
+		// can only return the model row this build resolved. The background fills change
+		// `update`/`notices`/`gpus`/`branch`, never the model. If the row is ever made
+		// live (re-resolved on `model_select`, say), this width-only key is what has to
+		// change — not the snapshot.
 		let cache: { width: number; lines: string[] } | undefined;
 		let disposed = false;
 		const refresh = () => {

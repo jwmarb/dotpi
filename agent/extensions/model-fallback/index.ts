@@ -94,6 +94,7 @@ import {
 	VIRTUAL_MODEL_API,
 	VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
 } from "./lib.js";
+import { publishServedRouter } from "./served.js";
 import { readSettingsKey } from "./settings.js";
 
 /** Footer key for the hop notice. */
@@ -204,6 +205,11 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Clear what a previous load published, first: before anything here can throw
+	// and before the `register` early return. A `/reload` that turns the router off
+	// must not leave the last load's chain behind for `startup-fetch` to name a
+	// router that no longer exists. See `served.ts`.
+	publishServedRouter(undefined);
 	// Read from disk, not `pi.getSettings()`: that is a throwing stub during
 	// extension load, and the chain must be known now because
 	// `registerVirtualModel` happens at load. See `settings.ts`.
@@ -574,6 +580,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerVirtualModel<FallbackState>(virtualModelDefinition(initialName));
+	// Publish the chain this load registered, not a fresh read of settings:
+	// `chain` is fixed until the next `/reload` while the files and
+	// `PI_FALLBACK_CHAIN` are not, so another surface re-reading them would name a
+	// chain the router is not serving. Reachability goes through this file's
+	// `resolve()`, the same check `route()` and the footer use. See `served.ts`.
+	publishServedRouter({
+		chain,
+		isReachable: (ctx, index) => {
+			const entry = chain[index];
+			return entry !== undefined && resolve(ctx, entry) !== undefined;
+		},
+	});
 
 	pi.registerCommand("fallback-chain", {
 		description: "Show the model fallback chain and its budget",

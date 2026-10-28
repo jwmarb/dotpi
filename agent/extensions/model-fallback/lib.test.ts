@@ -64,6 +64,7 @@ import {
 	upstreamHop,
 	upstreamRecovery,
 } from "./lib.ts";
+import { publishServedRouter, servedRouter } from "./served.ts";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 const CONFIG: FallbackConfig = { maxCycles: 10, maxProbes: 2 };
@@ -1781,6 +1782,107 @@ describe("index.ts registration", () => {
 			undefined,
 		);
 		expect(model).toBeUndefined();
+	});
+
+	describe("publishes the chain it registered, for startup-fetch's Model row", () => {
+		/**
+		 * Load the factory against one settings file and env chain, with the env
+		 * swapped back *before* the assertions run: the row must report what the
+		 * router registered at load, not whatever the env holds when it is read.
+		 */
+		async function load(settings: Record<string, unknown> | null, envChain: string | undefined) {
+			const prior = servedRouter();
+			const dir = mkdtempSync(join(tmpdir(), "model-fallback-served-"));
+			if (settings) writeFileSync(join(dir, "settings.json"), JSON.stringify(settings), "utf-8");
+			const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+			const originalEnvChain = process.env[CHAIN_ENV];
+			process.env.PI_CODING_AGENT_DIR = dir;
+			if (envChain === undefined) delete process.env[CHAIN_ENV];
+			else process.env[CHAIN_ENV] = envChain;
+			let registered: string | undefined;
+			let served: ReturnType<typeof servedRouter>;
+			try {
+				const mod = await import(`./index.js?mf-served=${++importCounter}`);
+				mod.default({
+					on: () => {},
+					getSettings: () => ({}),
+					registerVirtualModel: (def: { name: string }) => {
+						registered = def.name;
+					},
+					registerCommand: () => {},
+				} as unknown as Parameters<typeof mod.default>[0]);
+				served = servedRouter();
+			} finally {
+				// Restored in the same `finally` as the env, so a factory that throws
+				// cannot leave its chain in the process-wide slot for later tests.
+				publishServedRouter(prior);
+				if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+				else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+				if (originalEnvChain === undefined) delete process.env[CHAIN_ENV];
+				else process.env[CHAIN_ENV] = originalEnvChain;
+			}
+			return { registered, served };
+		}
+
+		test("the published chain is exactly the registered one", async () => {
+			const { registered, served } = await load({ modelFallback: { chain: ["a/1", { model: "b/2", thinking: "low" }] } }, undefined);
+			expect(registered).toBe("Fallback chain (a/1 → b/2)");
+			expect(served?.chain).toEqual([{ ref: "a/1" }, { ref: "b/2", thinking: "low" }]);
+		});
+
+		test("an env chain is published as registered, and stays put after the env changes", async () => {
+			// `ralph-loop`'s gate swaps PI_FALLBACK_CHAIN around a child spawn. A row
+			// that re-read the env would name the child's chain; the published value
+			// is still the one this process registered.
+			const { served } = await load({ modelFallback: { chain: ["a/1"] } }, "x/9,y/8");
+			process.env[CHAIN_ENV] = "other/1";
+			try {
+				expect(served?.chain.map(formatModelRef)).toEqual(["x/9", "y/8"]);
+			} finally {
+				delete process.env[CHAIN_ENV];
+			}
+		});
+
+		test("a load that registers nothing clears what an earlier load published", async () => {
+			// `/reload` after turning the router off: the previous chain must not survive
+			// for the row to name a router that no longer exists.
+			const prior = servedRouter();
+			try {
+				publishServedRouter({ chain: [{ ref: "stale/1" }], isReachable: () => true });
+				const dir = mkdtempSync(join(tmpdir(), "model-fallback-off-"));
+				writeFileSync(join(dir, "settings.json"), JSON.stringify({ modelFallback: { enabled: false, chain: ["a/1"] } }), "utf-8");
+				const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+				const originalEnvChain = process.env[CHAIN_ENV];
+				process.env.PI_CODING_AGENT_DIR = dir;
+				delete process.env[CHAIN_ENV];
+				try {
+					const mod = await import(`./index.js?mf-served=${++importCounter}`);
+					mod.default({ on: () => {}, getSettings: () => ({}), registerVirtualModel: () => {}, registerCommand: () => {} } as unknown as Parameters<
+						typeof mod.default
+					>[0]);
+				} finally {
+					if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+					else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+					if (originalEnvChain !== undefined) process.env[CHAIN_ENV] = originalEnvChain;
+				}
+				expect(servedRouter()).toBeUndefined();
+			} finally {
+				publishServedRouter(prior);
+			}
+		});
+
+		test("the published predicate is the router's resolve(): reachable only with auth, never virtual", async () => {
+			const { served } = await load({ modelFallback: { chain: ["a/1", "b/2", "fallback/auto"] } }, undefined);
+			const physical = (provider: string, id: string) => ({ provider, id, api: "openai-completions" });
+			const ctx = {
+				modelRegistry: {
+					getAvailable: () => [physical("p", "a/1"), physical("p", "b/2"), { provider: "fallback", id: "auto", api: VIRTUAL_MODEL_API }],
+					hasConfiguredAuth: (m: { id: string }) => m.id !== "a/1",
+				},
+			} as unknown as Parameters<NonNullable<typeof served>["isReachable"]>[0];
+			// a/1 has no auth, b/2 does, and the router itself is never "reachable".
+			expect([0, 1, 2, 3].map((i) => served!.isReachable(ctx, i))).toEqual([false, true, false, false]);
+		});
 	});
 });
 

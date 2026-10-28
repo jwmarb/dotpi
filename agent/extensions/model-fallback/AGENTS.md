@@ -7,8 +7,9 @@ failed; once a fallback answers, the **original model gets the next request**.
 | File | Owns |
 |---|---|
 | `lib.ts` | The state machine and every message, plus `computeDisplay` (which model the UI should name). Pure and pi-free; covered by `lib.test.ts` |
-| `index.ts` | Session wiring: `registerVirtualModel` (and its live re-registration), `/fallback-chain`, the footer notice, installing the custom footer |
+| `index.ts` | Session wiring: `registerVirtualModel` (and its live re-registration), `/fallback-chain`, the footer notice, installing the custom footer, and publishing the registered chain to `served.ts` |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
+| `served.ts` | The chain the router registered plus its `resolve()` predicate, on `globalThis` for other extensions (today `../startup-fetch.ts`'s `Model` row). Cleared on every load before the `register` early return |
 | `footer.ts` | The `setFooter` replacement that shows the in-use physical model. Forks pi's built-in `footer.js` — see its deliberate-divergences note, and keep the width guarantee |
 | `footer.test.ts` | The width invariant (`no line exceeds the width` — exceeding it kills the `pi` process), the pure formatters, and the scan cache |
 
@@ -219,6 +220,19 @@ is what made the formula wrong rather than merely conservative.
 
 ## CONVENTIONS
 
+- **Another extension that needs the router's chain reads `served.ts`, never settings.**
+  The router fixes its chain at load and keeps it until `/reload`, while `settings.json`
+  and `PI_FALLBACK_CHAIN` can change underneath it: a settings edit with no reload, or
+  `ralph-loop`'s gate swapping the env around a child spawn. Re-reading either one can name
+  a chain the router is not serving. That was the first version of `startup-fetch`'s
+  `Model` row, and calling one shared function from both sides does not help, because they
+  call it at different times. So `index.ts` publishes the value it registered, and readers
+  read that value. It lives on `globalThis` because pi loads each extension with
+  `moduleCache: false`: a module-level export would be a separate copy in every importer.
+  The predicate it publishes is `resolve()` itself, so a reader never writes a second
+  resolver. `lib.test.ts` ("publishes the chain it registered") pins four things: the
+  published chain equals the registered one, it stays fixed after the env changes, a load
+  that registers nothing clears it, and the published predicate is `resolve()` itself.
 - **A chain entry is the reference as written, never a split provider/id pair.**
   `ChainEntry.ref` holds `qwen/qwen3.8-27b` whole, because on this repo's litellm
   gateway that entire string is one model **id** under the provider `litellm` —

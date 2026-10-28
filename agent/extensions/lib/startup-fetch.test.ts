@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from
 import os from "node:os";
 import { basename, join } from "node:path";
 import { setCapabilities, resetCapabilitiesCache, visibleWidth } from "@earendil-works/pi-tui";
-import { type Art, captureNotices, cleanCatimg, diskUsage, newNoticeStore, onNotices, parseGpus, size, updateLines, layoutRows, warnOnce, firstFrame, MAX_IMAGE_COLS, parseStyle, pickImage, readConfig, renderArt, writeSetting } from "../startup-fetch.ts";
+import { type Art, captureNotices, cleanCatimg, diskUsage, modelRow, modelRowText, newNoticeStore, onNotices, parseGpus, size, updateLines, layoutRows, warnOnce, firstFrame, MAX_IMAGE_COLS, parseStyle, pickImage, readConfig, renderArt, writeSetting } from "../startup-fetch.ts";
+import { FALLBACK_MODEL_ID, FALLBACK_PROVIDER, type ChainEntry } from "../model-fallback/lib.ts";
+import { publishServedRouter, servedRouter, type ServedRouter } from "../model-fallback/served.ts";
 import { chooseImage, listImages } from "./startup-images.ts";
 import { LOGO_KEYS, pickLogo, renderLogo, truecolor } from "./distro-logos.ts";
 
@@ -289,5 +291,107 @@ describe("gpu / disk / updates", () => {
 		const late: unknown[] = [];
 		onNotices((n) => late.push(n), store);
 		expect(late).toEqual([{ release: { version: "2.0.0", note: "n" }, packages: ["b"] }]);
+	});
+});
+
+describe("modelRowText — the Model row names the model, not only the router", () => {
+	const CHAIN: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2", thinking: "low" }];
+	const ROUTER = { provider: FALLBACK_PROVIDER, modelId: FALLBACK_MODEL_ID };
+
+	test("a router selection names the chain primary, behind the router", () => {
+		expect(modelRowText({ selection: ROUTER, chain: CHAIN })).toBe("fallback/auto → a/1");
+	});
+	test("a pinned thinking level is shown and an unpinned one is not", () => {
+		expect(modelRowText({ selection: ROUTER, chain: [CHAIN[1]!] })).toBe("fallback/auto → b/2 (thinking: low)");
+		expect(modelRowText({ selection: ROUTER, chain: [CHAIN[0]!] })).toBe("fallback/auto → a/1");
+	});
+	test("a physical selection prints provider/id and ignores the chain", () => {
+		expect(modelRowText({ selection: { provider: "litellm", modelId: "gpt-5.6-sol" }, chain: CHAIN })).toBe("litellm/gpt-5.6-sol");
+	});
+	test("a gateway id containing a slash prints as a canonical provider/id ref", () => {
+		// `litellm/qwen/qwen3.8-27b` is the canonical ref pi resolves on its first
+		// rule, and byte-identical to what this row printed before the fix, so the
+		// two slashes are correct rather than a wart. The footer shows only the id.
+		expect(modelRowText({ selection: { provider: "litellm", modelId: "qwen/qwen3.8-27b" }, chain: CHAIN })).toBe(
+			"litellm/qwen/qwen3.8-27b",
+		);
+	});
+	test("an unreachable primary is walked past, as route() does", () => {
+		expect(modelRowText({ selection: ROUTER, chain: CHAIN, isReachable: (i) => i === 1 })).toBe("fallback/auto → b/2 (thinking: low)");
+	});
+	test("nothing reachable still names the primary rather than nothing", () => {
+		// `walkToReachable` keeps its start index when no entry is reachable, which is
+		// also what a registry that is not populated yet looks like.
+		expect(modelRowText({ selection: ROUTER, chain: CHAIN, isReachable: () => false })).toBe("fallback/auto → a/1");
+	});
+	test("with no router registered, a router selection prints the bare ref", () => {
+		expect(modelRowText({ selection: ROUTER, chain: [] })).toBe("fallback/auto");
+	});
+	test("no selection prints none even when a router is registered", () => {
+		// A snapshot must not guess: the footer assumes the router here because it is
+		// redrawn after every response, but this row is drawn once.
+		expect(modelRowText({ chain: CHAIN })).toBe("none");
+		expect(modelRowText({ chain: [] })).toBe("none");
+	});
+});
+
+describe("modelRow — the live wiring: published chain, router's resolver, no throw", () => {
+	const CHAIN: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+	const ROUTER_MODEL = { provider: FALLBACK_PROVIDER, id: FALLBACK_MODEL_ID };
+
+	/** Only the fields `modelRow` touches; the cast is the test's, not the code's. */
+	const ctx = (model?: { provider: string; id: string }) => ({ model }) as unknown as Parameters<typeof modelRow>[0];
+
+	/** A published router whose `isReachable` records what it was asked. */
+	function served(reachable: (index: number) => boolean): ServedRouter & { asked: number[]; seenCtx: unknown[] } {
+		const asked: number[] = [];
+		const seenCtx: unknown[] = [];
+		return {
+			chain: CHAIN,
+			asked,
+			seenCtx,
+			isReachable: (c, index) => {
+				seenCtx.push(c);
+				asked.push(index);
+				return reachable(index);
+			},
+		};
+	}
+
+	test("names the published chain's entry, walked by the router's own predicate", () => {
+		const router = served((i) => i === 1);
+		const live = ctx(ROUTER_MODEL);
+		expect(modelRow(live, router)).toBe("fallback/auto → b/2");
+		// It must ask the router (not resolve on its own), with this session's ctx.
+		expect(router.asked).toEqual([0, 1]);
+		expect(router.seenCtx[0]).toBe(live);
+	});
+	test("with no router published, prints the bare selection", () => {
+		expect(modelRow(ctx(ROUTER_MODEL), undefined)).toBe("fallback/auto");
+		expect(modelRow(ctx(undefined), undefined)).toBe("none");
+	});
+	test("a physical selection never consults the router", () => {
+		const router = served(() => true);
+		expect(modelRow(ctx({ provider: "litellm", id: "gpt-5.6-sol" }), router)).toBe("litellm/gpt-5.6-sol");
+		expect(router.asked).toEqual([]);
+	});
+	test("a throwing resolver degrades to the bare selection instead of losing the header", () => {
+		const router = served(() => {
+			throw new Error("registry not ready");
+		});
+		expect(modelRow(ctx(ROUTER_MODEL), router)).toBe("fallback/auto");
+	});
+	test("defaults to what model-fallback published on globalThis", () => {
+		// This is the cross-extension path: pi imports each extension with
+		// `moduleCache: false`, so the value has to survive a separate module copy.
+		const prior = servedRouter();
+		try {
+			publishServedRouter({ chain: [{ ref: "z/9" }], isReachable: () => true });
+			expect(modelRow(ctx(ROUTER_MODEL))).toBe("fallback/auto → z/9");
+			publishServedRouter(undefined);
+			expect(modelRow(ctx(ROUTER_MODEL))).toBe("fallback/auto");
+		} finally {
+			publishServedRouter(prior);
+		}
 	});
 });
