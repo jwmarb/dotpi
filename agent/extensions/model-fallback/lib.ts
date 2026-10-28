@@ -335,6 +335,127 @@ export function levelFor(
 }
 
 /**
+ * Minimal structural view of a session entry, for display decisions.
+ *
+ * Keeps `lib.ts` pi-free: only the fields the router-state lookup reads.
+ * `SessionEntry` (from pi) is structurally assignable to this, so a caller can
+ * pass a branch straight in.
+ */
+export interface DisplayEntry {
+	type: string;
+	customType?: string;
+	data?: unknown;
+}
+
+/**
+ * Which model the UI should display for the current selection.
+ *
+ * `fallback` names the chain index the router will use next — i.e. the
+ * physical model in use — with its effective level. `physical` names a
+ * concrete non-router selection the user made directly.
+ */
+export type ModelDisplay =
+	| { kind: "fallback"; index: number; level: ThinkingLevel }
+	| { kind: "physical"; provider: string; modelId: string; level: ThinkingLevel };
+
+/**
+ * Decide which model to display.
+ *
+ * The **selection** is authoritative and comes from pi itself — `ctx.model` for
+ * the model and `ctx.thinkingLevel` for the level. It is *not* inferred from
+ * the session branch: the branch is a record of what was used, it lags the
+ * selection, and it is not reconciled for non-router models at all. A session
+ * on physical `A` that navigates to a branch whose last `model_change` is
+ * physical `B` gets no new `model_change` (pi only records selections when one
+ * side is a virtual model), so a branch-derived display would name `B`
+ * indefinitely while `A` is selected.
+ *
+ * The branch is read for exactly one thing: the stored router state, which says
+ * which chain index the router will use next. That index is clamped to the
+ * chain and, given `isReachable`, walked forward to the first entry this machine
+ * can actually serve — mirroring `route()`. Without that walk the display can
+ * name an entry whose credentials are missing while every response actually
+ * comes from further down the chain, and it would never self-correct, because
+ * the stored index only moves when its state changes.
+ *
+ * Pass `selection: undefined` when no model is selected yet (startup): the
+ * router is then assumed, and the display names the chain primary.
+ *
+ * Pure: no pi imports. Reuses {@link readVirtualModelState}, {@link levelFor}
+ * and {@link isThinkingLevel}.
+ */
+export function computeDisplay(input: {
+	entries: readonly DisplayEntry[];
+	chain: readonly ChainEntry[];
+	/** Provider id of the router. */
+	provider: string;
+	/** Model id of the router. */
+	modelId: string;
+	/** The current selection, from pi (`ctx.model`). Undefined before one exists. */
+	selection?: { provider: string; modelId: string };
+	/** The selected thinking level, from pi (`ctx.thinkingLevel`). */
+	thinkingLevel?: string;
+	/**
+	 * Whether the chain entry at `index` can actually serve a request. When
+	 * given, the returned index walks forward from the stored index to the
+	 * first reachable entry, mirroring `route()`; when nothing is reachable the
+	 * stored index is kept, so the caller still has something to display.
+	 */
+	isReachable?: (index: number) => boolean;
+}): ModelDisplay {
+	const selectedLevel: ThinkingLevel = isThinkingLevel(input.thinkingLevel) ? input.thinkingLevel : "off";
+	const selection = input.selection;
+
+	// A concrete physical selection is displayed as itself; only the router needs
+	// to be resolved through the chain.
+	if (selection && !(selection.provider === input.provider && selection.modelId === input.modelId)) {
+		return {
+			kind: "physical",
+			provider: selection.provider,
+			modelId: selection.modelId,
+			level: selectedLevel,
+		};
+	}
+
+	const state = readVirtualModelState<FallbackState>(input.entries, input.provider, input.modelId);
+	const rawIndex = state?.index;
+	const maxIndex = Math.max(0, input.chain.length - 1);
+	const index =
+		typeof rawIndex === "number" && Number.isInteger(rawIndex) && rawIndex >= 0
+			? Math.min(rawIndex, maxIndex)
+			: 0;
+
+	// An empty chain has no entry to read a pinned level from, and `levelFor`
+	// indexes `chain[0]!` — it would throw. Registration never produces an
+	// empty chain, but this is an exported pure API and a caller passing one
+	// should get a displayable answer, not a `TypeError` inside a render.
+	if (input.chain.length === 0) return { kind: "fallback", index: 0, level: selectedLevel };
+
+	const reachableIndex = walkToReachable(input.chain, index, input.isReachable);
+	return { kind: "fallback", index: reachableIndex, level: levelFor(input.chain, reachableIndex, selectedLevel) };
+}
+
+/**
+ * Walk forward from `start` to the first entry `isReachable` accepts.
+ *
+ * Mirrors the reachability walk in `route()`: forward from the chosen index,
+ * wrapping once. Returns `start` unchanged when no predicate is given or no
+ * entry is reachable, so a caller always gets a usable index.
+ */
+function walkToReachable(
+	chain: readonly ChainEntry[],
+	start: number,
+	isReachable: ((index: number) => boolean) | undefined,
+): number {
+	if (!isReachable || chain.length === 0) return start;
+	for (let i = 0; i < chain.length; i++) {
+		const candidate = (start + i) % chain.length;
+		if (isReachable(candidate)) return candidate;
+	}
+	return start;
+}
+
+/**
  * Build a chain from entries, dropping unusable and repeated ones.
  *
  * An entry is a bare reference string or a `{ model, thinking }` object

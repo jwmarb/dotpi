@@ -61,9 +61,11 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	ExtensionVirtualModel,
 	SessionBoundaryDraft,
 	VirtualModelStateData,
 } from "@earendil-works/pi-coding-agent";
+import { createFallbackFooter } from "./footer.js";
 import {
 	type ChainEntry,
 	type FallbackState,
@@ -73,6 +75,7 @@ import {
 	FALLBACK_PROVIDER,
 	THINKING_LEVELS,
 	advance,
+	computeDisplay,
 	describeBudgetShortfall,
 	describeExhaustion,
 	describeHop,
@@ -98,6 +101,14 @@ const STATUS_KEY = "model-fallback";
 
 /** How long a hop notice stays in the footer. */
 const STATUS_TTL_MS = 20_000;
+
+/**
+ * How long a rename waits for the chain to stop moving.
+ *
+ * A re-registration costs a full `modelRuntime.refresh()` (see
+ * `syncVirtualModelName`), so rapid hops coalesce into one.
+ */
+const NAME_SYNC_COALESCE_MS = 250;
 
 /**
  * Settings key holding the chain and tunables.
@@ -205,10 +216,29 @@ export default function (pi: ExtensionAPI) {
 	const chain = plan.chain;
 	const config = readConfig(raw);
 
+	// The router's name is a fuzzy-match surface in pi's resolver and feeds the
+	// /model subtitle. We re-register it live (see `syncVirtualModelName`) so the
+	// subtitle names the in-use model; the bare chain name is the start state.
+	const initialName = `Fallback chain (${chain.map(formatModelRef).join(" → ")})`;
+	let lastRegisteredName = initialName;
+	//
+	// One accepted cost: the live name embeds model refs, so `--model <ref>` and
+	// `/model` search can also match this router (the same fuzzy-match surface
+	// `AGENTS.md` warns about for level words). Showing the in-use model in that
+	// subtitle is the point of the feature, so the collision is taken knowingly.
+	// It stays safe because pi's alias tie-break sorts ids *descending* and takes
+	// the first (`model-resolver.js`), so a real ref like `gpt-5.6-sol` beats
+	// `auto` — the router loses that tie, which is exactly why it is harmless.
+
 	/** The last error text seen, for {@link describeExhaustion}. */
 	let lastError: string | undefined;
 	let statusTimer: ReturnType<typeof setTimeout> | undefined;
 
+	let latestCtx: ExtensionContext | undefined;
+
+
+	/** Owns the coalesced rename slot, so at most one timer is pending. */
+	let nameSyncTimer: ReturnType<typeof setTimeout> | undefined;
 	/**
 	 * Show a footer notice for {@link STATUS_TTL_MS}. Every notice goes through
 	 * here so one timer owns the slot: a stale timer from an earlier hop can
@@ -219,6 +249,68 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, notice);
 		if (statusTimer) clearTimeout(statusTimer);
 		statusTimer = setTimeout(() => ctx.ui.setStatus(STATUS_KEY, undefined), STATUS_TTL_MS);
+	};
+
+	/**
+	 * Re-register the router with a name that names the in-use model, so the
+	 * /model subtitle shows it. A no-op unless the computed name differs from
+	 * what is registered, so it is cheap in steady state and never perturbs an
+	 * in-flight request — it runs at `session_start` and whenever the in-use
+	 * model could have changed, never mid-`route()`.
+	 *
+	 * Call it through {@link scheduleNameSync} for the event-driven paths: a
+	 * re-registration is not cheap in pi. `registerVirtualModel` ends with a
+	 * `modelRuntime.refresh()`, which reloads `models.json`, rebuilds providers
+	 * and runs one auth check per provider — so a burst of hops must not become a
+	 * burst of refreshes.
+	 */
+	const syncVirtualModelName = (ctx: ExtensionContext): void => {
+		const display = computeDisplay({
+			entries: ctx.sessionManager.getBranch(),
+			chain,
+			provider: FALLBACK_PROVIDER,
+			modelId: FALLBACK_MODEL_ID,
+			// The selection comes from pi, not from the branch: pi does not record a
+			// `model_change` when neither side is a virtual model, so a branch-derived
+			// selection would stick on a stale model after tree navigation.
+			selection: ctx.model ? { provider: ctx.model.provider, modelId: ctx.model.id } : undefined,
+			thinkingLevel: ctx.thinkingLevel,
+			// Name the entry that can actually serve, not the planned one: the
+			// stored index does not move when `route()` skips an unreachable entry,
+			// so without this the subtitle would name a dead model indefinitely.
+			isReachable: (index) => {
+				const entry = chain[index];
+				return entry !== undefined && resolve(ctx, entry) !== undefined;
+			},
+		});
+		const desired =
+			display.kind === "fallback"
+				// `planRegistration` only registers a non-empty chain, so the index is real.
+				? `Fallback chain (using ${formatModelRef(chain[display.index]!)})`
+				: initialName;
+		if (desired === lastRegisteredName) return;
+		lastRegisteredName = desired;
+		pi.registerVirtualModel<FallbackState>(virtualModelDefinition(desired));
+	};
+
+	/**
+	 * Coalesce a rename into one deferred re-registration, for UI sessions only.
+	 *
+	 * Two reasons. The subtitle is a UI surface, so a headless session
+	 * (print/json/rpc) must not pay a model-runtime refresh for it — and those
+	 * are exactly the sessions where chains hop unattended. And a burst of hops
+	 * inside {@link NAME_SYNC_COALESCE_MS} should cost one refresh, not one each.
+	 * The timer reads `latestCtx` when it fires, so a session that has gone away
+	 * in the meantime is a no-op rather than a stale render.
+	 */
+	const scheduleNameSync = (ctx: ExtensionContext): void => {
+		if (!ctx.hasUI) return;
+		if (nameSyncTimer) clearTimeout(nameSyncTimer);
+		nameSyncTimer = setTimeout(() => {
+			nameSyncTimer = undefined;
+			const current = latestCtx;
+			if (current?.hasUI) syncVirtualModelName(current);
+		}, NAME_SYNC_COALESCE_MS);
 	};
 
 	/**
@@ -257,6 +349,23 @@ export default function (pi: ExtensionAPI) {
 			statusTimer = undefined;
 		}
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+
+		latestCtx = ctx;
+		// Replace the built-in footer so the model on the right is the physical
+		// model in use (not the bare `auto`), and so it shows at startup (before
+		// the first response, the chain's primary). Restored on session_shutdown.
+		if (ctx.hasUI) {
+			ctx.ui.setFooter(createFallbackFooter({
+				chain,
+				provider: FALLBACK_PROVIDER,
+				modelId: FALLBACK_MODEL_ID,
+				getCtx: () => latestCtx,
+				resolveModel: resolve,
+				// The built-in's `(auto)` marker, from the same place pi reads it.
+				autoCompactionEnabled: () => pi.getSettings().compaction?.enabled ?? true,
+			}));
+		}
+		if (ctx.hasUI) syncVirtualModelName(ctx);
 		// `budgetWarning()` is recomputed here rather than cached at load, because a
 		// reload can change `retry.maxRetries` under a live session.
 		// Reported once per session rather than per hop: the mismatch is a
@@ -266,21 +375,40 @@ export default function (pi: ExtensionAPI) {
 		if (warning && ctx.hasUI) ctx.ui.notify(warning, "warning");
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		if (statusTimer) clearTimeout(statusTimer);
 		statusTimer = undefined;
+
+		// Restore the built-in footer. Take the context pi passes rather than the
+		// closure: this handler must be a no-op in a non-UI session and must not
+		// depend on `session_start` having run first.
+		if (ctx.hasUI) ctx.ui.setFooter(undefined);
+		if (nameSyncTimer) clearTimeout(nameSyncTimer);
+		nameSyncTimer = undefined;
+		latestCtx = undefined;
 	});
 
 	// The failure text comes from the assistant message rather than from
 	// `request.failed`, because the exhaustion path has no `failed` to read:
 	// it throws instead of routing, and the error it throws should still name
 	// what actually went wrong.
-	pi.on("message_end", (event) => {
+	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
 		if (message.role === "assistant" && message.stopReason === "error") {
 			lastError = message.errorMessage ?? undefined;
 		}
+
+		if (message.role === "assistant") scheduleNameSync(ctx);
 	});
+
+	// The /model subtitle names the in-use model, so it must follow every way the
+	// selection can change. A `model_select` (including `/model` and cycling) is
+	// the obvious one; `message_end` catches the router moving on its own. Tree
+	// navigation changes no selection, but it does move the leaf the router state
+	// is read from — so the subtitle's chain index can change without either
+	// event, and it gets its own hook.
+	pi.on("model_select", (_event, ctx) => scheduleNameSync(ctx));
+	pi.on("session_tree", (_event, ctx) => scheduleNameSync(ctx));
 
 	// pi's own retry classifier (pi-ai's `isRetryableAssistantError`) pattern-matches
 	// the assistant's `errorMessage`, and LiteLLM's gateway 400 — "Upstream
@@ -382,14 +510,14 @@ export default function (pi: ExtensionAPI) {
 		return { entries: [...event.entries, ...drafts], continue: true };
 	});
 
-	pi.registerVirtualModel<FallbackState>({
+	const virtualModelDefinition = (name: string): ExtensionVirtualModel<FallbackState> => ({
 		provider: FALLBACK_PROVIDER,
 		id: FALLBACK_MODEL_ID,
-		// The bare ref, deliberately not `formatEntry`: `name` is a fuzzy-match
-		// surface in pi's resolver (`model-resolver.js` `m.name.includes(pattern)`),
-		// so a level word like `high`/`max` in the name would let `--model high`
-		// silently select this router. The level stays on `/fallback-chain`.
-		name: `Fallback chain (${chain.map(formatModelRef).join(" → ")})`,
+		// `name` is a fuzzy-match surface in pi's resolver and feeds the /model
+		// subtitle; `syncVirtualModelName` re-registers it live as the chain
+		// hops. A level word is kept out of the bare chain name so `--model high`
+		// cannot silently select the router.
+		name,
 		// Every level the chain's members might accept. pi clamps to the routed
 		// model, so offering a level a given member lacks costs nothing, while
 		// omitting one would make it unselectable on the members that have it.
@@ -444,6 +572,8 @@ export default function (pi: ExtensionAPI) {
 			return { model, thinkingLevel: levelFor(chain, index, request.thinkingLevel), state };
 		},
 	});
+
+	pi.registerVirtualModel<FallbackState>(virtualModelDefinition(initialName));
 
 	pi.registerCommand("fallback-chain", {
 		description: "Show the model fallback chain and its budget",

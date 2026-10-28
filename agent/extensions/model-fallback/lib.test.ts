@@ -16,13 +16,16 @@ import { describe, expect, test } from "bun:test";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import {
 	type ChainEntry,
+	type DisplayEntry,
 	type FallbackConfig,
 	type FallbackState,
+	type ModelDisplay,
 	type RouteReason,
 	CHAIN_ENV,
 	GATEWAY_UPSTREAM_FAILURE_PATTERN,
 	MAX_UPSTREAM_DELAY_MS,
 	advance,
+	computeDisplay,
 	describeBudgetShortfall,
 	describeExhaustion,
 	describeHop,
@@ -1778,5 +1781,332 @@ describe("index.ts registration", () => {
 			undefined,
 		);
 		expect(model).toBeUndefined();
+	});
+});
+
+describe("computeDisplay", () => {
+	const CHAIN: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+	const ROUTER = { provider: "fallback", modelId: "auto" };
+
+	/** A stored router-state entry pinning the chain index. */
+	function stateEntry(index: number): DisplayEntry {
+		return {
+			type: "custom",
+			customType: VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
+			data: {
+				provider: "fallback",
+				modelId: "auto",
+				state: { index, cycles: 0, probes: 0, home: 0, probing: false },
+			},
+		};
+	}
+
+	/** A session entry recording a past selection; NOT consulted for display. */
+	function modelChange(provider: string, modelId: string): DisplayEntry {
+		return { type: "model_change", provider, modelId };
+	}
+
+	test("names the in-use chain index when the router is selected", () => {
+		const display: ModelDisplay = computeDisplay({
+			entries: [stateEntry(1)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "off" });
+	});
+
+	test("names a concrete physical selection", () => {
+		const display: ModelDisplay = computeDisplay({
+			entries: [],
+			chain: CHAIN,
+			...ROUTER,
+			selection: { provider: "litellm", modelId: "gpt-5.6-sol" },
+		});
+		expect(display).toEqual({ kind: "physical", provider: "litellm", modelId: "gpt-5.6-sol", level: "off" });
+	});
+
+	test("assumes the router before a selection exists (startup shows the primary)", () => {
+		const display = computeDisplay({ entries: [], chain: CHAIN, ...ROUTER, selection: undefined });
+		expect(display).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("follows the selection, not the branch's last model_change", () => {
+		// pi never records a model_change when neither side is a virtual model, so
+		// after tree navigation the branch can name a model that is NOT selected.
+		// The selection must win, or the display sticks on the wrong model forever.
+		const display = computeDisplay({
+			entries: [modelChange("litellm", "stale-model")],
+			chain: CHAIN,
+			...ROUTER,
+			selection: { provider: "litellm", modelId: "actually-selected" },
+		});
+		expect(display).toEqual({
+			kind: "physical",
+			provider: "litellm",
+			modelId: "actually-selected",
+			level: "off",
+		});
+	});
+
+	test("a selection of the router reads the router state even if the branch names a physical model", () => {
+		const display = computeDisplay({
+			entries: [modelChange("litellm", "old-physical"), stateEntry(1)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "off" });
+	});
+
+	test("pins a level set on the routed entry via levelFor", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2", thinking: "high" }];
+		const display = computeDisplay({
+			entries: [stateEntry(1)],
+			chain,
+			...ROUTER,
+			selection: ROUTER,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "high" });
+	});
+
+	test("passes the selected thinking level through for an unpinned entry", () => {
+		const display = computeDisplay({
+			entries: [stateEntry(1)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+			thinkingLevel: "low",
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "low" });
+	});
+
+	test("ignores an invalid thinking level", () => {
+		const display = computeDisplay({
+			entries: [stateEntry(0)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+			thinkingLevel: "bogus",
+		});
+		expect(display).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("clamps an out-of-range stored index", () => {
+		const hi = computeDisplay({ entries: [stateEntry(99)], chain: CHAIN, ...ROUTER, selection: ROUTER });
+		expect(hi).toEqual({ kind: "fallback", index: 1, level: "off" });
+		const neg = computeDisplay({ entries: [stateEntry(-1)], chain: CHAIN, ...ROUTER, selection: ROUTER });
+		expect(neg).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("ignores a missing router-state entry", () => {
+		const display = computeDisplay({ entries: [], chain: CHAIN, ...ROUTER, selection: ROUTER });
+		expect(display).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("uses the latest router-state entry, not an earlier one", () => {
+		const display = computeDisplay({
+			entries: [stateEntry(1), stateEntry(0)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("an empty chain returns a display instead of throwing", () => {
+		// `levelFor` indexes `chain[index]!`, so without an explicit branch this
+		// throws inside a render — and pi's footer render must never throw.
+		expect(computeDisplay({ entries: [], chain: [], ...ROUTER, selection: ROUTER })).toEqual({
+			kind: "fallback",
+			index: 0,
+			level: "off",
+		});
+		expect(computeDisplay({ entries: [stateEntry(1)], chain: [], ...ROUTER, selection: ROUTER })).toEqual({
+			kind: "fallback",
+			index: 0,
+			level: "off",
+		});
+	});
+
+	test("honours an explicit `off` pin rather than falling through to the selection", () => {
+		// `levelFor` is `entry.thinking ?? selected`, so a pinned `off` must beat a
+		// `high` selection — a `||` bug here would silently raise the level.
+		const chain: ChainEntry[] = [{ ref: "a/1", thinking: "off" }];
+		const display = computeDisplay({
+			entries: [stateEntry(0)],
+			chain,
+			...ROUTER,
+			selection: ROUTER,
+			thinkingLevel: "high",
+		});
+		expect(display).toEqual({ kind: "fallback", index: 0, level: "off" });
+	});
+
+	test("walks forward to the first reachable entry, mirroring route()", () => {
+		// The stored index names a model this machine cannot serve; the display
+		// must name the one that answers instead.
+		const display = computeDisplay({
+			entries: [stateEntry(0)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+			isReachable: (index) => index === 1,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "off" });
+	});
+
+	test("keeps the stored index when nothing is reachable", () => {
+		const display = computeDisplay({
+			entries: [stateEntry(1)],
+			chain: CHAIN,
+			...ROUTER,
+			selection: ROUTER,
+			isReachable: () => false,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "off" });
+	});
+
+	test("applies a forward-walked entry's own level pin", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2", thinking: "medium" }];
+		const display = computeDisplay({
+			entries: [stateEntry(0)],
+			chain,
+			...ROUTER,
+			selection: ROUTER,
+			isReachable: (index) => index === 1,
+		});
+		expect(display).toEqual({ kind: "fallback", index: 1, level: "medium" });
+	});
+
+	test("does not consult reachability for a physical selection", () => {
+		const isReachable = (): boolean => {
+			throw new Error("must not be called for a physical selection");
+		};
+		const display = computeDisplay({
+			entries: [],
+			chain: CHAIN,
+			...ROUTER,
+			selection: { provider: "litellm", modelId: "gpt" },
+			isReachable,
+		});
+		expect(display).toEqual({ kind: "physical", provider: "litellm", modelId: "gpt", level: "off" });
+	});
+});
+
+let syncImportCounter = 0;
+
+describe("index.ts name sync", () => {
+	/** A physical catalogue entry, as `resolve` sees it. */
+	function physical(provider: string, id: string) {
+		return { api: "openai-responses", provider, id, name: id, reasoning: false };
+	}
+
+	/** Router state pinning the chain index, as the branch stores it. */
+	const state = (index: number) => ({
+		type: "custom",
+		customType: VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
+		data: { provider: "fallback", modelId: "auto", state: { index, cycles: 0, probes: 0, home: 0, probing: false } },
+	});
+
+	/**
+	 * Load the extension with a fake pi, fire `session_start`, and report what was
+	 * registered. Re-registering is expensive in pi (a full model-runtime
+	 * refresh), so *when* it happens is the thing under test.
+	 */
+	async function startSession(hasUI: boolean, reachableIds?: readonly string[]) {
+		const dir = mkdtempSync(join(tmpdir(), "model-fallback-sync-"));
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({}), "utf-8");
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const originalEnvChain = process.env[CHAIN_ENV];
+		process.env.PI_CODING_AGENT_DIR = dir;
+		process.env[CHAIN_ENV] = "a/1,b/2";
+		try {
+			const mod = await import(`./index.js?mf-sync=${++syncImportCounter}`);
+			const names: string[] = [];
+			const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+			mod.default({
+				on: (name: string, fn: (event: unknown, ctx: unknown) => void) => handlers.set(name, fn),
+				getSettings: () => ({}),
+				registerVirtualModel: (def: { name: string }) => names.push(def.name),
+				registerCommand: () => {},
+			} as unknown as Parameters<typeof mod.default>[0]);
+
+			const branch: unknown[] = [state(1)];
+			const ctx = {
+				hasUI,
+				model: { provider: "fallback", id: "auto", api: VIRTUAL_MODEL_API, contextWindow: 1000 },
+				thinkingLevel: "off",
+				ui: { setFooter: () => {}, setStatus: () => {}, notify: () => {} },
+				sessionManager: {
+					getBranch: () => branch,
+					getEntries: () => branch,
+					getCwd: () => "/tmp",
+					getSessionId: () => "s",
+					getLeafId: () => "l",
+					getSessionName: () => undefined,
+					getEntryCount: () => branch.length,
+				},
+				modelRegistry: {
+					getAvailable: () => [physical("c", "a/1"), physical("d", "b/2")],
+					hasConfiguredAuth: (m: { id: string }) => reachableIds === undefined || reachableIds.includes(m.id),
+					isUsingOAuth: () => false,
+					getProvider: () => undefined,
+					find: () => undefined,
+				},
+				getContextUsage: () => undefined,
+			};
+			handlers.get("session_start")!({}, ctx);
+			return { names, handlers, ctx, branch };
+		} finally {
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			if (originalEnvChain === undefined) delete process.env[CHAIN_ENV];
+			else process.env[CHAIN_ENV] = originalEnvChain;
+		}
+	}
+
+	test("a UI session renames the router to the model that will serve", async () => {
+		// `a/1` is unreachable, so the walk stays on `b/2` — the name must say so,
+		// not name the dead primary.
+		const { names } = await startSession(true, ["b/2"]);
+		expect(names).toHaveLength(2);
+		expect(names[0]).toBe("Fallback chain (a/1 → b/2)");
+		expect(names[1]).toBe("Fallback chain (using b/2)");
+	});
+
+	test("a headless session never pays for a rename", async () => {
+		// The subtitle is a UI surface, and a re-registration costs a full
+		// model-runtime refresh — headless children must not pay it.
+		const { names, handlers, ctx } = await startSession(false);
+		expect(names).toHaveLength(1);
+		handlers.get("message_end")!({ message: { role: "assistant", stopReason: "stop" } }, ctx);
+		handlers.get("model_select")!({}, ctx);
+		expect(names).toHaveLength(1);
+	});
+
+	test("a burst of hops coalesces into one rename", async () => {
+		const { names, handlers, ctx, branch } = await startSession(true);
+		const before = names.length;
+		// The chain moved to index 0, then three events fire in the same tick.
+		branch.push(state(0));
+		handlers.get("message_end")!({ message: { role: "assistant", stopReason: "stop" } }, ctx);
+		handlers.get("model_select")!({}, ctx);
+		handlers.get("session_tree")!({}, ctx);
+		// Nothing synchronous: the rename is deferred so the burst collapses.
+		expect(names).toHaveLength(before);
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		expect(names).toHaveLength(before + 1);
+		expect(names[names.length - 1]).toBe("Fallback chain (using a/1)");
+	});
+
+	test("a burst that changes nothing registers nothing", async () => {
+		// The steady state must be free: no hop, no refresh.
+		const { names, handlers, ctx } = await startSession(true);
+		const before = names.length;
+		handlers.get("message_end")!({ message: { role: "assistant", stopReason: "stop" } }, ctx);
+		handlers.get("model_select")!({}, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		expect(names).toHaveLength(before);
 	});
 });

@@ -6,9 +6,11 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 | File | Owns |
 |---|---|
-| `lib.ts` | The state machine and every message. Pure, pi-free, and the one suite here covers it |
-| `index.ts` | Session wiring: `registerVirtualModel`, `/fallback-chain`, the footer notice |
+| `lib.ts` | The state machine and every message, plus `computeDisplay` (which model the UI should name). Pure and pi-free; covered by `lib.test.ts` |
+| `index.ts` | Session wiring: `registerVirtualModel` (and its live re-registration), `/fallback-chain`, the footer notice, installing the custom footer |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
+| `footer.ts` | The `setFooter` replacement that shows the in-use physical model. Forks pi's built-in `footer.js` — see its deliberate-divergences note, and keep the width guarantee |
+| `footer.test.ts` | The width invariant (`no line exceeds the width` — exceeding it kills the `pi` process), the pure formatters, and the scan cache |
 
 ## HOW IT IS TURNED ON HERE
 
@@ -311,11 +313,7 @@ the first lap runs at `cycles === 0`; exhausting on `cycles > maxCycles` therefo
 **three** times and spent 6 retries where the formula promised 4 — so a `maxRetries` set
 from the formula stopped pi mid-lap and the last models in the chain were never reached,
 silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
-`maxCycles + 1` laps. Measured before the fix: `maxCycles: 2` on a 2-model chain walked it
-**three** times and spent 6 retries where the formula promised 4 — so a `maxRetries` set
-from the formula stopped pi mid-lap and the last models in the chain were never reached,
-silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
-20 configurations (chain 1/2/3/4/7 × cycles 1/2/3/10) by asserting *failed requests* rather than
+20 configurations (chain 1/2/3/4/7 × cycles 1/2/3/10) by asserting *failed requests*.
 
 This repo sets `maxRetries: 30` for its 4-model chain and `maxCycles: 10` — short of the 40
 the 10 cycles need, so the warning is live; at the previous `maxRetries: 10` only 3 cycles
@@ -345,7 +343,7 @@ were reachable and `/fallback-chain` warned about it.
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/model-fallback/lib.test.ts   # the whole suite
+bun test agent/extensions/model-fallback/   # both suites (lib.test.ts, footer.test.ts)
 cd agent/extensions/model-fallback && \
   ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
