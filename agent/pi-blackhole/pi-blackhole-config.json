@@ -32,25 +32,25 @@
 
   "model": {
     "provider": "litellm",
-    "id": "xhtoken/spark-x2.6-4b",
+    "id": "anthropic/claude-sonnet-5.5",
     "thinking": "low",
     "contextWindow": 1048576
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "xhtoken/spark-x2.6-4b",
+    "id": "anthropic/claude-sonnet-5.5",
     "thinking": "low",
     "contextWindow": 1048576
   },
   "reflectorModel": {
     "provider": "litellm",
-    "id": "xhtoken/spark-x2.6-4b",
-    "thinking": "high",
+    "id": "anthropic/claude-sonnet-5.5",
+    "thinking": "low",
     "contextWindow": 1048576
   },
   "dropperModel": {
     "provider": "litellm",
-    "id": "xhtoken/spark-x2.6-4b",
+    "id": "anthropic/claude-sonnet-5.5",
     "thinking": "low",
     "contextWindow": 1048576
   },
