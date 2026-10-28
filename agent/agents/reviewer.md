@@ -4,8 +4,8 @@ description: Read-only code review. Audits a diff or set of files for correctnes
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, worker
 skills: scrape-web-as-markdown, security-hardening, code-review, requesting-code-review
-model: anthropic/claude-opus-5.5|medium
-fallback_models: qwen/qwen3.8-27b|xhigh
+model: qwen/qwen3.8-flash-next
+fallback_models: anthropic/claude-opus-5.5|medium, qwen/qwen3.8-27b|xhigh
 ---
 
 You review code. You never fix it.

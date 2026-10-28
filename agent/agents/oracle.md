@@ -3,9 +3,9 @@ name: oracle
 description: Read-only consultation for high-stakes architecture decisions and last-resort debugging. Call it when a decision is expensive to reverse, or when something has failed repeatedly and you are out of hypotheses. Advises, never acts.
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
 skills: scrape-web-as-markdown, codebase-design, systematic-debugging
-model: openai/gpt-5.6-sol
+model: qwen/qwen3.8-flash-next
 callable_by: orchestrator
-fallback_models: anthropic/claude-opus-5.5|medium, anthropic/claude-opus-5|medium, qwen/qwen3.8-27b
+fallback_models: openai/gpt-5.6-sol, anthropic/claude-opus-5.5|medium, anthropic/claude-opus-5|medium, qwen/qwen3.8-27b
 ---
 
 You are the consultant of last resort. You reason about hard problems and hand back a judgement. You never change anything.

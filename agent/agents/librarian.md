@@ -4,7 +4,7 @@ description: Read-only external research. Looks up library/API documentation on 
 tools: bash, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, oracle, reviewer, spiker, verifier, worker
 skills: scrape-web-as-markdown
-model: xhtoken/spark-x2.6-4b|low
+model: qwen/qwen3.8-27b|xhigh
 fallback_models: anthropic/claude-sonnet-5.5|off, deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
 ---
 
