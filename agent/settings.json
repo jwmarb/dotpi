@@ -27,7 +27,10 @@
   },
   "modelFallback": {
     "chain": [
-      "qwen/qwen3.8-flash-next|xhigh",
+      {
+        "model": "qwen/qwen3.8-flash-next",
+        "thinking": "xhigh"
+      },
       {
         "model": "anthropic/claude-opus-5.5",
         "thinking": "low"
