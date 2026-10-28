@@ -15,7 +15,9 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 ## HOW IT IS TURNED ON HERE
 
-`agent/settings.json`:
+`agent/settings.json` (an excerpt as of `61dc4a8`; the file is the authority, and the chain
+is the line that drifts. The startup header's `Model` row prints the registered primary, so
+`/fetch` shows what is actually configured):
 
 ```json
 "defaultProvider": "fallback",
