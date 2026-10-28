@@ -22,9 +22,9 @@ is the line that drifts. The startup header's `Model` row prints the registered 
 ```json
 "defaultProvider": "fallback",
 "defaultModel": "auto",
-"retry": { "maxRetries": 30, ... },
+"retry": { "maxRetries": 40, ... },
 "modelFallback": {
-  "chain": ["qwen/qwen3.8-27b", { "model": "anthropic/claude-opus-5.5", "thinking": "low" }, { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
+  "chain": [{ "model": "qwen/qwen3.8-flash-next", "thinking": "xhigh" }, { "model": "anthropic/claude-opus-5.5", "thinking": "low" }, { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
   "contextWindow": 262144, "maxTokens": 32768
 }
@@ -39,10 +39,15 @@ because the CLI flag goes through `findExactModelReferenceMatch` instead. Two di
 grammars for the same thing, so check `/model` or the session's `model_change` entry after
 changing either.
 
-`retry.maxRetries` is 30. The chain is now **4 models**, so one lap spends 4 and the 10
-configured cycles need 40 — 30 reaches 7 full laps plus 2 requests, so `index.ts`'s
-once-per-session "too small" warning is live on this host (see THE TWO BUDGETS). It covered
-the old 3-model chain exactly (3 × 10); with 10 only 3 cycles were reachable and it warned.
+`retry.maxRetries` is 40 (excerpt dated 2026-10-28). The chain is **4 models**, so one lap spends 4 and
+the 10 configured cycles need exactly 40, so `describeBudgetShortfall` returns nothing and
+`index.ts`'s once-per-session "too small" warning is **not** live (see THE TWO BUDGETS).
+
+**A `|level` suffix in a `settings.json` *string* is not a pin.** `parseChain` →
+`parseModelEntry(string)` → `parseModelRef` never splits on `|` (only `parseChainItem`, for agent
+files and `PI_FALLBACK_CHAIN`, does). Commit `693697c` wrote `"qwen/qwen3.8-flash-next|xhigh"`;
+the stored ref was the whole string, which no gateway model matched, so routing silently skipped
+the primary. Fixed 2026-10-28 by switching to the object form; in `settings.json` always use it for a pin.
 
 **A chain entry may pin a thinking level.** An entry is either a bare reference
 string or an object `{ "model": "provider/id", "thinking": "level" }` — both forms
@@ -178,7 +183,7 @@ answered, the next request went back to the primary, task completed.
 
 ## MEASURED BEHAVIOUR
 
-Everything below was produced by running pi 1.0.2 (the running pi is now **1.2.0**), not
+Everything below was produced by running pi 1.0.2 (the running pi is now **1.4.0**, measured 2026-10-28), not
 inferred. The harness used a provider whose `baseUrl` is `http://127.0.0.1:1/v1` (connection
 refused on every request), so the primary fails deterministically. The chains quoted below
 (`deadend/void`, `deadend/void2`, `claude-haiku-4.5`) are that harness's, **not** the live
@@ -331,9 +336,9 @@ from the formula stopped pi mid-lap and the last models in the chain were never 
 silently. The guard is now `prior.cycles + 1 >= maxCycles`, and the equality is pinned for
 20 configurations (chain 1/2/3/4/7 × cycles 1/2/3/10) by asserting *failed requests*.
 
-This repo sets `maxRetries: 30` for its 4-model chain and `maxCycles: 10` — short of the 40
-the 10 cycles need, so the warning is live; at the previous `maxRetries: 10` only 3 cycles
-were reachable and `/fallback-chain` warned about it.
+This repo sets `maxRetries: 40` for its 4-model chain and `maxCycles: 10`, which is exactly the
+40 the 10 cycles need, so no warning. At `maxRetries: 30` it warned, and at 10 only 3 cycles
+were reachable.
 ## ANTI-PATTERNS
 
 - Restating pi's retry patterns instead of importing `isRetryableAssistantError`.

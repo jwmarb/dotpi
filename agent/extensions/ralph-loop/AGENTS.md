@@ -31,10 +31,10 @@ completion claim is accepted only if every active gate agrees. They run in seque
 static first, and a static rejection short-circuits — no point spending a container run to
 prove a defect already found. `maxVerifications` (default 3) bounds gate rounds per loop.
 
-**Static** (`gate.ts`, `oracle`, chain `anthropic/claude-opus-5, qwen/qwen3.8-27b`) *reads* the repo: goal, starting `HEAD` + `git status`,
+**Static** (`gate.ts`, `oracle`, chain = `agents/oracle.md` `model` + `fallback_models`, resolved by `gate-agent.ts` — read the file, do not copy the list here) *reads* the repo: goal, starting `HEAD` + `git status`,
 touched paths, and the agent's claim. Catches "runs green but does the wrong thing". ~20s.
 
-**Runtime** (`runtime-gate.ts`, `verifier`, chain `openai/gpt-5.6-sol, anthropic/claude-opus-5.5|off`) *executes* the project's own tests in Docker.
+**Runtime** (`runtime-gate.ts`, `verifier`, chain = `agents/verifier.md`'s, same resolver) *executes* the project's own tests in Docker.
 
 Catches "reads fine but does not run". Minutes cold, ~20s once the image is cached:
 
@@ -137,8 +137,8 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
 - **`--no-extensions` must never be passed to the gate child.** The provider serving the
   gate model is itself a local extension (`litellm.ts`), so disabling discovery makes the
   model unresolvable (`Model "…" is ambiguous across providers` — measured).
-- **The pi binary comes from `process.argv[1]`, not `PATH`** — that is the install owning
-  the alias map and the litellm provider (see the root AGENTS.md note on the pre-rename copy).
+- **The pi binary comes from `piExecutable()` (`lib/runtime.ts`), not `PATH`** — `process.argv[1]` under
+  node/bun pi (the install owning the alias map and the litellm provider), the pi-bolt executable under Pi-Bolt.
 - **The two gates use different verdict vocabularies** (`APPROVE/REJECT` vs `PASS/FAIL`), so
   one gate's reply can never be silently read by the other's parser.
 - **Exit codes must not be piped.** `docker run ... | tail` reports `tail`'s status, always

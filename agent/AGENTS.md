@@ -86,8 +86,8 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   later entries are unreachable degrades a running child. An explicit `model` on the
   delegation call yields a **singleton chain** (the caller's pin is preserved, agent-file
   fallbacks are suppressed). See `extensions/model-fallback/AGENTS.md`. Recon
-  agents lead with a cheap model and keep the expensive ones in the chain — `explorer` and
-  `librarian` on `occamy-1.0`, `summarizer` on `openai/gpt-5.6-terra`. A model reference here
+  agents lead with a cheap model and keep the expensive ones in the chain (read the
+  frontmatter for the current picks; every past list written here drifted). A model reference here
   must exist on the gateway: an unreachable primary costs a launch attempt per run, and an
   unreachable *tail* degrades a running child, so verify against
   `/model_group/info` rather than by eye.
@@ -142,8 +142,7 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   invocation is a bug. `argument-hint` prefills the slash prompt.
 - **Personal-identity skills stay on disk and untracked**, not placeholdered —
   a gitignored skill directory under its category is the pattern (one is on disk
-  a gitignored skill directory under its category is the pattern (none is on disk
-  right now — the pattern stands, the instance does not). Add a `.gitignore` path rather than sanitising in place.
+  (`skills/other/uarizona-hpc/`, listed in `.gitignore`). Add a `.gitignore` path rather than sanitising in place.
 - **The superpowers bootstrap extension is deliberately disabled.** Its package entry is
   the object form with `extensions: ["-.pi/extensions/superpowers.ts"]`, so only the 15
   skills load. That extension injects an `<EXTREMELY_IMPORTANT>` block every turn

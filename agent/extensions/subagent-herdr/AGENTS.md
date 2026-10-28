@@ -8,7 +8,7 @@ Owns the `subagent` / `subagent_tasks` tools (advertised by the orchestrator pro
 
 The queue structure and `deliverAs` were last re-verified against an installed pi in the 1.0.x
 line; `index.ts`'s comment still cites the original 0.99.2 measurement, and the running pi is
-now **1.2.0**. Two revisions of this paragraph disagreed about which 1.0.x it was, so re-measure
+now **1.4.0** (measured 2026-10-28). Two revisions of this paragraph disagreed about which 1.0.x it was, so re-measure
 against the installed bundle rather than trusting any version written here.
 
 ## WHERE TO LOOK
@@ -79,7 +79,7 @@ runtime. Run it from here with the local binary:
 This is the **one typecheck scope whose own `tsconfig.json` has no `paths` entry**. That used
 to mean its `@earendil-works/*` types came from the stale `~/node_modules` (0.75.4) rather
 than the running pi; that tree is gone, and the upward walk now lands on the repo-root
-`node_modules` symlink — the live 1.2.0 bundle — so this scope and anything `bun` runs in
+`node_modules` symlink — the live pi bundle — so this scope and anything `bun` runs in
 this directory (resolution keys off the file's location, not your cwd) resolve the running
 pi like everyone else, *while the link exists*. Note this is still an opt-*out*:
 `agent/extensions/tsconfig.json` one level up maps `paths` at the live bundle, and a

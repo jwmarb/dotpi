@@ -40,6 +40,7 @@ scripts, so every command below comes from the repo root).
 | `lib/skill-activation.ts` | Which skills are live this session (`SkillActivation`, `skillsInPrompt`, `isSkillLoad`, `gateTools`, `parseOwnedTools`, `skillDirFromPath`, `loadSkillToolOwners`) — the inference behind skill-gated tools and agents |
 | `lib/todo.ts` | The `todo` reducer — `applyOp` is pure and never mutates a past snapshot. Also owns `demotedBy` (the item a `start` silently knocked back to pending) — the module's one drift-catcher. It has no settle guard (subagent-only; the orchestrator's guard is `kanban/lib.ts`) |
 | `lib/trade-journal-store.ts` | The single journal markdown grammar (`parseDay`, `renderDay`, `recordObservations`, `mergeObservations`, `findDuplicates`, `summarize`) — same format the journal agents hand-edit |
+| `lib/git-env.ts` | `gitEnv()` / `GIT_LOCATION_VARS` — strips `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`… for any git spawn against a cwd; used by `init.ts`, `changed-files.ts`; tested in `lib/git-env.test.ts` |
 | `lib/widget.ts` | `fitLines`, `fittedWidget`, `row`, `frame`, `cachedByWidth` — the measuring seam |
 
 ## CONVENTIONS
@@ -52,7 +53,7 @@ scripts, so every command below comes from the repo root).
   `promptGuidelines`: pi folds those into the prompt only while the tool is in the active
   set, so gating the tool and gating its advice are the same act.
 - **Skill activation is inferred, not reported, and the inference is load-bearing.**
-  Re-probed against the installed pi (1.2.0): there is still **no `skill_invoke` event**,
+  Re-probed against the installed pi (1.2.0; 1.4.0 now — re-check): there is still **no `skill_invoke` event**,
   and `systemPromptOptions.skills` is the **catalogue** (every discovered skill, every
   turn), *not* the loaded set — reading it as "loaded" silently ungates everything. The two
   real signals are a `/skill:x` invocation, which pi expands into `before_agent_start`'s
@@ -85,7 +86,7 @@ scripts, so every command below comes from the repo root).
 - **A subdirectory is invisible to pi unless it has `index.ts`.** That is what makes `lib/`
   safe for `*.test.ts`. Adding a bare `foo.ts` at this level ships it into every session
   whether you meant to or not.
-- **`lib/` modules import no pi package.** `node:*` only. They are imported from extension
+- **`lib/` modules import no pi package** — `node:*` only, with one exception: `widget.ts:46` imports `@earendil-works/pi-tui` (`visibleWidth`, `truncateToWidth`), never `pi-coding-agent`. They are imported from extension
   *top-level* code, which runs before pi can report an error, so a throw or a missing alias
   there is a startup failure with no diagnostic. Hence `layout.ts` never throws and
   `dotenv.ts` defers `requireEnv` to call time.
