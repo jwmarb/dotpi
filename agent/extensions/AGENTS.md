@@ -15,7 +15,7 @@ scripts, so every command below comes from the repo root).
 | `ask-user.ts` | `questionnaire` tool — TUI option list + free-text fallback, `executionMode: "sequential"` so two questions cannot open at once |
 | `changed-files.ts` | `/changed-files`, `/diff` — session change widget (moves into the kanban side pane when that is open, via `pi.events` `changed-files:update` / `kanban:pane`); tracks `write`/`edit` inputs *and* `git status --porcelain` on turn end |
 | `display-file.ts` | `display_file` tool — spawns the platform opener detached, then checks for a non-zero exit instead of faking success |
-| `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context. The handler only loads (skill activation, tool owners, `delegationRoster`, lineage) and applies the gated `selectedTools`; the pure, synchronous `promptInputs` does the gating and assembles `buildOrchestratorPrompt`'s parameter object, and both are tested from `lib/dynamic-prompt.test.ts` |
+| `dynamic-prompt.ts` | No tool. Hooks `before_agent_start` and **returns `{ systemPrompt }`, replacing pi's default prompt entirely** with runtime-discovered agents/tools/skills/context. The handler only loads (skill activation, tool owners, `delegationRoster`, lineage) and applies the gated `selectedTools`; the pure, synchronous `promptInputs` does the gating and assembles `buildOrchestratorPrompt`'s parameter object, and both are tested from `lib/dynamic-prompt.test.ts`. Each advice section is capability-gated: `## Kanban Board` on `hasKanban` and `## Asking the User` on `hasQuestionnaire` (both from `promptInputs`), `## Available Agents` on `hasSubagent` ∩ a non-empty roster, `## Plan Before You Implement` on `hasPlanner`, `## Delegate the Implementation` on `canDelegate` with the agent name on `hasWorker`, `## Quality Pass` on `graders`, `## Available Skills` on a non-empty `skillInventory`. The four roster-derived gates are `hasPlanner`, `canDelegate`, `hasWorker`, `graders` — all four require `hasSubagent` **and** `!isSubagent` (each derives it itself; do not remove one to "match" a doc sentence: on a host where `callable_by` already filters the child rosters, the deletion is invisible until a roster edit makes a child print it). `## Available Agents` is the one **roster-derived** section printed *without* `!isSubagent`, so a child renders its own spawnable roster; the tool-gated `## Asking the User`, `## Kanban Board` and inventory-gated `## Available Skills` are likewise not `!isSubagent`-gated, and the board reaches a child only if the tool is offered to one (`kanban/index.ts` returns early on `PI_SUBAGENT_RUN_ID`, which is why `hasKanban` needs no conjunct) |
 | `firecrawl-cli.ts` | No tool, no command. Loads `agent/.env` so `FIRECRAWL_API_URL` reaches the real `process.env`, where the `firecrawl` CLI (run via `bash`) can see it — the librarian's research path. Also sets `FIRECRAWL_NO_UPDATE_CHECK`/`_NO_TELEMETRY` when unset, so a registry banner cannot land inside an agent's `<result>`. Reports a missing URL and returns rather than throwing: pi must start without the research stack |
 | `git-hooks.ts` | No tool. Self-arms `core.hooksPath` and runs `scripts/setup-deps.sh` at startup; swallows every failure |
 | `herdr-agent-state.ts` | **Not in git** — herdr installs and overwrites this file itself (`.gitignore` excludes it); auto-loaded like every top-level `*.ts`, a fresh clone's first copy arrives from herdr's next start |
@@ -50,8 +50,9 @@ scripts, so every command below comes from the repo root).
   `skills/<skill>/agents/*.md`; `dynamic-prompt.ts` withholds both until that skill is
   active. Ownership is opt-in and one-directional — an unclaimed tool is always offered, so
   adding the key to one skill cannot hide another's tool. A gated tool also withholds its
-  `promptGuidelines`: pi folds those into the prompt only while the tool is in the active
-  set, so gating the tool and gating its advice are the same act.
+  `promptGuidelines`: pi folds those into **its own** prompt (its `rules` section) only while the
+  tool is in the active set, so gating the tool and gating its advice are the same act. Under this
+  extension that advice reaches nobody — see the `## Kanban Board` bullet below.
 - **Skill activation is inferred, not reported, and the inference is load-bearing.**
   Re-probed against the installed pi (1.2.0; 1.4.0 now — re-check): there is still **no `skill_invoke` event**,
   and `systemPromptOptions.skills` is the **catalogue** (every discovered skill, every
@@ -117,6 +118,24 @@ scripts, so every command below comes from the repo root).
   breaks is a silent load failure), so without it a session with no spawn tool still got a
   prompt mandating delegation. A roster is not a capability unless the tool that spawns it
   exists.
+  `## Kanban Board` is gated the same way on a `hasKanban` flag computed in `promptInputs` from the
+  gated `selectedTools`, or failing that the snippet inventory — never as a `toolInventory.some(name === 'kanban')`
+  inside the builder: the inventory is snippet-filtered. A field on `buildOptions` is checked against
+  the builder's real parameter type at every call site (`Parameters<typeof buildOrchestratorPrompt>[0]`);
+  a bare name match inside the builder is not
+  (that is how the `plan` section outlived its tool). `hasKanban` carries no `isSubagent` conjunct —
+  `kanban/index.ts`'s factory returns early for children, so the tool is never offered there and the
+  flag is naturally false. Sections that *name an agent* gate one level finer: `canDelegate` (spawn
+  tool + non-empty roster + not a child) for the section, `hasWorker` for the name. A roster with no
+  `worker` gets the same push naming "the roster agent whose role fits the step", because naming an
+  agent the roster does not have is the same unobeyable instruction one level down. That naming is
+  qualified by a **joint** condition — the row must fit the role *and* show `write`/`edit` — and it
+  is stated in `implName` itself, so the Execute step (prompt line 12, far above the section) carries
+  it too: a role-only test there denotes `planner` ("Writes no code") in the real fleet minus `worker`,
+  and a capability-only test denotes `spiker`, which has both tools and a throwaway-sandbox role.
+  The writer count in that sentence is derived (`writerRows`; `tools: []` counts, since it renders
+  as "all"), never a hardcoded quantifier, and the step-shaped `Delegate when:` bullets carry
+  "and a row does both" in the no-`worker` arm.
 - **The planner and the graders are one rule, stated in two places on purpose.**
   `## Plan Before You Implement` pushes multi-file/multi-step work through `planner` (a skip
   is allowed but must be *named*, the same stance the skill catalogue takes) and declares
@@ -130,6 +149,18 @@ scripts, so every command below comes from the repo root).
   prose edit. If you change either the exemption or that condition, change it in both: the
   contradiction is invisible at a glance because the two sections sit ~50 lines apart in the
   builder.
+  The board and the roster join the same rule set. `## Plan Before You Implement` gained a
+  planner→board clause gated on the **conjunction** `hasKanban && hasPlanner`, nested as a **sibling**
+  of the `graders.length > 0` block and never inside it: a planner-without-graders install is a real
+  shape (it has its own test), and a board clause nested in the grader block vanishes there. The first
+  cut nested it, and the pre-existing "no dangling comma" test caught it through its `\n\n\n`
+  assertion — the pinned formatting rule is load-bearing, not cosmetic. `## Delegate the
+  Implementation` owns *which work is yours and which is the child's*; `## Quality Pass` owns *how to
+  write a pass*. The worker self-grade exemption is now stated in **three** sections (planning,
+  delegation, Quality Pass), and every number-sensitive phrase in all three stays derived from
+  `graders.length` / `plural`. Change the exemption in all three. The premise behind it — that only
+  `worker` ends its own run with a grading pass — is pinned by the test "only worker declares a
+  self-grading pass" in `subagent-herdr/lib.test.ts`, so an agent file that starts self-grading breaks it.
 - **Every grader phrase is derived from the `graders` roster, including the number.** The
   prose around the list ("launch them", "those two tasks", "these graders"/"these agents")
   was hardcoded plural while the list itself was computed, so a reviewer-only or
@@ -154,6 +185,28 @@ scripts, so every command below comes from the repo root).
   extension. And do not rebuild either list from the branch inside `execute`: pi persists a
   parallel tool batch only after the whole batch, so every call replays the same stale
   branch and the last snapshot erases the rest (measured on `todo`).
+- **The settle guard and `## Kanban Board` are one rule, stated in two places on purpose.**
+  `kanban/lib.ts`'s `nudgeFor` enforces the accounting at end-of-turn; `dynamic-prompt.ts`'s
+  `## Kanban Board` states it up front. `kanban/index.ts`'s per-tool `promptGuidelines` look like a
+  third copy, but they **never arrive**: pi stores them in `toolGuidelines`, which feeds only pi's own
+  `rules` section, and this extension returns `{ systemPrompt }` → `forceSystemPrompt`, so
+  `buildSystemPromptState` returns `{ content }` with no sections and the forced-prompt projection drops
+  every system message pi built (probed: a sentinel passed through `toolGuidelines`/`toolInventory` is
+  absent from a build, while the flat `guidelines` field does print under `## Guidelines`). So the
+  section is the **only** copy the model reads; prose in the tool's `promptGuidelines` (a separate field
+  from its `description`) documents the module for humans — it does not steer behaviour.
+  The two copies share the prohibition (`nudgeFor`: "Never move a card just to clear this message";
+  the section: "Never move a card to silence the guard") and every disposition **except `review`**.
+  The section's accounted list must stay a subset of `actionableCards`' exemptions: `done`,
+  `blocked` with a note, a dropped card, a card linked to a run that is still running. `review` is
+  **not** exempt — `actionableCards` keeps counting it while nothing else is waiting — so the section
+  omits it and `nudgeFor` offers it only while another card waits on a running run. It used to offer
+  it flat, which told the model to perform the exact shuffle the guard punishes; the wording and
+  `lib.test.ts` now agree with `actionableCards`.
+  The prompt must never phrase the rule
+  as a way to get past the guard: the guard is answered by doing the work or by moving the card to the
+  column that is true, and a section that teaches shuffling converts a real signal into noise the model
+  learns to ignore.
 - **A boundary handler must not gate on the `canContinue` it was handed.** `kanban/`'s
   `agent_before_settle` guard returns `{ continue: true }` with a `custom_message` draft to
   stop the agent abandoning an unfinished board. At handler time `event.context.canContinue`

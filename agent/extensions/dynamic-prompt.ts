@@ -44,6 +44,40 @@ const QUESTIONNAIRE_TOOL = 'questionnaire';
 const SUBAGENT_TOOL = 'subagent';
 
 /**
+ * Name of the tool registered by the `kanban` extension. It is registered for the
+ * orchestrator only — the factory returns as soon as `PI_SUBAGENT_RUN_ID` is set —
+ * so this flag is naturally false in a child and needs no `isSubagent` conjunct of
+ * its own. Nothing from `kanban/lib.ts` is imported here: the *capability* reaches this
+ * module through `promptInputs` as a boolean, and a top-level extension taking a
+ * dependency on a sibling's internals is the coupling that gate avoids — pi-tui resolves
+ * at the repo root and `lib/runtime.test.ts` imports `../kanban/lib.js`, so the bar is
+ * architectural, not technical. Only one cap is restated, by hand, as a numeral in the
+ * prose below: the per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per call").
+ * The 200-card cap is never printed — the tool's refusal names it — so it has no copy
+ * to drift. Change `MAX_ADD_PER_CALL` and you change the prose here in the same commit:
+ * nothing at test time can catch that drift.
+ */
+const KANBAN_TOOL = 'kanban';
+
+/**
+ * A model ref in the fleet is written `provider/model|effort`, so it contains a pipe. Raw, it
+ * closes a cell early and a 5-column table renders 6 fields — and the Tools column is what
+ * `delegationSection` tells the model to read when picking an implementer, so a mangled row
+ * hides an agent's real tools from the one rule that depends on them. Module scope: the tool
+ * table uses it too, and a `const` below that template is in its TDZ when the template runs.
+ * GFM renders `\|` in a cell as a literal `|`.
+ */
+function cell(s: string): string {
+  return s.replace(/\|/g, '\\|');
+}
+
+/**
+ * The roster's implementation agent. Named in the prompt only when the roster this
+ * session may actually spawn has it — a roster is not a capability.
+ */
+const WORKER_AGENT = 'worker';
+
+/**
  * The two agents that grade an implementation: `reviewer` reads it, `verifier`
  * runs it. A closed union rather than `string`, so the role table below has to
  * cover every member and a third grader fails to compile at the one place that
@@ -275,6 +309,19 @@ export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
     selectedTools.includes(SUBAGENT_TOOL) ||
     toolInventory.some((t) => t.name === SUBAGENT_TOOL);
 
+  // --- Detect the kanban extension ---
+  // The same two signals as the questionnaire and subagent gates: the gated
+  // `selectedTools` AND the snippet-filtered inventory. `toolInventory` alone is the
+  // weaker signal — it lists only tools pi handed over with a snippet — so the flag
+  // is computed HERE, off the gated list, and not as a `toolInventory.some(...)`
+  // inside the builder: a builder-side check goes false on a session that really does
+  // have the tool, and a field on `buildOptions` is pinned at the call site by
+  // `Parameters<typeof buildOrchestratorPrompt>[0]`, which a bare name match is not.
+  // The retired `plan` section's gate was a bare name match, and it outlived its tool.
+  const hasKanban =
+    selectedTools.includes(KANBAN_TOOL) ||
+    toolInventory.some((t) => t.name === KANBAN_TOOL);
+
   return {
     selectedTools,
     buildOptions: {
@@ -285,6 +332,7 @@ export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
       guidelines,
       hasQuestionnaire,
       hasSubagent,
+      hasKanban,
       isSubagent: opts.lineage.length > 0,
       customPrompt: spo.customPrompt,
       appendSystemPrompt: spo.appendSystemPrompt,
@@ -424,6 +472,12 @@ export function buildOrchestratorPrompt(opts: {
    */
   hasSubagent: boolean;
   /**
+   * True when the `kanban` extension's tool is offered this run. Registered for the
+   * orchestrator only, so the tool gate is the whole gate: a child is never offered
+   * the tool, hence no `isSubagent` conjunct here.
+   */
+  hasKanban: boolean;
+  /**
    * True when this process is itself a delegated subagent (non-empty
    * lineage). The planning and Quality Pass sections are written for the
    * human's orchestrator; a subagent's own body carries its grading contract
@@ -457,7 +511,7 @@ sequences of tool calls, coordinate execution, and verify results.
 
 | Tool | Description |
 |------|-------------|
-${opts.toolInventory.map((t) => `| ${t.name} | ${t.description} |`).join('\n')}
+${opts.toolInventory.map((t) => `| ${cell(t.name)} | ${cell(t.description)} |`).join('\n')}
 
 **Orchestration rules:**
 - Break complex tasks into smaller, verifiable steps
@@ -469,6 +523,16 @@ ${opts.toolInventory.map((t) => `| ${t.name} | ${t.description} |`).join('\n')}
 `
       : '';
 
+  // The chain note names no agents. It used to be the literal "worker → reviewer", which
+  // dangled in a roster that has neither. Deriving the pair from the roster is no better: the
+  // arrow reads as a child spawning a child, and whether that is legal is decided by
+  // `lineageRejection(name, callableBy, lineage)` in lib/agents.ts. The roster entries do
+  // carry `callableBy`, but this builder is handed no lineage — only `isSubagent` — so it
+  // cannot evaluate the rule that would refuse the pair (explorer → healthcheck, and every
+  // self-chain, are refused for a child). State the capability, not a pair: the roster is
+  // already filtered for the process that prints it, so a sequential chain of its entries is
+  // something that process can actually do.
+
   // --- Agent inventory section ---
   const agentSection =
     opts.hasSubagent && opts.agentInventory.length > 0
@@ -479,15 +543,18 @@ Specialized subagents you can delegate tasks to via the \`subagent\` tool.
 Delegation runs in the background and returns a task id, not a result: you end
 your turn and the subagent wakes you when it has something to say.
 
+The Model column is markdown-escaped, so a \`\\|\` inside a cell is one \`|\`: a ref printed as
+\`provider/model\\|low\` is passed to a \`model:\` override as \`provider/model|low\` \u2014 drop the backslash.
+
 | Agent | Description | Model | Tools | From |
 |-------|-------------|-------|-------|------|
-${opts.agentInventory.map((a) => `| ${a.name} | ${a.description} | ${a.model ?? 'default'} | ${(a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all'} | ${a.skill ? `skill: ${a.skill}` : 'global'} |`).join('\n')}
+${opts.agentInventory.map((a) => `| ${cell(a.name)} | ${cell(a.description)} | ${cell(a.model ?? 'default')} | ${cell((a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all')} | ${cell(a.skill ? `skill: ${a.skill}` : 'global')} |`).join('\n')}
 
 **Agent usage notes:**
 - Each agent has a focused role — pick the right one for the task
 - Agents run in isolated context windows (don't pollute main conversation)
 - Delegate with the \`subagent\` tool, naming the agent and its task
-- You can chain agents (e.g., worker → reviewer) for complex workflows
+- You can chain agents: the report a child brings back is the next child's task — launch it in the turn you read the report
 
 **Delegation is asynchronous, and you must end your turn to collect it.**
 \`subagent\` starts a background *task* and returns a task id (e.g. \`sub-a3f1\`) —
@@ -520,8 +587,87 @@ The loop works like this:
 `
       : '';
 
+  // --- Delegation gates ---
+  // Delegation is a capability, not a roster: `agentInventory` is read off disk, so
+  // every phrase that names an agent is gated on that agent being one this session
+  // may spawn. `canDelegate` mirrors the gate `agentSection` gave its own table (spawn
+  // tool + non-empty roster) plus `!isSubagent`, so this module can never point at an
+  // `## Available Agents` table it did not print, and never hands a child a section
+  // written for its parent — the planning and Quality Pass sections withhold on the
+  // same conjunct.
+  const canDelegate =
+    opts.hasSubagent && !opts.isSubagent && opts.agentInventory.length > 0;
+  const hasWorker =
+    opts.hasSubagent &&
+    !opts.isSubagent &&
+    opts.agentInventory.some((a) => a.name === WORKER_AGENT);
+  // A roster with no `worker` gets the same push with no hardcoded name, so the
+  // section cannot dangle an agent this install does not have. The fallback carries
+  // the *joint* test — role and capability — because it is also printed in the Execute
+  // step, 190 lines above the delegation section's own qualifier: a role-only test
+  // there denotes `planner` ("Writes no code") in the real fleet minus `worker`, and a
+  // capability-only test denotes `spiker` (a throwaway sandbox).
+  const implName = hasWorker
+    ? `\`${WORKER_AGENT}\``
+    : 'the roster agent whose role fits the step and whose Tools column shows write and edit (or all)';
+  // Rows that can edit files: an explicit write+edit pair, or an unrestricted
+  // (`tools: []`) agent, which the table prints as "all". Counted, not described,
+  // so the sentence stays true of whatever roster this install has.
+  const writerRows = opts.agentInventory.filter(
+    (a) =>
+      (a.tools?.length ?? 0) === 0 || (a.tools!.includes('write') && a.tools!.includes('edit')),
+  ).length;
+  const rowsWord = (n: number) => (n === 1 ? 'row' : 'rows');
+  const writerCount = `${writerRows} of ${opts.agentInventory.length} ${rowsWord(opts.agentInventory.length)} ${writerRows === 1 ? 'shows' : 'show'} write and edit (or all)`;
+
+  // --- Kanban board section ---
+  // The board is the plan of record the user can watch. `kanban/lib.ts`'s `nudgeFor()`
+  // states the accounting rule at end-of-turn, so the dispositions and the prohibition
+  // below are lifted from that text on purpose: the rule a model reads up front must
+  // not drift from the guard that holds its turn, and nothing here may phrase that
+  // rule as a way to get past the guard.
+  const boardLinkLine = canDelegate
+    ? "- `link` a card to the run id `subagent` returned the moment you delegate it, so the board shows that run's live status.\n"
+    : '';
+  const boardAccounted = canDelegate
+    ? ', or linked to a run that is still running'
+    : '';
+  const boardSection = opts.hasKanban
+    ? `
+## Kanban Board
+
+Run the work on the board. The user watches it beside this conversation, and a step
+that is not on it is a step nobody can see you do.
+
+**Open it before you start.** For work of two or more steps, call \`kanban\` \`add\`
+(up to 20 titles per call) with one card per step, in the order you intend to do them;
+\`show\` first, so you extend the board instead of duplicating it. One card per step: not
+one per file, and not one card for "the rest".
+Skip the board for a single step, or for trivial work — a board for a one-line fix is
+noise the user has to look at.
+
+**Keep it true as you go.**
+- \`move\` to \`in_progress\` when you start a card. Several cards may be \`in_progress\` at once.
+${boardLinkLine}- \`move\` to \`review\` with the note naming what you ran; to \`done\` only once it is
+  genuinely verified, with that evidence in the note.
+- \`move\` to \`blocked\` with a note saying what it waits on (including the user).
+- \`drop\` a card that turns out not to be needed; \`clear_done\` to clear finished work off
+  the board before you add the next batch.
+
+**Account for every card before you end the turn:** each one is \`done\`, \`blocked\` with
+a note, dropped${boardAccounted}. \`review\` is not one of them: the guard keeps counting a
+card there while nothing else is waiting. The board's guard holds the turn open while a card is
+unaccounted for; answer it by doing the work, or by moving the card to the column that
+is true. Never move a card to silence the guard.
+
+Do not restate the board in your replies — the user sees it. Re-read it with \`show\`
+(for example after compaction). The user edits it with \`/kanban\`; follow their changes.
+`
+    : '';
+
   // --- Grading roster ---
-  // Shared by the two sections below, both of which name these agents directly.
+  // Shared by the three sections below (planning, delegation, quality pass), each of which
+  // names these agents directly.
   // Gated on them actually being spawnable, like askUserSection is gated on the
   // questionnaire tool: a prompt that orders a delegation to an agent this
   // install does not have is an instruction the model cannot obey.
@@ -560,6 +706,20 @@ The loop works like this:
       }.`
     : '';
 
+  // Additive clause on the Execute step, so the header states the board and
+  // delegation rules in the same sentence the rest of the prompt points at. Every
+  // branch keeps the sentence grammatical, and the no-capability branch is
+  // byte-identical to what shipped: `canDelegate` is false in a roster-less install,
+  // so no agent name is ever printed there.
+  const executeClause =
+    opts.hasKanban && canDelegate
+      ? ` with each step tracked on the \`${KANBAN_TOOL}\` board, delegating implementation to ${implName} (see **Kanban Board** and **Delegate the Implementation**)`
+      : opts.hasKanban
+        ? ` with each step tracked on the \`${KANBAN_TOOL}\` board (see **Kanban Board**)`
+        : canDelegate
+          ? `, delegating implementation to ${implName} (see **Delegate the Implementation**)`
+          : '';
+
   // --- Planning delegation section ---
   // The orchestrator's weakest moment is the one where it starts editing from a
   // plan it holds only in its own head: `planner` reads the actual files and
@@ -572,6 +732,13 @@ The loop works like this:
   // Quality Pass already makes — a `worker` ends its own run by handing its diff
   // to these graders, so re-grading it would buy a duplicate pass and nothing
   // else.
+  //
+  // The exemption names `worker`, so it is gated on `worker`: a roster without it has no
+  // self-grading child, and `delegationSection` tells that install the opposite ("No
+  // child's diff comes graded in this install"). Granting the exemption there is a
+  // licence to skip the only pass that exists, citing an agent the roster lacks — the
+  // identical bug one level down, which AGENTS.md records as this module's habit.
+  // Quality Pass gates its three `worker` branches for the same reason.
   const hasPlanner =
     opts.hasSubagent && !opts.isSubagent && opts.agentInventory.some((a) => a.name === 'planner');
   const planningSection = hasPlanner
@@ -611,12 +778,124 @@ below for how to write that task.`
 }
 
 The pairing is the point: a plan nobody checked against the result is a document,
-not an engineering step. The single exception is the one Quality Pass already
-names — a \`worker\` has passed its own diff through ${plural ? 'these graders' : 'this grader'}, so do not
-re-grade it. Grade what **you** implemented.
+not an engineering step.${hasWorker
+  ? `
+
+The single exception is the one Quality Pass already names: a \`worker\` has passed its own diff through ${plural ? 'these graders' : 'this grader'}, so do not re-grade it.`
+  : ''} Grade what **you** implemented.
+`
+    : ''
+}${
+  opts.hasKanban
+    ? `
+**Put the plan on the board.** \`planner\` returns an ordered list of steps; make that
+list the board. Call \`kanban\` \`add\` with one card per step, in the plan's order,
+before you touch code, then work the board. A plan that lives only in this transcript
+is a conversation, not a plan of record.
 `
     : ''
 }`
+    : '';
+
+  // --- Delegation-first section ---
+  // The orchestrator's second weakest moment: it takes a plan it did not write and
+  // executes the whole thing inline, so the implementation is graded by nobody and the
+  // user watches a wall of edits from the agent meant to coordinate. A `worker` ends
+  // its own run graded, so pushing work to the child also pushes it behind a gate.
+  // Gate: a roster this session can delegate to. The agent name is gated one level
+  // finer (`implName`), and every grader phrase — the Quality Pass pointer included —
+  // is gated on `graders`, because that section is emitted on exactly that condition
+  // and a pointer to a section that was never printed is the dangling reference this
+  // module keeps having to fix.
+  // The child's self-grade is derived, never hardcoded, for two reasons this module has
+  // already been burned by: `verifier` is conditional in `agents/worker.md` (as it is in
+  // Quality Pass below), and in an install with no spawnable grader *no* child is graded
+  // at all. Stating the pass as unconditional is how the orchestrator comes to believe a
+  // docs change was verified and declines the one pass still owed — so each phrase below
+  // prints only the pass that exists.
+  // Singular states the condition without naming the agent twice: the list already
+  // named it, and `verifierCaveat` is a separate sentence for exactly this reason.
+  const verifierParen = !graders.includes('verifier')
+    ? ''
+    : plural
+      ? ' (the `verifier` only when execution can settle the change)'
+      : ' (only when execution can settle the change)';
+  const childSelfGrade = graders.length > 0 ? `graded by ${graderList}${verifierParen}` : '';
+  const childReports = childSelfGrade
+    ? `has its own diff ${childSelfGrade} before it reports`
+    : 'reports what it ran — the check on it is yours';
+  const implSentence = hasWorker
+    ? `When a plan has implementation steps, delegate them to \`${WORKER_AGENT}\`: it edits the files, runs the project's checks, and ${childReports}.`
+    : `When a plan has implementation steps, delegate them to ${implName} — both conditions, read off the Available Agents table: ${writerCount}, and a row that can write but whose role is a throwaway spike is not an implementer either. If no row does both, this install has no implementer: the editing is yours, and so is the pass on it.`;
+  const qualityPassPointer =
+    graders.length > 0
+      ? ` See **Quality Pass** below for how to write ${plural ? 'those tasks' : 'that task'}.`
+      : '';
+  // The exemption from ordering a grader pass is an instruction to obey only where a
+  // graded child pass exists. `worker` is the only roster agent whose body ends its run
+  // with one, and with no grader spawnable there is no pass to decline — so the
+  // paragraph is gated on both, and the inverse is stated out loud rather than left
+  // out: an ungraded child's work must not read as work that was checked.
+  const gradingParagraph =
+    graders.length > 0 && hasWorker
+      ? `**Grading follows the work, not the doer.** A child that implements ends its own run
+by having its diff ${childSelfGrade} — do not order that pass again. Read the child's
+report of that pass: anything it says it skipped is yours. What is yours is what no child
+graded: the work you implemented yourself, and the glue you edited while integrating what
+came back.${qualityPassPointer}`
+      : `**The pass on what comes back is yours.** ${
+        graders.length > 0
+          ? `No agent in this roster ends its own run with a grading pass, so no child's diff arrives checked.${qualityPassPointer}`
+          : `No child's diff comes graded in this install: nothing here grades it, so run the project's own checks on what comes back, and fix what they report before you report the work done.`
+      }`;
+  // Delegating a step with nothing to implement buys a grading pass over an empty diff —
+  // where such a pass exists, and where a child's run is the thing that comes graded. So
+  // the tail is three-way: a self-grading implementer (a launch is spent for nothing); a
+  // roster with graders but no self-grading implementer (the section above says no child
+  // arrives checked, so the launch is one the orchestrator must order itself — saying "a
+  // graded implementer run" there contradicts it); and no graders at all, where the cost
+  // is only the turn of waiting.
+  const emptyDiffBullet =
+    graders.length > 0 && hasWorker
+      ? '- A step changes no files — a build, a test run, an inspection, a report. A graded implementer run over an empty diff buys a grader launch and a turn of waiting for nothing'
+      : graders.length > 0
+        ? '- A step changes no files — a build, a test run, an inspection, a report. Run it yourself: no child here comes back with its diff graded, so an empty one buys you a grader launch to order and a turn of waiting for nothing'
+        : '- A step changes no files — a build, a test run, an inspection, a report. Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing';
+
+  // The skip rule presumes the delegation it skips. In a roster where no row can write, the
+  // opener makes self-editing the outcome, so every implementation step would be a "named skip"
+  // and "the implementer" would name a role the section just said may not exist. State the rule
+  // that fits the roster.
+  const skipLine = hasWorker
+    ? '**Name any skip.** If a step clears the delegate bar above and you implement it yourself, say which and why, in one line.'
+    : '**Say who is doing it.** If no row fits the role and shows write and edit, the editing is yours: say so in one line, and run the pass on it yourself.';
+
+  const delegationSection = canDelegate
+    ? `
+## Delegate the Implementation
+
+${hasWorker ? 'You coordinate; the child implements.' : 'You coordinate; a child implements where one can.'} ${implSentence} ${
+  hasWorker
+    ? 'Executing a whole plan inline is work no child graded and no one can see.'
+    : 'Executing a whole plan inline when a row does both is work no child graded and no one can see.'}
+
+**Delegate when:**
+- A step changes files and the plan already specifies it: the file, the function, what to change, how it will be checked${hasWorker ? '' : ' — and a row does both'}
+- Two or more such steps are independent of each other — launch them in one turn, then end your turn
+- The step is a sweep over many files you would otherwise do line by line${hasWorker ? '' : ' — and a row does both'}
+${hasWorker ? '- The step is a read-heavy investigation → a read-only agent from the table above, if it has one; never the implementer' : '- The step is a read-heavy investigation → a read-only agent from the table above, if it has one; never a row that edits files'}
+
+**Stay direct when:**
+- It is a typo, a one-line fix, a single string or constant
+- You are only reading, researching, explaining, or answering a question
+- You are triaging a delegation that came back wrong — the child is gone; the diagnosis is yours
+- It is integration glue: wiring the returned pieces together, and the final assembly you have to hold in your own head
+${emptyDiffBullet}
+
+${skipLine}
+
+${gradingParagraph}
+`
     : '';
 
   // --- Quality pass section ---
@@ -632,9 +911,11 @@ re-grade it. Grade what **you** implemented.
 ## Quality Pass
 
 When **you** implemented something yourself — edited files, wrote a feature, fixed
-a bug — you are the worst available judge of it. A \`worker\` you delegate to ends
-its run by having its diff graded by an agent that did not write it. Hold yourself
-to the same standard: finish your own implementation work the same way.
+a bug — you are the worst available judge of it.${hasWorker
+  ? ` A \`worker\` you delegate to ends its run by having its diff graded by an agent that did
+not write it. Hold yourself to that standard: finish your own implementation work the same way.`
+  : ` Hold yourself to the standard a grader would apply: finish your own implementation work
+as an agent that did not write it would.`}
 
 Before you tell the user an implementation is done, delegate a quality pass:
 
@@ -647,8 +928,13 @@ for any remaining bugs, issues, or quality-of-life improvements.**
 
 **When it applies:** you changed code, config, or anything executable, and the
 change is more than a typo or a one-line string. It does **not** apply to work you
-only read, planned, or researched, nor to a change a subagent already had graded —
-do not re-grade a \`worker\`'s diff it has itself passed through ${plural ? 'these agents' : 'this agent'}.
+only read, planned, or researched.${hasWorker
+  ? ` Nor does it apply to a change a child already had graded: do not re-grade a
+\`worker\`'s diff it has itself passed through ${plural ? 'these agents' : 'this agent'}.`
+  : ''}
+It applies to glue **you edited yourself** while integrating what the children returned —
+no child graded that glue. Confirming the whole does what the goal asked is the project's
+own checks, not a second grader launch over ${hasWorker ? 'a diff a child already had graded' : 'work you have already checked yourself'}.
 
 **How to delegate it well:**
 - Write the task self-contained: the child cannot see this conversation. Name the
@@ -808,7 +1094,7 @@ skill invocations in the right order.
 
 1. **Decompose** — Break complex user requests into discrete, verifiable steps. If a request has gaps or is unclear, ask${opts.hasQuestionnaire ? ` using the \`${QUESTIONNAIRE_TOOL}\` tool` : ''} before planning.
 2. **Plan** — Consult the skills catalogue first, then${hasPlanner ? ` delegate the plan to \`planner\` for anything beyond a trivial edit (see **Plan Before You Implement**) and` : ''} determine the optimal sequence of tool calls and skill invocations
-3. **Execute** — Call tools and skills in the correct order, handling errors gracefully
+3. **Execute** — Call tools and skills in the correct order${executeClause}, handling errors gracefully
 4. **Verify** — Confirm each step's result before proceeding to the next
 5. **Adapt** — If something fails, diagnose and try a different approach
 
@@ -828,5 +1114,5 @@ When given a task:
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 
-${askUserSection}${toolSection}${agentSection}${planningSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
+${askUserSection}${toolSection}${agentSection}${boardSection}${planningSection}${delegationSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
 }

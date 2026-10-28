@@ -4,7 +4,7 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2428,6 +2428,38 @@ describe("the fleet delegation graph (agents/*.md callable_by)", () => {
     const agents = await discoverAgents(agentsDir());
     const actual = Object.fromEntries(agents.map((a) => [a.name, a.callableBy]));
     expect(actual).toEqual(EXPECTED);
+  });
+
+  // The fleet is the user's agent dir, and a container with HOME=/tmp has none of it. A silent
+  // `return` inside the body prints a pass for an assertion that ran nothing, so the skip is
+  // declared where the report can show it.
+  const fleetOnDisk = (() => {
+    try {
+      return readdirSync(agentsDir()).some((f) => f.endsWith(".md"));
+    } catch {
+      return false;
+    }
+  })();
+
+  test.skipIf(!fleetOnDisk)("only worker declares a self-grading pass — the premise of the prompt's worker gate", async () => {
+    // `dynamic-prompt.ts` grants the "do not re-grade a child's diff" exemption to `worker`
+    // alone, and withholds the whole exemption in a roster without it, because `worker.md`
+    // is the only body that ends its own run with a grading pass. Agent bodies are prose a
+    // human edits, so the premise is pinned, not assumed: an agent that starts self-grading
+    // has to be added to that gate, and one that stops has to be taken back out of it.
+    // Fence-stripped: worker.md's report template quotes a "## Quality Pass" heading, and a
+    // heading inside a code fence is not that agent's contract. A loose predicate here would
+    // certify any agent whose body merely shows such a heading, so the gate it protects
+    // ("only worker self-grades") would rest on a match that means nothing.
+    const selfGrades = (body: string) => {
+      const prose = body.replace(/```[\s\S]*?```/g, "");
+      return /^## Quality Pass$/m.test(prose) || /run the quality pass/i.test(prose);
+    };
+    const fleet = await discoverAgents(agentsDir());
+    // Guarded by `test.skipIf` above: with no fleet on disk there is no body to read.
+    const all = [...fleet, ...(await discoverSkillAgents(skillsDir()))];
+    const graded = all.filter((a) => selfGrades((a as { promptBody?: string }).promptBody ?? "")).map((a) => a.name);
+    expect(graded).toEqual(["worker"]);
   });
 
   test("every named caller is a real agent, `orchestrator`, or `any`", async () => {
