@@ -10,7 +10,6 @@
   "retainedToolOutputMaxTokens": 32000,
   "recallResponseMaxChars": 48000,
   "skipForProviders": [],
-
   "memory": true,
   "sessionFallback": true,
   "fullFoldAlways": true,
@@ -46,7 +45,7 @@
   "reflectorModel": {
     "provider": "litellm",
     "id": "xhtoken/spark-x2.6-4b",
-    "thinking": "xhigh",
+    "thinking": "high",
     "contextWindow": 1048576
   },
   "dropperModel": {
