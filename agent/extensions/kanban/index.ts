@@ -543,7 +543,7 @@ export default function kanban(pi: ExtensionAPI) {
 			"drop (id), clear_done, show. Cards are addressed by id, so you never resend the board.",
 		promptSnippet: "Plan and track multi-step work on the kanban board the user sees beside you (add/move/link/show).",
 		promptGuidelines: [
-			"For work of three or more non-trivial steps, call kanban op 'add' with one card per step before starting. Skip it for single-step or trivial requests.",
+			"For work of two or more non-trivial steps, call kanban op 'add' with one card per step before starting. Skip it for a single step or a trivial request.",
 			"Move a card to in_progress when you start it — several may be in progress at once while subagents work in parallel. When you delegate a card, call op 'link' with the run id the subagent tool returned, so the board shows the run's live status.",
 			"Move finished work to review while it is being verified (reviewer/verifier runs linked), and to done only once it is genuinely verified, with the evidence in the note. If something is in the way, move it to blocked with a note saying what it waits on; drop cards that turned out not to be needed.",
 			"Before you end your turn, every card must be done, blocked with a note, dropped, or waiting on a linked running subagent; otherwise the turn is held open with a reminder.",

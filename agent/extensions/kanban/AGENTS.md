@@ -22,6 +22,9 @@ covers what you need to know to change the module itself.
   fallback). Never under `agent/`, because that is Nextcloud-synced. User edits go through `/kanban`, never through the pane.
 - **Orchestrator only.** The factory returns immediately when `PI_SUBAGENT_RUN_ID` is set (children
   get `todo`); `gate.test.ts` pins it.
+  `dynamic-prompt.ts`'s `## Kanban Board` section is gated on the tool being *offered* — this
+  registration gate is what keeps the section out of a child's prompt, which is why the prompt
+  adds no `isSubagent` check of its own.
 - **No WIP limit.** Several cards may be `in_progress` (the opposite of `lib/todo.ts`).
 - **Refuse, don't repair.** A blank note on `move` keeps the existing note (only the `note` op clears it);
   leaving `blocked` drops the stale blocker note. Run links are advisory badges. A card is never

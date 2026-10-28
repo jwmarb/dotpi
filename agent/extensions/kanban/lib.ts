@@ -95,6 +95,13 @@ export const MAX_CARDS = 200;
 export const MAX_TITLE = 200;
 export const MAX_NOTE = 500;
 export const MAX_RUNS_PER_CARD = 8;
+/**
+ * Cards per `add` call. `dynamic-prompt.ts` states this number in prose ("up to 20 titles
+ * per call"), and nothing ties the two at test time: that module deliberately does not import
+ * a sibling extension's module (board facts reach it through `promptInputs`), which is an
+ * architectural choice, not a missing dependency — pi-tui resolves at the repo root and
+ * `lib/runtime.test.ts` already imports this file. If you change this cap, change the prose.
+ */
 export const MAX_ADD_PER_CALL = 20;
 
 export type KanbanOp =
@@ -589,8 +596,10 @@ export function nudgeFor(state: KanbanState, runs: RunInfos): KanbanNudge | unde
 		signature: settleSignature(state, runs),
 		text:
 			`Not done yet: ${subject} you — ${shown.join("; ")}${more}. ` +
-			"For each one do exactly one of: keep working on it; kanban op 'move' to review or done " +
-			"once it is genuinely verified (put the evidence in the note); op 'move' to blocked with a note " +
+			"For each one do exactly one of: keep working on it; kanban op 'move' to done once it " +
+			"is genuinely verified (put the evidence in the note); op 'move' to review only while another " +
+			"card is waiting on a running subagent — a review card is counted otherwise, so it does not " +
+			"settle this (a card linked to its own running run is the exempt case); op 'move' to blocked with a note " +
 			"saying what it waits on (including the user); op 'link' with the run id if a running subagent " +
 			"is doing it; or op 'drop' if it is not needed. Never move a card just to clear this message.",
 	};

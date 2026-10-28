@@ -312,6 +312,30 @@ describe("settle guard", () => {
 		expect(nudgeFor(s, {})).toBeUndefined();
 	});
 
+	test("review is accounted for only while something else is waiting", () => {
+		// `dynamic-prompt.ts`'s `## Kanban Board` lists the accounted dispositions and omits
+		// `review` on purpose, and extensions/AGENTS.md requires that list to stay a subset of
+		// `actionableCards`' exemptions. This is the source of that claim: a `review` card is
+		// counted while nothing is waiting, so moving a card to `review` does not settle the
+		// turn — it is the one disposition `nudgeFor`'s own text offers that this guard does
+		// not exempt, which is why the prompt must not list it.
+		const toReview = run(
+			{ op: "add", titles: ["a"] },
+			{ op: "move", id: "k1", column: "review" },
+		);
+		expect(actionableCards(toReview, {}).map((c) => c.id)).toEqual(["k1"]);
+		expect(nudgeFor(toReview, {})).toBeDefined();
+		// With a sibling waiting on a running run it is exempt — the only condition under
+		// which `review` settles a turn.
+		const waiting = run(
+			{ op: "add", titles: ["a", "b"] },
+			{ op: "move", id: "k1", column: "review" },
+			{ op: "move", id: "k2", column: "in_progress" },
+			{ op: "link", id: "k2", runId: "sub-0001" },
+		);
+		expect(actionableCards(waiting, running)).toEqual([]);
+	});
+
 	test("the signature re-arms when a linked run changes status", () => {
 		expect(settleSignature(delegated(), running)).not.toBe(settleSignature(delegated(), finished));
 		expect(nudgeFor(delegated(), finished)!.signature).toBe(settleSignature(delegated(), finished));
@@ -322,6 +346,11 @@ describe("settle guard", () => {
 		expect(text).toContain("k1");
 		expect(text).toContain("collect their results");
 		expect(text).toContain("Never move a card just to clear this message");
+		// The offered dispositions must match `actionableCards`: a `review` card is counted
+		// while nothing is waiting, so the guard may not offer `review` flat — that wording
+		// told the model to perform the shuffle this same sentence forbids.
+		expect(text).toContain("to review only while another card is waiting");
+		expect(text).toContain("a review card is counted otherwise");
 	});
 
 	test("linkedRunIds skips done cards", () => {
