@@ -192,6 +192,25 @@ describe("extractRunResult", () => {
     expect(r.sessionFile).toBe(join(dir, "2026-09-20T13-00-00-000Z_sub-0007.jsonl"));
   });
 
+  test("the sidecar-settled transcript wins over a newer post-completion resume", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const entry = (text: string) =>
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+      });
+    const settledName = "2026-09-20T12-00-00-000Z_sub-0008.jsonl";
+    writeFileSync(join(dir, settledName), `${entry("the run's answer")}\n`);
+    writeFileSync(join(dir, `${settledName}.exit`), "");
+    writeFileSync(join(dir, "2026-09-25T09-00-00-000Z_sub-0008.jsonl"), `${entry("resume chatter")}\n`);
+
+    const r = await extractRunResult(dir, "sub-0008");
+    expect(r.found).toBe(true);
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe("the run's answer");
+    expect(r.sessionFile).toBe(join(dir, settledName));
+  });
+
   test("reports found-but-unanswered when the session has no assistant text", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
     const lines = [

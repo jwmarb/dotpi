@@ -29,6 +29,7 @@ import {
   CARD_ID_PATTERN,
   type ChildReport,
   type RunRecord,
+  exitPath,
   isSessionFileFor,
   parseReportLine,
   qualifiesAsAnswer,
@@ -764,13 +765,19 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   }
   // A run dir can hold more than one session file (a resumed session): 18 of
   // 441 recorded dirs do. Names are ISO-timestamp-prefixed, so lexicographic
-  // order is chronological — take the newest, the same rule kanban/runs.ts
-  // uses to render the card sub-row, so the answer and the progress line are
-  // read from the same transcript.
+  // order is chronological. The transcript the child settled — the one with
+  // the `.exit` sidecar — IS the run's answer, and a post-completion resume
+  // (a newer transcript, no sidecar) must not overwrite it: measured on
+  // sub-2ea3, where the newest file is a resume days after the settled run.
+  // With no settled transcript (the run is live) the newest wins — the same
+  // rule kanban/runs.ts uses to render the card sub-row, so the answer and
+  // the progress line are read from the same transcript while the run runs.
   const names = dirEntries.filter((e) => isSessionFileFor(e, runId));
   if (names.length === 0) return undefined;
   names.sort();
-  return join(runDir, names[names.length - 1]);
+  const settled = names.filter((n) => dirEntries.includes(exitPath(n)));
+  const pick = settled.length > 0 ? settled[settled.length - 1] : names[names.length - 1];
+  return join(runDir, pick);
 }
 
 /**
