@@ -330,23 +330,30 @@ export function askExecute(
     };
   }
   const outcome = send();
-  if (outcome.kind === "no-run-dir") {
-    return {
-      text: "Error: PI_SUBAGENT_RUN_DIR is not set; the ask cannot be recorded.",
-      isError: false,
-      asksAfter: asks,
-    };
+  switch (outcome.kind) {
+    case "no-run-dir":
+      return {
+        text: "Error: PI_SUBAGENT_RUN_DIR is not set; the ask cannot be recorded.",
+        isError: false,
+        asksAfter: asks,
+      };
+    case "delivered":
+      return { text: "Ask sent to the orchestrator.", isError: false, asksAfter: asks + 1 };
+    case "recorded-no-parent":
+      return {
+        text: "Ask recorded; no parent pane is known, so the orchestrator will see it on its next task check.",
+        isError: false,
+        asksAfter: asks + 1,
+      };
+    default: {
+      // Exhaustive by construction: a fourth outcome variant must fail tsc
+      // here, not silently ride the "recorded" text and spend budget.
+      const unhandled: never = outcome;
+      return unhandled;
+    }
   }
-  const asksAfter = asks + 1;
-  if (outcome.kind === "delivered") {
-    return { text: "Ask sent to the orchestrator.", isError: false, asksAfter };
-  }
-  return {
-    text: "Ask recorded; no parent pane is known, so the orchestrator will see it on its next task check.",
-    isError: false,
-    asksAfter,
-  };
 }
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
