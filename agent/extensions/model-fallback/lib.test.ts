@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
 // "never retryable" invariant is checked against the real patterns.
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import {
+	type AdvanceResult,
 	type ChainEntry,
 	type DisplayEntry,
 	type FallbackConfig,
@@ -25,8 +26,13 @@ import {
 	GATEWAY_UPSTREAM_FAILURE_PATTERN,
 	MAX_UPSTREAM_DELAY_MS,
 	advance,
+	applyConcurrency,
 	computeDisplay,
+	concurrencyKeyFor,
+	concurrencyLimitFor,
+	DEFAULT_CONCURRENCY,
 	describeBudgetShortfall,
+	describeConcurrencyHop,
 	describeExhaustion,
 	describeHop,
 	describeNoneAvailable,
@@ -47,12 +53,15 @@ import {
 	parseChainItem,
 	parseModelEntry,
 	parseModelRef,
+	pickFreeIndex,
 	planRegistration,
 	readChain,
 	readConfig,
+	readConcurrency,
 	readLimits,
 	readVirtualModelState,
 	THINKING_LEVELS,
+	UNLIMITED_CONCURRENCY,
 	VIRTUAL_MODEL_API,
 	VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
 	requiredPhysicalRetries,
@@ -65,7 +74,8 @@ import {
 	upstreamRecovery,
 } from "./lib.ts";
 import { publishServedRouter, servedRouter } from "./served.ts";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { LEASE_DIR_ENV } from "./concurrency.ts";
+import { mkdtempSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 const CONFIG: FallbackConfig = { maxCycles: 10, maxProbes: 2 };
 
@@ -1035,6 +1045,327 @@ describe("readLimits", () => {
 	});
 });
 
+
+describe("readConcurrency", () => {
+	test("defaults an absent blob", () => {
+		expect(readConcurrency(undefined)).toEqual(DEFAULT_CONCURRENCY);
+		expect(readConcurrency({})).toEqual(DEFAULT_CONCURRENCY);
+		expect(readConcurrency({ chain: ["a/1"] })).toEqual(DEFAULT_CONCURRENCY);
+	});
+
+	test("reads per-ref caps, lower-casing the keys", () => {
+		expect(readConcurrency({ concurrency: { "A/1": 2, "B/2": 1 } })).toEqual({
+			limits: { "a/1": 2, "b/2": 1 },
+		});
+	});
+
+	test("a * key becomes the defaultLimit, not a model entry", () => {
+		expect(readConcurrency({ concurrency: { "*": 4, "a/1": 2 } })).toEqual({
+			limits: { "a/1": 2 },
+			defaultLimit: 4,
+		});
+	});
+
+	test("drops zero, negative, fractional, string, and null values", () => {
+		expect(readConcurrency({ concurrency: { "a/1": 0, "b/2": -1, "c/3": 1.5, "d/4": "2", "e/5": null } })).toEqual({
+			limits: {},
+		});
+	});
+
+	test("drops keys that fail the ref grammar", () => {
+		// `a/1:low` (a level has no home in a key), `a,1` (the transport
+		// separator), `a 1` (the env token separator), `/a` (a leading slash
+		// names nothing) — all parse to no usable reference.
+		expect(readConcurrency({ concurrency: { "a/1:low": 2, "a,1": 1, "a 1": 3, "/a": 4, "": 5 } })).toEqual({
+			limits: {},
+		});
+	});
+
+	test("a non-object concurrency blob is the default", () => {
+		expect(readConcurrency({ concurrency: "a/1" })).toEqual(DEFAULT_CONCURRENCY);
+		expect(readConcurrency({ concurrency: ["a/1"] })).toEqual(DEFAULT_CONCURRENCY);
+		expect(readConcurrency({ concurrency: null })).toEqual(DEFAULT_CONCURRENCY);
+		expect(readConcurrency({ concurrency: 7 })).toEqual(DEFAULT_CONCURRENCY);
+	});
+
+	test("an enabled:false blob is tolerated", () => {
+		expect(readConcurrency({ enabled: false, concurrency: { "*": 1 } })).toEqual({ limits: {}, defaultLimit: 1 });
+	});
+
+	test("limit lookup: explicit entry, then *, then unlimited", () => {
+		const config = readConcurrency({ concurrency: { "*": 2, "a/1": 3 } });
+		expect(concurrencyLimitFor(config, "a/1")).toBe(3);
+		expect(concurrencyLimitFor(config, "A/1 ")).toBe(3); // the key rule is trim + case
+		expect(concurrencyLimitFor(config, "b/2")).toBe(2);
+		expect(concurrencyLimitFor(DEFAULT_CONCURRENCY, "b/2")).toBe(UNLIMITED_CONCURRENCY);
+		expect(concurrencyKeyFor(" A/1 ")).toBe("a/1");
+	});
+});
+
+describe("sticky: sanitize and round-trip", () => {
+	const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+
+	test("sanitize clamps an out-of-range sticky via advance() on a shortened chain", () => {
+		// A 3-model session resumed on a 2-model chain: sticky 99 must clamp to
+		// the last index, and the decision must not run off the chain.
+		const state: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 99 };
+		const result = advance({ reason: "continuation", chainLength: chain.length, state, config: CONFIG }) as Extract<AdvanceResult, { kind: "route" }>;
+		const d = applyConcurrency({ reason: "continuation", chain, result, state, concurrency: DEFAULT_CONCURRENCY, inUse: {} });
+		expect(d.index).toBe(1);
+		expect(d.state?.sticky).toBe(1);
+	});
+
+	test("sanitize clamps -1 and non-integer sticky to zero", () => {
+		for (const sticky of [-1, 1.5]) {
+			const state: FallbackState = { index: 0, cycles: 0, probes: 0, home: 0, probing: false, sticky };
+			const result = advance({ reason: "continuation", chainLength: chain.length, state, config: CONFIG }) as Extract<AdvanceResult, { kind: "route" }>;
+			const d = applyConcurrency({ reason: "continuation", chain, result, state, concurrency: DEFAULT_CONCURRENCY, inUse: {} });
+			expect(d.index).toBe(0);
+			expect(d.state?.sticky).toBe(0);
+		}
+	});
+
+	test("a pre-feature state (no sticky) round-trips unchanged", () => {
+		const state: FallbackState = { index: 1, cycles: 2, probes: 1, home: 0, probing: false };
+		const result = advance({ reason: "retry", chainLength: 3, state, config: CONFIG });
+		expect(result.kind).toBe("route");
+		if (result.kind !== "route") return;
+		expect(result.state).toBeDefined();
+		expect("sticky" in result.state!).toBe(false);
+		// And the concurrency decision leaves it that way when nothing rotates.
+		const d = applyConcurrency({
+			reason: "retry",
+			chain: [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }],
+			result,
+			state,
+			concurrency: DEFAULT_CONCURRENCY,
+			inUse: {},
+		});
+		expect(d.state && "sticky" in d.state).toBe(false);
+	});
+});
+
+describe("concurrency rotation", () => {
+	/** Drive `advance` + `applyConcurrency` the way `index.ts` `route()` does. */
+	function route(
+		reason: RouteReason,
+		state: FallbackState | undefined,
+		chain: readonly ChainEntry[],
+		concurrency: ConcurrencyConfigLike,
+		inUse: Readonly<Record<string, number>>,
+		isUsable?: (index: number) => boolean,
+	): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number } } {
+		const result = advance({ reason, chainLength: chain.length, state, config: CONFIG });
+		if (result.kind !== "route") throw new Error(`expected a route, got ${result.kind}`);
+		return applyConcurrency({ reason, chain, result, state, concurrency, inUse, isUsable });
+	}
+
+	type ConcurrencyConfigLike = Parameters<typeof applyConcurrency>[0]["concurrency"];
+
+	test("rotates off a capped index to the next free one, and records the sticky", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, { "a/1": 1 });
+		expect(d.index).toBe(1);
+		expect(d.rotate).toEqual({ from: 0, to: 1 });
+		expect(d.state?.sticky).toBe(1);
+		expect(d.state?.index).toBe(0); // the state `advance` computed, pre-override
+	});
+
+	test("skips an unreachable entry while rotating", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, { "a/1": 1 }, (i) => i !== 1);
+		expect(d.index).toBe(2);
+		expect(d.rotate).toEqual({ from: 0, to: 2 });
+	});
+
+	test("a plain continuation stays on the sticky model, un-probed", () => {
+		// `advance` alone would hand back to home 0 with `probing: true`; the
+		// concurrency decision overrides both: the held model is not a probe.
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("continuation", held, chain, DEFAULT_CONCURRENCY, {});
+		expect(d.index).toBe(1);
+		expect(d.state?.index).toBe(1);
+		expect(d.state?.probing).toBe(false);
+		expect(d.state?.sticky).toBe(1);
+		expect(d.rotate).toBeUndefined();
+	});
+
+	test("a capped sticky model rotates to the next free one", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("continuation", held, chain, { limits: { "b/2": 1 } }, { "b/2": 1 });
+		expect(d.index).toBe(2);
+		expect(d.rotate).toEqual({ from: 1, to: 2 });
+		expect(d.state?.sticky).toBe(2);
+	});
+
+	test("a user turn clears the sticky index", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("user", held, chain, DEFAULT_CONCURRENCY, {});
+		expect(d.index).toBe(0);
+		expect(d.state).toBeDefined();
+		expect(d.state && "sticky" in d.state).toBe(false);
+	});
+
+	test("a retry clears the sticky index", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("retry", held, chain, DEFAULT_CONCURRENCY, {});
+		expect(d.index).toBe(0); // retry from 1 wraps to 0; nothing capped
+		expect(d.state && "sticky" in d.state).toBe(false);
+	});
+
+	test("a forced continuation clears the sticky index", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 3, probes: 0, home: 0, probing: false, forced: true, sticky: 1 };
+		const d = route("continuation", held, chain, DEFAULT_CONCURRENCY, {});
+		expect(d.index).toBe(1);
+		expect(d.state && "sticky" in d.state).toBe(false);
+		expect(d.state?.forced).toBeUndefined();
+	});
+
+	test("six rotation hops over a chain that exhausts in two cycles: the budget stays byte-identical to advance() alone", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+		const config: FallbackConfig = { maxCycles: 2, maxProbes: 2 };
+		const limits: ConcurrencyConfigLike = { limits: { "a/1": 1, "b/2": 1, "c/3": 1 } };
+		// Each step caps exactly the model `advance` aims at, so every step
+		// rotates one position forward: six rotation hops, then exhaustion.
+		const target = ["a/1", "c/3", "b/2", "a/1", "c/3", "b/2"];
+
+		let withCaps: FallbackState | undefined;
+		let plain: FallbackState | undefined;
+		let hops = 0;
+		for (let step = 0; step < 10; step++) {
+			const reason: RouteReason = step === 0 ? "user" : "retry";
+			const plainResult = advance({ reason, chainLength: chain.length, state: plain, config });
+			const capsResult = advance({ reason, chainLength: chain.length, state: withCaps, config });
+			if (plainResult.kind !== "route" || capsResult.kind !== "route") {
+				expect(plainResult.kind).toBe("exhausted");
+				expect(capsResult.kind).toBe("exhausted");
+				expect((plainResult as { cycles: number }).cycles).toBe((capsResult as { cycles: number }).cycles);
+				break;
+			}
+			const decision = applyConcurrency({
+				reason,
+				chain,
+				result: capsResult,
+				state: withCaps,
+				concurrency: limits,
+				inUse: { [target[step]!]: 1 },
+			});
+			expect(decision.state).toBeDefined();
+			const s = decision.state!;
+			const p = capsResult.state ?? withCaps ?? initialState(); // the state `advance` effectively set
+			// A rotation touches nothing of the budget.
+			expect([s.cycles, s.probes, s.home, s.probing, s.forced]).toEqual([p.cycles, p.probes, p.home, p.probing, p.forced]);
+			expect(decision.rotate).toBeDefined(); // every step rotates
+			hops += 1;
+			// Where the request actually went — the state the next step carries.
+			withCaps = { ...s, index: decision.index };
+			plain = { ...(plainResult.state ?? initialState()), index: plainResult.index };
+		}
+		expect(hops).toBe(6);
+	});
+
+	test("all at cap routes to the advance index over the cap, sticky cleared", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("continuation", held, chain, { limits: { "a/1": 1, "b/2": 1 } }, { "a/1": 1, "b/2": 1 });
+		// `advance` hands back to home 0; everything is capped, so the request
+		// goes to that index over the cap, and the sticky is dropped.
+		expect(d.index).toBe(0);
+		expect(d.state && "sticky" in d.state).toBe(false);
+		expect(d.rotate).toBeUndefined();
+	});
+
+	test("a user turn after a sticky materialises the no-change state without the sticky", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		// index 0 with sticky 1: `advance` reports no change (`sameState` ignores
+		// sticky), so `result.state` is undefined — and the stored state would
+		// survive untouched, sticky and all, without the materialisation rule.
+		const held: FallbackState = { index: 0, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("user", held, chain, DEFAULT_CONCURRENCY, {});
+		expect(d.index).toBe(0); // advance's index
+		expect(d.state).toBeDefined();
+		expect(d.state && "sticky" in d.state).toBe(false);
+		// The stored state, minus sticky: base() semantics.
+		expect(d.state).toEqual({ index: 0, cycles: 0, probes: 0, home: 0, probing: false });
+	});
+
+	test("a retry clears the sticky even when advance reports no change", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 2, probes: 0, home: 0, probing: false, sticky: 1 };
+		// `advance("retry")` always reports a change on a real chain (index or
+		// cycles moves), so the no-change result is constructed: the contract
+		// under test is what applyConcurrency does with a sticky-carrying stored
+		// state and a `state: undefined` result.
+		const result: Extract<AdvanceResult, { kind: "route" }> = { kind: "route", index: 1, state: undefined };
+		const d = applyConcurrency({ reason: "retry", chain, result, state: held, concurrency: DEFAULT_CONCURRENCY, inUse: {} });
+		expect(d.index).toBe(1);
+		expect(d.state).toEqual({ index: 1, cycles: 2, probes: 0, home: 0, probing: false });
+	});
+
+	test("all-at-cap clears the sticky even when advance reports no change", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		// Home answered and nothing moved: `advance` reports no change, so
+		// `result.state` is undefined. The held sticky model is capped, and so
+		// is everything else — the walk reports all-at-cap.
+		const held: FallbackState = { index: 0, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("continuation", held, chain, { limits: { "a/1": 1, "b/2": 1 } }, { "a/1": 1, "b/2": 1 });
+		expect(d.index).toBe(0);
+		expect(d.state).toEqual({ index: 0, cycles: 0, probes: 0, home: 0, probing: false });
+	});
+
+	test("direct requests pass through: no lease, no stickiness", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const result = advance({ reason: "direct", chainLength: chain.length, state: held, config: CONFIG }) as Extract<AdvanceResult, { kind: "route" }>;
+		const d = applyConcurrency({
+			reason: "direct",
+			chain,
+			result,
+			state: held,
+			concurrency: { limits: { "a/1": 1 } },
+			inUse: { "a/1": 1 },
+		});
+		expect(d.index).toBe(held.home); // home, exactly as `advance` routes direct
+		expect(d.state).toBe(result.state); // undefined: direct never mutates
+		expect(d.rotate).toBeUndefined();
+	});
+
+	test("an env-chain ref with a pinned level matches its caps entry, and the pin survives", () => {
+		const chain = parseChainEnv("a/1|low,b/2");
+		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, { "a/1": 1 });
+		expect(d.index).toBe(1);
+		expect(chain[0]!.thinking).toBe("low");
+		expect(levelFor(chain, 0, "high")).toBe("low"); // the pin is intact
+		expect(levelFor(chain, d.index, "high")).toBe("high"); // the routed entry passes through
+	});
+
+	test("describeConcurrencyHop is plain text, unsanitized (status line only)", () => {
+		const line = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, 2);
+		expect(line).toContain("timeout/model"); // no sanitizeModelRef: a status line
+		expect(line).toContain("a/1");
+		expect(line).toContain("(2)");
+		// The limit clause is a claim about capping: an ∞ limit (an entry skipped
+		// for unreachability, not its cap) must not be printed as one.
+		const uncapped = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, Number.POSITIVE_INFINITY);
+		expect(uncapped).toContain("a/1");
+		expect(uncapped).not.toContain("concurrency limit");
+	});
+
+	test("pickFreeIndex: missing in-use keys count as zero, unlimited never caps", () => {
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
+		expect(pickFreeIndex({ chain, start: 0, concurrency: DEFAULT_CONCURRENCY, inUse: {} })).toEqual({ kind: "free", index: 0, rotated: false });
+		expect(pickFreeIndex({ chain, start: 0, concurrency: { limits: { "a/1": 2 } }, inUse: { "a/1": 2 } })).toEqual({ kind: "free", index: 1, rotated: true });
+		expect(pickFreeIndex({ chain, start: 0, concurrency: { limits: { "a/1": 1, "b/2": 1 } }, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
+			kind: "all-at-cap",
+			index: 0,
+		});
+	});
+});
 describe("sanitizeModelRef", () => {
 	// Found by attacking describeExhaustion after the provider-error path was
 	// already sealed: chain entries are printed verbatim, so a model NAME
@@ -1883,6 +2214,63 @@ describe("index.ts registration", () => {
 			// a/1 has no auth, b/2 does, and the router itself is never "reachable".
 			expect([0, 1, 2, 3].map((i) => served!.isReachable(ctx, i))).toEqual([false, true, false, false]);
 		});
+	});
+});
+describe("route() direct guard", () => {
+	test("direct requests acquire no lease; non-direct requests do", async () => {
+		const leaseDir = mkdtempSync(join(tmpdir(), "model-fallback-direct-"));
+		const originalLeaseDir = process.env[LEASE_DIR_ENV];
+		process.env[LEASE_DIR_ENV] = leaseDir;
+
+		const dir = mkdtempSync(join(tmpdir(), "model-fallback-direct-settings-"));
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({ modelFallback: { chain: ["a/1", "b/2"] } }), "utf-8");
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		const originalEnvChain = process.env[CHAIN_ENV];
+		delete process.env[CHAIN_ENV];
+
+		try {
+			let directImportCounter = 0;
+			const mod = await import(`./index.js?mf-direct=${++directImportCounter}`);
+			let routeFn: ((request: { reason: string; state?: unknown; thinkingLevel?: unknown }, ctx: unknown) => { model: unknown; thinkingLevel: unknown; state?: unknown }) | undefined;
+			mod.default({
+				on: () => {},
+				getSettings: () => ({}),
+				registerVirtualModel: (def: { route: typeof routeFn }) => {
+					routeFn = def.route;
+				},
+				registerCommand: () => {},
+			} as unknown as Parameters<typeof mod.default>[0]);
+
+			expect(routeFn).toBeDefined();
+
+			const physical = (provider: string, id: string) => ({ provider, id, api: "openai-completions" });
+			const ctx = {
+				hasUI: false,
+				ui: { notify: () => {} },
+				modelRegistry: {
+					getAvailable: () => [physical("p", "a/1"), physical("p", "b/2")],
+					hasConfiguredAuth: () => true,
+				},
+			};
+
+			// `direct` requests (auto-compaction, streamSimple) never emit a session
+			// `message_end`, so they must not acquire a lease or desync the release
+			// FIFO: no lease file is created.
+			routeFn!({ reason: "direct", state: undefined, thinkingLevel: undefined }, ctx);
+			expect(readdirSync(leaseDir)).toEqual([]);
+
+			// A non-`direct` request acquires a lease: one file in the lease dir.
+			routeFn!({ reason: "user", state: undefined, thinkingLevel: undefined }, ctx);
+			expect(readdirSync(leaseDir)).toHaveLength(1);
+		} finally {
+			if (originalLeaseDir === undefined) delete process.env[LEASE_DIR_ENV];
+			else process.env[LEASE_DIR_ENV] = originalLeaseDir;
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			if (originalEnvChain === undefined) delete process.env[CHAIN_ENV];
+			else process.env[CHAIN_ENV] = originalEnvChain;
+		}
 	});
 });
 

@@ -75,8 +75,12 @@ import {
 	FALLBACK_PROVIDER,
 	THINKING_LEVELS,
 	advance,
+	applyConcurrency,
 	computeDisplay,
+	concurrencyKeyFor,
+	concurrencyLimitFor,
 	describeBudgetShortfall,
+	describeConcurrencyHop,
 	describeExhaustion,
 	describeHop,
 	describeNoneAvailable,
@@ -87,6 +91,7 @@ import {
 	levelFor,
 	planRegistration,
 	readConfig,
+	readConcurrency,
 	readLimits,
 	readVirtualModelState,
 	upstreamDelayMs,
@@ -94,6 +99,16 @@ import {
 	VIRTUAL_MODEL_API,
 	VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
 } from "./lib.js";
+import {
+	acquireLease,
+	releaseAll,
+	releaseLease,
+	resolveLeaseDir,
+	snapshotLeases,
+	sweepDir,
+	type Lease,
+} from "./concurrency.js";
+
 import { publishServedRouter } from "./served.js";
 import { readSettingsKey } from "./settings.js";
 
@@ -221,7 +236,11 @@ export default function (pi: ExtensionAPI) {
 	if (!plan.register) return;
 	const chain = plan.chain;
 	const config = readConfig(raw);
-
+	// The per-model global caps ride the same load-time read (see `settings.ts`),
+	// and the lease directory is resolved once here: it is a filesystem path,
+	// not a session fact, so it does not move on `session_start`.
+	const concurrency = readConcurrency(raw);
+	const leaseDirPath = resolveLeaseDir();
 	// The router's name is a fuzzy-match surface in pi's resolver and feeds the
 	// /model subtitle. We re-register it live (see `syncVirtualModelName`) so the
 	// subtitle names the in-use model; the bare chain name is the start state.
@@ -238,6 +257,17 @@ export default function (pi: ExtensionAPI) {
 
 	/** The last error text seen, for {@link describeExhaustion}. */
 	let lastError: string | undefined;
+	/**
+	 * In-flight requests this process reserved a concurrency slot for, one
+	 * lease each, released on the matching `message_end`.
+	 *
+	 * Process-wide rather than per-session: requests inside one pi process are
+	 * serial, so this is normally length 1, and it must NOT be cleared at
+	 * `session_start` — a `reload`/`resume`/`fork` session_start can land
+	 * mid-flight, and clearing it here would orphan the in-flight lease (do
+	 * not copy the `lastError` idiom).
+	 */
+	const outstanding: Lease[] = [];
 	let statusTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let latestCtx: ExtensionContext | undefined;
@@ -391,6 +421,12 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) ctx.ui.setFooter(undefined);
 		if (nameSyncTimer) clearTimeout(nameSyncTimer);
 		nameSyncTimer = undefined;
+		// The session is gone: nothing of this process's is in flight any more.
+		releaseAll(leaseDirPath, outstanding);
+		outstanding.length = 0;
+		// And sweep the shared directory, so a crash that skipped both nets
+		// above costs at most one stale lease per model.
+		sweepDir(leaseDirPath);
 		latestCtx = undefined;
 	});
 
@@ -404,7 +440,21 @@ export default function (pi: ExtensionAPI) {
 			lastError = message.errorMessage ?? undefined;
 		}
 
-		if (message.role === "assistant") scheduleNameSync(ctx);
+		if (message.role === "assistant") {
+			// Every request — success, error, abort — ends with an assistant
+			// message, so every lease is released here; an errored one must
+			// release too, or its slot stays held until the TTL sweep.
+			const lease = outstanding.shift();
+			if (lease) releaseLease(leaseDirPath, lease);
+			scheduleNameSync(ctx);
+		}
+	});
+
+	// The net for a turn that ends without a matching `message_end`: whatever
+	// is still outstanding is this process's, and it is released in full.
+	pi.on("agent_end", () => {
+		releaseAll(leaseDirPath, outstanding);
+		outstanding.length = 0;
 	});
 
 	// The /model subtitle names the in-use model, so it must follow every way the
@@ -535,6 +585,10 @@ export default function (pi: ExtensionAPI) {
 		// leaving these unset does not disturb compaction.
 		...chainLimits,
 		route(request, ctx) {
+			// Resolve every entry once per request, not per visit: the reachability
+			// walk, the cap walk's `isUsable`, and the reservation walk all ask the
+			// same questions, and the catalogue does not move inside one route().
+			const resolved = chain.map((e) => resolve(ctx, e));
 			const result = advance({
 				reason: request.reason,
 				chainLength: chain.length,
@@ -549,14 +603,31 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(describeExhaustion(chain, result.cycles, lastError));
 			}
 
+			// The concurrency decision, pure and lease-free: the caps are
+			// consulted before anything is reserved, so a budget throw above never
+			// holds a lease, and a rotation — not a failure — costs nothing of
+			// the budget `advance` just spent. `isUsable` is load-bearing: a
+			// rotation must not land on an entry this machine cannot reach, so the
+			// walk skips one exactly as the reachability walk below does.
+			const decision = applyConcurrency({
+				reason: request.reason,
+				chain,
+				result,
+				state: request.state,
+				concurrency,
+				inUse: snapshotLeases(leaseDirPath, chain.map((e) => e.ref)),
+				isUsable: (i) => resolved[i] !== undefined,
+			});
+
 			// Walk forward from the chosen index to the first model this machine
 			// can actually reach, so an unreachable entry costs a position in the
-			// chain rather than the request.
-			let index = result.index;
-			let model = resolve(ctx, chain[index]!);
+			// chain rather than the request — the final net for an `all-at-cap`
+			// index and for a snapshot that went stale between the read and now.
+			let index = decision.index;
+			let model = resolved[index];
 			for (let i = 1; i < chain.length && !model; i++) {
-				index = (result.index + i) % chain.length;
-				model = resolve(ctx, chain[index]!);
+				index = (decision.index + i) % chain.length;
+				model = resolved[index];
 			}
 			if (!model) {
 				// Message lives in lib.ts: it prints the chain, so it needs the same
@@ -565,12 +636,59 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(describeNoneAvailable(chain));
 			}
 
-			if (result.hop) showStatus(ctx, describeHop(chain[result.hop.from], chain[index]!, result.hop.cycles));
+			// Reserve the slot only now: no path below this throws, so the lease
+			// cannot outlive the request it guards.
+			//
+			// `direct` requests are excluded from both the acquire and the
+			// `outstanding` push: pi's direct routes (auto-compaction's
+			// `_getSummarizationRequestAuth`, `model-runtime.js` `streamSimple`)
+			// never emit a session `message_end`, so a lease acquired here would be
+			// held all turn — eating the cap — and the push would desync the release
+			// FIFO, so the next `message_end` shifts the *previous* request's lease.
+			// Direct requests route to `home`, as today, with no lease and no push;
+			// the release nets stay as-is.
+			if (request.reason !== "direct") {
+				let lease = acquireLease(leaseDirPath, chain[index]!.ref, concurrencyLimitFor(concurrency, chain[index]!.ref));
+				if (!lease.ok) {
+					// The slot filled between the snapshot and now — another pi process
+					// took it. Walk forward, reserving as we go, until one takes, skipping
+					// entries this machine cannot reach.
+					let lastReachable = index;
+					for (let i = 1; i < chain.length; i++) {
+						const candidate = (index + i) % chain.length;
+						const candidateModel = resolved[candidate];
+						if (candidateModel === undefined) continue;
+						const tried = acquireLease(leaseDirPath, chain[candidate]!.ref, concurrencyLimitFor(concurrency, chain[candidate]!.ref));
+						if (tried.ok) {
+							lease = tried;
+							index = candidate;
+							model = candidateModel;
+							break;
+						}
+						lastReachable = candidate;
+					}
+					if (!lease.ok) {
+						// Every candidate at its cap: the limit is soft, so route over the
+						// cap to the last reachable candidate — never wait, never throw.
+						index = lastReachable;
+						model = resolved[index]!;
+					}
+				}
+				// One entry per in-flight request keeps `outstanding` aligned with the
+				// `message_end` releases, over-cap requests included (their lease has
+				// no file, so its release is a no-op).
+				outstanding.push(lease.ok ? lease.lease : { key: concurrencyKeyFor(chain[index]!.ref), ref: chain[index]!.ref });
+			}
 
-			// `state.index` must record where the request actually went, not where
-			// `advance` aimed, or the next hop would step from a model that never
-			// ran and silently skip the one that did.
-			const state = result.state ? { ...result.state, index } : undefined;
+			if (result.hop) showStatus(ctx, describeHop(chain[result.hop.from], chain[index]!, result.hop.cycles));
+			if (decision.rotate)
+				showStatus(ctx, describeConcurrencyHop(chain[decision.rotate.from]!, chain[index]!, concurrencyLimitFor(concurrency, chain[decision.rotate.from]!.ref)));
+
+			// `state.index` must record where the request actually went, not
+			// where `advance` aimed — now including the concurrency rotation —
+			// or the next hop would step from a model that never ran and silently
+			// skip the one that did.
+			const state = decision.state ? { ...decision.state, index } : undefined;
 			// A level pinned on the routed entry overrides the selection; an
 			// unpinned entry passes it through. `levelFor` takes the final `index`,
 			// after the reachability walk, so a skipped entry's level cannot leak
@@ -597,21 +715,27 @@ export default function (pi: ExtensionAPI) {
 		description: "Show the model fallback chain and its budget",
 		handler: async (_args, ctx) => {
 			const warning = budgetWarning();
+			// One snapshot for every row: the in-use counts are a fact about
+			// the shared lease directory, not per-entry work.
+			const inUse = snapshotLeases(leaseDirPath, chain.map((e) => e.ref));
 			const lines = [
 				`Chain (${FALLBACK_MODEL_REF}):`,
 				...chain.map((entry, i) => {
 					const model = resolve(ctx, entry);
 					const mark = model ? "ok" : "UNAVAILABLE";
-					return `  ${i}. ${formatEntry(entry)} [${mark}]`;
+					const limit = concurrencyLimitFor(concurrency, entry.ref);
+					const count = inUse[concurrencyKeyFor(entry.ref)] ?? 0;
+					return `  ${i}. ${formatEntry(entry)} [${mark}] · limit ${limit === Number.POSITIVE_INFINITY ? "∞" : limit} · in use ${count}`;
 				}),
 				"",
 				`Cycles allowed: ${config.maxCycles} (one cycle = one full lap of the chain = one retry)`,
 				`Primary probes before settling on a fallback: ${config.maxProbes}`,
+				`Concurrency: global per-model caps from settings.modelFallback.concurrency (default ${concurrency.defaultLimit ?? "∞"}, leases in ${leaseDirPath})`,
 				`settings.retry.maxRetries: ${pi.getSettings().retry?.maxRetries ?? 0}`,
 				...(warning ? ["", warning] : []),
 				...(plan.source === "environment" ? ["", `Chain came from ${CHAIN_ENV} (set by the parent).`] : []),
 			];
-			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), warning ? "warning" : "info");
+		if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), warning ? "warning" : "info");
 		},
 	});
 }

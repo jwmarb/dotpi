@@ -106,6 +106,16 @@ export interface FallbackState {
 	 * of treating it as a success. Consumed (cleared) by that one request.
 	 */
 	forced?: boolean;
+	/**
+	 * Chain index the router is holding because the chosen model was at its
+	 * global concurrency cap; cleared by a user turn, a retry, and a forced
+	 * continuation.
+	 *
+	 * Set and cleared only by {@link applyConcurrency}: the {@link advance}
+	 * branches never construct it, which is why it is deliberately absent from
+	 * {@link sameState} — see there.
+	 */
+	sticky?: number;
 }
 
 /** Why pi is routing a request. Mirrors pi's `ModelRouteReason`. */
@@ -691,10 +701,24 @@ function sanitize(state: FallbackState | undefined, chainLength: number): Fallba
 		// Optional so states stored before `forced` existed, and every ordinary
 		// state, keep their exact shape.
 		...(base.forced === true ? { forced: true } : {}),
+		// Same idiom for `sticky`: absent stays absent, present gets clamped.
+		...(base.sticky !== undefined ? { sticky: clamp(base.sticky) } : {}),
 	};
 }
 
-/** Whether two states differ, so an unchanged state is not re-stored. */
+/**
+ * Whether two states differ, so an unchanged state is not re-stored.
+ *
+ * `sticky` is deliberately **not** compared: every {@link advance} branch
+ * constructs its next state without it, so comparing it would make
+ * `sameState` false on every request whose carried state carries a sticky
+ * index, and `advance` would then return a sticky-less state to be stored —
+ * only {@link applyConcurrency}'s re-application of `sticky` repairs it.
+ * Keeping the comparison sticky-free lets `advance` report "no change" and
+ * leave the stored state (with its sticky) untouched, exactly as it does for
+ * `forced` today. Any state this function emits is sticky-less on purpose;
+ * `applyConcurrency` owns sticky.
+ */
 function sameState(a: FallbackState, b: FallbackState): boolean {
 	return (
 		a.index === b.index &&
@@ -816,6 +840,171 @@ export function advance(input: AdvanceInput): AdvanceResult {
 	}
 
 	return settle({ index, cycles, probes, home, probing: false }, prior.index);
+}
+
+/**
+ * Walk forward from `start` to the first chain entry that is both usable and
+ * under its global concurrency cap.
+ *
+ * Mirrors {@link walkToReachable}: forward from the chosen index, wrapping
+ * once. An entry is free when `isUsable` accepts it (default true) and its
+ * in-flight count in `inUse` (keyed by {@link concurrencyKeyFor}, a missing
+ * key counting as 0) is below {@link concurrencyLimitFor}. When every entry
+ * is capped the walk reports `all-at-cap` with the start index: the cap is a
+ * **soft** limit, so the caller routes over the cap rather than waiting.
+ */
+export function pickFreeIndex(input: {
+	chain: readonly ChainEntry[];
+	start: number;
+	concurrency: ConcurrencyConfig;
+	inUse: Readonly<Record<string, number>>;
+	isUsable?: (index: number) => boolean;
+}): { kind: "free"; index: number; rotated: boolean } | { kind: "all-at-cap"; index: number } {
+	const { chain, start, concurrency, inUse, isUsable } = input;
+	const n = chain.length;
+	if (n === 0) return { kind: "all-at-cap", index: start };
+	const s = ((start % n) + n) % n;
+	for (let i = 0; i < n; i++) {
+		const index = (s + i) % n;
+		const entry = chain[index]!;
+		if (isUsable && !isUsable(index)) continue;
+		const count = inUse[concurrencyKeyFor(entry.ref)] ?? 0;
+		if (count < concurrencyLimitFor(concurrency, entry.ref)) {
+			return { kind: "free", index, rotated: index !== s };
+		}
+	}
+	return { kind: "all-at-cap", index: s };
+}
+
+/**
+ * Layer the global concurrency caps onto an {@link advance} route decision.
+ *
+ * A rotation — routing off a capped model to the next free one — is **not a
+ * failure**: it costs zero `cycles`, never touches `probes` or `forced`, and
+ * must never surface as an assistant error, so it reuses the state
+ * `advance()` computed, with `cycles`/`probes`/`home` exactly as `advance()`
+ * set them. It only changes the index, and records `sticky` when the request
+ * lands somewhere `advance()` did not aim.
+ *
+ * The rules, in order:
+ *
+ * - `direct` — pass `result` through: compaction and extension calls do not
+ *   participate in the caps (no lease, no stickiness), which keeps a `direct`
+ *   lease from being a guaranteed leak.
+ * - `retry`, or a forced continuation — failure-driven routing drops the
+ *   sticky index, because sticky must never re-ask a model that just failed;
+ *   the walk starts at `result.index`.
+ * - `continuation` (non-forced) with a prior sticky — the request stays on the
+ *   sticky model while it is free, which **overrides `advance()`'s
+ *   hand-back-to-`home`** and forces `probing: false` (the held model is not
+ *   a probe); when the sticky model is capped, the walk starts from it.
+ * - everything else — the walk starts at `result.index` (a `user` turn clears
+ *   the sticky with it); `sticky` is set to the landed index **only when the
+ *   walk rotated**.
+ * - `all-at-cap` — route to the walked start over the cap, sticky cleared.
+ *
+ * `sticky` is re-applied onto the state `advance()` returned (its branches
+ * never carry it — see {@link sameState}), and a state object is
+ * materialised when `advance()` returned `undefined` but the index or sticky
+ * changed, so pi stores the state the request actually ran under.
+ *
+ * Clearing sticky obeys the same materialisation rule: every path that drops
+ * the prior `sticky` (retry, forced continuation, all-at-cap, non-rotated)
+ * materialises the state when `advance()` reported no change
+ * (`result.state === undefined`) — otherwise pi stores the *stored* state
+ * untouched and its stale `sticky` survives, suppressing every later
+ * hand-back-to-`home`. The materialised state is the stored state with
+ * `sticky` deleted: `base()` semantics, minus sticky.
+ */
+export function applyConcurrency(input: {
+	reason: RouteReason;
+	chain: readonly ChainEntry[];
+	result: Extract<AdvanceResult, { kind: "route" }>;
+	state: FallbackState | undefined;
+	concurrency: ConcurrencyConfig;
+	inUse: Readonly<Record<string, number>>;
+	isUsable?: (index: number) => boolean;
+}): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number } } {
+	const { reason, chain, result, state, concurrency, inUse, isUsable } = input;
+
+	if (reason === "direct") return { index: result.index, state: result.state };
+
+	const prior = sanitize(state, chain.length);
+	const pick = (start: number) =>
+		pickFreeIndex({ chain, start, concurrency, inUse, isUsable });
+
+	// The state `advance()` computed, or the stored state when `advance()`
+	// reported no change — `advance`'s states never carry `sticky`, so the
+	// sticky value is always set or dropped explicitly below.
+	const base = (): FallbackState => result.state ?? prior;
+
+	// The clearing paths below return `result.state` as-is when it exists;
+	// when it is `undefined` (`advance` reported no change) and the prior state
+	// carried a sticky, returning it would leave pi's stored state untouched
+	// and the stale sticky would survive — see the docstring. Materialise the
+	// no-change state with sticky dropped: the stored state, minus sticky.
+	const cleared = (): FallbackState | undefined => {
+		if (result.state !== undefined || prior.sticky === undefined) return result.state;
+		const { sticky: _drop, ...rest } = prior;
+		return rest;
+	};
+
+	// Failure-driven: `retry` and a forced continuation re-ask after a
+	// failure, so the sticky index — a record of where a request *succeeded*
+	// to sit — is cleared and the walk starts where `advance` aimed.
+	if (reason === "retry" || (reason === "continuation" && prior.forced)) {
+		const free = pick(result.index);
+		if (free.kind === "all-at-cap") return { index: free.index, state: cleared() };
+		if (!free.rotated) return { index: free.index, state: cleared() };
+		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index } };
+	}
+
+	if (reason === "continuation" && prior.sticky !== undefined) {
+		const sticky = prior.sticky;
+		const entry = chain[sticky];
+		const freeSticky =
+			entry !== undefined &&
+			(isUsable ? isUsable(sticky) : true) &&
+			(inUse[concurrencyKeyFor(entry.ref)] ?? 0) < concurrencyLimitFor(concurrency, entry.ref);
+		if (freeSticky) {
+			// Stay on the held model: override the hand-back-to-home and the
+			// probe mark, keep everything else `advance` set.
+			return { index: sticky, state: { ...base(), index: sticky, probing: false, sticky } };
+		}
+		// The held model capped: rotate from it. `all-at-cap` routes to
+		// `result.index` over the cap, per the rule above, and clears sticky.
+		const free = pick(sticky);
+		if (free.kind === "all-at-cap") return { index: result.index, state: cleared() };
+		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: sticky, to: free.index } };
+	}
+
+	// No sticky to keep (a `user` turn, an ordinary continuation, a first
+	// request): walk from where `advance` aimed.
+	const free = pick(result.index);
+	if (free.kind === "all-at-cap") return { index: free.index, state: cleared() };
+	if (!free.rotated) return { index: free.index, state: cleared() };
+	return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index } };
+}
+
+/**
+ * The one-line notice for a concurrency rotation, for the status line only.
+ *
+ * Never an error message: `index.ts` shows it in the footer
+ * (`ctx.ui.setStatus`) — pi's retry classifier never reads it. That is why,
+ * unlike {@link describeExhaustion} and {@link describeNoneAvailable}, it
+ * does not go through {@link sanitizeModelRef}. If it ever becomes an error
+ * message, it must.
+ *
+ * @param from - The chain entry the request rotated off.
+ * @param to - The chain entry taking over.
+ * @param limit - The `from` entry's limit, so the notice says why. Printed
+ * only when finite: a rotation off an entry skipped for unreachability was
+ * not capped, and saying so would be a lie.
+ */
+export function describeConcurrencyHop(from: ChainEntry, to: ChainEntry, limit: number): string {
+	return Number.isFinite(limit)
+		? `model-fallback: ${formatEntry(from)} is at its concurrency limit (${limit}), routing to ${formatEntry(to)}`
+		: `model-fallback: routing to ${formatEntry(to)}`;
 }
 
 /**
@@ -1167,6 +1356,84 @@ export function readConfig(raw: unknown): FallbackConfig {
 		maxCycles: positive(obj.maxCycles, DEFAULT_MAX_CYCLES),
 		maxProbes: positive(obj.maxProbes, DEFAULT_MAX_PROBES),
 	};
+}
+
+/**
+ * Per-model global concurrency limits, from `settings.modelFallback.concurrency`.
+ *
+ * The limits are global across every pi process on this machine — the parent
+ * session, subagent-herdr children, ralph-loop gate children — because they are
+ * counted by file leases in a shared directory (`concurrency.ts`), not in
+ * process memory.
+ */
+export interface ConcurrencyConfig {
+	/** Per-model caps, keyed by {@link concurrencyKeyFor} (lower-cased ref). */
+	limits: Record<string, number>;
+	/** Cap for models without an explicit entry, when the `"*"` key was written. */
+	defaultLimit?: number;
+}
+
+/**
+ * No caps configured: every model is unlimited.
+ *
+ * Frozen (both levels): {@link readConcurrency} returns this object directly,
+ * so a caller mutation would poison the caps of every later session.
+ */
+export const DEFAULT_CONCURRENCY: ConcurrencyConfig = Object.freeze({ limits: Object.freeze({}) });
+
+/** The limit of a model with no entry and no `"*"` default. */
+export const UNLIMITED_CONCURRENCY = Number.POSITIVE_INFINITY;
+
+/**
+ * The key a model is looked up under in {@link ConcurrencyConfig.limits}.
+ *
+ * `ref.trim().toLowerCase()` — the same key rule as {@link pushUnique}'s dedup,
+ * so a caps map written in any casing matches the chain entry it names.
+ */
+export function concurrencyKeyFor(ref: string): string {
+	return ref.trim().toLowerCase();
+}
+
+/**
+ * Read the per-model concurrency limits from a `modelFallback` settings blob.
+ *
+ * Mirrors {@link readLimits} in leniency: a non-object `concurrency` value
+ * yields {@link DEFAULT_CONCURRENCY}, each entry is kept only when its key
+ * parses through {@link parseModelRef} (with `*` accepted as the special
+ * default key) and its value is a positive integer. Never throws.
+ */
+export function readConcurrency(raw: unknown): ConcurrencyConfig {
+	if (Array.isArray(raw) || raw == null) return DEFAULT_CONCURRENCY;
+	const obj = raw as Record<string, unknown>;
+	const blob = obj.concurrency;
+	if (!blob || typeof blob !== "object" || Array.isArray(blob)) return DEFAULT_CONCURRENCY;
+	const limits: Record<string, number> = {};
+	let defaultLimit: number | undefined;
+	for (const [key, value] of Object.entries(blob)) {
+		if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) continue;
+		if (key === "*") {
+			defaultLimit = value;
+			continue;
+		}
+		const entry = parseModelRef(key);
+		if (!entry) continue;
+		limits[concurrencyKeyFor(entry.ref)] = value;
+	}
+	return {
+		limits,
+		...(defaultLimit === undefined ? {} : { defaultLimit }),
+	};
+}
+
+/**
+ * The global in-flight cap for one model reference.
+ *
+ * An explicit entry wins over the `"*"` default; a model with neither is
+ * {@link UNLIMITED_CONCURRENCY} — unlimited models never cap, so a caps map
+ * that names some of the chain leaves the rest unaccounted.
+ */
+export function concurrencyLimitFor(config: ConcurrencyConfig, ref: string): number {
+	return config.limits[concurrencyKeyFor(ref)] ?? config.defaultLimit ?? UNLIMITED_CONCURRENCY;
 }
 
 /**

@@ -13,6 +13,8 @@ failed; once a fallback answers, the **original model gets the next request**.
 | Cross-module contract (in `lib.ts`) | `FALLBACK_MODEL_REF` (= `fallback/auto`) and `CHAIN_ENV` (= `PI_FALLBACK_CHAIN`) are the two symbols other extensions import this dir for: `ralph-loop/gate.ts` + `runtime-gate.ts` launch their gate children on them, and `subagent-herdr` passes the parent's chain to its children the same way. `parseChainItem` (`lib.ts:234`) is the parser for that env syntax (`ref|level`, comma-separated) — the settings.json grammar is *not* the same parser (see the `|level` note above; line numbers here are as of 2026-10-28 and drift). Rename either symbol and those importers break at load, not at call. |
 | `footer.ts` | The `setFooter` replacement that shows the in-use physical model. Forks pi's built-in `footer.js` — see its deliberate-divergences note, and keep the width guarantee |
 | `footer.test.ts` | The width invariant (`no line exceeds the width` — exceeding it kills the `pi` process), the pure formatters, and the scan cache |
+| `concurrency.ts` | Global per-model in-flight leases — one file per request, `O_EXCL`, TTL-swept; owns its dir under `agent/cache/`, takes the dir as a parameter |
+| `concurrency.test.ts` | The lease store's tests: the failure rule (missing/unwritable dir degrades to unlimited), stale-by-age sweeping, the env override |
 
 ## HOW IT IS TURNED ON HERE
 
@@ -31,6 +33,7 @@ is the line that drifts. The startup header's `Model` row prints the registered 
 "modelFallback": {
   "chain": [{ "model": "qwen/qwen3.8-flash-next", "thinking": "xhigh" }, { "model": "anthropic/claude-opus-5.5", "thinking": "low" }, { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
+  "concurrency": { "*": 2, "qwen/qwen3.8-flash-next": 2, "anthropic/claude-opus-5.5": 1, "anthropic/claude-opus-5": 1, "openai/gpt-5.6-sol": 2 },
   "contextWindow": 262144, "maxTokens": 32768
 }
 ```
@@ -88,6 +91,7 @@ router.
 | How a subagent gets a chain | `subagent-herdr/lib.ts` `childFallbackChain` → `PI_FALLBACK_CHAIN` (items as `ref` or `ref|level`) → here |
 | How a ralph-loop gate gets one | `ralph-loop/gate.ts` `resolveGateAgent` + `withChainEnv` (same env var; `pi.exec()` has no `env` option) |
 | How to configure it | `settings.json` `modelFallback.chain`, then select `fallback/auto` |
+| Why a capped model rotates instead of waiting | `lib.ts` `applyConcurrency` + `concurrency.ts` leases |
 | Whether it is on | `/fallback-chain` — lists the chain, marks unavailable entries, prints the budget |
 
 ## THE MECHANISM, AND WHY IT IS THIS ONE
@@ -331,6 +335,12 @@ is what made the formula wrong rather than merely conservative.
   anyway, and letting a summarization failure spend the conversation's retry
   budget would make the budget mean two different things.
 
+- **Concurrency caps are global, and the counting is file-based.** The `modelFallback.concurrency` limits are enforced across every pi process — parent session, subagent-herdr children, ralph-loop gate children — by file leases in `agent/cache/model-fallback-leases` (`PI_MODEL_FALLBACK_LEASE_DIR` overrides the dir): every process resolves the same agent dir, so the directory is the shared memory.
+- **A concurrency rotation costs zero `cycles` and never touches `probes`/`forced`.** It is not a failure, so it must not spend the budget, move `home`, or surface as an assistant error — `applyConcurrency` layers it onto `advance()`'s state rather than replacing it.
+- **Sticky lives in `FallbackState.sticky`**, set when a rotation lands off the aimed index, and cleared by a user turn, a retry, and a forced continuation — sticky must never re-ask a model that just failed.
+- **`sticky` is deliberately absent from `sameState()`** and re-applied by `applyConcurrency`: `advance()`'s branches construct states without it, so comparing it would make `advance` emit sticky-less states on every sticky-carrying request.
+- **The lease store degrades to unlimited on a missing or unwritable dir and never throws** — a cap that kills the request it is scheduling is not a cap. TTL is 15 min, age-only: the tree is sync-replicated across hosts, where pids are per-host and only an mtime survives.
+- **All-at-cap routes over the cap — halting is not an option.** The limit is soft: a capped chain walks to the cap's index (or the last reachable candidate, after the in-flight reservation) and sends the request, rather than waiting for a slot that may never free.
 ## THE TWO BUDGETS
 
 pi increments its own retry counter on **every** failed request, so one lap of an
@@ -376,7 +386,7 @@ were reachable.
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/model-fallback/   # both suites (lib.test.ts, footer.test.ts)
+bun test agent/extensions/model-fallback/   # three suites (lib.test.ts, footer.test.ts, concurrency.test.ts)
 cd agent/extensions/model-fallback && \
   ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
