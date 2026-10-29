@@ -843,15 +843,97 @@ export function advance(input: AdvanceInput): AdvanceResult {
 }
 
 /**
+ * Why a chain entry cannot take a request.
+ *
+ * `model` — the entry's own global cap is reached. `group` — a group
+ * containing the entry is at its shared cap; `name` and `inUse` are what the
+ * status notice prints.
+ */
+export type ConcurrencyBlock =
+	| { kind: "model"; limit: number }
+	| { kind: "group"; name: string; limit: number; inUse: number };
+
+/**
+ * The in-flight count per group, keyed by group name.
+ *
+ * There is a key for **every** group — `0` when none of its members is in
+ * use — and the result is `{}` when no groups are configured. Each count is
+ * summed from the per-model lease counts the caller already holds (the one
+ * `snapshotLeases` call, keyed by {@link concurrencyKeyFor}): one source of
+ * truth, never a second lease namespace. A model that is a member of two
+ * groups counts toward both.
+ */
+export function groupInUse(
+	concurrency: ConcurrencyConfig,
+	inUse: Readonly<Record<string, number>>,
+): Record<string, number> {
+	const groups = concurrency.groups ?? [];
+	const out: Record<string, number> = {};
+	for (const group of groups) {
+		let count = 0;
+		for (const model of group.models) count += inUse[concurrencyKeyFor(model)] ?? 0;
+		out[group.name] = count;
+	}
+	return out;
+}
+
+/**
+ * The groups that contain `ref`, in configuration order.
+ *
+ * Membership is by {@link concurrencyKeyFor} — trim and case, like the caps
+ * keys — so a group written `A/1` contains the chain entry `a/1`.
+ */
+export function groupsForModel(concurrency: ConcurrencyConfig, ref: string): ConcurrencyGroup[] {
+	const key = concurrencyKeyFor(ref);
+	return (concurrency.groups ?? []).filter((group) => group.models.some((m) => concurrencyKeyFor(m) === key));
+}
+
+/**
+ * The block that keeps `entry` from taking a request, `undefined` when it is
+ * free.
+ *
+ * The rule is an AND: the entry is free only when it is under its own cap
+ * **and** under every group's cap. The own cap is checked first — a model at
+ * its own cap is blocked by it, whatever its groups say — then the groups in
+ * configuration order, so the first full group is the one named.
+ * `groupsInUse` defaults to {@link groupInUse} when omitted; a caller that
+ * checks many entries (the rotation walk) passes the one it computed.
+ */
+export function concurrencyBlockFor(
+	entry: ChainEntry,
+	concurrency: ConcurrencyConfig,
+	inUse: Readonly<Record<string, number>>,
+	groupsInUse?: Record<string, number>,
+): ConcurrencyBlock | undefined {
+	const key = concurrencyKeyFor(entry.ref);
+	const limit = concurrencyLimitFor(concurrency, entry.ref);
+	if ((inUse[key] ?? 0) >= limit) return { kind: "model", limit };
+	const groups = concurrency.groups;
+	if (groups) {
+		const sums = groupsInUse ?? groupInUse(concurrency, inUse);
+		for (const group of groups) {
+			if (!group.models.some((m) => concurrencyKeyFor(m) === key)) continue;
+			const count = sums[group.name] ?? 0;
+			if (count >= group.max) return { kind: "group", name: group.name, limit: group.max, inUse: count };
+		}
+	}
+	return undefined;
+}
+
+/**
  * Walk forward from `start` to the first chain entry that is both usable and
- * under its global concurrency cap.
+ * under its caps — its own, and every group's: the AND rule in
+ * {@link concurrencyBlockFor}.
  *
  * Mirrors {@link walkToReachable}: forward from the chosen index, wrapping
- * once. An entry is free when `isUsable` accepts it (default true) and its
- * in-flight count in `inUse` (keyed by {@link concurrencyKeyFor}, a missing
- * key counting as 0) is below {@link concurrencyLimitFor}. When every entry
- * is capped the walk reports `all-at-cap` with the start index: the cap is a
- * **soft** limit, so the caller routes over the cap rather than waiting.
+ * once. An entry is free when `isUsable` accepts it (default true) and
+ * nothing caps it. When every entry is blocked the walk reports `all-at-cap`
+ * with the start index: the caps are **soft** limits, so the caller routes
+ * over the cap rather than waiting.
+ *
+ * A rotated result carries `blockedBy`, the block on the walk's start — the
+ * reason the rotation was needed — for the status notice; a walk that found
+ * room at its start has nothing to report and no `blockedBy`.
  */
 export function pickFreeIndex(input: {
 	chain: readonly ChainEntry[];
@@ -859,19 +941,38 @@ export function pickFreeIndex(input: {
 	concurrency: ConcurrencyConfig;
 	inUse: Readonly<Record<string, number>>;
 	isUsable?: (index: number) => boolean;
-}): { kind: "free"; index: number; rotated: boolean } | { kind: "all-at-cap"; index: number } {
+	/**
+	 * Pre-computed {@link groupInUse} sums, threaded by {@link applyConcurrency}
+	 * so one route pays the group pass once, not once per walk.
+	 */
+	groupsInUse?: Readonly<Record<string, number>>;
+}): { kind: "free"; index: number; rotated: boolean; blockedBy?: ConcurrencyBlock } | { kind: "all-at-cap"; index: number } {
 	const { chain, start, concurrency, inUse, isUsable } = input;
 	const n = chain.length;
 	if (n === 0) return { kind: "all-at-cap", index: start };
 	const s = ((start % n) + n) % n;
+	// The group sums cost one pass over the groups' members; pay it once,
+	// before the walk, and only when groups exist — the no-groups path stays
+	// exactly what it was.
+	const groupsInUse =
+		input.groupsInUse ?? (concurrency.groups ? groupInUse(concurrency, inUse) : undefined);
+	const blocks = (entry: ChainEntry): ConcurrencyBlock | undefined =>
+		concurrencyBlockFor(entry, concurrency, inUse, groupsInUse);
+	let startBlock: ConcurrencyBlock | undefined;
 	for (let i = 0; i < n; i++) {
 		const index = (s + i) % n;
 		const entry = chain[index]!;
 		if (isUsable && !isUsable(index)) continue;
-		const count = inUse[concurrencyKeyFor(entry.ref)] ?? 0;
-		if (count < concurrencyLimitFor(concurrency, entry.ref)) {
-			return { kind: "free", index, rotated: index !== s };
+		const block = blocks(entry);
+		if (block === undefined) {
+			return {
+				kind: "free",
+				index,
+				rotated: index !== s,
+				blockedBy: index !== s ? startBlock : undefined,
+			};
 		}
+		if (i === 0) startBlock = block;
 	}
 	return { kind: "all-at-cap", index: s };
 }
@@ -899,9 +1000,11 @@ export function pickFreeIndex(input: {
  *   hand-back-to-`home`** and forces `probing: false` (the held model is not
  *   a probe); when the sticky model is capped, the walk starts from it.
  * - everything else — the walk starts at `result.index` (a `user` turn clears
- *   the sticky with it); `sticky` is set to the landed index **only when the
  *   walk rotated**.
  * - `all-at-cap` — route to the walked start over the cap, sticky cleared.
+ * - `rotate.blockedBy` records the block — own cap or group cap — the walk
+ *   rotated off, so the status notice can say why; see
+ *   {@link concurrencyBlockFor}.
  *
  * `sticky` is re-applied onto the state `advance()` returned (its branches
  * never carry it — see {@link sameState}), and a state object is
@@ -924,14 +1027,18 @@ export function applyConcurrency(input: {
 	concurrency: ConcurrencyConfig;
 	inUse: Readonly<Record<string, number>>;
 	isUsable?: (index: number) => boolean;
-}): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number } } {
+}): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number; blockedBy?: ConcurrencyBlock } } {
 	const { reason, chain, result, state, concurrency, inUse, isUsable } = input;
 
 	if (reason === "direct") return { index: result.index, state: result.state };
 
 	const prior = sanitize(state, chain.length);
+	// The group sums once per route, shared by every walk and the sticky test.
+	const groupsInUse = concurrency.groups ? groupInUse(concurrency, inUse) : undefined;
+	const blocks = (entry: ChainEntry): ConcurrencyBlock | undefined =>
+		concurrencyBlockFor(entry, concurrency, inUse, groupsInUse);
 	const pick = (start: number) =>
-		pickFreeIndex({ chain, start, concurrency, inUse, isUsable });
+		pickFreeIndex({ chain, start, concurrency, inUse, isUsable, groupsInUse });
 
 	// The state `advance()` computed, or the stored state when `advance()`
 	// reported no change — `advance`'s states never carry `sticky`, so the
@@ -956,16 +1063,14 @@ export function applyConcurrency(input: {
 		const free = pick(result.index);
 		if (free.kind === "all-at-cap") return { index: free.index, state: cleared() };
 		if (!free.rotated) return { index: free.index, state: cleared() };
-		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index } };
+		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index, blockedBy: free.blockedBy } };
 	}
 
 	if (reason === "continuation" && prior.sticky !== undefined) {
 		const sticky = prior.sticky;
 		const entry = chain[sticky];
 		const freeSticky =
-			entry !== undefined &&
-			(isUsable ? isUsable(sticky) : true) &&
-			(inUse[concurrencyKeyFor(entry.ref)] ?? 0) < concurrencyLimitFor(concurrency, entry.ref);
+			entry !== undefined && (isUsable ? isUsable(sticky) : true) && blocks(entry) === undefined;
 		if (freeSticky) {
 			// Stay on the held model: override the hand-back-to-home and the
 			// probe mark, keep everything else `advance` set.
@@ -975,7 +1080,7 @@ export function applyConcurrency(input: {
 		// `result.index` over the cap, per the rule above, and clears sticky.
 		const free = pick(sticky);
 		if (free.kind === "all-at-cap") return { index: result.index, state: cleared() };
-		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: sticky, to: free.index } };
+		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: sticky, to: free.index, blockedBy: free.blockedBy } };
 	}
 
 	// No sticky to keep (a `user` turn, an ordinary continuation, a first
@@ -983,7 +1088,7 @@ export function applyConcurrency(input: {
 	const free = pick(result.index);
 	if (free.kind === "all-at-cap") return { index: free.index, state: cleared() };
 	if (!free.rotated) return { index: free.index, state: cleared() };
-	return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index } };
+		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index, blockedBy: free.blockedBy } };
 }
 
 /**
@@ -993,18 +1098,29 @@ export function applyConcurrency(input: {
  * (`ctx.ui.setStatus`) — pi's retry classifier never reads it. That is why,
  * unlike {@link describeExhaustion} and {@link describeNoneAvailable}, it
  * does not go through {@link sanitizeModelRef}. If it ever becomes an error
- * message, it must.
+ * message, it must. A group `name` is user-authored settings text printed
+ * verbatim under the same rule; if this line ever becomes an assistant error
+ * message, the name must be sanitized with it.
  *
  * @param from - The chain entry the request rotated off.
  * @param to - The chain entry taking over.
- * @param limit - The `from` entry's limit, so the notice says why. Printed
- * only when finite: a rotation off an entry skipped for unreachability was
- * not capped, and saying so would be a lie.
+ * @param blockedBy - The block the walk rotated off, when known: a model
+ *   block prints the entry's own limit, a group block names the group and
+ *   prints the shared count. `undefined` — or a model block with a
+ *   non-finite limit — falls back to the short form: a rotation off an entry
+ *   skipped for unreachability was not capped, and saying so would be a lie.
  */
-export function describeConcurrencyHop(from: ChainEntry, to: ChainEntry, limit: number): string {
-	return Number.isFinite(limit)
-		? `model-fallback: ${formatEntry(from)} is at its concurrency limit (${limit}), routing to ${formatEntry(to)}`
-		: `model-fallback: routing to ${formatEntry(to)}`;
+export function describeConcurrencyHop(from: ChainEntry, to: ChainEntry, blockedBy: ConcurrencyBlock | undefined): string {
+	if (blockedBy?.kind === "group") {
+		return (
+			`model-fallback: ${formatEntry(from)} is in concurrency group ${blockedBy.name} ` +
+			`at its shared limit (${blockedBy.inUse}/${blockedBy.limit}), routing to ${formatEntry(to)}`
+		);
+	}
+	if (blockedBy?.kind === "model" && Number.isFinite(blockedBy.limit)) {
+		return `model-fallback: ${formatEntry(from)} is at its concurrency limit (${blockedBy.limit}), routing to ${formatEntry(to)}`;
+	}
+	return `model-fallback: routing to ${formatEntry(to)}`;
 }
 
 /**
@@ -1371,6 +1487,41 @@ export interface ConcurrencyConfig {
 	limits: Record<string, number>;
 	/** Cap for models without an explicit entry, when the `"*"` key was written. */
 	defaultLimit?: number;
+	/**
+	 * Shared group budgets, in settings order.
+	 *
+	 * Absent when the settings named none: {@link readConcurrency} omits the
+	 * key, so a config with no groups is indistinguishable from one written
+	 * before groups existed (`toEqual(DEFAULT_CONCURRENCY)`).
+	 *
+	 * A group's cap is **soft**, like a per-model cap: it is read from the
+	 * in-flight snapshot, never reserved, so a cross-process race may land the
+	 * count over `max`. A model in `n` groups must satisfy all `n` caps **and**
+	 * its own.
+	 */
+	groups?: readonly ConcurrencyGroup[];
+}
+
+/**
+ * A shared in-flight budget over a set of models, from
+ * `settings.modelFallback.groups`.
+ *
+ * The members are counted by summing the existing per-model lease counts —
+ * one source of truth, never a second lease namespace — so there is no group
+ * key on disk, no group lease, and no second `readdir`.
+ */
+export interface ConcurrencyGroup {
+	/** The name as written, trimmed. User-authored settings text. */
+	name: string;
+	/**
+	 * Member references, each through {@link parseModelRef}, with `"*"`
+	 * rejected: it parses as an ordinary reference, and the default key would
+	 * then become a phantom member. Deduped by {@link concurrencyKeyFor},
+	 * first casing wins.
+	 */
+	models: string[];
+	/** The group's global in-flight cap; a positive integer. */
+	max: number;
 }
 
 /**
@@ -1395,21 +1546,29 @@ export function concurrencyKeyFor(ref: string): string {
 }
 
 /**
- * Read the per-model concurrency limits from a `modelFallback` settings blob.
- *
+ * Read the concurrency configuration from a `modelFallback` settings blob.
  * Mirrors {@link readLimits} in leniency: a non-object `concurrency` value
- * yields {@link DEFAULT_CONCURRENCY}, each entry is kept only when its key
+ * yields {@link DEFAULT_CONCURRENCY} **when no groups parsed** — a groups-only
+ * config is a real shape and survives a broken caps blob. Each entry is kept
+ * only when its key
  * parses through {@link parseModelRef} (with `*` accepted as the special
- * default key) and its value is a positive integer. Never throws.
+ * default key) and its value is a positive integer. `groups` is parsed from
+ * the same blob, independently of the per-entry caps: a malformed group
+ * entry is dropped, never thrown, and never discards the already-parsed
+ * `limits`. Never throws.
  */
 export function readConcurrency(raw: unknown): ConcurrencyConfig {
 	if (Array.isArray(raw) || raw == null) return DEFAULT_CONCURRENCY;
 	const obj = raw as Record<string, unknown>;
 	const blob = obj.concurrency;
-	if (!blob || typeof blob !== "object" || Array.isArray(blob)) return DEFAULT_CONCURRENCY;
+	// Groups are read independently of the caps blob: a groups-only config
+	// (no `concurrency` key at all) is a real shape and must not be dropped.
+	const groups = parseConcurrencyGroups(obj.groups);
+	const blobOk = !!blob && typeof blob === "object" && !Array.isArray(blob);
+	if (!blobOk && groups.length === 0) return DEFAULT_CONCURRENCY;
 	const limits: Record<string, number> = {};
 	let defaultLimit: number | undefined;
-	for (const [key, value] of Object.entries(blob)) {
+	for (const [key, value] of Object.entries(blobOk ? (blob as object) : {})) {
 		if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) continue;
 		if (key === "*") {
 			defaultLimit = value;
@@ -1422,7 +1581,68 @@ export function readConcurrency(raw: unknown): ConcurrencyConfig {
 	return {
 		limits,
 		...(defaultLimit === undefined ? {} : { defaultLimit }),
+		...(groups.length > 0 ? { groups: Object.freeze(groups) } : {}),
 	};
+}
+
+/**
+ * Parse `settings.modelFallback.groups` — an array of objects, in settings
+ * order.
+ *
+ * Lenient, never throws: an entry is kept only when it is a non-array
+ * object, its `name` is a non-empty string (trimmed), its `max` is a
+ * positive integer, and its `models` is a non-empty array of references that
+ * parse through {@link parseModelRef} — with `"*"` rejected explicitly, since
+ * it would parse as an ordinary reference and the default key would become a
+ * phantom member. Members are deduped by {@link concurrencyKeyFor}, first
+ * casing wins; a duplicate group name (compared the same way) keeps the
+ * first.
+ */
+function parseConcurrencyGroups(blob: unknown): ConcurrencyGroup[] {
+	if (!Array.isArray(blob)) return [];
+	const groups: ConcurrencyGroup[] = [];
+	const seenNames = new Set<string>();
+	for (const value of blob) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+		const obj = value as Record<string, unknown>;
+		const name = typeof obj.name === "string" ? obj.name.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim() : "";
+		if (name === "") continue;
+		if (typeof obj.max !== "number" || !Number.isInteger(obj.max) || obj.max <= 0) continue;
+		if (!Array.isArray(obj.models)) continue;
+		const models: string[] = [];
+		const seenModels = new Set<string>();
+		let valid = true;
+		for (const model of obj.models) {
+			if (typeof model !== "string") {
+				valid = false;
+				break;
+			}
+			const entry = parseModelRef(model);
+			// `ref|level` is the *chain* grammar, a different parser: a member
+			// written that way can never match a lease key, so the shared cap
+			// would be silently looser than configured. Drop the group.
+			if (!entry || model.includes("|")) {
+				valid = false;
+				break;
+			}
+			if (entry.ref === "*") continue; // the default key is not a member
+			const key = concurrencyKeyFor(entry.ref);
+			if (seenModels.has(key)) continue;
+			seenModels.add(key);
+			models.push(entry.ref);
+		}
+		if (!valid || models.length === 0) continue;
+		// `name` is already control-stripped and trimmed above.
+		const nameKey = concurrencyKeyFor(name);
+		if (seenNames.has(nameKey)) continue;
+		seenNames.add(nameKey);
+		groups.push({ name, models: Object.freeze(models) as unknown as string[], max: obj.max });
+	}
+	// Frozen deeply enough to matter: the same objects are handed to every
+	// route(), and "a caller mutation would poison the caps of every later
+	// session" is the reason DEFAULT_CONCURRENCY freezes (see its comment).
+	for (const group of groups) Object.freeze(group);
+	return Object.freeze(groups) as ConcurrencyGroup[];
 }
 
 /**

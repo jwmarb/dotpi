@@ -6,21 +6,23 @@ failed; once a fallback answers, the **original model gets the next request**.
 
 | File | Owns |
 |---|---|
-| `lib.ts` | The state machine and every message, plus `computeDisplay` (which model the UI should name). Pure and pi-free; covered by `lib.test.ts` |
+| `lib.ts` | The state machine and every message, plus `computeDisplay` (which model the UI should name) and the shared group budgets (`groupInUse` / `concurrencyBlockFor` — a group's cap is summed from the per-model counts). Pure and pi-free; covered by `lib.test.ts` |
 | `index.ts` | Session wiring: `registerVirtualModel` (and its live re-registration), `/fallback-chain`, the footer notice, installing the custom footer, and publishing the registered chain to `served.ts` |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
 | `served.ts` | The chain the router registered plus its `resolve()` predicate, on `globalThis` for other extensions (today `../startup-fetch.ts`'s `Model` row). Cleared on every load before the `register` early return |
 | Cross-module contract (in `lib.ts`) | `FALLBACK_MODEL_REF` (= `fallback/auto`) and `CHAIN_ENV` (= `PI_FALLBACK_CHAIN`) are the two symbols other extensions import this dir for: `ralph-loop/gate.ts` + `runtime-gate.ts` launch their gate children on them, and `subagent-herdr` passes the parent's chain to its children the same way. `parseChainItem` (`lib.ts:234`) is the parser for that env syntax (`ref|level`, comma-separated) — the settings.json grammar is *not* the same parser (see the `|level` note above; line numbers here are as of 2026-10-28 and drift). Rename either symbol and those importers break at load, not at call. |
 | `footer.ts` | The `setFooter` replacement that shows the in-use physical model. Forks pi's built-in `footer.js` — see its deliberate-divergences note, and keep the width guarantee |
 | `footer.test.ts` | The width invariant (`no line exceeds the width` — exceeding it kills the `pi` process), the pure formatters, and the scan cache |
-| `concurrency.ts` | Global per-model in-flight leases — one file per request, `O_EXCL`, TTL-swept; owns its dir under `agent/cache/`, takes the dir as a parameter |
+| `concurrency.ts` | Global per-model in-flight leases — one file per request, `O_EXCL`, TTL-swept; owns its dir under `agent/cache/`, takes the dir as a parameter. Group budgets are summed from these per-model counts, never a separate lease namespace |
 | `concurrency.test.ts` | The lease store's tests: the failure rule (missing/unwritable dir degrades to unlimited), stale-by-age sweeping, the env override |
 
 ## HOW IT IS TURNED ON HERE
 
 `agent/settings.json` (an excerpt as of `ceb3112` — the commit that moved the primary pin
-from the `"ref|xhigh"` string form to the object form, so the worktree file is identical to
-it; `git diff ceb3112 -- agent/settings.json` is empty. The older `61dc4a8` excerpt this
+from the `"ref|xhigh"` string form to the object form, so the worktree file's **chain**
+is identical to it; `git diff ceb3112 -- agent/settings.json` is empty. (The block's
+`concurrency` and `groups` lines are documentation of the grammar — the worktree file
+names different caps and ships no live group.) The older `61dc4a8` excerpt this
 note used to cite has a *bare* `"qwen/qwen3.8-27b"` primary and is **not** the block below.
 The file is the authority, and the chain
 is the line that drifts. The startup header's `Model` row prints the registered primary, so
@@ -34,9 +36,21 @@ is the line that drifts. The startup header's `Model` row prints the registered 
   "chain": [{ "model": "qwen/qwen3.8-flash-next", "thinking": "xhigh" }, { "model": "anthropic/claude-opus-5.5", "thinking": "low" }, { "model": "anthropic/claude-opus-5", "thinking": "low" }, "openai/gpt-5.6-sol"],
   "maxCycles": 10, "maxProbes": 2,
   "concurrency": { "*": 2, "qwen/qwen3.8-flash-next": 2, "anthropic/claude-opus-5.5": 1, "anthropic/claude-opus-5": 1, "openai/gpt-5.6-sol": 2 },
+  "groups": [ { "name": "g1", "models": ["qwen/qwen3.8-flash-next", "anthropic/claude-opus-5.5"], "max": 4 } ],
   "contextWindow": 262144, "maxTokens": 32768
 }
 ```
+
+**`groups` is an array of objects, in order** — a shared in-flight budget over
+its `models`. `name` is required: a non-empty string, trimmed as written, and
+compared case-insensitively (the first of a duplicate name wins). `models`
+runs through the same ref grammar as the caps keys (trim + case) and `"*"`
+is not a member — it would parse as an ordinary reference, and the default
+key would become a phantom one. `max` is a positive integer. A malformed
+entry is dropped, never thrown, and never discards the `concurrency` caps
+already parsed. A model in two groups must satisfy both caps and its own.
+The snippet above is documentation — `settings.json` ships no live group, and
+the feature is inert until one is added.
 
 **`defaultModel` is the bare model id, not `provider/id`.** pi looks the default up as
 `getModel(defaultProvider, defaultModelId)` (`core/model-resolver.js`, step 3), so
@@ -91,7 +105,8 @@ router.
 | How a subagent gets a chain | `subagent-herdr/lib.ts` `childFallbackChain` → `PI_FALLBACK_CHAIN` (items as `ref` or `ref|level`) → here |
 | How a ralph-loop gate gets one | `ralph-loop/gate.ts` `resolveGateAgent` + `withChainEnv` (same env var; `pi.exec()` has no `env` option) |
 | How to configure it | `settings.json` `modelFallback.chain`, then select `fallback/auto` |
-| Why a capped model rotates instead of waiting | `lib.ts` `applyConcurrency` + `concurrency.ts` leases |
+| Why a capped model rotates instead of waiting | `lib.ts` `applyConcurrency` + `concurrencyBlockFor` + `concurrency.ts` leases |
+| Why a model with room at its own cap still rotates | `lib.ts` `groupInUse` + `concurrencyBlockFor` (shared group budget) |
 | Whether it is on | `/fallback-chain` — lists the chain, marks unavailable entries, prints the budget |
 
 ## THE MECHANISM, AND WHY IT IS THIS ONE
@@ -341,6 +356,7 @@ is what made the formula wrong rather than merely conservative.
 - **`sticky` is deliberately absent from `sameState()`** and re-applied by `applyConcurrency`: `advance()`'s branches construct states without it, so comparing it would make `advance` emit sticky-less states on every sticky-carrying request.
 - **The lease store degrades to unlimited on a missing or unwritable dir and never throws** — a cap that kills the request it is scheduling is not a cap. TTL is 15 min, age-only: the tree is sync-replicated across hosts, where pids are per-host and only an mtime survives.
 - **All-at-cap routes over the cap — halting is not an option.** The limit is soft: a capped chain walks to the cap's index (or the last reachable candidate, after the in-flight reservation) and sends the request, rather than waiting for a slot that may never free.
+- **A group is a shared budget over the same lease files.** `modelFallback.groups` names a set of models that share one global in-flight cap, counted by summing the per-model in-use from the one `snapshotLeases` call — no group lease, no group key, no second `readdir`, and `concurrency.ts` stays group-blind. The group cap is snapshot-only and soft, like a per-model cap: the snapshot precedes the lease, so a cross-process race may land the count over `max`. A group-saturated chain routes over the cap — halting is not an option.
 ## THE TWO BUDGETS
 
 pi increments its own retry counter on **every** failed request, so one lap of an

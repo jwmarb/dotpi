@@ -68,6 +68,7 @@ import type {
 import { createFallbackFooter } from "./footer.js";
 import {
 	type ChainEntry,
+	type ConcurrencyBlock,
 	type FallbackState,
 	CHAIN_ENV,
 	FALLBACK_MODEL_ID,
@@ -88,6 +89,8 @@ import {
 	describeUpstreamHop,
 	formatEntry,
 	formatModelRef,
+	groupInUse,
+	groupsForModel,
 	levelFor,
 	planRegistration,
 	readConfig,
@@ -240,6 +243,13 @@ export default function (pi: ExtensionAPI) {
 	// and the lease directory is resolved once here: it is a filesystem path,
 	// not a session fact, so it does not move on `session_start`.
 	const concurrency = readConcurrency(raw);
+	// The group budgets are summed from the same leases, so a model that is a
+	// group member but not a chain entry is requested from the snapshot too:
+	// one readdir per route, no lease-format change.
+	const leaseRefs = [
+		...chain.map((e) => e.ref),
+		...(concurrency.groups ?? []).flatMap((g) => g.models),
+	];
 	const leaseDirPath = resolveLeaseDir();
 	// The router's name is a fuzzy-match surface in pi's resolver and feeds the
 	// /model subtitle. We re-register it live (see `syncVirtualModelName`) so the
@@ -615,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 				result,
 				state: request.state,
 				concurrency,
-				inUse: snapshotLeases(leaseDirPath, chain.map((e) => e.ref)),
+				inUse: snapshotLeases(leaseDirPath, leaseRefs),
 				isUsable: (i) => resolved[i] !== undefined,
 			});
 
@@ -648,6 +658,8 @@ export default function (pi: ExtensionAPI) {
 			// Direct requests route to `home`, as today, with no lease and no push;
 			// the release nets stay as-is.
 			if (request.reason !== "direct") {
+				// Per-model reservation only: a group cap is snapshot-only and soft —
+				// read from `inUse` above, never reserved here.
 				let lease = acquireLease(leaseDirPath, chain[index]!.ref, concurrencyLimitFor(concurrency, chain[index]!.ref));
 				if (!lease.ok) {
 					// The slot filled between the snapshot and now — another pi process
@@ -682,7 +694,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (result.hop) showStatus(ctx, describeHop(chain[result.hop.from], chain[index]!, result.hop.cycles));
 			if (decision.rotate)
-				showStatus(ctx, describeConcurrencyHop(chain[decision.rotate.from]!, chain[index]!, concurrencyLimitFor(concurrency, chain[decision.rotate.from]!.ref)));
+				showStatus(ctx, describeConcurrencyHop(chain[decision.rotate.from]!, chain[index]!, decision.rotate.blockedBy));
 
 			// `state.index` must record where the request actually went, not
 			// where `advance` aimed — now including the concurrency rotation —
@@ -717,7 +729,8 @@ export default function (pi: ExtensionAPI) {
 			const warning = budgetWarning();
 			// One snapshot for every row: the in-use counts are a fact about
 			// the shared lease directory, not per-entry work.
-			const inUse = snapshotLeases(leaseDirPath, chain.map((e) => e.ref));
+			const inUse = snapshotLeases(leaseDirPath, leaseRefs);
+			const groupsInUse = groupInUse(concurrency, inUse);
 			const lines = [
 				`Chain (${FALLBACK_MODEL_REF}):`,
 				...chain.map((entry, i) => {
@@ -725,12 +738,17 @@ export default function (pi: ExtensionAPI) {
 					const mark = model ? "ok" : "UNAVAILABLE";
 					const limit = concurrencyLimitFor(concurrency, entry.ref);
 					const count = inUse[concurrencyKeyFor(entry.ref)] ?? 0;
-					return `  ${i}. ${formatEntry(entry)} [${mark}] · limit ${limit === Number.POSITIVE_INFINITY ? "∞" : limit} · in use ${count}`;
+					const gs = groupsForModel(concurrency, entry.ref);
+					const groupTag = gs.length
+						? ` · ${gs.map((g) => `group ${g.name} ${groupsInUse[g.name] ?? 0}/${g.max}`).join(", ")}`
+						: "";
+					return `  ${i}. ${formatEntry(entry)} [${mark}] · limit ${limit === Number.POSITIVE_INFINITY ? "∞" : limit} · in use ${count}${groupTag}`;
 				}),
 				"",
 				`Cycles allowed: ${config.maxCycles} (one cycle = one full lap of the chain = one retry)`,
 				`Primary probes before settling on a fallback: ${config.maxProbes}`,
 				`Concurrency: global per-model caps from settings.modelFallback.concurrency (default ${concurrency.defaultLimit ?? "∞"}, leases in ${leaseDirPath})`,
+				`Groups: ${concurrency.groups ? concurrency.groups.map((g) => `${g.name} [${g.models.join(", ")}] ${groupsInUse[g.name] ?? 0}/${g.max}`).join(" · ") : "none"}`,
 				`settings.retry.maxRetries: ${pi.getSettings().retry?.maxRetries ?? 0}`,
 				...(warning ? ["", warning] : []),
 				...(plan.source === "environment" ? ["", `Chain came from ${CHAIN_ENV} (set by the parent).`] : []),

@@ -17,6 +17,8 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import {
 	type AdvanceResult,
 	type ChainEntry,
+	type ConcurrencyBlock,
+	type ConcurrencyGroup,
 	type DisplayEntry,
 	type FallbackConfig,
 	type FallbackState,
@@ -28,6 +30,7 @@ import {
 	advance,
 	applyConcurrency,
 	computeDisplay,
+	concurrencyBlockFor,
 	concurrencyKeyFor,
 	concurrencyLimitFor,
 	DEFAULT_CONCURRENCY,
@@ -41,6 +44,8 @@ import {
 	formatChainItem,
 	formatEntry,
 	formatModelRef,
+	groupInUse,
+	groupsForModel,
 	initialState,
 	isDisabled,
 	isGatewayUpstreamFailure,
@@ -1100,6 +1105,76 @@ describe("readConcurrency", () => {
 		expect(concurrencyLimitFor(DEFAULT_CONCURRENCY, "b/2")).toBe(UNLIMITED_CONCURRENCY);
 		expect(concurrencyKeyFor(" A/1 ")).toBe("a/1");
 	});
+
+	test("reads groups as written, in settings order", () => {
+		const config = readConcurrency({
+			concurrency: { "a/1": 2 },
+			groups: [{ name: "g1", models: ["a/1", "B/2"], max: 4 }],
+		});
+		expect(config).toEqual({
+			limits: { "a/1": 2 },
+			groups: [{ name: "g1", models: ["a/1", "B/2"], max: 4 }],
+		});
+	});
+
+	test("a malformed group entry is dropped, its neighbours survive", () => {
+		const good = { name: "g1", models: ["a/1"], max: 2 };
+		const config = readConcurrency({
+			concurrency: { "a/1": 1 },
+			groups: [
+				"not-an-object",
+				null,
+				[1, 2],
+				{ name: "zero-max", models: ["a/1"], max: 0 },
+				{ name: "neg-max", models: ["a/1"], max: -1 },
+				{ name: "frac-max", models: ["a/1"], max: 1.5 },
+				{ name: "string-max", models: ["a/1"], max: "2" },
+				{ name: "null-max", models: ["a/1"], max: null },
+				{ name: "no-max", models: ["a/1"] },
+				{ models: ["a/1"], max: 1 },
+				{ name: "", models: ["a/1"], max: 1 },
+				{ name: 7, models: ["a/1"], max: 1 },
+				{ name: "no-models", max: 1 },
+				{ name: "models-not-array", models: "a/1", max: 1 },
+				{ name: "empty-models", models: [], max: 1 },
+				good,
+			],
+		});
+		expect(config.groups).toEqual([good]);
+		// The caps blob parsed around the bad groups is untouched.
+		expect(config.limits).toEqual({ "a/1": 1 });
+	});
+
+	test("group models follow the caps key rule: trim + case, first casing wins; * is not a member", () => {
+		const config = readConcurrency({
+			concurrency: {},
+			groups: [{ name: "g1", models: ["  A/1 ", "a/1", "*", "b/2", "B/2"], max: 2 }],
+		});
+		expect(config.groups).toEqual([{ name: "g1", models: ["A/1", "b/2"], max: 2 }]);
+	});
+
+	test("duplicate group names keep the first, case-insensitively", () => {
+		const config = readConcurrency({
+			concurrency: {},
+			groups: [
+				{ name: "g1", models: ["a/1"], max: 4 },
+				{ name: "G1", models: ["b/2"], max: 9 },
+			],
+		});
+		expect(config.groups).toEqual([{ name: "g1", models: ["a/1"], max: 4 }]);
+	});
+
+	test("a bad groups blob never discards the limits", () => {
+		for (const bad of ["x", 7, null, { name: "g1" }]) {
+			const config = readConcurrency({ concurrency: { "a/1": 3 }, groups: bad });
+			expect(config.limits).toEqual({ "a/1": 3 });
+			expect("groups" in config).toBe(false);
+		}
+	});
+
+	test("an absent groups array omits the key", () => {
+		expect("groups" in readConcurrency({ concurrency: { "a/1": 1 } })).toBe(false);
+	});
 });
 
 describe("sticky: sanitize and round-trip", () => {
@@ -1154,7 +1229,7 @@ describe("concurrency rotation", () => {
 		concurrency: ConcurrencyConfigLike,
 		inUse: Readonly<Record<string, number>>,
 		isUsable?: (index: number) => boolean,
-	): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number } } {
+	): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number; blockedBy?: ConcurrencyBlock } } {
 		const result = advance({ reason, chainLength: chain.length, state, config: CONFIG });
 		if (result.kind !== "route") throw new Error(`expected a route, got ${result.kind}`);
 		return applyConcurrency({ reason, chain, result, state, concurrency, inUse, isUsable });
@@ -1166,7 +1241,7 @@ describe("concurrency rotation", () => {
 		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
 		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, { "a/1": 1 });
 		expect(d.index).toBe(1);
-		expect(d.rotate).toEqual({ from: 0, to: 1 });
+		expect(d.rotate).toEqual({ from: 0, to: 1, blockedBy: { kind: "model", limit: 1 } });
 		expect(d.state?.sticky).toBe(1);
 		expect(d.state?.index).toBe(0); // the state `advance` computed, pre-override
 	});
@@ -1175,7 +1250,20 @@ describe("concurrency rotation", () => {
 		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
 		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, { "a/1": 1 }, (i) => i !== 1);
 		expect(d.index).toBe(2);
-		expect(d.rotate).toEqual({ from: 0, to: 2 });
+		expect(d.rotate).toEqual({ from: 0, to: 2, blockedBy: { kind: "model", limit: 1 } });
+	});
+
+	test("rotating off an UNREACHABLE start carries no blockedBy — short-form notice", () => {
+		// The start was skipped for unreachability, not for a cap: saying
+		// "at its concurrency limit" would be a lie, so `blockedBy` stays
+		// undefined and the notice falls to its short form.
+		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+		const d = route("user", undefined, chain, { limits: { "a/1": 1 } }, {}, (i) => i !== 0);
+		expect(d.index).toBe(1);
+		expect(d.rotate?.blockedBy).toBeUndefined();
+		expect(describeConcurrencyHop(chain[0]!, chain[1]!, d.rotate?.blockedBy)).toBe(
+			"model-fallback: routing to b/2",
+		);
 	});
 
 	test("a plain continuation stays on the sticky model, un-probed", () => {
@@ -1196,7 +1284,7 @@ describe("concurrency rotation", () => {
 		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
 		const d = route("continuation", held, chain, { limits: { "b/2": 1 } }, { "b/2": 1 });
 		expect(d.index).toBe(2);
-		expect(d.rotate).toEqual({ from: 1, to: 2 });
+		expect(d.rotate).toEqual({ from: 1, to: 2, blockedBy: { kind: "model", limit: 1 } });
 		expect(d.state?.sticky).toBe(2);
 	});
 
@@ -1345,13 +1433,13 @@ describe("concurrency rotation", () => {
 	});
 
 	test("describeConcurrencyHop is plain text, unsanitized (status line only)", () => {
-		const line = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, 2);
+		const line = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, { kind: "model", limit: 2 });
 		expect(line).toContain("timeout/model"); // no sanitizeModelRef: a status line
 		expect(line).toContain("a/1");
 		expect(line).toContain("(2)");
 		// The limit clause is a claim about capping: an ∞ limit (an entry skipped
 		// for unreachability, not its cap) must not be printed as one.
-		const uncapped = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, Number.POSITIVE_INFINITY);
+		const uncapped = describeConcurrencyHop({ ref: "timeout/model" }, { ref: "a/1" }, { kind: "model", limit: Number.POSITIVE_INFINITY });
 		expect(uncapped).toContain("a/1");
 		expect(uncapped).not.toContain("concurrency limit");
 	});
@@ -1359,11 +1447,278 @@ describe("concurrency rotation", () => {
 	test("pickFreeIndex: missing in-use keys count as zero, unlimited never caps", () => {
 		const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }];
 		expect(pickFreeIndex({ chain, start: 0, concurrency: DEFAULT_CONCURRENCY, inUse: {} })).toEqual({ kind: "free", index: 0, rotated: false });
-		expect(pickFreeIndex({ chain, start: 0, concurrency: { limits: { "a/1": 2 } }, inUse: { "a/1": 2 } })).toEqual({ kind: "free", index: 1, rotated: true });
+		expect(pickFreeIndex({ chain, start: 0, concurrency: { limits: { "a/1": 2 } }, inUse: { "a/1": 2 } })).toEqual({ kind: "free", index: 1, rotated: true, blockedBy: { kind: "model", limit: 2 } });
 		expect(pickFreeIndex({ chain, start: 0, concurrency: { limits: { "a/1": 1, "b/2": 1 } }, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
 			kind: "all-at-cap",
 			index: 0,
 		});
+	});
+});
+describe("concurrency groups", () => {
+	const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+
+	/** Drive `advance` + `applyConcurrency` the way `index.ts` `route()` does. */
+	function route(
+		reason: RouteReason,
+		state: FallbackState | undefined,
+		chain: readonly ChainEntry[],
+		concurrency: Parameters<typeof applyConcurrency>[0]["concurrency"],
+		inUse: Readonly<Record<string, number>>,
+	): { index: number; state: FallbackState | undefined; rotate?: { from: number; to: number; blockedBy?: ConcurrencyBlock } } {
+		const result = advance({ reason, chainLength: chain.length, state, config: CONFIG });
+		if (result.kind !== "route") throw new Error(`expected a route, got ${result.kind}`);
+		return applyConcurrency({ reason, chain, result, state, concurrency, inUse });
+	}
+
+	test("the user example: groups-only config g1 {A,B} max 4, A at 3 leaves B 1, A at 4 leaves B 0", () => {
+		const c = readConcurrency({ groups: [{ name: "g1", models: ["a/A", "b/B"], max: 4 }] });
+		const A = { ref: "a/A" } as ChainEntry;
+		const B = { ref: "b/B" } as ChainEntry;
+		expect(concurrencyBlockFor(B, c, { "a/a": 3, "b/b": 0 })).toBeUndefined();
+		expect(concurrencyBlockFor(B, c, { "a/a": 3, "b/b": 1 })?.kind).toBe("group");
+		expect(concurrencyBlockFor(B, c, { "a/a": 4, "b/b": 0 })?.kind).toBe("group");
+		expect(concurrencyBlockFor(A, c, { "a/a": 4, "b/b": 0 })?.kind).toBe("group");
+	});
+
+	test("a member in the chain `ref|level` grammar drops the group, not a phantom member", () => {
+		// `|` parses as an ordinary ref but can never match a lease key — a
+		// surviving group would be silently looser than configured.
+		const c = readConcurrency({ groups: [{ name: "g1", models: ["qwen/x|xhigh", "a/1"], max: 2 }] });
+		expect("groups" in c).toBe(false);
+	});
+
+	test("a group name's internal control characters are stripped, never forwarded", () => {
+		const c = readConcurrency({ groups: [{ name: "g1\nGroups: x", models: ["a/1"], max: 2 }] });
+		expect(c.groups?.[0]?.name).toBe("g1 Groups: x");
+	});
+
+	test("groupInUse sums its members, and a shared model counts in both groups", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [
+				{ name: "g1", models: ["a/1", "b/2"], max: 4 },
+				{ name: "g2", models: ["b/2", "c/3"], max: 2 },
+			],
+		};
+		expect(groupInUse(concurrency, { "a/1": 2, "b/2": 3 })).toEqual({ g1: 5, g2: 3 });
+		// Every group gets a key, zero when nothing of its members is in use.
+		expect(groupInUse(concurrency, {})).toEqual({ g1: 0, g2: 0 });
+		// No groups: an empty map, not a key per group.
+		expect(groupInUse(DEFAULT_CONCURRENCY, { "a/1": 1 })).toEqual({});
+	});
+
+	test("a group is the only cap for a member with no per-model entry", () => {
+		const group: ConcurrencyGroup = { name: "g1", models: ["a/1", "b/2"], max: 2 };
+		const concurrency: ConcurrencyConfig = { limits: {}, groups: [group] };
+		// Neither member has a per-model cap: the own limit is unlimited, so
+		// only the group's budget can block them.
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
+			kind: "free",
+			index: 2,
+			rotated: true,
+			blockedBy: { kind: "group", name: "g1", limit: 2, inUse: 2 },
+		});
+	});
+
+	test("groupsForModel is case-insensitive and keeps configuration order", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [
+				{ name: "first", models: ["A/1"], max: 1 },
+				{ name: "second", models: ["a/1", "b/2"], max: 2 },
+				{ name: "third", models: ["c/3"], max: 1 },
+			],
+		};
+		expect(groupsForModel(concurrency, "a/1")).toEqual(concurrency.groups!.slice(0, 2));
+		expect(groupsForModel(concurrency, "c/3")).toEqual([{ name: "third", models: ["c/3"], max: 1 }]);
+		expect(groupsForModel(concurrency, "x/9")).toEqual([]);
+	});
+
+	test("concurrencyBlockFor: own cap first, then the first full group, then free", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: { "a/1": 1 },
+			groups: [{ name: "g1", models: ["a/1", "b/2"], max: 2 }],
+		};
+		// Both full: the own cap wins, whatever the group says.
+		expect(concurrencyBlockFor({ ref: "a/1" }, concurrency, { "a/1": 1, "b/2": 1 })).toEqual({ kind: "model", limit: 1 });
+		// Room at the own cap, group full: the group is named.
+		expect(concurrencyBlockFor({ ref: "b/2" }, concurrency, { "a/1": 1, "b/2": 1 })).toEqual({
+			kind: "group",
+			name: "g1",
+			limit: 2,
+			inUse: 2,
+		});
+		// Room in both: free.
+		expect(concurrencyBlockFor({ ref: "b/2" }, concurrency, { "a/1": 1 })).toBeUndefined();
+	});
+
+	test("pickFreeIndex rotates past a group-full model that has room at its own cap", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: { "a/1": 2 },
+			groups: [{ name: "g1", models: ["a/1", "b/2"], max: 2 }],
+		};
+		// a/1 is 1/2 at its own cap, but the group is 2/2.
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
+			kind: "free",
+			index: 2,
+			rotated: true,
+			blockedBy: { kind: "group", name: "g1", limit: 2, inUse: 2 },
+		});
+	});
+
+	test("the * default cap is free, but a full group still rotates", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			defaultLimit: 2,
+			groups: [{ name: "g1", models: ["a/1", "b/2"], max: 2 }],
+		};
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
+			kind: "free",
+			index: 2,
+			rotated: true,
+			blockedBy: { kind: "group", name: "g1", limit: 2, inUse: 2 },
+		});
+	});
+
+	test("a member in two groups needs room in both", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [
+				{ name: "g1", models: ["a/1"], max: 2 },
+				{ name: "g2", models: ["a/1", "b/2"], max: 1 },
+			],
+		};
+		// g1 has room; g2 is full through b/2, and a/1 is a g2 member.
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: { "b/2": 1 } })).toEqual({
+			kind: "free",
+			index: 2,
+			rotated: true,
+			blockedBy: { kind: "group", name: "g2", limit: 1, inUse: 1 },
+		});
+	});
+
+	test("a group naming a model outside the chain does not move the walk", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [{ name: "g1", models: ["x/9", "a/1"], max: 2 }],
+		};
+		// x/9 is not a chain entry: with no leases the group has room and the
+		// walk stays put.
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: {} })).toEqual({ kind: "free", index: 0, rotated: false });
+		// A lease on the off-chain member counts against the shared budget.
+		expect(pickFreeIndex({ chain, start: 0, concurrency, inUse: { "x/9": 2 } })).toEqual({
+			kind: "free",
+			index: 1,
+			rotated: true,
+			blockedBy: { kind: "group", name: "g1", limit: 2, inUse: 2 },
+		});
+	});
+
+	test("every entry group-blocked: all-at-cap at the start index, no rotate, no blockedBy", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [{ name: "g1", models: ["a/1", "b/2", "c/3"], max: 2 }],
+		};
+		expect(pickFreeIndex({ chain, start: 1, concurrency, inUse: { "a/1": 1, "b/2": 1 } })).toEqual({
+			kind: "all-at-cap",
+			index: 1,
+		});
+	});
+
+	test("a full group rotates to the next model with group room, naming the group", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [{ name: "g1", models: ["a/1", "b/2"], max: 2 }],
+		};
+		const d = route("user", undefined, chain, concurrency, { "a/1": 1, "b/2": 1 });
+		expect(d.index).toBe(2);
+		expect(d.rotate).toEqual({ from: 0, to: 2, blockedBy: { kind: "group", name: "g1", limit: 2, inUse: 2 } });
+		expect(d.state?.sticky).toBe(2);
+	});
+
+	test("the notice carries the group name, the shared count, and verbatim text", () => {
+		// `timeout/503` is a deliberate pin: a group name is user-authored
+		// settings text, and this line is a status line, not an error — so the
+		// name goes in verbatim, retry keywords and all.
+		const line = describeConcurrencyHop({ ref: "a/1" }, { ref: "c/3" }, { kind: "group", name: "timeout/503", limit: 4, inUse: 3 });
+		expect(line).toContain("timeout/503");
+		expect(line).toContain("(3/4)");
+		expect(line).toContain("routing to c/3");
+	});
+
+	test("a group-capped sticky model rotates and re-stickies", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [{ name: "g1", models: ["a/1", "b/2"], max: 1 }],
+		};
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		// The held b/2 is group-blocked (a/1 fills g1): rotate from it.
+		const d = route("continuation", held, chain, concurrency, { "a/1": 1 });
+		expect(d.index).toBe(2);
+		expect(d.rotate).toEqual({ from: 1, to: 2, blockedBy: { kind: "group", name: "g1", limit: 1, inUse: 1 } });
+		expect(d.state?.sticky).toBe(2);
+	});
+
+	test("every group-blocked entry routes to the advance index over the cap, sticky cleared", () => {
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [{ name: "g1", models: ["a/1", "b/2", "c/3"], max: 1 }],
+		};
+		const held: FallbackState = { index: 1, cycles: 0, probes: 0, home: 0, probing: false, sticky: 1 };
+		const d = route("continuation", held, chain, concurrency, { "a/1": 1, "b/2": 1 });
+		expect(d.index).toBe(0);
+		expect(d.state && "sticky" in d.state).toBe(false);
+		expect(d.rotate).toBeUndefined();
+	});
+
+	test("six rotation hops over a group-saturated chain: the budget stays byte-identical to advance() alone", () => {
+		const config: FallbackConfig = { maxCycles: 2, maxProbes: 2 };
+		// One single-member group per model: group saturation is per-model
+		// saturation, so every step caps exactly the model `advance` aims at
+		// and rotates one position forward — six rotation hops, then
+		// exhaustion.
+		const concurrency: ConcurrencyConfig = {
+			limits: {},
+			groups: [
+				{ name: "ga", models: ["a/1"], max: 1 },
+				{ name: "gb", models: ["b/2"], max: 1 },
+				{ name: "gc", models: ["c/3"], max: 1 },
+			],
+		};
+		const target = ["a/1", "c/3", "b/2", "a/1", "c/3", "b/2"];
+
+		let withCaps: FallbackState | undefined;
+		let plain: FallbackState | undefined;
+		let hops = 0;
+		for (let step = 0; step < 10; step++) {
+			const reason: RouteReason = step === 0 ? "user" : "retry";
+			const plainResult = advance({ reason, chainLength: chain.length, state: plain, config });
+			const capsResult = advance({ reason, chainLength: chain.length, state: withCaps, config });
+			if (plainResult.kind !== "route" || capsResult.kind !== "route") {
+				expect(plainResult.kind).toBe("exhausted");
+				expect(capsResult.kind).toBe("exhausted");
+				expect((plainResult as { cycles: number }).cycles).toBe((capsResult as { cycles: number }).cycles);
+				break;
+			}
+			const decision = applyConcurrency({
+				reason,
+				chain,
+				result: capsResult,
+				state: withCaps,
+				concurrency,
+				inUse: { [target[step]!]: 1 },
+			});
+			expect(decision.state).toBeDefined();
+			const s = decision.state!;
+			const p = capsResult.state ?? withCaps ?? initialState(); // the state `advance` effectively set
+			// A rotation touches nothing of the budget.
+			expect([s.cycles, s.probes, s.home, s.probing, s.forced]).toEqual([p.cycles, p.probes, p.home, p.probing, p.forced]);
+			expect(decision.rotate).toBeDefined(); // every step rotates
+			hops += 1;
+			withCaps = { ...s, index: decision.index };
+			plain = { ...(plainResult.state ?? initialState()), index: plainResult.index };
+		}
+		expect(hops).toBe(6);
 	});
 });
 describe("sanitizeModelRef", () => {
