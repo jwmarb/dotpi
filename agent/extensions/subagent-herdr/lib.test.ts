@@ -192,6 +192,39 @@ describe("extractRunResult", () => {
     expect(r.sessionFile).toBe(join(dir, "2026-09-20T13-00-00-000Z_sub-0007.jsonl"));
   });
 
+  test("extractRunResult carries the final todo counts from the same transcript", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0009" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          details: {
+            state: {
+              items: [
+                { id: "t1", text: "a", status: "done" },
+                { id: "t2", text: "b", status: "done" },
+                { id: "t3", text: "c", status: "in_progress" },
+              ],
+              nextId: 4,
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "<result>\n## Map\n</result>" }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "2026-09-20T12-00-00-000Z_sub-0009.jsonl"), `${lines.join("\n")}\n`);
+
+    const r = await extractRunResult(dir, "sub-0009");
+    expect(r.answered).toBe(true);
+    expect(r.todos).toEqual({ total: 3, done: 2, inProgress: 1, blocked: 0, pending: 0 });
+  });
+
   test("the sidecar-settled transcript wins over a newer post-completion resume", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
     const entry = (text: string) =>

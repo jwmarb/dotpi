@@ -26,6 +26,11 @@ import {
   parseChainItem,
 } from "../model-fallback/lib.js";
 import {
+  counts,
+  parseTodoState,
+  type TodoCounts,
+} from "../lib/todo.js";
+import {
   CARD_ID_PATTERN,
   type ChildReport,
   type RunRecord,
@@ -531,6 +536,13 @@ export interface RunResult {
   sessionFile?: string;
   /** Set only when the answer had to be salvaged from somewhere unintended. */
   salvagedFrom?: AnswerSource;
+  /**
+   * The child's final todo counts, from the newest valid `todo` tool result
+   * in the same transcript the answer came from (shared `parseTodoState`).
+   * Present when the child built a list; the wake briefing renders it so the
+   * orchestrator sees what the run settled even when its prose is a one-liner.
+   */
+  todos?: TodoCounts;
 }
 
 /**
@@ -614,6 +626,18 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
     }
   }
 
+  // The child's final todo state, walked back from the end of the SAME parsed
+  // entries (no second read): the newest VALID todo tool result wins,
+  // malformed ones skipped — the shared `parseTodoState` rule the board and
+  // the child's own gate apply.
+  let todos: TodoCounts | undefined;
+  for (let i = parsed.length - 1; i >= 0 && !todos; i--) {
+    const m = (parsed[i] as { message?: { role?: string; toolName?: string; details?: unknown } }).message;
+    if (m?.role !== "toolResult" || m.toolName !== "todo") continue;
+    const state = parseTodoState((m.details as { state?: unknown } | undefined)?.state);
+    if (state) todos = counts(state);
+  }
+
   // The contract the child was launched under. Unreadable (a historical run, a
   // corrupt dir) degrades to the weaker rule rather than declaring every such
   // run unanswered.
@@ -674,6 +698,7 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
         text,
         stopReason: m.stopReason,
         sessionFile,
+        ...(todos ? { todos } : {}),
         // Only the boundary message is "where the answer belongs"; anything
         // earlier is the model having answered and then carried on.
         ...(i === doneIdx ? {} : { salvagedFrom: "earlier-message" as const }),
@@ -698,6 +723,7 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
           text,
           stopReason: doneMessage?.stopReason,
           sessionFile,
+          ...(todos ? { todos } : {}),
           salvagedFrom: "done-arguments",
         };
       }
@@ -723,6 +749,7 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
         text,
         stopReason: m.stopReason,
         sessionFile,
+        ...(todos ? { todos } : {}),
         salvagedFrom: i === doneIdx ? "truncated-answer" : "earlier-message",
       };
     }
@@ -748,12 +775,28 @@ export async function extractRunResult(runDir: string, runId: string): Promise<R
         text,
         stopReason: m.stopReason,
         sessionFile,
+        ...(todos ? { todos } : {}),
         salvagedFrom: "non-conforming",
       };
     }
   }
 
-  return { found: true, answered: false, text: "", sessionFile };
+  return { found: true, answered: false, text: "", sessionFile, ...(todos ? { todos } : {}) };
+}
+
+/**
+ * The one transcript-selection rule, as a pure function over a directory
+ * listing: the `.exit`-settled transcript wins, else the newest (ISO-prefixed
+ * names sort chronologically). `findSessionFile` and the lifecycle's
+ * `evidenceStamp` (a sync reader) share it so a resumed dir fingerprints and
+ * answers from the same file.
+ */
+export function pickSessionName(names: readonly string[], runId: string): string | undefined {
+  const own = names.filter((n) => isSessionFileFor(n, runId));
+  if (own.length === 0) return undefined;
+  own.sort();
+  const settled = own.filter((n) => names.includes(exitPath(n)));
+  return settled.length > 0 ? settled[settled.length - 1] : own[own.length - 1];
 }
 
 async function findSessionFile(runDir: string, runId: string): Promise<string | undefined> {
@@ -763,8 +806,9 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   } catch {
     return undefined;
   }
-  // A run dir can hold more than one session file (a resumed session): 18 of
-  // 441 recorded dirs do. Names are ISO-timestamp-prefixed, so lexicographic
+  // A run dir can hold more than one session file (a resumed session): 3 of
+  // 443 recorded dirs do (18 is the naive *.jsonl glob, which counts foreign-
+  // id transcripts; the isSessionFileFor-scoped count is what matters). Names are ISO-timestamp-prefixed, so lexicographic
   // order is chronological. The transcript the child settled — the one with
   // the `.exit` sidecar — IS the run's answer, and a post-completion resume
   // (a newer transcript, no sidecar) must not overwrite it: measured on
@@ -772,12 +816,8 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   // With no settled transcript (the run is live) the newest wins — the same
   // rule kanban/runs.ts uses to render the card sub-row, so the answer and
   // the progress line are read from the same transcript while the run runs.
-  const names = dirEntries.filter((e) => isSessionFileFor(e, runId));
-  if (names.length === 0) return undefined;
-  names.sort();
-  const settled = names.filter((n) => dirEntries.includes(exitPath(n)));
-  const pick = settled.length > 0 ? settled[settled.length - 1] : names[names.length - 1];
-  return join(runDir, pick);
+  const name = pickSessionName(dirEntries, runId);
+  return name === undefined ? undefined : join(runDir, name);
 }
 
 /**

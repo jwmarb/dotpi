@@ -142,6 +142,7 @@ import {
   herdrAgentName,
   makeRunId,
   parseLineage,
+  pickSessionName,
   readReports,
   type HealthCheckTrigger,
   type RunResult,
@@ -161,7 +162,6 @@ import {
   CARD_ID_PATTERN,
   hasExitSidecar,
   isRunRecord,
-  isSessionFileFor,
   metaPath,
   type Notice,
   parseNotice,
@@ -350,7 +350,10 @@ loadRegistry();
  */
 function evidenceStamp(runDirPath: string, runId: string): string | undefined {
   try {
-    const name = readdirSync(runDirPath).find((n) => isSessionFileFor(n, runId));
+    // Shared rule with findSessionFile: a resumed dir's fingerprint must
+    // move when the transcript the run is READ from moves — the oldest
+    // (frozen) transcript would pin revival off forever.
+    const name = pickSessionName(readdirSync(runDirPath), runId);
     if (!name) return undefined;
     const stat = statSync(join(runDirPath, name));
     return `${stat.size}:${stat.mtimeMs}`;
@@ -711,7 +714,11 @@ async function launchRegisteredRun(
       agent.tools.some((t) => READING_TOOLS.has(t));
     promptBody = appendSkillCatalogue(promptBody, selected, canRead);
   }
-  if (rec.card) promptBody = appendCardBrief(promptBody, rec.card);
+  // The card id came off disk (a revival re-renders the prompt): the spawn
+  // site validated it, this reader guards too — a malformed id would write a
+  // prompt promising a card the child's env never carries (inert gate).
+  const cardId = typeof rec.card === "string" && CARD_ID_PATTERN.test(rec.card) ? rec.card : undefined;
+  if (cardId) promptBody = appendCardBrief(promptBody, cardId);
   if (superseded()) return abandon(undefined);
   try {
     writeFileSync(promptPath, promptBody);
@@ -915,6 +922,18 @@ async function renderResultBlock(
       "(NOT AN ANSWER — this run produced no report, only this line. Everything it concluded is lost; re-delegate the task rather than relying on this.)",
   };
   if (resolved.salvagedFrom) out.push(salvageNote[resolved.salvagedFrom]);
+  // The child's checklist rides the briefing itself: what the run settled
+  // is orchestrator-relevant even when its prose is one line. Counts come
+  // from extractRunResult's single pass (the shared parseTodoState rule),
+  // so this costs no extra read.
+  const td = resolved.todos;
+  if (td && td.total > 0) {
+    const bits = [`${td.done}/${td.total} done`];
+    if (td.inProgress) bits.push(`${td.inProgress} in progress`);
+    if (td.blocked) bits.push(`${td.blocked} blocked`);
+    if (td.pending) bits.push(`${td.pending} pending`);
+    out.push(`todos: ${bits.join(", ")}`);
+  }
   out.push(resolved.answered ? truncate(resolved.text) : "(no final answer in transcript)");
   if (rec.status === "failed" && !resolved.answered) {
     const diag = await paneDiagnostic(rec);

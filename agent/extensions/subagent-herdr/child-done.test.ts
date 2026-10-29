@@ -1406,6 +1406,7 @@ describe("cardAccounting", () => {
         { id: "t3", text: "c", status: "pending" },
         { id: "t4", text: "d", status: "in_progress" },
       ],
+      nextId: 5,
     };
     const acct = cardAccounting(state);
     expect(acct.empty).toBe(false);
@@ -1498,13 +1499,31 @@ describe("completion gate: card children", () => {
     }, {
       messages: [withText("<result>\n## Done\n</result>", "toolUse")],
       systemPrompt: RESULT_PROMPT,
-      cardTodos: { items: [{ id: "t1", text: "s", status: "done" }, { id: "t2", text: "b", status: "blocked" }] },
+      cardTodos: { items: [{ id: "t1", text: "s", status: "done" }, { id: "t2", text: "b", status: "blocked" }], nextId: 3 },
     });
 
     expect(outcome.kind).toBe("completed");
     expect(shutdownCalled).toBe(true);
     expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
   });
+
+  test("no answer with a SETTLED list: the refusal is answer guidance alone, no card clause", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {}, {
+      messages: [withText("Compiling.", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: todo("done", 2),
+    });
+
+    expect(outcome.kind).toBe("no-answer");
+    expect(outcome.guidance).toContain("Your run has no answer the orchestrator can read");
+    // The list is settled — the card clause would send the child to settle
+    // a list that is already settled, and the refusal's reason is the answer.
+    expect(outcome.guidance).not.toContain("k42");
+  });
+
 
   test("the card gate shares the answer gate's refusal budget", () => {
     const { effects } = makeRecordingEffects();

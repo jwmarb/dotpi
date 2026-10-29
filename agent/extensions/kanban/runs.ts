@@ -29,12 +29,13 @@ const KNOWN_STATUS = new Set(["running", "done", "failed", "cancelled"]);
  * is a recent `todo` op near the end of the transcript, so the first pass is
  * small; a miss expands the window before "no list" is concluded, to the cap.
  *
- * The bounds are measured, not assumed: re-measured over 446 recorded
- * transcripts, 37 carry a todo snapshot — 15 sit >32 KB from EOF, the p90 gap
- * is ~1.0 MB, the max ~4.0 MB, and the largest single line ~1.0 MB. The 4 MB
- * cap covers 37/37 recorded runs; a miss with the window already at the cap is
- * evidence the transcript really has no list. A first pass that misses is
- * evidence the window was too small, not that the child never built a list.
+ * The bounds are measured, not assumed: re-measured over 450 transcripts in
+ * 443 recorded run dirs, 37 carry a todo snapshot — 15 sit >32 KB from EOF,
+ * the p90 gap is ~1.0 MB, the max ~2.8 MB, and the largest single line ~1.0
+ * MB. The 4 MB cap covers 37/37 recorded runs with ~1.2 MB of headroom; a
+ * miss with the window already at the cap is evidence the transcript really
+ * has no list. A first pass that misses is evidence the window was too small,
+ * not that the child never built a list.
  */
 const TODO_TAIL_STEPS = [32 * 1024, 512 * 1024, 4 * 1024 * 1024];
 
@@ -91,25 +92,56 @@ const todoCache = new Map<string, { stamp: string; todos: RunTodoCounts | undefi
  */
 const todoFileOf = new Map<string, string>();
 
+/**
+ * Byte offsets scanned to EOF with NO todo snapshot found, per transcript.
+ * The transcript is append-only, so on the next read only [offset, size) is
+ * new — and it starts at an EOF boundary, so its first line is complete.
+ * Without this, a live run with no list and a transcript past the 4 MB cap
+ * pays the whole ladder (32 KB + 512 KB + 4 MB read AND parsed, synchronously
+ * in pi's main loop) on every append; with it, growth costs one appended-
+ * region read. Cleared when a snapshot IS found (the region stops being
+ * evidence) and on every cache drop.
+ */
+const scannedTo = new Map<string, number>();
+
 function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 	try {
 		const names = readdirSync(dir).filter((n) => isSessionFileFor(n, runId));
 		if (names.length === 0) return undefined;
 		// A run dir can hold more than one session file (a resumed session):
-		// 18 of 441 recorded dirs do. The names are ISO-timestamp-prefixed, so
+		// 3 of 443 recorded dirs do. The names are ISO-timestamp-prefixed, so
 		// lexicographic order is chronological order — the newest wins.
 		names.sort();
 		const file = join(dir, names[names.length - 1]);
 		const prev = todoFileOf.get(runId);
-		if (prev && prev !== file) todoCache.delete(prev); // resumed dir: the older transcript is gone
+		// resumed dir: the older transcript is gone — drop both caches for it
+		if (prev && prev !== file) {
+			todoCache.delete(prev);
+			scannedTo.delete(prev);
+		}
 		todoFileOf.set(runId, file);
 		const st = statSync(file);
 		const stamp = `${st.size}:${st.mtimeMs}`;
 		const hit = todoCache.get(file);
 		if (hit && hit.stamp === stamp) return hit.todos;
+		const scanned = scannedTo.get(file);
+		if (scanned !== undefined) {
+			// Append-only: the bytes below `scanned` were read to EOF and carry
+			// no snapshot. Unchanged size = nothing possible; growth = scan the
+			// appended region only.
+			if (scanned >= st.size) return undefined;
+			const lines = readRange(file, scanned, st.size - scanned).split("\n");
+			lines.pop(); // torn final line: not evidence
+			const grown = parseRunTodos(lines);
+			scannedTo.set(file, st.size);
+			if (!grown) todoCache.set(file, { stamp, todos: undefined });
+			else scannedTo.delete(file); // a found list is not "no list"
+			return grown;
+		}
 		// The ladder: a miss in the small window expands before "no list" is
 		// concluded (the measured bound is on TODO_TAIL_STEPS).
 		let todos: RunTodoCounts | undefined;
+		let covered = false;
 		for (const bytes of TODO_TAIL_STEPS) {
 			const lines = readTail(file, bytes).split("\n");
 			// A torn final line (a write in progress) is not evidence: drop it, the
@@ -121,12 +153,29 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 			// every larger step would re-read and re-parse byte-identical bytes, and
 			// a run with no list walks this ladder on **every** append (the board
 			// polls at 1 s, the widget refreshes inside pi's main loop). Stop covered.
-			if (bytes >= st.size) break;
+			if (bytes >= st.size) {
+				covered = true;
+				break;
+			}
 		}
+		if (todos) scannedTo.delete(file);
+		else if (covered) scannedTo.set(file, st.size); // EOF proven empty
 		todoCache.set(file, { stamp, todos });
 		return todos;
 	} catch {
 		return undefined;
+	}
+}
+
+/** `len` bytes starting at `offset`, for the appended region of a scan. */
+function readRange(file: string, offset: number, len: number): string {
+	const fd = openSync(file, "r");
+	try {
+		const buf = Buffer.alloc(len);
+		const n = readSync(fd, buf, 0, len, offset);
+		return buf.toString("utf-8", 0, n);
+	} finally {
+		closeSync(fd);
 	}
 }
 
@@ -158,6 +207,7 @@ export function readRunInfo(agentDir: string, runId: string): RunInfo {
 		if (file) {
 			todoCache.delete(file);
 			todoFileOf.delete(runId);
+			scannedTo.delete(file);
 		}
 	};
 	let record: unknown;

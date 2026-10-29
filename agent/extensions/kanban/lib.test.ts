@@ -646,6 +646,28 @@ describe("runs.ts (meta.json reader)", () => {
 		});
 	});
 
+	test("a ladder proven EOF-empty is remembered; a snapshot appended later is found via the appended region", () => {
+		// The transcript is append-only: after a covered miss, the next read
+		// scans only [scanned, size). The appended region starts at the old EOF,
+		// so its first line is complete — no step-1 window needed.
+		const name = "2026-10-09T00-00-00-000Z_sub-000e.jsonl";
+		const first = JSON.stringify({ type: "message", message: { role: "user", content: "go" } }) + "\n";
+		write("sub-000e", { runId: "sub-000e", agent: "worker", status: "running" }, { [name]: first });
+		expect(readRunInfo(agent, "sub-000e").todos).toBeUndefined(); // covered: marker set
+		const appended =
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "todo",
+					details: { state: { items: [{ id: "t1", text: "a", status: "in_progress" }], nextId: 2 } },
+				},
+			}) + "\n";
+		write("sub-000e", { runId: "sub-000e", agent: "worker", status: "running" }, { [name]: first + appended });
+		expect(readRunInfo(agent, "sub-000e").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+
 	test("a non-todo newest result is skipped; the newest todo snapshot wins; malformed states are skipped", () => {
 		const todo = (items: Array<{ id: string; text: string; status: string }>) =>
 			JSON.stringify({
