@@ -125,8 +125,13 @@ import { Type } from "typebox";
 
 import { LINEAGE_ENV as SHARED_LINEAGE_ENV } from "../lib/agents.js";
 
+// The channel name is a contract with the kanban extension, so it lives in
+// the shared `lib/` and not in either sibling (see `lib/todo.ts`).
+import { RUN_TODOS_EVENT } from "../lib/todo.js";
+
 import {
   admitSpawn,
+  appendCardBrief,
   appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
@@ -153,6 +158,7 @@ import {
 } from "../lib/agents.js";
 import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
 import {
+  CARD_ID_PATTERN,
   hasExitSidecar,
   isRunRecord,
   isSessionFileFor,
@@ -380,6 +386,12 @@ interface SpawnParams {
   cwd?: string;
   model?: string;
   /**
+   * The kanban card id this delegation does, when the caller passed one.
+   * The child is told it (env + system-prompt block) and its todo list is the
+   * card; the board reads that list live from the child's session file.
+   */
+  card?: string;
+  /**
    * Who is asking: a model's tool delegation, or the extension's own health
    * check of `targetRunId`. Internal — it is not part of the public `subagent`
    * schema, and only the system origin relaxes `callable_by`.
@@ -476,6 +488,7 @@ export async function launchAttempt(
     dir,
     [...parseLineage(process.env[LINEAGE_ENV]), rec.agent],
     fallbackChain,
+    rec.card,
   );
   const label = `${agent.name} ${rec.runId}`;
   const pane = await launcher.createChildPane(rec.cwd, label, env);
@@ -499,6 +512,7 @@ export async function launchAttempt(
     runId: rec.runId,
     tools: agent.tools,
     systemPromptPath: promptPath,
+    card: rec.card,
   });
   // Registered under a *run-scoped* name: herdr agent names are globally
   // unique, so the bare `agent.name` let one live child lock out every sibling
@@ -627,6 +641,8 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     // only this pane's process may autonomously sweep the run (see
     // isOwnedBy). Absent when the process has no pane of its own.
     ...(process.env.HERDR_PANE_ID ? { ownerPane: process.env.HERDR_PANE_ID } : {}),
+    // The card this run does, when the parent passed one (see SpawnParams).
+    ...(params.card !== undefined ? { card: params.card } : {}),
   };
   const dir = dirFor(runId);
   mkdirSync(dir, { recursive: true });
@@ -680,7 +696,9 @@ async function launchRegisteredRun(
   // The child's system prompt. Its body is the agent definition verbatim, plus
   // a skills catalogue when the agent declared one: pi builds `## Available
   // Skills` for the orchestrator only, so a subagent cannot otherwise know a
-  // skill exists. Discovery failing costs the catalogue, never the launch.
+  // skill exists. A card run additionally gets the `## Assigned Kanban Card`
+  // block: the child sees no board, so the card and its rules cross in the
+  // prompt. Discovery failing costs the catalogue, never the launch.
   const promptPath = systemPromptPath(dir);
   let promptBody = agent.promptBody;
   if (agent.skills && agent.skills.length > 0) {
@@ -693,6 +711,7 @@ async function launchRegisteredRun(
       agent.tools.some((t) => READING_TOOLS.has(t));
     promptBody = appendSkillCatalogue(promptBody, selected, canRead);
   }
+  if (rec.card) promptBody = appendCardBrief(promptBody, rec.card);
   if (superseded()) return abandon(undefined);
   try {
     writeFileSync(promptPath, promptBody);
@@ -1024,6 +1043,7 @@ export default function (pi: ExtensionAPI): void {
       "You get a task id back, not the answer. There is no blocking wait: end your turn, and the subagent wakes you with a message carrying its result.",
       "Do not poll, spin, or stall after delegating — and do not ask the user to wait. Ending your turn is how you wait.",
       "You can spawn several subagents in one turn; they run concurrently in their own tabs and their completions are batched into one wake-up.",
+      "Pass `card` on every delegation that answers to a board card (the `k`-id from `/kanban`), then `link` the returned run id to that card — the child sees the card, builds its todo list from it, and the board shows that list live.",
     ],
     parameters: Type.Object({
       agent: Type.String({ description: "Name of the agent to delegate to (see Available Agents)" }),
@@ -1033,15 +1053,27 @@ export default function (pi: ExtensionAPI): void {
       }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the child (default: the orchestrator's cwd)" })),
       model: Type.Optional(Type.String({ description: "Model override for the child: `provider/id` or `provider/id|level` (level: off|minimal|low|medium|high|xhigh|max; a pi-style `ref:level` is translated when the ref is plain). `fallback/auto` is not accepted — the router cannot route to itself. Default: the agent's declared model." })),
+      card: Type.Optional(Type.String({ description: "Kanban card id (`k3`) this delegation does. Advisory: the shape is validated only — a card the board lacks yields a run the board cannot match — and `card` does NOT link the run to the card; the delegator must also `kanban op link` it. The child is told the id and must build its todo list from the card before any work; the board shows that list live. Refused if not a well-formed card id." })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       // Only the public schema's fields cross: `origin` is internal and a system
       // origin relaxes the `callable_by` guard, so a model must not be able to
       // smuggle one in as an extra property. Never spread `params`.
-      const { agent, task, cwd, model } = params;
+      const { agent, task, cwd, model, card } = params;
+      if (card !== undefined && !CARD_ID_PATTERN.test(card)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: card "${card}" is not a kanban card id: the shape is k + a positive integer, no leading zero (k3). Pass the card's id from the board, or omit card.`,
+            },
+          ],
+          details: { ok: false },
+        };
+      }
       const out = await spawnRun(
-        { agent, task, cwd, model, origin: { kind: "tool-delegation" } },
+        { agent, task, cwd, model, card, origin: { kind: "tool-delegation" } },
         ctx.cwd,
       );
       if (!out.ok || !out.rec) {
@@ -1056,7 +1088,7 @@ export default function (pi: ExtensionAPI): void {
           {
             type: "text",
             text:
-              `Delegated to ${rec.agent}: task ${rec.runId} is running in tab ${rec.tabId} (pane ${rec.paneId}) of this workspace. ` +
+              `Delegated to ${rec.agent}: task ${rec.runId}${rec.card ? ` card ${rec.card}` : ""} is running in tab ${rec.tabId} (pane ${rec.paneId}) of this workspace. ` +
               `Do NOT wait for it — there is no blocking wait. Finish this turn (do any other work you have first). ` +
               `${rec.agent} will wake you with a new message when it reports something or finishes, and you continue from there.`,
           },
@@ -1212,6 +1244,11 @@ export default function (pi: ExtensionAPI): void {
         .flush(Math.max(Date.now(), deadline))
         .then((text) => {
           if (text) deliver(text);
+          // A child's todo list may have moved since the board last read it
+          // (the flush coalesces on a deadline, and the tick enqueues its own
+          // notices): ask the kanban board to re-read the runs. No-op when no
+          // board is listening.
+          pi.events?.emit(RUN_TODOS_EVENT, undefined);
         })
         .catch(() => {
           // A flush that rejected outright has nothing to deliver; the run
@@ -1224,7 +1261,13 @@ export default function (pi: ExtensionAPI): void {
   const enqueueNotice = (notice: Notice): void => armFlush(ledger.enqueue(notice, Date.now()));
 
   /** One liveness tick through the ledger, arming the flush its notices call for. */
-  const runLivenessTick = async (): Promise<void> => armFlush(await ledger.tick(Date.now()));
+  const runLivenessTick = async (): Promise<void> => {
+    armFlush(await ledger.tick(Date.now()));
+    // The tick is the board's other heartbeat: even with no notices queued, a
+    // child's todo list may have moved, so ask the kanban board to re-read the
+    // runs. No-op when no board is listening.
+    pi.events?.emit(RUN_TODOS_EVENT, undefined);
+  };
 
   /**
    * Recognises a child's notice in this session's input and swallows it.
@@ -1599,7 +1642,7 @@ async function listRuns(): Promise<{ content: { type: "text"; text: string }[]; 
   const running = all.filter((r) => r.status === "running").length;
   const lines = all.map((rec) => {
     const age = Math.max(0, Math.round(((rec.finishedAt ?? Date.now()) - startedAtOf(rec)) / 1000));
-    return `${rec.runId} (${rec.agent}): ${rec.status} [${age}s]${rec.tabId ? ` tab ${rec.tabId}` : ""}${rec.paneId ? ` pane ${rec.paneId}` : ""}`;
+    return `${rec.runId} (${rec.agent}): ${rec.status} [${age}s]${rec.tabId ? ` tab ${rec.tabId}` : ""}${rec.paneId ? ` pane ${rec.paneId}` : ""}${rec.card ? ` card ${rec.card}` : ""}`;
   });
   return {
     content: [{ type: "text", text: `${all.length} task(s), ${running} running.\n${lines.join("\n")}` }],
@@ -1611,6 +1654,7 @@ async function listRuns(): Promise<{ content: { type: "text"; text: string }[]; 
         tabId: r.tabId,
         paneId: r.paneId,
         ...(healthCheckOfId(r) ? { healthCheckOf: healthCheckOfId(r) } : {}),
+        ...(r.card ? { card: r.card } : {}),
       })),
     },
   };

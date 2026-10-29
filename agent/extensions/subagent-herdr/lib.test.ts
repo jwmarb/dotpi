@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
 import { agentsDir, skillsDir } from "../lib/layout.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
+import { CARD_ID_PATTERN as BOARD_CARD_ID_PATTERN } from "../kanban/lib.js";
 import {
   admitSpawn,
   appendSkillCatalogue,
@@ -42,6 +43,7 @@ import { classifyExecFailure, errorPayload, paneRectFrom, probeFromCall, splitAr
 import { createTerminalResultCache, interruptRun, launchAttempt, type Launcher } from "./index.js";
 import type { RunObservation } from "./run-lifecycle.js";
 import {
+  CARD_ID_PATTERN,
   exitPath,
   formatExitSidecar,
   formatNotice,
@@ -172,6 +174,22 @@ describe("extractRunResult", () => {
     expect(r.text).toBe("final answer");
     expect(r.stopReason).toBe("stop");
     expect(r.sessionFile).toBe(join(dir, "2026-09-20T12-00-00-000Z_sub-0002.jsonl"));
+  });
+
+  test("a resumed run dir with two session files reads the NEWEST — the same rule kanban/runs.ts uses", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const entry = (text: string) =>
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+      });
+    writeFileSync(join(dir, "2026-09-20T12-00-00-000Z_sub-0007.jsonl"), `${entry("old transcript")}\n`);
+    writeFileSync(join(dir, "2026-09-20T13-00-00-000Z_sub-0007.jsonl"), `${entry("new transcript")}\n`);
+
+    const r = await extractRunResult(dir, "sub-0007");
+    expect(r.found).toBe(true);
+    expect(r.text).toBe("new transcript");
+    expect(r.sessionFile).toBe(join(dir, "2026-09-20T13-00-00-000Z_sub-0007.jsonl"));
   });
 
   test("reports found-but-unanswered when the session has no assistant text", async () => {
@@ -1116,6 +1134,16 @@ describe("rundir record shapes", () => {
     const line = formatReportLine("found the bug", 1700);
     expect(line.endsWith("\n")).toBe(true);
     expect(parseReportLine(line)).toEqual({ at: 1700, message: "found the bug" });
+  });
+
+  test("the card id shape is one contract: the spawn seam and the board's mint agree", () => {
+    // Two siblings, two mints, one shape: `subagent` validates the delegator's
+    // `card` against rundir's `CARD_ID_PATTERN`, and kanban mints ids with its
+    // own copy (siblings stay unlinked). A drift in either mint fails here
+    // before a child can be launched for a card the board cannot match, or
+    // vice versa.
+    for (const id of ["k1", "k20", "k999"]) expect(BOARD_CARD_ID_PATTERN.test(id)).toBe(CARD_ID_PATTERN.test(id));
+    for (const id of ["k0", "K1", "k", "x1", "k1a", ""]) expect(BOARD_CARD_ID_PATTERN.test(id)).toBe(CARD_ID_PATTERN.test(id));
   });
 
   test("a report line tolerates a truncated tail and junk", () => {

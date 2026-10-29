@@ -71,6 +71,16 @@ export function runDir(agentDir: string, runId: string): string {
 	return join(runsDir(agentDir), runId);
 }
 
+/**
+ * The kanban card id shape (`k3`): `k` plus a positive integer, no leading
+ * zero. The canonical mint is `CARD_ID_PATTERN` in `kanban/lib.ts`; this copy
+ * lives here because the shape is part of the run record and the seam, and
+ * siblings must not import each other. `lib.test.ts` compares the two over a
+ * table (k1, k20, k0, K1, k, k999, x1), so a drift in either mint fails the
+ * suite.
+ */
+export const CARD_ID_PATTERN = /^k([1-9][0-9]*)$/;
+
 /** The parent's registry record for a run. */
 export function metaPath(runDirPath: string): string {
 	return join(runDirPath, "meta.json");
@@ -206,6 +216,14 @@ export interface RunRecord {
 	 * (string equality only), so a corrupted value cannot make a run invisible.
 	 */
 	ownerPane?: string;
+	/**
+	 * The kanban card id this delegation does, when the parent passed one. The
+	 * child is told the id (env `PI_KANBAN_CARD` + the `## Assigned Kanban Card`
+	 * block in its system prompt) and must build its todo list from the card;
+	 * the board reads the child's todo progress from its session file and shows
+	 * it under the run line. Absent for ordinary runs.
+	 */
+	card?: string;
 }
 
 /**

@@ -26,6 +26,7 @@ import {
   parseChainItem,
 } from "../model-fallback/lib.js";
 import {
+  CARD_ID_PATTERN,
   type ChildReport,
   type RunRecord,
   isSessionFileFor,
@@ -52,6 +53,13 @@ export const REPORT_TOOL_NAME = "subagent_report";
 export const TODO_TOOL_NAME = "todo";
 
 /**
+ * The tool a card-bearing child calls to request guidance from the orchestrator
+ * about its card (see `child-done.ts`). Registered only when the child was
+ * launched with a card — a child without a card has nothing to ask about.
+ */
+export const ASK_TOOL_NAME = "subagent_ask";
+
+/**
  * A run id in the `sub-a3f1` shape that the orchestrator prompt advertises.
  * Four hex chars: plenty for a handful of concurrent runs, short enough to
  * read aloud.
@@ -72,6 +80,12 @@ export interface ChildLaunchOptions {
   tools?: string[];
   /** Absolute path to the composed system prompt, passed by file not by value. */
   systemPromptPath?: string;
+  /**
+   * The card id this run does, when the parent passed one: it adds
+   * `subagent_ask` to the allowlist, because the tool is registered in the
+   * child only for a card run.
+   */
+  card?: string;
 }
 
 /**
@@ -99,6 +113,11 @@ export interface ChildLaunchOptions {
  * rather than as an argv flag because the chain belongs to the child's model
  * routing, not to its launch: `--model fallback/auto` names the router, and this
  * tells the router what to route between.
+ * `PI_KANBAN_CARD` is the kanban card id the delegation does, when the parent
+ * passed one. Only a well-shaped id (`CARD_ID_PATTERN`) crosses: the child's
+ * gate and the board both trust it without re-checking, and a malformed one is
+ * a parent-side refusal (the `subagent` tool refuses it at spawn), not a
+ * child-side mystery.
  */
 export function buildChildEnv(
   rec: { runId: string; agent: string },
@@ -106,6 +125,7 @@ export function buildChildEnv(
   runDir: string,
   childLineage: string[] = [rec.agent],
   fallbackChain?: readonly string[],
+  card?: string,
 ): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_RUN_ID: rec.runId,
@@ -121,6 +141,9 @@ export function buildChildEnv(
   // `spawnRun` refuses before any pane exists.
   if (fallbackChain && fallbackChain.length > 0) {
     env[CHAIN_ENV] = fallbackChain.join(",");
+  }
+  if (card !== undefined && CARD_ID_PATTERN.test(card)) {
+    env.PI_KANBAN_CARD = card;
   }
   return env;
 }
@@ -164,6 +187,9 @@ export async function readReports(runDir: string): Promise<ChildReport[]> {
  * subagent gets its private checklist, which is launch policy rather than a
  * capability to copy into each agent's frontmatter (it writes no files, so a
  * read-only agent stays read-only).
+ * `subagent_ask` is appended only for a card run: the tool is registered in
+ * the child only when `PI_KANBAN_CARD` is set, and an allowlist entry for a
+ * tool the child does not have is noise the model would have to look past.
  */
 export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   const argv: string[] = [
@@ -181,7 +207,10 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
     FALLBACK_MODEL_REF,
   ];
   if (opts.tools && opts.tools.length > 0) {
-    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME, TODO_TOOL_NAME])];
+    // `subagent_ask` is registered in the child only for a pattern-valid card
+    // (`buildChildEnv` gates the same way) — an allowlisted tool the child
+    // never registers would be a promise the argv breaks.
+    const tools = [...new Set([...opts.tools, DONE_TOOL_NAME, REPORT_TOOL_NAME, TODO_TOOL_NAME, ...(opts.card !== undefined && CARD_ID_PATTERN.test(opts.card) ? [ASK_TOOL_NAME] : [])])];
     argv.push("--tools", tools.join(","));
   }
   if (opts.systemPromptPath) argv.push("--append-system-prompt", opts.systemPromptPath);
@@ -291,6 +320,40 @@ export function appendSkillCatalogue(
           "what exists and delegate the work that needs one.",
   );
 
+  return `${promptBody.trimEnd()}\n${lines.join("\n")}\n`;
+}
+
+/**
+ * The `## Assigned Kanban Card` block a card-bearing child's system prompt gets.
+ *
+ * The child sees no conversation and no board: the card id and the rules of
+ * engagement with it have to cross in its system prompt, the way the skills
+ * catalogue does. The list the child keeps *is* the card — one item per step —
+ * which is what makes the board's live view and the child's completion gate
+ * read the same fact (the child's own session).
+ *
+ * Deliberately never contains the string `<result>`: the run's answer contract
+ * is judged against this composed prompt, and a quoted `<result>` in the
+ * framing text is how `requiresResultBlock` would start requiring a block the
+ * agent was only told about in passing.
+ *
+ * @param promptBody - The agent definition's body, after any skills catalogue.
+ * @param card - The card id, already validated against `CARD_ID_PATTERN`.
+ */
+export function appendCardBrief(promptBody: string, card: string): string {
+  const lines = [
+    "",
+    "## Assigned Kanban Card",
+    "",
+    `This delegation does kanban card **${card}**. Your list of work is the card:`,
+    "",
+    "- FIRST ACTION: `todo` with op `add`, one item per step of this card — before any other work.",
+    "- `start` an item before working it; `complete` it immediately after, with a note naming how you checked it.",
+    "- `block` (with a note) anything you are waiting on, so the board can show it as blocked.",
+    "- `subagent_ask` to request guidance from the orchestrator about the card — it wakes the orchestrator, your run keeps working, and the reply arrives as a normal message here.",
+    "- Do not finish the run with items open: complete, block-with-note, or drop every one.",
+    `- Name the card id (${card}) in your final report.`,
+  ];
   return `${promptBody.trimEnd()}\n${lines.join("\n")}\n`;
 }
 
@@ -699,8 +762,15 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   } catch {
     return undefined;
   }
-  const file = dirEntries.find((e) => isSessionFileFor(e, runId));
-  return file ? join(runDir, file) : undefined;
+  // A run dir can hold more than one session file (a resumed session): 18 of
+  // 441 recorded dirs do. Names are ISO-timestamp-prefixed, so lexicographic
+  // order is chronological — take the newest, the same rule kanban/runs.ts
+  // uses to render the card sub-row, so the answer and the progress line are
+  // read from the same transcript.
+  const names = dirEntries.filter((e) => isSessionFileFor(e, runId));
+  if (names.length === 0) return undefined;
+  names.sort();
+  return join(runDir, names[names.length - 1]);
 }
 
 /**

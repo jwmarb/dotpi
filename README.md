@@ -195,6 +195,7 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | `worker`    | Implements a single well-specified change end to end                   | qwen3.8-27b       |
 
 Every agent declares `fallback_models`, tried when a child fails to *launch* (unknown model, provider down, rate-limited) — not when it fails its task. Read-only agents carry no `write`/`edit`: the `tools` list is the enforcement.
+A child delegated a **kanban card** works by the list it keeps: it builds the card's steps into its `todo` list before other work, and `subagent_done` is refused (through the same bounded budget as a missing answer) while the list is empty or items are still open. The kanban board reads that list straight from the child's session file and renders per-card progress, so the list *is* the card's progress.
 
 ## Skills 🃏
 

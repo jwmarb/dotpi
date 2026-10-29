@@ -622,8 +622,143 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "sub-0005")).toEqual({ status: "done", agent: "explorer" });
 	});
 
+	test("the tail ladder finds a todo snapshot >32 KB from EOF, and a torn final line is dropped", () => {
+		// The measured p90 EOF gap is ~1.0 MB — the 32 KB and 512 KB windows
+		// both miss, a wider step must find it.
+		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }], nextId: 2 } },
+			},
+		});
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(2048) } });
+		const lines: string[] = [todo, ...Array.from({ length: 40 }, () => filler)];
+		write("sub-0008", { runId: "sub-0008", agent: "worker", status: "running" }, {
+			// ~80 KB past the snapshot: past step 1 (32 KB), inside step 2 (512 KB).
+			"2026-10-09T00-00-00-000Z_sub-0008.jsonl": lines.join("\n") + "\n" + "{\"torn\": true",
+		});
+		expect(readRunInfo(agent, "sub-0008")).toEqual({
+			status: "running",
+			agent: "worker",
+			todos: { done: 1, total: 1, inProgress: 0, blocked: 0 },
+		});
+	});
+
+	test("a non-todo newest result is skipped; the newest todo snapshot wins; malformed states are skipped", () => {
+		const todo = (items: Array<{ id: string; text: string; status: string }>) =>
+			JSON.stringify({
+				type: "message",
+				message: { role: "toolResult", toolName: "todo", details: { state: { items, nextId: 9 } } },
+			});
+		const bash = JSON.stringify({
+			type: "message",
+			message: { role: "toolResult", toolName: "bash", details: { state: { items: [] , nextId: 1} } },
+		});
+		write("sub-0009", { runId: "sub-0009", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-0009.jsonl": [
+				todo([{ id: "t1", text: "old", status: "pending" }]),
+				bash,
+				todo([{ id: "t1", text: "old", status: "done" }, { id: "t2", text: "new", status: "in_progress" }]),
+				bash, // newest is a bash result — the walk must keep going back
+			].join("\n") + "\n",
+		});
+		expect(readRunInfo(agent, "sub-0009").todos).toEqual({ done: 1, total: 2, inProgress: 1, blocked: 0 });
+		write("sub-000b", { runId: "sub-000b", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-000b.jsonl":
+				JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: "nope" } } } }) +
+				"\n",
+		});
+		expect(readRunInfo(agent, "sub-000b").todos).toBeUndefined();
+	});
+
+	test("a resumed run dir reads the newest session file; a sidecar-terminal run drops its cache entry", () => {
+		const todo = (text: string) =>
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "todo",
+					details: { state: { items: [{ id: "t1", text, status: "done" }], nextId: 2 } },
+				},
+			}) + "\n";
+		// Two session files (a relaunch): the ISO prefix sorts chronologically.
+		write("sub-000c", { runId: "sub-000c", agent: "worker", status: "running" }, {
+			"2026-10-08T00-00-00-000Z_sub-000c.jsonl": todo("old session"),
+			"2026-10-09T00-00-00-000Z_sub-000c.jsonl": todo("new session"),
+		});
+		expect(readRunInfo(agent, "sub-000c").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+		// The sidecar terminal transition (meta `running` + `.exit`): reads as
+		// done, renders no todos — and the cache entry must be DROPPED, not
+		// pinned. Assert the drop through behaviour: no todos on the terminal read.
+		write("sub-000d", { runId: "sub-000d", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-000d.jsonl": todo("live"),
+		});
+		expect(readRunInfo(agent, "sub-000d").todos).toBeDefined();
+		write("sub-000d", { runId: "sub-000d", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-000d.jsonl": todo("live"),
+			"2026-10-09T00-00-00-000Z_sub-000d.jsonl.exit": "{}",
+		});
+		expect(readRunInfo(agent, "sub-000d")).toEqual({ status: "done", agent: "worker" });
+	});
+
 	test("readRunInfos maps every id", () => {
 		expect(Object.keys(readRunInfos(agent, ["sub-0001", "sub-0002"]))).toEqual(["sub-0001", "sub-0002"]);
+	});
+
+	test("the todo sub-row renders for a live run and not for a terminal one", () => {
+		const todoLine = (items: Array<{ id: string; text: string; status: string }>, nextId: number) =>
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "todo",
+					details: { state: { items, nextId } },
+				},
+			}) + "\n";
+		write("sub-0006", { runId: "sub-0006", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-0006.jsonl": todoLine(
+				[
+					{ id: "t1", text: "a", status: "done" },
+					{ id: "t2", text: "b", status: "in_progress" },
+				],
+				3,
+			),
+		});
+		write("sub-0007", { runId: "sub-0007", agent: "worker", status: "running" }, {
+			"2026-10-09T00-00-00-000Z_sub-0007.jsonl": todoLine(
+				[
+					{ id: "t1", text: "a", status: "done" },
+					{ id: "t2", text: "b", status: "in_progress" },
+					{ id: "t3", text: "c", status: "pending" },
+				],
+				4,
+			),
+			"2026-10-09T00-00-00-000Z_sub-0007.jsonl.exit": "{}",
+		});
+
+		const infos = readRunInfos(agent, ["sub-0006", "sub-0007"]);
+		expect(infos["sub-0006"]).toEqual({ status: "running", agent: "worker", todos: { done: 1, total: 2, inProgress: 1, blocked: 0 } });
+		// Terminal (exit sidecar): the session file is not read, so no todos.
+		expect(infos["sub-0007"]).toEqual({ status: "done", agent: "worker" });
+
+		const state = run(
+			{ op: "add", titles: ["live card", "terminal card"] },
+			{ op: "link", id: "k1", runId: "sub-0006" },
+			{ op: "link", id: "k2", runId: "sub-0007" },
+		);
+
+		// renderBody: the live run's progress sub-row is present; the terminal
+		// run's snapshot (different counts) is not rendered at all.
+		const body = renderBody(state, infos, 100).join("\n");
+		expect(body).toContain("1/2");
+		expect(body).not.toContain("1/3");
+
+		// compactLines: the same rule in the widget line.
+		const compact = compactLines(state, infos, 100, PLAIN_STYLE).join("\n");
+		expect(compact).toContain("1/2");
+		expect(compact).not.toContain("1/3");
 	});
 });
 

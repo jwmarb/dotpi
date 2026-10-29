@@ -15,6 +15,9 @@ import childDone, {
   type ChildDoneEffects,
   type ChildWatchdogEffects,
   type MessageLike,
+  cardAccounting,
+  cardDoneRefusal,
+  cardNudgeTail,
   createChildDoneHandshake,
   createChildWatchdog,
   continuationMessage,
@@ -1372,5 +1375,357 @@ describe("createChildWatchdog", () => {
       if (savedPane === undefined) delete process.env.PI_SUBAGENT_PARENT_PANE;
       else process.env.PI_SUBAGENT_PARENT_PANE = savedPane;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The card gate: a child delegated a kanban card owes the board a list
+// ---------------------------------------------------------------------------
+
+const CARD_ENV: NodeJS.ProcessEnv = { ...BASE_ENV, PI_KANBAN_CARD: "k42" };
+
+const todo = (status: "pending" | "in_progress" | "blocked" | "done", n = 1) => ({
+  items: Array.from({ length: n }, (_, i) => ({ id: `t${i + 1}`, text: `step ${i + 1}`, status })),
+  nextId: n + 1,
+});
+
+describe("cardAccounting", () => {
+  test("no list is an empty list — the failure the gate catches", () => {
+    expect(cardAccounting(undefined)).toEqual({ empty: true, open: [] });
+  });
+
+  test("an empty items array is empty", () => {
+    expect(cardAccounting({ items: [], nextId: 1 })).toEqual({ empty: true, open: [] });
+  });
+
+  test("done and blocked items are not open; pending and in_progress are", () => {
+    const state = {
+      items: [
+        { id: "t1", text: "a", status: "done" },
+        { id: "t2", text: "b", status: "blocked" },
+        { id: "t3", text: "c", status: "pending" },
+        { id: "t4", text: "d", status: "in_progress" },
+      ],
+    };
+    const acct = cardAccounting(state);
+    expect(acct.empty).toBe(false);
+    expect(acct.open.map((i) => i.id)).toEqual(["t3", "t4"]);
+  });
+});
+
+describe("cardNudgeTail", () => {
+  test("an empty list names the first action: build the list", () => {
+    const tail = cardNudgeTail("k42", { empty: true, open: [] });
+    expect(tail).toContain("k42");
+    expect(tail).toContain("todo");
+    expect(tail).toContain("add");
+  });
+
+  test("open items are named, up to 8, then counted", () => {
+    const open = Array.from({ length: 10 }, (_, i) => ({ id: `t${i + 1}`, text: `step ${i + 1}`, status: "pending" as const }));
+    const tail = cardNudgeTail("k42", { empty: false, open });
+    expect(tail).toContain("t1 (step 1)");
+    expect(tail).toContain("t8 (step 8)");
+    expect(tail).toContain("2 more");
+    expect(tail).not.toContain("t9 (step 9)");
+  });
+});
+
+describe("cardDoneRefusal", () => {
+  test("an empty list refusal names the card and the budget", () => {
+    const refusal = cardDoneRefusal("k42", { empty: true, open: [] }, 1, 2);
+    expect(refusal).toContain("k42");
+    expect(refusal).toContain("todo");
+    expect(refusal).toContain("budget");
+  });
+
+  test("the refusal counts against the shared refusal budget", () => {
+    const refusal = cardDoneRefusal("k42", { empty: false, open: [{ id: "t1", text: "s", status: "pending" }] }, 1, 2);
+    expect(refusal).toContain("t1 (s)");
+    expect(refusal).toContain("1 left after this one");
+  });
+});
+
+describe("completion gate: card children", () => {
+  test("a qualifying answer with an empty list is refused, with no sidecar", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+    let shutdownCalled = false;
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {
+      shutdownCalled = true;
+    }, {
+      messages: [withText("<result>\n## Done\n</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: undefined,
+    });
+
+    expect(outcome.kind).toBe("no-answer");
+    expect(shutdownCalled).toBe(false);
+    expect(calls.length).toBe(0);
+    expect(outcome.guidance).toContain("k42");
+    // Card-only refusal: the answer exists, so the answer guidance's
+    // answer-negating opening and "receives nothing" closing must be absent —
+    // and so must an instruction to re-emit the answer, which would strand
+    // the report the model already wrote.
+    expect(outcome.guidance).toContain("an answer the orchestrator can read, but kanban card k42 is not settled");
+    expect(outcome.guidance).not.toContain("Your run has no answer the orchestrator can read");
+    expect(outcome.guidance).not.toContain("receives nothing");
+    expect(outcome.guidance).not.toContain("as a normal assistant message");
+  });
+
+  test("a qualifying answer with open items is refused", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {}, {
+      messages: [withText("<result>\n## Done\n</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: todo("pending", 2),
+    });
+
+    expect(outcome.kind).toBe("no-answer");
+    expect(outcome.guidance).toContain("t1 (step 1)");
+  });
+
+  test("a fully settled list (done/blocked) completes", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+    let shutdownCalled = false;
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {
+      shutdownCalled = true;
+    }, {
+      messages: [withText("<result>\n## Done\n</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: { items: [{ id: "t1", text: "s", status: "done" }, { id: "t2", text: "b", status: "blocked" }] },
+    });
+
+    expect(outcome.kind).toBe("completed");
+    expect(shutdownCalled).toBe(true);
+    expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
+  });
+
+  test("the card gate shares the answer gate's refusal budget", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+    const ctx = {
+      messages: [withText("<result>\n## Done\n</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: todo("pending", 1),
+    };
+
+    // Two card refusals consume the whole budget; the third passes even though
+    // the list is still open, exactly as a stubborn missing answer would.
+    expect(handshake.complete("/tmp/s.jsonl", () => {}, ctx).kind).toBe("no-answer");
+    expect(handshake.complete("/tmp/s.jsonl", () => {}, ctx).kind).toBe("no-answer");
+    expect(handshake.complete("/tmp/s.jsonl", () => {}, ctx).kind).toBe("completed");
+  });
+
+  test("a non-card child ignores cardTodos entirely", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {}, {
+      messages: [withText("<result>\n## Done\n</result>", "toolUse")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: todo("pending", 3),
+    });
+
+    expect(outcome.kind).toBe("completed");
+  });
+
+  test("a card child that never called the gate context completes", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    // No AnswerContext at all: the gate is skipped, so a card child whose caller
+    // cannot supply one is never trapped.
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {});
+
+    expect(outcome.kind).toBe("completed");
+  });
+  test("a missing answer with open items carries the answer guidance AND the card clause", () => {
+    const { effects } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    const outcome = handshake.complete("/tmp/s.jsonl", () => {}, {
+      messages: [withText("Compiling.", "stop")],
+      systemPrompt: RESULT_PROMPT,
+      cardTodos: todo("pending", 1),
+    });
+
+    expect(outcome.kind).toBe("no-answer");
+    // Both halves: the answer guidance leads, the card clause is appended —
+    // one refusal, one budget increment.
+    expect(outcome.guidance).toContain("Your run has no answer the orchestrator can read");
+    expect(outcome.guidance).toContain("Card k42:");
+    expect(outcome.guidance).toContain("t1 (step 1)");
+    expect(outcome.attemptsLeft).toBe(1);
+  });
+});
+
+describe("agent_end: truncation × card children", () => {
+	test("a truncated card child WITH an answer and an unsettled list gets one card-only nudge, then finishes", () => {
+		const { effects, calls } = makeRecordingEffects();
+		const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+		let shutdownCalled = false;
+		const truncated = truncatedText("<result>\n## Map\n</result>");
+
+		handshake.onAgentEnd([truncated], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("in_progress", 2));
+
+		expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+		const nudge = String(calls[0].args[0]);
+		// The truth: an answer exists; the card list is what blocks.
+		expect(nudge).toContain("an answer the orchestrator can read, but kanban card k42 is not settled");
+		expect(nudge).toContain("t1 (step 1)");
+
+		// The truncation budget is untouched (no continuation fired); the next
+		// truncated end is answered, list state ignored — it finishes.
+		handshake.onAgentEnd([truncated], "/tmp/s.jsonl", () => {
+			shutdownCalled = true;
+		}, RESULT_PROMPT, todo("in_progress", 2));
+		expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge", "writeExitSidecar", "sendNotice", "closePane"]);
+		expect(shutdownCalled).toBe(true);
+	});
+
+	test("a truncated card child WITHOUT an answer carries the card tail on the continuation, never the card-only opening", () => {
+		const { effects, calls } = makeRecordingEffects();
+		const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+		handshake.onAgentEnd([truncatedText("mid-sent")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+
+		expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+		const nudge = String(calls[0].args[0]);
+		expect(nudge).toContain("truncated before completion");
+		expect(nudge).toContain("Kanban card k42 is not accounted for");
+		expect(nudge).toContain("t1 (step 1)");
+		// The card-only opening claims the answer exists — a lie for a
+		// no-answer run, so that sentence must not ride the continuation.
+		// (The continuation's own prose about *leaving* an answer is fine.)
+		expect(nudge).not.toContain("Your run has an answer the orchestrator can read");
+	});
+
+	test("a truncated card child WITHOUT an answer and with a SETTLED list gets no card tail", () => {
+		const { effects, calls } = makeRecordingEffects();
+		const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+		handshake.onAgentEnd([truncatedText("mid-sent")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("done", 2));
+
+		expect(calls.map((c) => c.name)).toEqual(["sendAnswerNudge"]);
+		const nudge = String(calls[0].args[0]);
+		expect(nudge).toContain("truncated before completion");
+		// A settled list leaves `openItemsClause([])` empty — the tail would
+		// read "…:  are still open", a sentence about nothing.
+		expect(nudge).not.toContain("k42");
+	});
+
+	test("bound spent on a no-answer truncation: the run finishes without spending the nudge slot on a card lie", () => {
+		const { effects, calls } = makeRecordingEffects();
+		const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+		let shutdownCalled = false;
+		const truncated = [truncatedText("still writing…")];
+
+		for (let i = 0; i < MAX_CONTINUATIONS; i++) {
+			handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+		}
+		handshake.onAgentEnd(truncated, "/tmp/s.jsonl", () => {
+			shutdownCalled = true;
+		}, RESULT_PROMPT, todo("pending", 1));
+
+		// Three continuations (each with the card tail), then the finish:
+		// the spent-bound truncation completes — no card-only nudge fired,
+		// because the answer it asserts does not exist.
+		expect(calls.filter((c) => c.name === "sendAnswerNudge")).toHaveLength(MAX_CONTINUATIONS);
+		expect(calls.filter((c) => c.name === "writeExitSidecar")).toHaveLength(1);
+		expect(shutdownCalled).toBe(true);
+	});
+});
+
+describe("agent_end: card nudge tail", () => {
+  test("a card child that ends without an answer gets the card tail on its one nudge", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    handshake.onAgentEnd([withText("Compiling.", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+
+    const nudge = calls.find((c) => c.name === "sendAnswerNudge");
+    expect(nudge).toBeDefined();
+    expect(String(nudge?.args[0])).toContain("k42");
+    expect(String(nudge?.args[0])).toContain("t1 (step 1)");
+  });
+
+  test("a card child with a SETTLED list and no answer gets the plain answer nudge, no card tail", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    handshake.onAgentEnd([withText("Compiling.", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("done", 2));
+
+    const nudge = calls.find((c) => c.name === "sendAnswerNudge");
+    expect(nudge).toBeDefined();
+    // Settled list: the card clause is empty, so appending would read
+    // "…:  are still open" and spend the one-shot slot on nothing.
+    expect(String(nudge?.args[0])).not.toContain("k42");
+  });
+
+  test("a non-card child's nudge carries no card tail", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+
+    handshake.onAgentEnd([withText("Compiling.", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+
+    const nudge = calls.find((c) => c.name === "sendAnswerNudge");
+    expect(nudge).toBeDefined();
+    expect(String(nudge?.args[0])).not.toContain("k42");
+  });
+
+  test("the card tail is spent with the one-shot nudge", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    // First clean end: nudged once with the card tail.
+    handshake.onAgentEnd([withText("Compiling.", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+    // Second clean end, still no answer: the nudge is spent, so it completes.
+    handshake.onAgentEnd([withText("Compiling.", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+
+    expect(calls.filter((c) => c.name === "sendAnswerNudge")).toHaveLength(1);
+    expect(calls.map((c) => c.name)).toContain("writeExitSidecar");
+  });
+  test("a clean end with an answer and an unsettled list gets one follow-up, no sidecar; the next end finishes", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    // First clean end: qualifying answer, list still open.
+    handshake.onAgentEnd([withText("<result>\n## Done\n</result>", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+
+    const nudges = calls.filter((c) => c.name === "sendAnswerNudge");
+    expect(nudges).toHaveLength(1);
+    // The card-only nudge: the answer is fine, the card is not — and it must
+    // not be the answer nudge's "no answer" prose.
+    expect(String(nudges[0].args[0])).toContain("k42");
+    expect(String(nudges[0].args[0])).toContain("t1 (step 1)");
+    expect(String(nudges[0].args[0])).toContain("subagent_done");
+    expect(String(nudges[0].args[0])).not.toContain("Your run has no answer");
+    expect(calls.map((c) => c.name)).not.toContain("writeExitSidecar");
+
+    // The follow-up end finishes the run whatever the list state.
+    handshake.onAgentEnd([withText("<result>\n## Done\n</result>", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, todo("pending", 1));
+    expect(calls.map((c) => c.name)).toContain("writeExitSidecar");
+    expect(calls.filter((c) => c.name === "sendAnswerNudge")).toHaveLength(1);
+  });
+
+  test("a clean end with an answer and an empty list gets the build-the-list follow-up", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...CARD_ENV });
+
+    handshake.onAgentEnd([withText("<result>\n## Done\n</result>", "stop")], "/tmp/s.jsonl", () => {}, RESULT_PROMPT, undefined);
+
+    const nudges = calls.filter((c) => c.name === "sendAnswerNudge");
+    expect(nudges).toHaveLength(1);
+    expect(String(nudges[0].args[0])).toContain("k42");
+    expect(String(nudges[0].args[0])).toContain("empty");
+    expect(String(nudges[0].args[0])).toContain("add");
+    expect(String(nudges[0].args[0])).not.toContain("Your run has no answer");
+    expect(calls.map((c) => c.name)).not.toContain("writeExitSidecar");
   });
 });

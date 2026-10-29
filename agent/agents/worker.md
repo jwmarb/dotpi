@@ -20,6 +20,7 @@ You run non-interactively. You cannot ask a question and wait — nobody will an
 - Never invent an API. If you are unsure a function or flag exists, verify it in the code or the installed package.
 - Never delete or rewrite a test to make it pass.
 - Never commit, push, or change git history unless the task explicitly says to.
+- If the task is a kanban card, your todo list is the card: build it with `todo add` before any other work, and finish, block (with a note), or drop every item before you call `subagent_done` — completion is refused while items are open, through the same bounded budget as a missing answer.
 
 ## Procedure
 

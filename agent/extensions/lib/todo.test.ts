@@ -6,6 +6,8 @@ import {
 	counts,
 	demotedBy,
 	emptyState,
+	openItems,
+	parseTodoState,
 	summarize,
 	TodoError,
 	type TodoState,
@@ -208,5 +210,70 @@ describe("demotedBy", () => {
 		// thing. Only a slide back to pending is worth warning about.
 		const before = build({ op: "add", texts: ["one"] }, { op: "start", id: "t1" });
 		expect(demotedBy(before, applyOp(before, { op: "complete", id: "t1" }))).toBeUndefined();
+	});
+});
+
+describe("parseTodoState", () => {
+	test("parses a valid snapshot", () => {
+		const parsed = parseTodoState({
+			items: [
+				{ id: "t1", text: "one", status: "done", note: "checked" },
+				{ id: "t2", text: "two", status: "in_progress" },
+				{ id: "t3", text: "three", status: "blocked", note: "waiting" },
+				{ id: "t4", text: "four", status: "pending" },
+			],
+			nextId: 5,
+		});
+		expect(parsed).toEqual({
+			items: [
+				{ id: "t1", text: "one", status: "done", note: "checked" },
+				{ id: "t2", text: "two", status: "in_progress" },
+				{ id: "t3", text: "three", status: "blocked", note: "waiting" },
+				{ id: "t4", text: "four", status: "pending" },
+			],
+			nextId: 5,
+		});
+	});
+
+	test("refuses an item with an unknown status", () => {
+		expect(
+			parseTodoState({ items: [{ id: "t1", text: "one", status: "wip" }], nextId: 2 }),
+		).toBeUndefined();
+	});
+
+	test("refuses an item with a non-string text", () => {
+		expect(
+			parseTodoState({ items: [{ id: "t1", text: 42, status: "pending" }], nextId: 2 }),
+		).toBeUndefined();
+	});
+
+	test("refuses non-objects and missing items outright", () => {
+		expect(parseTodoState(null)).toBeUndefined();
+		expect(parseTodoState("items")).toBeUndefined();
+		expect(parseTodoState({})).toBeUndefined();
+		expect(parseTodoState({ items: "nope" })).toBeUndefined();
+		expect(parseTodoState({ items: [42] })).toBeUndefined();
+	});
+
+	test("refuses a missing or non-number nextId", () => {
+		expect(parseTodoState({ items: [] })).toBeUndefined();
+		expect(parseTodoState({ items: [], nextId: "1" })).toBeUndefined();
+		expect(parseTodoState({ items: [], nextId: 7 })).toEqual({ items: [], nextId: 7 });
+	});
+});
+
+describe("openItems", () => {
+	test("skips done and blocked, keeps pending and in_progress", () => {
+		const state = build(
+			{ op: "add", texts: ["a", "b", "c", "d"] },
+			{ op: "complete", id: "t1" },
+			{ op: "start", id: "t2" },
+			{ op: "block", id: "t3", note: "waiting" },
+		);
+		expect(openItems(state).map((i) => i.id)).toEqual(["t2", "t4"]);
+	});
+
+	test("an empty list has no open items", () => {
+		expect(openItems(emptyState())).toEqual([]);
 	});
 });

@@ -99,6 +99,7 @@ import {
 	parseChangedFiles,
 } from "./lib.js";
 import { readRunInfos } from "./runs.js";
+import { RUN_TODOS_EVENT } from "../lib/todo.js";
 
 const WIDGET_KEY = "kanban";
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
@@ -683,6 +684,24 @@ export default function kanban(pi: ExtensionAPI) {
 				publish(current);
 			} catch {
 				// a context from a replaced session; the next event republishes
+			}
+		}
+	});
+	// A child's todo list moved (or a run's state changed, via the liveness tick):
+	// re-read the run infos and re-render. The read is cheap (size/mtime-stamped
+	// cache, bounded tail), so the event carries no payload.
+	//
+	// `refreshWidget` only — no `publish`: the board pane polls the runs itself
+	// (`board.ts` re-reads `readRunInfos` on every projection refresh), so a
+	// projection write here would bump the seq for a board that re-reads on its
+	// own cadence anyway. The widget, by contrast, renders its runs inline and
+	// only learns of the change here.
+	pi.events?.on(RUN_TODOS_EVENT, () => {
+		if (current) {
+			try {
+				refreshWidget(current);
+			} catch {
+				// a context from a replaced session; the next event redraws
 			}
 		}
 	});

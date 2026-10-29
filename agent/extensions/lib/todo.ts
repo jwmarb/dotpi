@@ -52,6 +52,38 @@ export interface TodoState {
 }
 
 export const emptyState = (): TodoState => ({ items: [], nextId: 1 });
+/**
+ * The pi.events channel on which subagent-herdr tells the kanban board a
+ * child's todo list (or its run's state) changed and the board should re-read
+ * it. The name lives in `lib/` — not in either extension — because it is a
+ * contract between two sibling extensions, and siblings must not import each
+ * other for a name.
+ */
+export const RUN_TODOS_EVENT = "kanban:run-todos";
+
+/**
+ * The disk-side counterpart of the branch rebuild: a `todo` snapshot read
+ * from a file instead of a live session (the kanban board reads the child's
+ * session JSONL, not a live tool call).
+ *
+ * The session file is untrusted input — the same refuse-don't-repair rule as
+ * kanban's `parseSnapshot`. Anything malformed is `undefined`, never
+ * repaired, never partially applied.
+ */
+export function parseTodoState(value: unknown): TodoState | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const v = value as { items?: unknown; nextId?: unknown };
+	if (!Array.isArray(v.items)) return undefined;
+	if (typeof v.nextId !== "number") return undefined;
+	for (const item of v.items) {
+		if (typeof item !== "object" || item === null) return undefined;
+		const it = item as { id?: unknown; text?: unknown; status?: unknown };
+		if (typeof it.id !== "string" || typeof it.text !== "string") return undefined;
+		if (it.status !== "pending" && it.status !== "in_progress" && it.status !== "blocked" && it.status !== "done")
+			return undefined;
+	}
+	return { items: v.items as TodoItem[], nextId: v.nextId };
+}
 
 export type TodoOp =
 	| { op: "add"; texts: string[] }
@@ -167,6 +199,14 @@ export function counts(state: TodoState): TodoCounts {
 /** The item the widget highlights: whatever is in flight. */
 export const activeItem = (state: TodoState): TodoItem | undefined =>
 	state.items.find((i) => i.status === "in_progress");
+
+/**
+ * The items a run is still accountable for: not `done` and not `blocked`.
+ * `blocked` is not "open" in the sense of "work to finish" — it is a waiting
+ * state with a note, and the board surfaces it separately.
+ */
+export const openItems = (state: TodoState): TodoItem[] =>
+	state.items.filter((i) => i.status !== "done" && i.status !== "blocked");
 
 /**
  * The item a `start` knocked back to pending, recovered by diffing snapshots.

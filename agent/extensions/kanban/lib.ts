@@ -89,7 +89,13 @@ export const emptyState = (): KanbanState => ({
 
 /** The run-id shape `subagent-herdr`'s `makeRunId` mints. Strict: it is joined into a path. */
 export const RUN_ID_PATTERN = /^sub-[0-9a-f]{4}$/;
-const CARD_ID_PATTERN = /^k([1-9][0-9]*)$/;
+/**
+ * The kanban card id shape (`k3`): `k` plus a positive integer, no leading zero.
+ * The canonical mint — `subagent-herdr/rundir.ts` keeps its own copy because
+ * siblings stay unlinked, and `lib.test.ts` (subagent-herdr) compares the two
+ * over a table.
+ */
+export const CARD_ID_PATTERN = /^k([1-9][0-9]*)$/;
 
 export const MAX_CARDS = 200;
 export const MAX_TITLE = 200;
@@ -505,9 +511,27 @@ export function parseProjection(value: unknown): KanbanProjection | undefined {
 /** A run's status as the board sees it; `unknown` when its record cannot be read. */
 export type EffectiveRunStatus = RunStatus | "unknown";
 
+/** A run's todo progress, as the board reads it off the child's session file. */
+export interface RunTodoCounts {
+	/** Items marked done. */
+	done: number;
+	/** The list's length. */
+	total: number;
+	/** Items in progress. */
+	inProgress: number;
+	/** Items blocked (with a note) — surfaced separately, not counted as open. */
+	blocked: number;
+}
+
 export interface RunInfo {
 	status: EffectiveRunStatus;
 	agent?: string;
+	/**
+	 * The child's todo progress, read live from the child's session file. Advisory
+	 * only: it is rendered under the run line while the run is live, and it never
+	 * moves a card — run status is the only thing that does.
+	 */
+	todos?: RunTodoCounts;
 }
 
 export type RunInfos = Readonly<Record<string, RunInfo>>;
@@ -751,6 +775,15 @@ function cardLines(card: KanbanCard, runs: RunInfos, width: number, style: Style
 		const agent = info?.agent ? cleanText(info.agent).slice(0, 40) : "";
 		const label = `${RUN_GLYPH[s]} ${r}${agent ? ` ${agent}` : ""} ${s}`;
 		out.push(fit(pad + style.fg(RUN_TONE[s], label), width));
+		// The child's live todo progress: one indented line under its run line,
+		// for live work only (the board is about work in flight, not history).
+		const t = info?.todos;
+		if (t && s !== "done" && s !== "failed" && s !== "cancelled") {
+			const parts = [`${t.done}/${t.total}`];
+			if (t.blocked > 0) parts.push(`▲${t.blocked}`);
+			if (t.inProgress > 0) parts.push("◐");
+			out.push(fit(pad + "  " + style.fg(RUN_TONE[s], parts.join(" ")), width));
+		}
 	}
 	if (needsAttention(card, runs)) out.push(fit(pad + style.fg("warning", "⚑ runs finished — collect results"), width));
 	if (card.note) {
@@ -925,7 +958,12 @@ export function compactLines(state: KanbanState, runs: RunInfos, width: number, 
 	const open = order.flatMap((col) => state.cards.filter((c) => c.column === col));
 	for (const card of open.slice(0, maxCards)) {
 		const runsTag = (card.runIds ?? [])
-			.map((r) => style.fg(RUN_TONE[runs[r]?.status ?? "unknown"], ` ${RUN_GLYPH[runs[r]?.status ?? "unknown"]}${r}`))
+			.map((r) => {
+				const s = runs[r]?.status ?? "unknown";
+				const t = runs[r]?.todos;
+				const tds = t && s !== "done" && s !== "failed" && s !== "cancelled" ? ` ${t.done}/${t.total}` : "";
+				return style.fg(RUN_TONE[s], ` ${RUN_GLYPH[s]}${r}${tds}`);
+			})
 			.join("");
 		const note = card.note ? style.fg("dim", `  ${cleanText(card.note)}`) : "";
 		lines.push(

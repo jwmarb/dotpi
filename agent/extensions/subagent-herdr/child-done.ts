@@ -102,6 +102,7 @@ import {
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { openItems, parseTodoState, type TodoItem, type TodoState } from "../lib/todo.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -132,6 +133,12 @@ export interface AnswerContext {
   messages: readonly MessageLike[];
   /** The child's composed system prompt, for `qualifiesAsAnswer`. */
   systemPrompt: string | undefined;
+  /**
+   * The child's todo list, replayed from the branch (see `branchTodoState`).
+   * Only a card child's gate consults it; absent means "no list", which for
+   * a card child is the failure the gate catches.
+   */
+  cardTodos?: TodoState;
 }
 /** The side effects the handshake can perform. */
 export interface ChildDoneEffects {
@@ -180,6 +187,128 @@ export type ChildReportOutcome =
   | { kind: "recorded-no-parent" }
   | { kind: "delivered" };
 
+
+// ---------------------------------------------------------------------------
+// The card gate: a child that was delegated a kanban card owes the board a list
+// ---------------------------------------------------------------------------
+
+/**
+ * The card id this child was delegated, when the parent passed one.
+ *
+ * One truthiness check for the whole file: an empty string (a malformed
+ * `PI_KANBAN_CARD`) is "no card" — it gates nothing, registers no ask tool,
+ * and prints in no prose.
+ */
+function cardOf(env: NodeJS.ProcessEnv): string | undefined {
+  const card = env.PI_KANBAN_CARD;
+  return card && card.length > 0 ? card : undefined;
+}
+
+/** The open items, named for the guidance prose: up to 8, then a count. */
+function openItemsClause(open: readonly TodoItem[]): string {
+  const shown = open.slice(0, 8).map((i) => `${i.id} (${i.text})`).join("; ");
+  const more = open.length > 8 ? ` … and ${open.length - 8} more` : "";
+  return shown + more;
+}
+
+/** The settlement demand for an unsettled (non-empty) list, shared by every card message. */
+function cardOpenClause(card: string, open: readonly TodoItem[]): string {
+  return `Kanban card ${card} is not accounted for: ${openItemsClause(open)} are still open. Complete each (with a note naming how it was checked), \`block\` it with a note if it waits on something, or \`drop\` it if it is not needed.`;
+}
+
+/**
+ * The card gate's view of the child's list: whether it is empty, and which
+ * items are still the child's to settle.
+ *
+ * `blocked` is not open: it is a declared waiting state with a note, and the
+ * board surfaces it separately. `undefined` (the child never built a list)
+ * is `empty` — for a card child that is exactly the failure the gate exists
+ * to catch: the list the child keeps *is* the card.
+ */
+export function cardAccounting(state: TodoState | undefined): { empty: boolean; open: TodoItem[] } {
+  if (!state || state.items.length === 0) return { empty: true, open: [] };
+  return { empty: false, open: openItems(state) };
+}
+
+/**
+ * The card half of the one `agent_end` nudge, appended to the answer nudge
+ * when a card child stops talking without an answer.
+ */
+export function cardNudgeTail(card: string, accounting: { empty: boolean; open: readonly TodoItem[] }): string {
+  const clause = accounting.empty
+    ? `You are working kanban card ${card}, and your todo list is empty: your first action is a \`todo\` \`add\` of one item per step of card ${card}, before any other work.`
+    : cardOpenClause(card, accounting.open);
+  return `\n\n${clause}`;
+}
+
+/**
+ * What the child is told when it stops with a qualifying answer but an
+ * unsettled card list: the answer is fine, the list is not, and the run
+ * cannot finish until the list is settled.
+ */
+export function cardOnlyNudge(card: string, accounting: { empty: boolean; open: readonly TodoItem[] }): string {
+  const clause = accounting.empty
+    ? `Your todo list is empty: your first action is a \`todo\` \`add\` of one item per step of card ${card}, before any other work.`
+    : cardOpenClause(card, accounting.open);
+  return [
+    `Your run has an answer the orchestrator can read, but kanban card ${card} is not settled, so the run cannot finish yet.`,
+    ``,
+    clause,
+    ``,
+    `Then call \`subagent_done\`.`,
+  ].join("\n");
+}
+
+/**
+ * The card half of a refused `subagent_done`. `left`/`max` mirror the answer
+ * gate's bound — the card gate shares that budget rather than consuming a
+ * second one.
+ *
+ * The opening is accurate on its own, because the refusal is what the model
+ * reads: when only the card list blocks (a qualifying answer exists), this
+ * is the *whole* guidance, and an answer-negating opening would be a lie.
+ */
+export function cardDoneRefusal(
+  card: string,
+  accounting: { empty: boolean; open: readonly TodoItem[] },
+  left: number,
+  max: number,
+): string {
+  const clause = accounting.empty
+    ? `Your first action is a \`todo\` \`add\` of one item per step of card ${card}: build the list before any other work, and finish every item before you close the run.`
+    : cardOpenClause(card, accounting.open);
+  return [
+    `Your run has an answer the orchestrator can read, but kanban card ${card} is not settled, so completion was refused.`,
+    ``,
+    `Card ${card}: ${clause}`,
+    ``,
+    `This refusal counts against the same ${max}-refusal budget as a missing answer (${left} left after this one).`,
+  ].join("\n");
+}
+
+/**
+ * The card clause of a refusal that already carries the answer guidance:
+ * the same settlement demand in refusal tone, without the standalone opening
+ * (the answer guidance's opening is the refusal's own there).
+ */
+function cardRefusalClause(
+  card: string,
+  accounting: { empty: boolean; open: readonly TodoItem[] },
+  left: number,
+  max: number,
+): string {
+  const clause = accounting.empty
+    ? `Your first action is a \`todo\` \`add\` of one item per step of card ${card}: build the list before any other work, and finish every item before you close the run.`
+    : cardOpenClause(card, accounting.open);
+  return `\n\nCard ${card}: ${clause} This refusal counts against the same ${max}-refusal budget as a missing answer (${left} left after this one).`;
+}
+/**
+ * How many times a card child may ask the orchestrator for guidance about its
+ * card before the tool stops delivering. Mirrors the {@link MAX_REFUSED_COMPLETIONS}
+ * discipline: bounded, and the refusal is visible (`isError`) rather than a
+ * silently dropped wake-up.
+ */
+export const MAX_ASKS_PER_RUN = 3;
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -328,9 +457,17 @@ export function continuationMessage(requiresResult: boolean): string {
  * refusing a caller that cannot prove it answered would make the run
  * unfinishable, which is a worse failure than the one being prevented.
  *
+ * ## The card gate
+ *
+ * A child that was delegated a kanban card (`PI_KANBAN_CARD`) is refused the
+ * same way while its list is empty (it never built it from the card) or items
+ * are still open. The card gate shares the answer gate's refusal counter: one
+ * bad `subagent_done` consumes one refusal, whatever it got wrong.
+ *
  * @param effects The side effects to perform.
  * @param env The process environment (for `HERDR_PANE_ID`, `HERDR_ENV`,
- *   `PI_SUBAGENT_PARENT_PANE`, `PI_SUBAGENT_RUN_ID`, `PI_SUBAGENT_AGENT`).
+ *   `PI_SUBAGENT_PARENT_PANE`, `PI_SUBAGENT_RUN_ID`, `PI_SUBAGENT_AGENT`,
+ *   `PI_KANBAN_CARD`).
  */
 export function createChildDoneHandshake(
   effects: ChildDoneEffects,
@@ -350,6 +487,7 @@ export function createChildDoneHandshake(
     sessionFile: string | undefined,
     shutdown: () => void,
     systemPrompt?: string,
+    cardTodos?: TodoState,
   ): void;
 } {
   /** Written at most once: a second sidecar would tell the parent nothing new. */
@@ -375,20 +513,38 @@ export function createChildDoneHandshake(
     // The gate. Only ever consulted before the first durable signal: once the
     // sidecar is on disk the run *is* finished, and re-judging it would refuse
     // a second call that is merely redundant.
+    //
+    // A card child owes the board a list, not just an answer: an empty list
+    // (the child never built it from its card) and open items are refused the
+    // same way a missing answer is — through this same counter, so one bad
+    // call consumes one refusal, not two.
+    const card = cardOf(env);
+    const acct = card !== undefined && answer ? cardAccounting(answer.cardTodos) : undefined;
+    const cardBlocking = acct !== undefined && (acct.empty || acct.open.length > 0);
     if (
       !signalled &&
       answer &&
       refusedCompletions < MAX_REFUSED_COMPLETIONS &&
-      !hasQualifyingAnswer(answer)
+      (!hasQualifyingAnswer(answer) || cardBlocking)
     ) {
       refusedCompletions++;
+      const left = MAX_REFUSED_COMPLETIONS - refusedCompletions;
+      const answered = hasQualifyingAnswer(answer);
+      // When only the card list blocks, the refusal is the card refusal alone:
+      // the answer guidance's opening ("no answer") and closing ("receives
+      // nothing") are both lies in that case, and an instruction to re-emit the
+      // answer would strand the report the model already wrote.
+      const guidance =
+        answered && cardBlocking && card !== undefined && acct
+          ? cardDoneRefusal(card, acct, left, MAX_REFUSED_COMPLETIONS)
+          : answerGuidance(requiresResultBlock(answer.systemPrompt), left) +
+            (cardBlocking && card !== undefined && acct
+              ? cardRefusalClause(card, acct, left, MAX_REFUSED_COMPLETIONS)
+              : "");
       return {
         kind: "no-answer",
-        guidance: answerGuidance(
-          requiresResultBlock(answer.systemPrompt),
-          MAX_REFUSED_COMPLETIONS - refusedCompletions,
-        ),
-        attemptsLeft: MAX_REFUSED_COMPLETIONS - refusedCompletions,
+        guidance,
+        attemptsLeft: left,
       };
     }
 
@@ -449,9 +605,19 @@ export function createChildDoneHandshake(
     sessionFile: string | undefined,
     shutdown: () => void,
     systemPrompt?: string,
+    cardTodos?: TodoState,
   ): void {
     if (signalled) return;
     if (!sessionFile) return;
+
+    // A card child owes the board a settled list: an empty list (never built
+    // from the card) and open items are a first-class reason to continue the
+    // run, like a missing answer — one follow-up turn through the same
+    // one-shot nudge slot, no sidecar from the nudge path, and the next clean
+    // end finishes the run whatever the list state.
+    const card = cardOf(env);
+    const acct = card !== undefined ? cardAccounting(cardTodos) : undefined;
+    const cardUnsettled = acct !== undefined && (acct.empty || acct.open.length > 0);
 
     // A response cut off by the output token limit is not a finish: the model
     // stopped mid-answer because its output budget ran out, and nothing in pi's
@@ -462,11 +628,28 @@ export function createChildDoneHandshake(
     // MAX_CONTINUATIONS; when the bound is spent (or an answer already exists)
     // finish the run the same way a clean end does, so the parent reads
     // whatever the transcript carries and labels a short answer as salvage.
+    const answered = hasQualifyingAnswer({ messages, systemPrompt });
     const lastAssistant = lastAssistantOf(messages);
     if (lastAssistant?.stopReason === "length") {
-      if (continuations < MAX_CONTINUATIONS && !hasQualifyingAnswer({ messages, systemPrompt })) {
+      if (continuations < MAX_CONTINUATIONS && !answered) {
         continuations++;
-        effects.sendAnswerNudge(continuationMessage(requiresResultBlock(systemPrompt)));
+        // A truncated `!answered` run is also a card run when its list has
+        // open items: the one continuation turn carries both. A settled list
+        // gets no tail — `openItemsClause([])` returns "", so appending would
+        // read "…:  are still open" and spend the one-shot nudge on nothing.
+        effects.sendAnswerNudge(
+          continuationMessage(requiresResultBlock(systemPrompt)) +
+            (cardUnsettled && card !== undefined && acct ? cardNudgeTail(card, acct) : ""),
+        );
+        return;
+      }
+      // `cardOnlyNudge` opens "Your run has an answer the orchestrator can
+      // read" — true only when `answered`. A truncation with no answer must
+      // not spend the one-shot `nudged` slot on a lie: that slot is what
+      // recovers a stranded report at the clean-end path.
+      if (!nudged && answered && cardUnsettled && card !== undefined && acct) {
+        nudged = true;
+        effects.sendAnswerNudge(cardOnlyNudge(card, acct));
         return;
       }
       finishRun(sessionFile, shutdown);
@@ -475,7 +658,8 @@ export function createChildDoneHandshake(
 
     if (!endedCleanly(messages)) return;
 
-    // A clean end with nothing visible to report: ask once, then let it go.
+    // A clean end with nothing visible to report (or, for a card child, an
+    // unsettled list): ask once, then let it go.
     //
     // `endedCleanly` is satisfied by a `stopReason: "stop"` message that
     // carries only reasoning, which is how sub-9bad finished — the parent dutifully
@@ -483,9 +667,21 @@ export function createChildDoneHandshake(
     // that into a second turn in which the model can write what it already
     // worked out; an ignored nudge must not loop the session, so it is spent
     // once and the next clean end completes as before.
-    if (!nudged && !hasQualifyingAnswer({ messages, systemPrompt })) {
+    if (!nudged && (!answered || cardUnsettled)) {
       nudged = true;
-      effects.sendAnswerNudge(nudgeMessage(requiresResultBlock(systemPrompt)));
+      if (answered && card !== undefined && acct) {
+        // The answer is fine; the card list is the only thing blocking.
+        effects.sendAnswerNudge(cardOnlyNudge(card, acct));
+      } else {
+        let nudge = nudgeMessage(requiresResultBlock(systemPrompt));
+        // A card child that stops without an answer and has open items is,
+        // for the board, a card that stopped without a list: the same one
+        // nudge carries both. A settled list gets no tail (empty clause).
+        if (cardUnsettled && card !== undefined && acct) {
+          nudge += cardNudgeTail(card, acct);
+        }
+        effects.sendAnswerNudge(nudge);
+      }
       return;
     }
 
@@ -956,6 +1152,40 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * The child's todo state, replayed from the current branch — the newest
+   * `todo` tool result's `details.state`, validated by the shared
+   * `parseTodoState` (`lib/todo.ts`) — the same rule the kanban board's
+   * reader applies (`todo.ts`'s own rebuild is looser).
+   *
+   * The same replay rule as the todo extension's `reconstruct`: the last
+   * snapshot wins, malformed ones SKIPPED — the same "skip, keep walking"
+   * rule {@link ../kanban/runs.ts} applies, so one fact has one rule and the
+   * board and the gate can never disagree about which snapshot is current.
+   * `undefined` only when the branch carries no valid `todo` result at all.
+   */
+  const branchTodoState = (ctx: { sessionManager: { getBranch(): unknown[] } }): TodoState | undefined => {
+    try {
+      // The branch is oldest-first: keep the LAST valid snapshot, skipping
+      // malformed ones (the board's rule in `kanban/runs.ts`) — one fact, one
+      // rule, so a torn write never reads as "no list" for the gate while the
+      // board shows progress.
+      let best: TodoState | undefined;
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if ((entry as { type?: unknown }).type !== "message") continue;
+        const msg = (entry as { message?: unknown }).message as
+          | { role?: unknown; toolName?: unknown; details?: unknown }
+          | undefined;
+        if (msg?.role !== "toolResult" || msg?.toolName !== "todo") continue;
+        const parsed = parseTodoState((msg.details as { state?: unknown } | undefined)?.state);
+        if (parsed) best = parsed;
+      }
+      return best;
+    } catch {
+      return undefined;
+    }
+  };
+
   pi.registerTool({
     name: "subagent_done",
     label: "Subagent Done",
@@ -975,9 +1205,13 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = ctx.sessionManager.getSessionFile();
+      // The list is the card's, and only a card child's gate consults it — so
+      // only a card child pays for the branch replay.
+      const card = cardOf(process.env);
       const outcome = handshake.complete(sessionFile, () => ctx.shutdown(), {
         messages: branchMessages(ctx),
         systemPrompt: readSystemPrompt(),
+        cardTodos: card !== undefined ? branchTodoState(ctx) : undefined,
       });
 
       switch (outcome.kind) {
@@ -1060,12 +1294,78 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Card children only: the board is the contract, and a card child that
+  // cannot progress because the card is ambiguous is stuck in a pane the
+  // orchestrator is not watching. One bounded channel to ask for guidance;
+  // delivery is `handshake.report`, so the ask is recorded in the run's
+  // report log like any other mid-run message.
+  if (cardOf(process.env) !== undefined) {
+    let asks = 0;
+    pi.registerTool({
+      name: "subagent_ask",
+      label: "Ask Orchestrator",
+      description:
+        "Ask the orchestrator for guidance about your kanban card: an ambiguity you cannot resolve, a missing input, a decision the card leaves open. The orchestrator receives it shortly and may answer in this session. Bounded per run.",
+      promptSnippet: "Ask the orchestrator for guidance about your card (card runs only).",
+      promptGuidelines: [
+        "Use subagent_ask when the card is ambiguous or an input is missing and you cannot proceed without the orchestrator's answer.",
+        "An ask is not a status update (that is subagent_report) and not your final answer (that is your last message).",
+        `You may ask at most ${MAX_ASKS_PER_RUN} times per run; after that the tool reports the budget is spent.`,
+      ],
+      parameters: Type.Object({
+        question: Type.String({ description: "The question about your card" }),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        if (asks >= MAX_ASKS_PER_RUN) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `The ask budget for this run is spent (${MAX_ASKS_PER_RUN} asks). Decide from the card and the report log, or finish the run with an explanation of what is unresolved.`,
+              },
+            ],
+            details: {},
+          };
+        }
+        const runDir = process.env.PI_SUBAGENT_RUN_DIR;
+        const outcome = handshake.report(`[ask] ${params.question}`, runDir);
+        // The budget is spent only by an ask that actually posted: a no-run-dir
+        // ask is a launch misconfiguration, and burning one of the three on it
+        // would leave a live child with less guidance than it was promised.
+        if (outcome.kind !== "no-run-dir") asks++;
+        switch (outcome.kind) {
+          case "no-run-dir":
+            return {
+              content: [{ type: "text", text: "Error: PI_SUBAGENT_RUN_DIR is not set; the ask cannot be recorded." }],
+              details: {},
+            };
+          case "recorded-no-parent":
+            return {
+              content: [
+                { type: "text", text: "Ask recorded; no parent pane is known, so the orchestrator will see it on its next task check." },
+              ],
+              details: {},
+            };
+          case "delivered":
+            return {
+              content: [{ type: "text", text: "Ask sent to the orchestrator." }],
+              details: {},
+            };
+        }
+      },
+    });
+  }
+
   pi.on("agent_end", (event, ctx) => {
+    // Same rule as the tool: the branch replay is for card children only.
+    const card = cardOf(process.env);
     handshake.onAgentEnd(
       event.messages as MessageLike[],
       ctx.sessionManager.getSessionFile(),
       () => ctx.shutdown(),
       readSystemPrompt(),
+      card !== undefined ? branchTodoState(ctx) : undefined,
     );
   });
   // Child-side stall watchdog: independent of the handshake. It observes
