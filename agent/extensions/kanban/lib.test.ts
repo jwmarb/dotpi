@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -710,27 +710,213 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "sub-0012").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
 	});
 
-	test("a transcript first read PAST the 4 MB cap is memoed too: a snapshot appended at EOF is found", () => {
-		// Board restart mid-run / the 60 s liveness tick: the first ladder on a
-		// 4.5 MB file covers no step past 4 MB, so the old guard never armed the
-		// memo and every append re-paid the whole ladder. This pins REACHABILITY
-		// of the memo path (a mis-armed offset, a wrong boundary, an over-claim);
-		// the read-count effect is not observable through the public API.
+	test("a memoed past-cap transcript finds a snapshot appended DEEP, not at EOF", () => {
+		// Board restart mid-run: the first ladder on a 4.75 MiB file proves the cap
+		// tail and the memo arms there. The snapshot is then followed by enough
+		// filler that it sits BEYOND the 4 MB tail — the ladder can never reach
+		// it, and a region read floored at `size - 4 MiB` (6f7f4c1) starts 1.15 MiB
+		// past its END and skips it forever. Only the uncapped, chunked region
+		// read reaches it, and only the memo makes the read cheap.
 		const name = "2026-10-09T00-00-00-000Z_sub-0013.jsonl";
 		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(4096) } });
-		const head = Array.from({ length: 1200 }, () => filler).join("\n") + "\n"; // ~4.9 MB, no list
+		const head = Array.from({ length: 1200 }, () => filler).join("\n") + "\n"; // 4.75 MiB, no list
 		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head });
-		expect(readRunInfo(agent, "sub-0013").todos).toBeUndefined();
+		expect(readRunInfo(agent, "sub-0013").todos).toBeUndefined(); // memo arms at EOF: the 4 MiB cap tail ends exactly on a newline
 		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "pending" }], nextId: 3 } },
+			},
+		}) + "\n";
+		// 5.15 MiB AFTER the snapshot, putting it 5.15 MiB from EOF — 1.15 MiB
+		// past the 4 MiB ladder tail. A thinner margin (285 KiB at 1080 lines)
+		// dies silently if the cap or the fixture moves.
+		const pad = Array.from({ length: 1300 }, () => filler).join("\n") + "\n";
+		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head + todo + pad });
+		expect(readRunInfo(agent, "sub-0013").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
+	});
+
+	test("a snapshot in a delta bigger than the 4 MB cap stays visible", () => {
+		// The floor-removal regression: memo armed at a small EOF, then one append
+		// of todo + ~5 MB of filler. The snapshot is ~5 MB from EOF, so the old
+		// capped region read (`max(memo.off, size - 4 MB)`) starts past it and
+		// never sees it, and the memo means the ladder never re-runs to help.
+		const name = "2026-10-09T00-00-00-000Z_sub-0015.jsonl";
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(4096) } });
+		const head = Array.from({ length: 3 }, () => filler).join("\n") + "\n";
+		write("sub-0015", { runId: "sub-0015", agent: "worker", status: "running" }, { [name]: head });
+		expect(readRunInfo(agent, "sub-0015").todos).toBeUndefined(); // memo armed at a small EOF
+		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "pending" }], nextId: 3 } },
+			},
+		}) + "\n";
+		const pad = Array.from({ length: 1300 }, () => filler).join("\n") + "\n"; // 5.15 MiB after the snapshot
+		write("sub-0015", { runId: "sub-0015", agent: "worker", status: "running" }, { [name]: head + todo + pad });
+		expect(readRunInfo(agent, "sub-0015").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
+	});
+
+	// The byte fixtures below write ~67 MiB of temp files (5 + 29 + 9 +
+	// 12 + 12) and the cap tests re-read up to 12 MiB per poll — unavoidable
+	// for byte-level pins.
+
+	test("an unreadable transcript mid-scan stops at a safe offset, never spins, and recovers", () => {
+		// The scanRegion zero-read guard. A chunk read that delivers NOTHING
+		// (EACCES here; EMFILE / a mid-scan shrink in the field) must stop the
+		// scan at `pos` — the loop's only advance needs bytes, and an empty
+		// read repeating byte-identical state would hang pi's main loop at 100%
+		// CPU on the board's 1 s poll. Write-only chmod: the child keeps
+		// appending, the reader cannot read. On b03bdea (no guard) this test
+		// HANGS (verified by swap + timeout).
+		const name = "2026-10-09T00-00-00-000Z_sub-0017.jsonl";
+		// chmod blocks the OWNER's reads; uid 0 ignores permissions, and
+		// Windows chmod maps only the write bit (0o200 stays readable) —
+		// the unreadable-mid-scan arm cannot be built on either host.
+		if (process.platform === "win32") return;
+		if (typeof process.getuid === "function" && process.getuid() === 0) return;
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(512) } });
+		const head = filler + "\n";
+		write("sub-0017", { runId: "sub-0017", agent: "worker", status: "running" }, { [name]: head });
+		expect(readRunInfo(agent, "sub-0017").todos).toBeUndefined(); // memo armed at EOF
+		const snapshot = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "pending" }], nextId: 3 } },
+			},
+		});
+		const file = join(agent, "subagent-runs", "sub-0017", name);
+		chmodSync(file, 0o200); // write-only: stat works, reads fail
+		appendFileSync(file, snapshot + "\n");
+		expect(readRunInfo(agent, "sub-0017").todos).toBeUndefined(); // empty read -> stop at pos, no spin
+		chmodSync(file, 0o644);
+		appendFileSync(file, "\n"); // bump the stamp: the failed read cached {stamp, undefined} and chmod alone does not move mtime
+		expect(readRunInfo(agent, "sub-0017").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 }); // recovery
+	});
+
+	test("one line longer than the chunk buffers whole, and its snapshot is found once it closes", () => {
+		const name = "2026-10-09T00-00-00-000Z_sub-0019.jsonl";
+		const head = Array.from({ length: 60 }, () => JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n").join("");
+		write("sub-0019", { runId: "sub-0019", agent: "worker", status: "running" }, { [name]: head });
+		const file = join(agent, "subagent-runs", "sub-0019", name);
+		expect(readRunInfo(agent, "sub-0019").todos).toBeUndefined(); // memo armed at the EOF boundary
+		const big = "x".repeat(5 * 1024 * 1024); // one line, no newline, bigger than the 4 MB chunk
+		appendFileSync(file, big);
+		expect(readRunInfo(agent, "sub-0019").todos).toBeUndefined(); // carried across chunks; nothing to parse yet
+		appendFileSync(file, "\n" + JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "grew", status: "in_progress" }], nextId: 2 } } } }) + "\n");
+		// The multi-chunk line keeps the memo at its START; once it closes,
+		// the next scan re-reads it whole and finds the snapshot after it.
+		expect(readRunInfo(agent, "sub-0019").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+	test("a carried line past the 2-chunk cap stops at its start; snapshots behind it stay invisible", () => {
+		const name = "2026-10-09T00-00-00-000Z_sub-0020.jsonl";
+		write("sub-0020", { runId: "sub-0020", agent: "worker", status: "running" }, { [name]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
+		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined(); // memo armed at the EOF boundary
+		const snap = JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "wide", status: "in_progress" }], nextId: 2 } } } }) + "\n";
+		appendFileSync(join(agent, "subagent-runs", "sub-0020", name), "x".repeat(20 * 1024 * 1024) + "\n" + snap);
+		// 20 MB line: the carry caps at 2 chunks and the scan STOPS at the
+		// line's start — memory bounded on untrusted input; a snapshot after
+		// a line longer than 3 chunks is invisible (documented reach cost).
+		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined();
+		appendFileSync(join(agent, "subagent-runs", "sub-0020", name), "y".repeat(9 * 1024 * 1024) + "\n" + snap);
+		// The scan re-proves from the same offset each poll (bounded), and
+		// the snapshot behind the 20 MB line stays invisible — the scan can
+		// never advance past it, the 9 MB filler behind it never helps.
+		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined();
+	});
+
+	test("a 2.25-chunk line is found once it closes (the cap's reach edge is 12 MiB - 1)", () => {
+		const name = "2026-10-09T00-00-00-000Z_sub-0021.jsonl";
+		const file = join(agent, "subagent-runs", "sub-0021", name);
+		write("sub-0021", { runId: "sub-0021", agent: "worker", status: "running" }, { [name]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
+		expect(readRunInfo(agent, "sub-0021").todos).toBeUndefined(); // memo armed at the EOF boundary
+		appendFileSync(file, "z".repeat(9 * 1024 * 1024)); // 2.25 chunks: at the cap, the scan reaches EOF with no newline
+		expect(readRunInfo(agent, "sub-0021").todos).toBeUndefined(); // boundary stays at the line's start
+		appendFileSync(file, "\n" + JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "edge", status: "in_progress" }], nextId: 2 } } } }) + "\n");
+		// Within cap reach — this fixture's concat is ~9 MiB; the cap's
+		// worst case is carry 8 + chunk 4 = 12 MiB: the closed line parses
+		// and the snapshot after it is FOUND, not just bounded.
+		expect(readRunInfo(agent, "sub-0021").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+	test("the reach edge: a closed 12 MiB - 1 line is found, a closed 12 MiB line is invisible forever", () => {
+		const thin = "2026-10-09T00-00-00-000Z_sub-0022.jsonl";
+		write("sub-0022", { runId: "sub-0022", agent: "worker", status: "running" }, { [thin]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
+		expect(readRunInfo(agent, "sub-0022").todos).toBeUndefined();
+		const snap = JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "edge", status: "in_progress" }], nextId: 2 } } } }) + "\n";
+		appendFileSync(join(agent, "subagent-runs", "sub-0022", thin), "x".repeat(12 * 1024 * 1024 - 1) + "\n" + snap);
+		// 12 MiB - 1: its terminating newline is the LAST byte of the 12 MiB
+		// window — the scan advances past the closed line and finds the snapshot.
+		expect(readRunInfo(agent, "sub-0022").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+		const thick = "2026-10-09T00-00-00-000Z_sub-0023.jsonl";
+		write("sub-0023", { runId: "sub-0023", agent: "worker", status: "running" }, { [thick]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
+		expect(readRunInfo(agent, "sub-0023").todos).toBeUndefined();
+		appendFileSync(join(agent, "subagent-runs", "sub-0023", thick), "y".repeat(12 * 1024 * 1024) + "\n" + snap);
+		// 12 MiB exactly: the newline sits ONE byte outside the window, the
+		// cap fires, the scan stops at the line's start forever — closed line,
+		// invisible snapshot. The edge the docstring's split claims.
+		expect(readRunInfo(agent, "sub-0023").todos).toBeUndefined();
+	});
+
+	test("a failed ladder read recovers on the next good read (the no-arm contract is not observable here)", () => {
+		// readTail's catch returns size -1; the ladder must return undefined
+		// WITHOUT arming the memo — a memo armed at 0 from an empty text would
+		// make every future append a full-transcript rescan on every poll.
+		const name = "2026-10-09T00-00-00-000Z_sub-0018.jsonl";
+		// 0o000 is inert on Windows (chmod maps only the write bit) and
+		// under uid 0 (root ignores permissions): the read would succeed,
+		// the test would pass, and pin nothing.
+		if (process.platform === "win32") return;
+		if (typeof process.getuid === "function" && process.getuid() === 0) return;
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(512) } });
+		write("sub-0018", { runId: "sub-0018", agent: "worker", status: "running" }, { [name]: filler + "\n" });
+		const file = join(agent, "subagent-runs", "sub-0018", name);
+		chmodSync(file, 0o000); // stat succeeds, every read fails
+		expect(readRunInfo(agent, "sub-0018").todos).toBeUndefined();
+		chmodSync(file, 0o644);
+		const snapshot = JSON.stringify({
 			type: "message",
 			message: {
 				role: "toolResult",
 				toolName: "todo",
 				details: { state: { items: [{ id: "t1", text: "a", status: "done" }], nextId: 2 } },
 			},
-		}) + "\n";
-		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head + todo });
-		expect(readRunInfo(agent, "sub-0013").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+		});
+		appendFileSync(file, snapshot + "\n");
+		expect(readRunInfo(agent, "sub-0018").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+	});
+
+	test("a snapshot torn across two polls on the MEMO path is found once complete", () => {
+		// Pins the region scan's torn-tail INVARIANT: a poll that sees a PARTIAL
+		// snapshot line arms the boundary at the line's START, so completing the
+		// line next poll surfaces the snapshot. Not a regression pin for this
+		// commit — the string-carry version computed the same offset (slice(0)
+		// on a newline-free region); the point is that the byte-carry rewrite
+		// keeps it, so a future rewrite that offsets PAST a partial line would
+		// make the completed line a permanent fragment and this test catches it.
+		const name = "2026-10-09T00-00-00-000Z_sub-0016.jsonl";
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(512) } });
+		write("sub-0016", { runId: "sub-0016", agent: "worker", status: "running" }, { [name]: filler + "\n" });
+		expect(readRunInfo(agent, "sub-0016").todos).toBeUndefined(); // memo armed at EOF
+		const snapshot = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "pending" }], nextId: 3 } },
+			},
+		});
+		write("sub-0016", { runId: "sub-0016", agent: "worker", status: "running" }, { [name]: filler + "\n" + snapshot.slice(0, 40) });
+		expect(readRunInfo(agent, "sub-0016").todos).toBeUndefined(); // partial line popped, memo at its start
+		write("sub-0016", { runId: "sub-0016", agent: "worker", status: "running" }, { [name]: filler + "\n" + snapshot + "\n" });
+		expect(readRunInfo(agent, "sub-0016").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
 	});
 
 	test("a SIZE-EQUAL in-place rewrite (sync restore) is not latched by the memo", () => {
