@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -713,7 +713,9 @@ describe("runs.ts (meta.json reader)", () => {
 	test("a transcript first read PAST the 4 MB cap is memoed too: a snapshot appended at EOF is found", () => {
 		// Board restart mid-run / the 60 s liveness tick: the first ladder on a
 		// 4.5 MB file covers no step past 4 MB, so the old guard never armed the
-		// memo and every append re-paid the whole ladder.
+		// memo and every append re-paid the whole ladder. This pins REACHABILITY
+		// of the memo path (a mis-armed offset, a wrong boundary, an over-claim);
+		// the read-count effect is not observable through the public API.
 		const name = "2026-10-09T00-00-00-000Z_sub-0013.jsonl";
 		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(4096) } });
 		const head = Array.from({ length: 1200 }, () => filler).join("\n") + "\n"; // ~4.9 MB, no list
@@ -729,6 +731,32 @@ describe("runs.ts (meta.json reader)", () => {
 		}) + "\n";
 		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head + todo });
 		expect(readRunInfo(agent, "sub-0013").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+	});
+
+	test("a SIZE-EQUAL in-place rewrite (sync restore) is not latched by the memo", () => {
+		// The shrink rule covers sizes that go down; an append always changes the
+		// size; so a stamp that moves while the size does not is a REPLACED file.
+		// The old rule read `scanned === size` as "nothing new" and stayed blind
+		// to the rewritten prefix for the rest of the run.
+		const name = "2026-10-09T00-00-00-000Z_sub-0014.jsonl";
+		const dir = join(agent, "subagent-runs", "sub-0014");
+		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }], nextId: 2 } },
+			},
+		});
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(todo.length) } });
+		const body1 = filler + "\n";
+		write("sub-0014", { runId: "sub-0014", agent: "worker", status: "running" }, { [name]: body1 });
+		expect(readRunInfo(agent, "sub-0014").todos).toBeUndefined(); // memo: off = size
+		const body2 = todo + "\n" + " ".repeat(body1.length - todo.length - 1); // exact same bytes
+		expect(Buffer.byteLength(body2)).toBe(Buffer.byteLength(body1));
+		write("sub-0014", { runId: "sub-0014", agent: "worker", status: "running" }, { [name]: body2 });
+		utimesSync(join(dir, name), new Date(Date.now()), new Date(Date.now() + 60_000)); // stamp must move
+		expect(readRunInfo(agent, "sub-0014").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
 	});
 
 	test("a non-todo newest result is skipped; the newest todo snapshot wins; malformed states are skipped", () => {

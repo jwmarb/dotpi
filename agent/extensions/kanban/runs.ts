@@ -93,22 +93,24 @@ const todoCache = new Map<string, { stamp: string; todos: RunTodoCounts | undefi
 const todoFileOf = new Map<string, string>();
 
 /**
- * Byte offsets the ladder has proven free of todo snapshots, per transcript.
- * The transcript is append-only, so on the next read only the bytes above
- * the offset are new — and the offset is a newline boundary (the torn tail
- * is re-read next pass), so the region's first line is complete. A live run
- * with no list therefore costs one appended-region read per growth, not the
- * whole ladder (32 KB + 512 KB + 4 MB read AND parsed, synchronously in pi's
- * main loop) on every append, at any size — including a transcript first
- * read past the cap (board restart mid-run, the 60 s liveness tick).
- * The region scan reads at most the cap: a todo snapshot more than 4 MB
- * behind EOF is abandoned (never observed: measured max gap 2.8 MB over 37
- * recorded todo runs). A size that goes DOWN means the file was replaced
- * (a sync-client rewrite is not exotic under Nextcloud): the marker is a
- * lie, so it is dropped and the ladder re-proves from scratch. Cleared when
- * a snapshot IS found (the region stops being evidence) and on cache drop.
+ * Offsets the ladder has proven free of todo snapshots, per transcript, with
+ * the `size:mtimeMs` stamp they were proven under. The transcript is
+ * append-only, so the next read only scans above the offset — and the offset
+ * is a newline boundary (the torn tail is re-read next pass), so the region's
+ * first line is complete. A live run with no list therefore costs one
+ * appended-region read per growth, not the whole ladder (32 KB + 512 KB +
+ * 4 MB read AND parsed, synchronously in pi's main loop) on every append, at
+ * any size — including a transcript first read past the cap (board restart
+ * mid-run, the 60 s liveness tick); there the ladder's 4 MB tail simply never
+ * reaches farther from EOF, the measured tradeoff (max gap 2.8 MB over 37
+ * recorded todo runs). The stamp guards the size-equal in-place rewrite (a
+ * Nextcloud sync restore): an append always changes the size, so a stamp
+ * that moves while the size does not is a replaced file, not a grown one.
+ * A size that goes DOWN is likewise a replaced file: the marker is a lie,
+ * dropped, and the ladder re-proves from scratch. The memo is cleared when a
+ * snapshot IS found (the region stops being evidence) and on cache drop.
  */
-const scannedTo = new Map<string, number>();
+const scannedTo = new Map<string, { off: number; stamp: string }>();
 
 function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 	try {
@@ -130,22 +132,26 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 		const stamp = `${st.size}:${st.mtimeMs}`;
 		const hit = todoCache.get(file);
 		if (hit && hit.stamp === stamp) return hit.todos;
-		const scanned = scannedTo.get(file);
-		if (scanned !== undefined) {
-			if (scanned > st.size) {
+		const memo = scannedTo.get(file);
+		if (memo) {
+			if (memo.off > st.size) {
 				// The file shrank: append-only is broken, the marker proves nothing.
 				scannedTo.delete(file);
-			} else if (scanned === st.size) {
-				return undefined; // Append-only: unchanged size, nothing new above EOF.
+			} else if (memo.off === st.size) {
+				if (memo.stamp === stamp) return undefined; // nothing new above EOF
+				// Same size, new stamp: an in-place rewrite (sync restore). The memo
+				// was proven against bytes that are gone; the ladder re-proves.
+				scannedTo.delete(file);
 			} else {
-				// Scan only the appended region, capped at the ladder's reach.
-				const from = Math.max(scanned, Math.max(0, st.size - TODO_TAIL_STEPS[TODO_TAIL_STEPS.length - 1]));
-				const text = readRange(file, from, st.size - from);
+				// Scan the appended region from the proven offset. No floor: a >cap
+				// delta in one poll is rare (max recorded line ~1 MB) and the old
+				// uncapped delta read is what keeps a snapshot in a big append visible.
+				const text = readRange(file, memo.off, st.size - memo.off);
 				const lines = text.split("\n");
 				lines.pop(); // torn final line: not evidence
 				const grown = parseRunTodos(lines);
 				if (grown) scannedTo.delete(file); // a found list is not "no list"
-				else scannedTo.set(file, eofBoundary(text, st.size));
+				else scannedTo.set(file, { off: eofBoundary(text, st.size), stamp });
 				if (!grown) todoCache.set(file, { stamp, todos: undefined });
 				return grown;
 			}
@@ -172,9 +178,10 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 		if (todos) scannedTo.delete(file);
 		// Arm the memo on every miss, at the newline boundary of the last window
 		// read: covered files prove everything below it; a past-cap file proves the
-		// cap tail, and the region scan's cap floor abandons what lies above that
+		// cap tail and bytes farther from EOF than that tail are never reached
+		// (see the scannedTo docstring).
 		// tail (see the scannedTo docstring).
-		else scannedTo.set(file, eofBoundary(lastText, st.size));
+		else scannedTo.set(file, { off: eofBoundary(lastText, st.size), stamp });
 		todoCache.set(file, { stamp, todos });
 		return todos;
 	} catch {
