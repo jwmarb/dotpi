@@ -12,6 +12,7 @@
 import { describe, expect, mock, test } from "bun:test";
 
 import childDone, {
+  askExecute,
   type ChildDoneEffects,
   type ChildWatchdogEffects,
   type MessageLike,
@@ -22,12 +23,48 @@ import childDone, {
   createChildWatchdog,
   continuationMessage,
   MAX_CONTINUATIONS,
+  MAX_ASKS_PER_RUN,
   STREAMING_STALL_MS,
   TOOL_STALL_MS,
   WATCHDOG_TICK_MS,
 } from "./child-done.js";
 import { formatNotice } from "./rundir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+describe("askExecute: the card child's guidance budget", () => {
+	test("a delivered ask spends one of the budget and says it was sent", () => {
+		const r = askExecute(0, () => ({ kind: "delivered" }));
+		expect(r.isError).toBe(false);
+		expect(r.asksAfter).toBe(1);
+		expect(r.text).toBe("Ask sent to the orchestrator.");
+	});
+
+	test("a recorded ask with no parent pane still spends the budget", () => {
+		const r = askExecute(1, () => ({ kind: "recorded-no-parent" }));
+		expect(r.isError).toBe(false);
+		expect(r.asksAfter).toBe(2);
+		expect(r.text).toContain("no parent pane");
+	});
+
+	test("a no-run-dir ask is a launch misconfiguration and spends nothing", () => {
+		const r = askExecute(0, () => ({ kind: "no-run-dir" }));
+		expect(r.isError).toBe(false);
+		expect(r.asksAfter).toBe(0);
+		expect(r.text).toContain("PI_SUBAGENT_RUN_DIR");
+	});
+
+	test("the spent budget refuses without touching the wire", () => {
+		let sent = 0;
+		const r = askExecute(3, () => {
+			sent++;
+			return { kind: "delivered" } as const;
+		});
+		expect(sent).toBe(0);
+		expect(r.isError).toBe(true);
+		expect(r.asksAfter).toBe(3);
+		expect(r.text).toContain(`${MAX_ASKS_PER_RUN} asks`);
+	});
+});
 
 // ---------------------------------------------------------------------------
 // Recording stub

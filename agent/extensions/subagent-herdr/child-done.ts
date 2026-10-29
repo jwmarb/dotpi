@@ -309,6 +309,44 @@ function cardRefusalClause(
  * silently dropped wake-up.
  */
 export const MAX_ASKS_PER_RUN = 3;
+
+/**
+ * The ask tool's whole decision, made pure: budget first, send second.
+ *
+ * The budget is spent only by an ask that actually posted: a `no-run-dir`
+ * ask is a launch misconfiguration, and burning one of the three on it
+ * would leave a live child with less guidance than it was promised. The
+ * send is a thunk so the budget-spent refusal never touches the wire.
+ */
+export function askExecute(
+  asks: number,
+  send: () => ChildReportOutcome,
+): { text: string; isError: boolean; asksAfter: number } {
+  if (asks >= MAX_ASKS_PER_RUN) {
+    return {
+      isError: true,
+      asksAfter: asks,
+      text: `The ask budget for this run is spent (${MAX_ASKS_PER_RUN} asks). Decide from the card and the report log, or finish the run with an explanation of what is unresolved.`,
+    };
+  }
+  const outcome = send();
+  if (outcome.kind === "no-run-dir") {
+    return {
+      text: "Error: PI_SUBAGENT_RUN_DIR is not set; the ask cannot be recorded.",
+      isError: false,
+      asksAfter: asks,
+    };
+  }
+  const asksAfter = asks + 1;
+  if (outcome.kind === "delivered") {
+    return { text: "Ask sent to the orchestrator.", isError: false, asksAfter };
+  }
+  return {
+    text: "Ask recorded; no parent pane is known, so the orchestrator will see it on its next task check.",
+    isError: false,
+    asksAfter,
+  };
+}
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -1316,43 +1354,14 @@ export default function (pi: ExtensionAPI) {
         question: Type.String({ description: "The question about your card" }),
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        if (asks >= MAX_ASKS_PER_RUN) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `The ask budget for this run is spent (${MAX_ASKS_PER_RUN} asks). Decide from the card and the report log, or finish the run with an explanation of what is unresolved.`,
-              },
-            ],
-            details: {},
-          };
-        }
         const runDir = process.env.PI_SUBAGENT_RUN_DIR;
-        const outcome = handshake.report(`[ask] ${params.question}`, runDir);
-        // The budget is spent only by an ask that actually posted: a no-run-dir
-        // ask is a launch misconfiguration, and burning one of the three on it
-        // would leave a live child with less guidance than it was promised.
-        if (outcome.kind !== "no-run-dir") asks++;
-        switch (outcome.kind) {
-          case "no-run-dir":
-            return {
-              content: [{ type: "text", text: "Error: PI_SUBAGENT_RUN_DIR is not set; the ask cannot be recorded." }],
-              details: {},
-            };
-          case "recorded-no-parent":
-            return {
-              content: [
-                { type: "text", text: "Ask recorded; no parent pane is known, so the orchestrator will see it on its next task check." },
-              ],
-              details: {},
-            };
-          case "delivered":
-            return {
-              content: [{ type: "text", text: "Ask sent to the orchestrator." }],
-              details: {},
-            };
-        }
+        const r = askExecute(asks, () => handshake.report(`[ask] ${params.question}`, runDir));
+        asks = r.asksAfter;
+        return {
+          ...(r.isError ? { isError: true } : {}),
+          content: [{ type: "text", text: r.text }],
+          details: {},
+        };
       },
     });
   }
