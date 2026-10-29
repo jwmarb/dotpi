@@ -17,11 +17,15 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
 | What a theme key may be | `themes/tokyo-night.json` `$schema` → pi's own `theme-schema.json` in the installed bundle |
 | The verifier's container contract | `docker/verify-base.Dockerfile` — four measured behaviours in its header, `AGENT_BROWSER_VERSION` pinned at 0.38.1 |
 | The spiker's sandbox contract | `agents/spiker.md` — Docker preferred, Apptainer needs `--containall --no-home` |
-| Which builtins are on/off | `settings.json` `extensions` — one `+builtin:`/`-builtin:` entry each; currently `mcp` and `codemode` enabled, `llama.cpp` and `tool-search` disabled |
+| Which builtins are on/off | `settings.json` `extensions` — one `+builtin:`/`-builtin:` entry each; currently `+mcp`, `+codemode`, `-llama.cpp`, `-tool-search`, `-herdr`. The last is not cosmetic: Pi-Bolt's built-in herdr reporter labels the pane `pi-bolt`, so `herdr agent start --kind pi` fails `agent_kind_mismatch` while it is enabled (root NOTES) |
 | Why a skill's `agents/` yields nothing | It holds `openai.yaml` alone — which is why discovery gates on `agents/*.md`, not on the directory existing. `technical-analysis` is currently the only skill whose `agents/` holds real `*.md` definitions (and the only one with no `openai.yaml`); derive it with `find agent/skills -path '*/agents/*.md'` rather than trusting a count |
 | This tier's own build/test commands | There are none — it is data, not code. Every command lives at the repo root (`scripts/check.sh`); the suites that assert *this* tier's grammars live in `extensions/lib/` — `agents.test.ts` for the frontmatter, and `skill-catalogue.test.ts`, which walks the **live** `skills/` tree rather than a fixture |
 
 ## CONVENTIONS
+
+- **`settings.json` is the live config, and most of it is machine taste, not contract.** What is load-bearing for this repo's code: `defaultProvider/defaultModel` = `fallback/auto` (the virtual model `extensions/model-fallback/` registers — setting it to a real model disables the router), `defaultThinkingLevel`, `retry.*` (long backoff; `retry.provider.maxRetries: 0` because the provider's own retry fights the router), `modelFallback.*` (the chain, `maxCycles`, `maxProbes`, the window/token caps the router advertises), `extensions` (builtins), `packages` (the `git:`/`npm:` loads; the object form with `extensions: ["-…"]` excludes one of the package's extensions — used for superpowers, see the bullet below), `quietStartup`, `startupFetch.*`, `piBolt.*` (Pi-Bolt-only overrides; `packagesOverlay` is what keeps `opensec-pi-fff` out of plain pi's list). Theme `tokyo-night` resolves to `themes/tokyo-night.json`.
+- **`mcp.json` is read by pi's *built-in* MCP extension** (`+builtin:mcp`), not by a local one — there is no `agent/extensions/mcp/` any more. Two servers, and the two secret mechanisms differ: `github` is enabled with `headers.Authorization: "Bearer ${GITHUB_TOKEN}"` (placeholders expand in `headers`/`env` **only**; the builtin validates `url` with `URL.canParse()` *before* expansion, so a secret *URL* cannot be a `${VAR}` in `url` — register such a server from an extension with `pi.registerMcpServer()`), and `robinhood` is `"enabled": false` with `oauth.clientName` — it authenticates by OAuth, whose token state lands in the gitignored `agent/mcp-auth.json` (the file the builtin writes), with `agent/mcp-auth/<server>.json` as the older local extension's per-server leftovers. Runtime management is `/mcp`.
+- **An agent's `model:` is a gateway reference, and the fleet's exact frontmatter is on disk.** Read `agents/*.md` for current models, pins and `fallback_models` (all 10 agents declare both); do not copy a table here — every past copy drifted. Verify a reference against the gateway (`/model_group/info`), not by eye: an unreachable primary costs a launch attempt per run, an unreachable tail degrades a running child.
 
 - **`agents/*.md` frontmatter draws on a seven-key vocabulary**, parsed only by
   `extensions/lib/agents.ts`: `name`, `description`, `tools` (comma-separated; omit for
@@ -179,6 +183,13 @@ delegation *mechanism* behind the `skills:`/`callable_by` keys is documented in
   **Sole exception:** `pi-blackhole/pi-blackhole-config.json` *is* hand-edited tracked
   configuration (the only non-ignored file in `pi-blackhole/`). Edit it directly or via
   `/blackhole settings`; note that a modal save rewrites the file, so keep it valid JSON.
+  Their ignore rules are not uniform, and the difference is only about *noise*:
+  `agent/pi-blackhole/*` and `agent/images/*` are ignored by **contents** (the directory
+  itself is not, and a negation under a directory-exclusion is silently dead — that is why
+  the config file is re-included by pattern and lands in a fresh clone), `agent/sessions/`
+  and `agent/verify-images/` are ignored by path, and `agent/bin/` is ignored while being
+  **absent on this host** (a Windows-only `fd`/`rg` drop-in). Check with
+  `git check-ignore -v <path>` before concluding anything from `git status`.
 - Following `git/github.com/obra/superpowers/AGENTS.md`. That is the vendored package's
   own contributor guide; its rules govern *its* repo, not this one.
 - Editing `docker/verify-base.Dockerfile` without building and running it. Every line

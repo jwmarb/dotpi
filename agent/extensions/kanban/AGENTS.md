@@ -1,19 +1,23 @@
 # kanban — the orchestrator's board: single-writer state, settle guard, read-only side-pane viewer
 
 Inventory row and the "not the old `plan` extension" rule live in `../AGENTS.md`; this file
-covers what you need to know to change the module itself.
+covers what you need to know to change the module itself. Every `:NNN` below is a line number
+measured 2026-10-28 in a file that is edited constantly: treat it as a hint, and grep for the
+exported name when it misses.
 
 ## WHERE TO LOOK
 
 | Question | Answer |
 |---|---|
-| Op semantics, id minting, note rules, caps | `lib.ts` `applyOp` (pure reducer; `KanbanError` on refusal) |
+| Op semantics, id minting, note rules, caps | `lib.ts` `applyOp` (`:206`; pure reducer; `KanbanError` on refusal). Caps (`lib.ts:94-105`): `MAX_CARDS` 200, `MAX_TITLE` 200, `MAX_NOTE` 500, `MAX_RUNS_PER_CARD` 8, `MAX_ADD_PER_CALL` 20 — the last is restated **by hand** in `dynamic-prompt.ts`'s prose ("up to 20 titles per call") with nothing tying them at test time, so change both. (A test *does* pin the prose string — `lib/dynamic-prompt.test.ts:544` asserts the literal sentence, with the numeral hardcoded — so raising the cap fails nothing: it just makes that assertion's string stale-looking, which is exactly why prose and code drift here.) |
 | How state survives reload/rewind | `lib.ts` `reconstructFromEntries` — replays the session branch (`kanban-state` custom entries + tool-result `details`) |
 | Settle guard (holds the turn while cards are unaccounted for) | `lib.ts` `nudgeFor`/`settleSignature`/`actionableCards`; wired at `index.ts` `agent_before_settle` |
 | Pane open/adopt/close, projection publish | `index.ts` (`publish`, `replaceSync`, `findBun`) |
 | The viewer process | `board.ts` (shebang, plain bun; args via `lib.ts` `parseBoardArgs`) |
 | Linked-run badges | `runs.ts` — the only reader of `subagent-runs/<id>/meta.json`, via `../subagent-herdr/rundir.ts` |
-| Pane geometry | `lib.ts` `decideSplit` |
+| Pane geometry (which side, how wide) | `lib.ts` `decideSplit` (`:977`) from the pane rect |
+| `/kanban` argument parsing | `lib.ts` `parseCommand` (`:1095`) → `opFromParams` (`:1144`); board-process args `parseBoardArgs` (`:1206`, returns a `string` usage error) |
+| What the pane draws (TUI + widget fallback) | `lib.ts` `renderFrame` (`:888`), `compactLines` (`:921`, capped at 8 cards), `fit`; the viewer contract is `board.ts`: watches the **directory** + polls at 1 s, alternate screen/raw mode/autowrap off, exits on `q`/Ctrl-C, on the owner pid dying, or when the runtime dir is removed (`board.ts:15-16`) — every exit path runs `restore()` (`board.ts:148`) |
 
 ## CONVENTIONS
 

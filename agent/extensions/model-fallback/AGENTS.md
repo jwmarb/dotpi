@@ -10,12 +10,17 @@ failed; once a fallback answers, the **original model gets the next request**.
 | `index.ts` | Session wiring: `registerVirtualModel` (and its live re-registration), `/fallback-chain`, the footer notice, installing the custom footer, and publishing the registered chain to `served.ts` |
 | `settings.ts` | Load-time `settings.json` read — `pi.getSettings()` throws during extension load |
 | `served.ts` | The chain the router registered plus its `resolve()` predicate, on `globalThis` for other extensions (today `../startup-fetch.ts`'s `Model` row). Cleared on every load before the `register` early return |
+| Cross-module contract (in `lib.ts`) | `FALLBACK_MODEL_REF` (= `fallback/auto`) and `CHAIN_ENV` (= `PI_FALLBACK_CHAIN`) are the two symbols other extensions import this dir for: `ralph-loop/gate.ts` + `runtime-gate.ts` launch their gate children on them, and `subagent-herdr` passes the parent's chain to its children the same way. `parseChainItem` (`lib.ts:234`) is the parser for that env syntax (`ref|level`, comma-separated) — the settings.json grammar is *not* the same parser (see the `|level` note above; line numbers here are as of 2026-10-28 and drift). Rename either symbol and those importers break at load, not at call. |
 | `footer.ts` | The `setFooter` replacement that shows the in-use physical model. Forks pi's built-in `footer.js` — see its deliberate-divergences note, and keep the width guarantee |
 | `footer.test.ts` | The width invariant (`no line exceeds the width` — exceeding it kills the `pi` process), the pure formatters, and the scan cache |
 
 ## HOW IT IS TURNED ON HERE
 
-`agent/settings.json` (an excerpt as of `61dc4a8`; the file is the authority, and the chain
+`agent/settings.json` (an excerpt as of `ceb3112` — the commit that moved the primary pin
+from the `"ref|xhigh"` string form to the object form, so the worktree file is identical to
+it; `git diff ceb3112 -- agent/settings.json` is empty. The older `61dc4a8` excerpt this
+note used to cite has a *bare* `"qwen/qwen3.8-27b"` primary and is **not** the block below.
+The file is the authority, and the chain
 is the line that drifts. The startup header's `Model` row prints the registered primary, so
 `/fetch` shows what is actually configured):
 
@@ -107,7 +112,9 @@ assistant's `errorMessage`, and LiteLLM's gateway 400 — "Upstream request fail
 Received Model Group=… Fallbacks=None" — matches none of its patterns, so pi treats
 the failure as non-retryable and settles the session. The chain therefore never sees a
 `retry` reason, and a subagent (with no human to nudge it) sits waiting on the dead
-model. The `agent_before_settle` boundary (pi 1.1.0) is the one seam that runs before
+model. The `agent_before_settle` boundary (added in pi **0.87.0**, 2026-09-21 — the heading
+above it in `CHANGELOG.md`; present in the 1.4.0 bundle at
+`dist/core/agent-session.js`) is the one seam that runs before
 settlement and may force exactly one more request, so `index.ts` handles that case there.
 It only acts when the session is on `fallback/auto` (on a physical model `route()` never
 runs, so forcing a request would just re-ask the failing model), and only on the run's
@@ -308,9 +315,14 @@ is what made the formula wrong rather than merely conservative.
   exhaustion in a later session could report a `Cause:` derived from an earlier
   session's provider error — a diagnostic that confidently names the wrong cause.
 - **An unreachable chain entry costs a position, not the request.** A router that
-  returns a model without credentials makes pi **fail** the request
-  (`docs/virtual-models.md`), turning a recoverable error into a dead session, so
-  `route()` walks forward to the first reachable entry.
+  returns a model without credentials makes pi **fail** the request — pi's own
+  bundled doc, `node_modules/@earendil-works/pi-coding-agent/docs/virtual-models.md`
+  (pi 1.4.0): *"If `route()` throws, or returns a virtual model or a model without
+  credentials, the request ends with an error response."* That turns a recoverable
+  error into a dead session, so `route()` walks forward to the first reachable entry.
+  Note this is **pi's** doc tree, not this repo's `docs/` (which holds only the
+  architecture reviews and the vendored `superpowers/`) — citing it as `docs/…`
+  resolves to a file that does not exist here.
 - **`state.index` records where the request actually went**, not where `advance()`
   aimed. Otherwise the next hop steps from a model that never ran and skips the
   one that did.

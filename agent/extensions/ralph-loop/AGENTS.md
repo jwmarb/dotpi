@@ -10,10 +10,10 @@ cap is reached, it stalls, or the user stops it. A port of oh-my-openagent's
 
 | File | Owns |
 |---|---|
-| `lib.ts` | All pure logic: arg parsing, completion + stall detection, prompt rendering |
+| `lib.ts` | All pure logic: arg parsing, completion + stall detection, prompt rendering. The knobs live here, in code, not in prose: `DEFAULT_PROMISE` `DONE`, `DEFAULT_MAX_ITERATIONS` 25, `DEFAULT_MAX_VERIFICATIONS` 3, `STALL_LIMIT` 4 (`--max-iterations=` / `--promise=` override them) |
 | `index.ts` | Session wiring: the `agent_settled` state machine, observation hooks, the three commands |
 | `gate.ts` | The **static** gate — resolves the oracle definition, captures the git baseline, runs the headless audit child |
-| `runtime-gate.ts` | The **runtime** gate — runs the `verifier` agent, which executes the project's checks in Docker |
+| `runtime-gate.ts` | The **runtime** gate — runs the `verifier` agent, which executes the project's checks in Docker. `RUNTIME_TIMEOUT_MS` 600 000 (10 min; a timeout is `inconclusive`, which stops the loop), `RUNTIME_FALLBACK_MODEL` `anthropic/claude-opus-5` and `DEFAULT_RUNTIME_TOOLS` (`read grep find ls bash`) are only used when `agents/verifier.md` cannot be read — the file is the authority |
 | `image.ts` | Container image provisioning: prefers the project's Dockerfile, else synthesises one extending the reference base; keyed by manifest hash |
 | `lib.test.ts` | The pure parts, both gate protocols, image + web detection (the one suite here; count it rather than trusting a number) |
 
@@ -40,14 +40,17 @@ Catches "reads fine but does not run". Minutes cold, ~20s once the image is cach
 
 ```
 docker run --rm --network none --memory=2g --pids-limit=512 \
-  -v <project>:/project:ro -w /project \
+  -v <project>:/project:ro -v <artifacts>:/artifacts -w /project \
   --user "$(id -u):$(id -g)" -e HOME=/tmp <image> <test command>
 ```
 
 All four safety properties are measured, not assumed: network blocked, writes to the mount
 refused, the **live working tree** visible (so edits need no rebuild), real exit codes
-propagated. Artifacts go to a per-audit host scratch dir mounted at `/artifacts`, because
-`/project` is read-only by design.
+propagated. Both mounts are in the real invocation (`runtime-gate.ts:146-149`), and the
+`/artifacts` one is not decoration: `/project` is read-only **by design**, so a verifier with
+no writable path cannot produce evidence at all — drop the mount and the run yields
+`inconclusive`, not a pass. (Copy-pasting a stripped version of the block above is how this
+mistake is made.)
 
 Images are at most three layers: the tracked reference base
 (`../../docker/verify-base.Dockerfile`, tag `ralph-verify/base:latest` — Node 24 + Chrome +
@@ -83,11 +86,15 @@ computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</
   fallback" has to include it. Each gate passes its own `defaultTools` so the seam does not
   couple the two gates' tool policy.
 - **Chain items may pin a thinking level (`ref|level`), and the chain is always non-empty.**
-  `withChainEnv` (gate.ts) requires a non-empty chain and always sets `PI_FALLBACK_CHAIN`
-  around the spawn, restoring the previous value in `finally`. There is no `useChain`
-  boolean and no `isRoutable` check at the gate: the chain is guaranteed non-empty by
-  `resolveGateAgent`, and the child always launches on `fallback/auto`, so even a single
-  unpinned entry must cross. `--provider` is always omitted.
+  `withChainEnv` (`gate.ts:70`) sets `PI_FALLBACK_CHAIN` around the spawn and restores the
+  previous value in `finally`. There is no `useChain` boolean and no `isRoutable` check at the
+  gate, and the child always launches on `fallback/auto`, so even a single unpinned entry must
+  cross. **Non-emptiness is a type-level guarantee, not a runtime check here:**
+  `resolveGateAgent` returns a required non-empty chain, but `withChainEnv` itself opens with
+  `if (chain.length === 0) return spawn();` (`gate.ts:74`) — an empty chain spawns with the env
+  **untouched**, inheriting whatever the parent had. Do not read that early return as a
+  supported "no chain" mode: the only way to reach it is a caller bypassing
+  `resolveGateAgent`, and the inherited-env behaviour is a silent fallback, not a feature.
 - **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
   calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
   `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the
