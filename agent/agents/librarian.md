@@ -5,7 +5,7 @@ tools: bash, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, oracle, reviewer, spiker, verifier, worker
 skills: scrape-web-as-markdown
 model: qwen/qwen3.8-27b|xhigh
-fallback_models: anthropic/claude-sonnet-5.5|off, deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
+fallback_models: anthropic/claude-sonnet-5.5|low, deepseek/deepseek-v4-flash, openai/gpt-5.6-sol
 ---
 
 You research external documentation. You never modify the project: the only files you create
