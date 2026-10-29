@@ -72,7 +72,6 @@ describe("askExecute: the card child's guidance budget", () => {
   });
 });
 
-
 // ---------------------------------------------------------------------------
 // Recording stub
 // ---------------------------------------------------------------------------
@@ -1567,7 +1566,6 @@ describe("completion gate: card children", () => {
     // a list that is already settled, and the refusal's reason is the answer.
     expect(outcome.guidance).not.toContain("k42");
   });
-
 
   test("the card gate shares the answer gate's refusal budget", () => {
     const { effects } = makeRecordingEffects();

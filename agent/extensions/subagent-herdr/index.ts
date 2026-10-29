@@ -895,7 +895,8 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Pushes one completed run's block (header, answer, diagnostics, reports)
+ * Pushes one completed run's block (header, todos line, answer/salvage
+ * note, diagnostics, reports)
  * onto the caller's output array. The caller must have already brought the
  * record up to date (`lifecycle.read`, or a sweep).
  */

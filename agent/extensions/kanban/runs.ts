@@ -93,14 +93,20 @@ const todoCache = new Map<string, { stamp: string; todos: RunTodoCounts | undefi
 const todoFileOf = new Map<string, string>();
 
 /**
- * Byte offsets scanned to EOF with NO todo snapshot found, per transcript.
- * The transcript is append-only, so on the next read only [offset, size) is
- * new — and it starts at an EOF boundary, so its first line is complete.
- * Without this, a live run with no list and a transcript past the 4 MB cap
- * pays the whole ladder (32 KB + 512 KB + 4 MB read AND parsed, synchronously
- * in pi's main loop) on every append; with it, growth costs one appended-
- * region read. Cleared when a snapshot IS found (the region stops being
- * evidence) and on every cache drop.
+ * Byte offsets the ladder has proven free of todo snapshots, per transcript.
+ * The transcript is append-only, so on the next read only the bytes above
+ * the offset are new — and the offset is a newline boundary (the torn tail
+ * is re-read next pass), so the region's first line is complete. A live run
+ * with no list therefore costs one appended-region read per growth, not the
+ * whole ladder (32 KB + 512 KB + 4 MB read AND parsed, synchronously in pi's
+ * main loop) on every append, at any size — including a transcript first
+ * read past the cap (board restart mid-run, the 60 s liveness tick).
+ * The region scan reads at most the cap: a todo snapshot more than 4 MB
+ * behind EOF is abandoned (never observed: measured max gap 2.8 MB over 37
+ * recorded todo runs). A size that goes DOWN means the file was replaced
+ * (a sync-client rewrite is not exotic under Nextcloud): the marker is a
+ * lie, so it is dropped and the ladder re-proves from scratch. Cleared when
+ * a snapshot IS found (the region stops being evidence) and on cache drop.
  */
 const scannedTo = new Map<string, number>();
 
@@ -126,24 +132,32 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 		if (hit && hit.stamp === stamp) return hit.todos;
 		const scanned = scannedTo.get(file);
 		if (scanned !== undefined) {
-			// Append-only: the bytes below `scanned` were read to EOF and carry
-			// no snapshot. Unchanged size = nothing possible; growth = scan the
-			// appended region only.
-			if (scanned >= st.size) return undefined;
-			const lines = readRange(file, scanned, st.size - scanned).split("\n");
-			lines.pop(); // torn final line: not evidence
-			const grown = parseRunTodos(lines);
-			scannedTo.set(file, st.size);
-			if (!grown) todoCache.set(file, { stamp, todos: undefined });
-			else scannedTo.delete(file); // a found list is not "no list"
-			return grown;
+			if (scanned > st.size) {
+				// The file shrank: append-only is broken, the marker proves nothing.
+				scannedTo.delete(file);
+			} else if (scanned === st.size) {
+				return undefined; // Append-only: unchanged size, nothing new above EOF.
+			} else {
+				// Scan only the appended region, capped at the ladder's reach.
+				const from = Math.max(scanned, Math.max(0, st.size - TODO_TAIL_STEPS[TODO_TAIL_STEPS.length - 1]));
+				const text = readRange(file, from, st.size - from);
+				const lines = text.split("\n");
+				lines.pop(); // torn final line: not evidence
+				const grown = parseRunTodos(lines);
+				if (grown) scannedTo.delete(file); // a found list is not "no list"
+				else scannedTo.set(file, eofBoundary(text, st.size));
+				if (!grown) todoCache.set(file, { stamp, todos: undefined });
+				return grown;
+			}
 		}
 		// The ladder: a miss in the small window expands before "no list" is
 		// concluded (the measured bound is on TODO_TAIL_STEPS).
 		let todos: RunTodoCounts | undefined;
-		let covered = false;
+		let lastText = "";
 		for (const bytes of TODO_TAIL_STEPS) {
-			const lines = readTail(file, bytes).split("\n");
+			const text = readTail(file, bytes);
+			lastText = text;
+			const lines = text.split("\n");
 			// A torn final line (a write in progress) is not evidence: drop it, the
 			// same rule `extractRunResult` applies.
 			lines.pop();
@@ -153,13 +167,14 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 			// every larger step would re-read and re-parse byte-identical bytes, and
 			// a run with no list walks this ladder on **every** append (the board
 			// polls at 1 s, the widget refreshes inside pi's main loop). Stop covered.
-			if (bytes >= st.size) {
-				covered = true;
-				break;
-			}
+			if (bytes >= st.size) break;
 		}
 		if (todos) scannedTo.delete(file);
-		else if (covered) scannedTo.set(file, st.size); // EOF proven empty
+		// Arm the memo on every miss, at the newline boundary of the last window
+		// read: covered files prove everything below it; a past-cap file proves the
+		// cap tail, and the region scan's cap floor abandons what lies above that
+		// tail (see the scannedTo docstring).
+		else scannedTo.set(file, eofBoundary(lastText, st.size));
 		todoCache.set(file, { stamp, todos });
 		return todos;
 	} catch {
@@ -167,7 +182,26 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 	}
 }
 
-/** `len` bytes starting at `offset`, for the appended region of a scan. */
+/**
+ * The byte offset of the end of `text`'s last COMPLETE line, relative to a
+ * file of `size` bytes that ends with `text`. `text.length` is UTF-16 units;
+ * transcript JSONL is ASCII-escaped JSON, so units equal bytes — the one
+ * risk (raw multibyte in a tool payload) is contained: the offset just moves
+ * back into bytes already scanned, it never skips new ones.
+ */
+function eofBoundary(text: string, size: number): number {
+	const cut = text.lastIndexOf("\n");
+	if (cut < 0) return Math.max(0, size - Buffer.byteLength(text));
+	return size - Buffer.byteLength(text.slice(cut + 1));
+}
+
+
+/**
+ * `len` bytes starting at `offset`, for the appended region of a scan.
+ *
+ * Not capped: the delta is bounded by the poll cadence, and callers floor
+ * the offset so the read never exceeds the ladder's reach.
+ */
 function readRange(file: string, offset: number, len: number): string {
 	const fd = openSync(file, "r");
 	try {

@@ -24,6 +24,7 @@ import {
   childFallbackChain,
   DONE_TOOL_NAME,
   extractRunResult,
+  pickSessionName,
   herdrAgentName,
   makeRunId,
   formatLineage,
@@ -242,6 +243,38 @@ describe("extractRunResult", () => {
     expect(r.answered).toBe(true);
     expect(r.text).toBe("the run's answer");
     expect(r.sessionFile).toBe(join(dir, settledName));
+  });
+
+  test("the todo walk: non-todo results, non-toolResult rows, and malformed states are all skipped", async () => {
+    // The backward walk's whole contract: newest VALID todo snapshot wins;
+    // a bash result carrying todo-shaped details is a decoy; a malformed
+    // todo state (the newest) must fall through to the older valid one.
+    const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const todo = (items: unknown) =>
+      JSON.stringify({
+        type: "message",
+        message: { role: "toolResult", toolName: "todo", details: { state: { items, nextId: 9 } } },
+      });
+    const lines = [
+      todo([{ id: "t1", text: "a", status: "done" }]),
+      JSON.stringify({
+        type: "message",
+        message: { role: "toolResult", toolName: "bash", details: { state: { items: [{ id: "x", text: "y", status: "done" }], nextId: 1 } } },
+      }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "todo chatter, not a result" } }),
+      todo("not-an-array"), // newest todo: malformed, must be skipped
+      todo([{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "blocked" }]),
+      todo(undefined), // newer still: no state at all — also skipped
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "<result>done</result>" }], stopReason: "stop" },
+      }),
+    ];
+    writeFileSync(join(dir, "2026-09-20T12-00-00-000Z_sub-0021.jsonl"), `${lines.join("\n")}\n`);
+
+    const r = await extractRunResult(dir, "sub-0021");
+    expect(r.answered).toBe(true);
+    expect(r.todos).toEqual({ total: 2, done: 1, inProgress: 0, blocked: 1, pending: 0 });
   });
 
   test("reports found-but-unanswered when the session has no assistant text", async () => {
@@ -742,6 +775,40 @@ describe("extractRunResult", () => {
     expect(r.text).toBe("plain answer");
   });
 
+});
+
+// ---------------------------------------------------------------------------
+// pickSessionName
+// ---------------------------------------------------------------------------
+
+describe("pickSessionName", () => {
+  test("no transcript for the run yields undefined (foreign files ignored)", () => {
+    expect(pickSessionName(["2026-09-20T12-00-00-000Z_sub-00bb.jsonl", "meta.json"], "sub-00aa")).toBeUndefined();
+  });
+
+  test("with nothing settled, the newest transcript wins (the run is live)", () => {
+    expect(
+      pickSessionName(
+        ["2026-09-20T12-00-00-000Z_sub-00aa.jsonl", "2026-09-25T09-00-00-000Z_sub-00aa.jsonl"],
+        "sub-00aa",
+      ),
+    ).toBe("2026-09-25T09-00-00-000Z_sub-00aa.jsonl");
+  });
+
+  test("a settled transcript beats a newer sidecar-less resume; the newest settled wins", () => {
+    expect(
+      pickSessionName(
+        [
+          "2026-09-20T12-00-00-000Z_sub-00aa.jsonl",
+          "2026-09-20T12-00-00-000Z_sub-00aa.jsonl.exit",
+          "2026-09-22T10-00-00-000Z_sub-00aa.jsonl",
+          "2026-09-22T10-00-00-000Z_sub-00aa.jsonl.exit",
+          "2026-09-25T09-00-00-000Z_sub-00aa.jsonl", // post-completion resume, no sidecar
+        ],
+        "sub-00aa",
+      ),
+    ).toBe("2026-09-22T10-00-00-000Z_sub-00aa.jsonl");
+  });
 });
 
 // ---------------------------------------------------------------------------

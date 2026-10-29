@@ -667,6 +667,69 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "sub-000e").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
 	});
 
+	test("a memoed transcript that SHRINKS (sync rewrite) is re-proven, not latched", () => {
+		// The board lives under Nextcloud: a sync client replacing the file is
+		// not exotic. The old rule read `scanned >= size` as "nothing new" and
+		// latched "no list" for the rest of the run.
+		const name = "2026-10-09T00-00-00-000Z_sub-0011.jsonl";
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(4096) } });
+		write("sub-0011", { runId: "sub-0011", agent: "worker", status: "running" }, {
+			[name]: filler + "\n" + filler + "\n", // covered miss: memo armed at EOF
+		});
+		expect(readRunInfo(agent, "sub-0011").todos).toBeUndefined();
+		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }], nextId: 2 } },
+			},
+		}) + "\n";
+		write("sub-0011", { runId: "sub-0011", agent: "worker", status: "running" }, { [name]: todo }); // smaller
+		expect(readRunInfo(agent, "sub-0011").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+	});
+
+	test("a torn tail is RE-READ whole: the memo resumes at the newline boundary", () => {
+		// The memo offset must sit at the end of the last COMPLETE line. Storing
+		// the raw EOF put the next region read mid-line: the snapshot's head was
+		// never re-read and the board stayed blind until the child touched todo.
+		const name = "2026-10-09T00-00-00-000Z_sub-0012.jsonl";
+		const head = JSON.stringify({ type: "message", message: { role: "user", content: "go" } }) + "\n";
+		const todoLine = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "in_progress" }], nextId: 2 } },
+			},
+		});
+		const cut = Math.floor(todoLine.length / 2);
+		write("sub-0012", { runId: "sub-0012", agent: "worker", status: "running" }, { [name]: head + todoLine.slice(0, cut) });
+		expect(readRunInfo(agent, "sub-0012").todos).toBeUndefined(); // torn tail popped
+		write("sub-0012", { runId: "sub-0012", agent: "worker", status: "running" }, { [name]: head + todoLine + "\n" });
+		expect(readRunInfo(agent, "sub-0012").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+	test("a transcript first read PAST the 4 MB cap is memoed too: a snapshot appended at EOF is found", () => {
+		// Board restart mid-run / the 60 s liveness tick: the first ladder on a
+		// 4.5 MB file covers no step past 4 MB, so the old guard never armed the
+		// memo and every append re-paid the whole ladder.
+		const name = "2026-10-09T00-00-00-000Z_sub-0013.jsonl";
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(4096) } });
+		const head = Array.from({ length: 1200 }, () => filler).join("\n") + "\n"; // ~4.9 MB, no list
+		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head });
+		expect(readRunInfo(agent, "sub-0013").todos).toBeUndefined();
+		const todo = JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "todo",
+				details: { state: { items: [{ id: "t1", text: "a", status: "done" }], nextId: 2 } },
+			},
+		}) + "\n";
+		write("sub-0013", { runId: "sub-0013", agent: "worker", status: "running" }, { [name]: head + todo });
+		expect(readRunInfo(agent, "sub-0013").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
+	});
 
 	test("a non-todo newest result is skipped; the newest todo snapshot wins; malformed states are skipped", () => {
 		const todo = (items: Array<{ id: string; text: string; status: string }>) =>
