@@ -2,35 +2,41 @@
 # decisions behind them. Everything a pi session GENERATES is ignored, because
 # it is machine-written, changes on every run, and would bury the config it sits
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
+#
+# Machine-state and secret paths are pinned to a leading `*/` (any profile
+# directory: agent/, quant-trader/, the orchestrator symlink, ...), because the
+# same files a profile generates must be ignored in every profile, not just the
+# one this repo started with.
 
 # ---- Secrets ----------------------------------------------------------------
-# The real .env: the ONLY file here holding live credentials, plus the provider
-# base URL. Everything agent/extensions/litellm.ts and firecrawl-cli.ts need is
-# read from it — LITELLM_API_KEY and LITELLM_BASE_URL for the litellm provider,
-# FIRECRAWL_API_URL for the librarian's research CLI.
+# The real .env: the ONLY file in a profile holding live credentials, plus the
+# provider base URL. Everything agent/extensions/litellm.ts and firecrawl-cli.ts
+# need is read from it — LITELLM_API_KEY and LITELLM_BASE_URL for the litellm
+# provider, FIRECRAWL_API_URL for the librarian's research CLI.
 # Losing this file means re-minting the provider key; losing it to git history
 # would mean rotating it under pressure.
-agent/.env
-agent/.env.*
-!agent/.env.example
+*/.env
+*/.env.*
+!*/.env.example
 # NOTE: agent/extensions/litellm.ts used to be ignored here because it
-# hardcoded a key. It now reads from agent/.env, so it is committed. This is
+# hardcoded a key. It now reads from a profile .env, so it is committed. This is
 # the change the old comment on litellm.ts anticipated: its doc comments always
 # claimed LITELLM_API_KEY came from the environment, and now that is true.
 # Credential stores. Empty right now, which is exactly why they are easy to
 # commit by accident and then hard to notice when they fill up.
-agent/auth.json
-agent/models-store.json
+*/auth.json
+*/models-store.json
 # Per-server OAuth state (registered client + tokens) from an mcp.json "oauth" entry.
-# pi's built-in MCP extension keeps this in the mcp-auth.json FILE; agent/mcp-auth/
-# is the old local extension's directory, kept ignored so a leftover never lands in git.
-agent/mcp-auth.json
-agent/mcp-auth/
+# pi's built-in MCP extension keeps this in the mcp-auth.json FILE; a profile's
+# mcp-auth/ directory is the old local extension's, kept ignored so a leftover
+# never lands in git.
+*/mcp-auth.json
+*/mcp-auth/
 # Connection log written by the built-in MCP extension.
-agent/mcp.log
+*/mcp.log
 # pi's project-trust decisions (absolute paths of folders you trusted). Written
 # by pi's trust prompt, per machine; a cloned copy must ask again, not inherit.
-agent/trust.json
+*/trust.json
 # Never commit a backup of a config that may contain a key.
 *.bak
 *.orig-backup
@@ -47,7 +53,7 @@ agent/trust.json
 # category, because a skill sitting loose at the top level of the library breaks
 # the layout the library asserts (`lib/skill-catalogue.test.ts`) — a gitignored
 # skill is still a skill, and the guard walks the live tree, not the index.
-agent/skills/other/uarizona-hpc/
+*/skills/other/uarizona-hpc/
 
 # ---- Dependencies -----------------------------------------------------------
 node_modules/
@@ -61,52 +67,42 @@ bun.lockb
 # Full conversation transcripts. Large, constantly rewritten, and they contain
 # whatever the agents happened to read — including file contents from anywhere
 # on this machine.
-agent/sessions/
-agent/subagent-sessions/
+*/sessions/
+*/subagent-sessions/
 # subagent-herdr extension: one dir per delegated run (child session file,
 # .exit sidecar, system prompt, meta.json). Machine state, never config.
-agent/subagent-runs/
+*/subagent-runs/
 # pi's managed install: releases/, current-version — machine state.
-agent/install/
+*/install/
 
 # herdr's pi integration. Installed and overwritten by herdr itself (its header
 # says so), so tracking it would only record herdr upgrades as diffs here.
-agent/extensions/herdr-agent-state.ts
+*/extensions/herdr-agent-state.ts
 
 # Generated Dockerfiles for the ralph-loop runtime gate, one dir per project.
 # Derived from each project's manifests and rebuildable on demand — deleting them
 # costs one image build.
-agent/verify-images/
+*/verify-images/
 
 # pi-blackhole's state directory is machine-written EXCEPT for its config file,
 # which is hand-tuned configuration and belongs in git like settings.json does.
-# Note the `/*` — a bare `agent/pi-blackhole/` excludes the DIRECTORY, and git
-# never descends into an excluded directory, so a `!…/pi-blackhole-config.json`
-# negation under it would be silently dead. Ignoring the directory's *contents*
-# keeps the negation reachable. Everything else here stays ignored: per-session
-# `<id>-pending.json` / `-pending.stale.json` run state and `debug.ndjson`.
-agent/pi-blackhole/*
-!agent/pi-blackhole/pi-blackhole-config.json
-# Trading profile (~/.pi/agent-trading): symlinks share the default profile's
-# tree, so only its own machine state is ignored here. Its .env and mcp-auth
-# are symlinks into agent/ and track as (relative) symlinks, not secrets.
-agent-trading/sessions/
-agent-trading/subagent-sessions/
-agent-trading/subagent-runs/
-agent-trading/verify-images/
-agent-trading/pi-blackhole/*
-!agent-trading/pi-blackhole/pi-blackhole-config.json
-agent-trading/auth.json
-agent-trading/models-store.json
+# Note the `/*` — a bare `pi-blackhole/` (the whole directory) excludes it, and
+# git never descends into an excluded directory, so a negation like
+# `!…/pi-blackhole-config.json` under it would be silently dead. Ignoring the
+# directory's *contents* keeps the negation reachable. Everything else here
+# stays ignored: per-session `<id>-pending.json` / `-pending.stale.json` run
+# state and `debug.ndjson`.
+*/pi-blackhole/*
+!*/pi-blackhole/pi-blackhole-config.json
 # Plans are per-session working state keyed by session id, and the archive grows
 # without bound. The decisions worth keeping end up in docs/adr and CONTEXT.md.
-agent/plans/
+/*/plans/
 # Exported single-session HTML, megabytes each.
 pi-session-*.html
 
 # ---- Logs, scratch and crash output ----------------------------------------
-agent/run-history.jsonl
-agent/pi-tui-crash.log
+*/run-history.jsonl
+*/pi-tui-crash.log
 herdr.jsonl
 *.log
 # Loose scratch files from debugging sessions.
@@ -114,12 +110,12 @@ g.jsonl
 o3.raw
 
 # ---- Local caches -----------------------------------------------------------
-agent/fff/
-agent/npm/
-agent/bin/
-agent/git/
-agent/cache/
-
+*/fff/
+*/npm/
+/*/bin/
+*/git/
+*/cache/
+/*/cache/
 # Scratch materialisation of the git index by scripts/check.sh (CHECK_STAGED=1).
 .git-check/
 
@@ -137,9 +133,25 @@ agent/cache/
 .vscode/
 
 # ---- Startup-panel images ---------------------------------------------------
-# agent/images/ is the user's picture folder for startup-fetch.ts (which one
-# shows: settings.json startupFetch.mode/image). Personal and usually
+# A profile's images/ is the user's picture folder for startup-fetch.ts (which
+# one shows: settings.json startupFetch.mode/image). Personal and usually
 # third-party art, so the pictures stay local; only the README is tracked so
 # a fresh clone has the folder. The cycle/random state file is machine state.
-agent/images/*
-!agent/images/README.md
+/*/images/*
+!/*/images/README.md
+
+# The four rules above (plans, bin, cache, images) are machine state that lives at
+# a PROFILE ROOT, so they are anchored to one path component. Two top-level trees
+# in this repo are SOURCE, not profile state, and must never be swallowed by them:
+# docs/ (notes, diagrams, adr) and scripts/ (a tool under scripts/bin/ is a
+# committed file). plans/bin/cache are DIRECTORY patterns, so they are negated as
+# directories — a negated file cannot be re-included while its parent directory is
+# excluded; images is a FILE pattern, so it is negated as files.
+!/docs/plans/
+!/docs/bin/
+!/docs/cache/
+!/docs/images/**
+!/scripts/plans/
+!/scripts/bin/
+!/scripts/cache/
+!/scripts/images/**
