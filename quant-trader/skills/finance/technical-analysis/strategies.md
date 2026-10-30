@@ -1,0 +1,1 @@
+../../../../agent/skills/finance/technical-analysis/strategies.md

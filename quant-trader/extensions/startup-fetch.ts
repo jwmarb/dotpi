@@ -1,0 +1,1 @@
+../../agent/extensions/startup-fetch.ts
