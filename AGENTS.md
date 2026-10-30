@@ -28,6 +28,15 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `README.md` — the human-facing twin (what/why, features, install, layout, commands, Pi-Bolt, OS compatibility). It restates this file's conventions for readers who never open `AGENTS.md`; keep it in sync by pointing here rather than forking the prose.
 - `.firecrawl/` — gitignored scratch for scraped pages (the `scrape-web-as-markdown` CLI and the `librarian` agent's clones). Not repo content.
 
+## Profiles
+
+A *profile* is an agent directory under the repo root that pi runs as its entire configuration. `~/.pi/agent` **is** the default profile and stays canonical — no move, no rename, no replacement; bare `pi` and bare `pi-bolt` run it, and `orchestrator` is a symlink to it (a stable alias, not a copy). Non-default personas live beside it; `quant-trader/` is the only one today (a curated skills set, a four-agent fleet under `quant-trader/agents/`, its own `quant-prompt.ts`, a `settings.json` copy). Launchers live in `scripts/pi-profile.sh` (sourced from `~/.bashrc`): `pi-p <profile>`, `pi-quant`, `pi-bolt-p <profile>` — the last under the Pi-Bolt executable. All of them work on both binaries because both read `PI_CODING_AGENT_DIR`, the only relocation mechanism that does (neither exposes a `--agent-dir` flag at 1.4.0).
+
+- **Profiles symlink INTO `agent/`; they never copy it.** Never copy `agent/skills/` (~300 MB, Nextcloud-synced) into a profile — curate by symlink (`quant-trader/skills/` is one category symlink plus one local category). A profile's `extensions/` is a per-item symlink list of `agent/extensions/` (minus `dynamic-prompt.ts`) plus the profile's own top-level `.ts`.
+- **`dynamic-prompt.ts` must never load in a non-orchestrator profile.** It replaces pi's system prompt in every top-level session with the orchestrator's; a persona that loads it stops being a persona. The profile's own prompt extension takes its place (`quant-trader/extensions/quant-prompt.ts`).
+- **Adding a profile re-runs the `.gitignore` battery over its secret/machine-state paths.** The rules are `*/`-anchored (any profile dir), but a new top-level tree earns its exclusions by being checked, not by inheriting them: `git check-ignore -v quant-trader/.env quant-trader/sessions/ …` — directory paths need the trailing slash, because `*/sessions/` matches a directory and a path that does not exist on disk is not one.
+- **A repo's own `.pi/` narrows a global profile — the project-override pattern.** When pi runs inside a checkout that carries its own `.pi/` (`SYSTEM.md`, `agents/`, `skills/`, `settings.json`), that project tree layers over the global profile and its agents/skills/settings take precedence. It needs trust first (`--approve`). Documented as the pattern; nothing in this repo ships a project `.pi/`.
+
 ## WHERE TO LOOK
 
 | Task | Path |

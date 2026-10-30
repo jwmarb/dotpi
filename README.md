@@ -158,8 +158,11 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | `agent/mcp.json`                  | MCP servers for the builtin MCP extension — keys as placeholders, from `agent/.env`     |
 | `agent/.env`                      | The only file with live credentials (gitignored; template is `agent/.env.example`)      |
 | `agent/docker/`                   | Tracked reference image for runtime verification                                       |
+| `orchestrator`                    | Symlink to `agent` — a stable alias for the default profile, which is never moved       |
+| `quant-trader/`                   | pi profile: curated skills + own 4-agent fleet + own prompt extension — run with `pi-quant` (see Profiles below) |
 | `.githooks/`                      | Tracked `pre-commit`, `post-checkout`, `post-merge` hooks                              |
 | `scripts/setup-deps.sh`           | Installs each extension's npm dependencies                                             |
+| `scripts/pi-profile.sh`           | Profile launchers `pi-p` / `pi-quant` / `pi-bolt-p` (sourced from `~/.bashrc`)          |
 | `agent/sessions/`, `agent/subagent-runs/`, `agent/npm/`, `agent/git/`, … | Machine state — all gitignored                                   |
 
 ## Extensions 🧩
@@ -196,6 +199,17 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 
 Every agent declares `fallback_models`, tried when a child fails to *launch* (unknown model, provider down, rate-limited) — not when it fails its task. Read-only agents carry no `write`/`edit`: the `tools` list is the enforcement.
 A child delegated a **kanban card** works by the list it keeps: it builds the card's steps into its `todo` list before other work, and `subagent_done` is refused (through the same bounded budget as a missing answer) while the list is empty or items are still open. The kanban board reads that list straight from the child's session file and renders per-card progress, so the list *is* the card's progress.
+
+## Profiles 🛰
+
+A *profile* is an agent directory under the repo root, and pi runs it as its whole configuration. The switch is `PI_CODING_AGENT_DIR` — an env var **both** the bun `pi` and the Pi-Bolt executable read, and the only mechanism that works on both (neither exposes an `--agent-dir` flag at 1.4.0). Bare `pi` and bare `pi-bolt` need no launcher: they are the default orchestrator, `~/.pi/agent` — canonical, never moved. Non-default personas launch from `scripts/pi-profile.sh` (sourced from `~/.bashrc`):
+
+| Profile           | Launcher                                                | Fleet                                                              |
+| ----------------- | ------------------------------------------------------- | ------------------------------------------------------------------ |
+| `agent` (default) | `pi` / `pi-bolt` | ten in `agent/agents/`: nine the model can delegate to, plus `healthcheck`, which pi spawns itself, not the model |
+| `quant-trader`    | `pi-quant` (= `pi-p quant-trader`) · `pi-bolt-p quant-trader` | the four in `quant-trader/agents/`: market-scout, backtester, risk-check, scribe |
+
+A profile **symlinks into** `agent/` — curated skills, per-item extension symlinks, shared prompts/themes — and owns only its differences: its own fleet, its own prompt extension (`quant-prompt.ts`; the orchestrator's `dynamic-prompt.ts` never loads in a non-orchestrator profile), and a `settings.json` copy.
 
 ## Skills 🃏
 
@@ -286,7 +300,7 @@ cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p
 
 ## Pi-Bolt ⚡
 
-[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably.
+[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably. A profile runs under both the same way — `PI_CODING_AGENT_DIR` is read by both binaries — and a profile needs the `piBolt` keys in **its own** `settings.json` for Pi-Bolt parity (`quant-trader/settings.json` carries its own copy); `bash scripts/migrate-pi-bolt.sh --check` remains the parity checker.
 
 ```sh
 bash scripts/migrate-pi-bolt.sh           # set it up (or: install.sh --pi-bolt)
@@ -311,10 +325,10 @@ Two things are genuinely Linux/macOS-only and degrade on Windows: the `--verify`
 
 ## Known Limitations ⚠️
 
-- **The pre-commit hook is dormant.** `.githooks/pre-commit` invokes a `scripts/check.sh` that was removed; the hook then silently exits 0. Nothing currently enforces "extension sources must load" at commit time — `/reload` after editing is the only guard.
 - **Test/host version skew.** `bun test` resolves the packages pi normally injects by walking up to `~/node_modules`, which lags the running pi (0.75.4 vs 0.85.1 today). A test that passes here can still disagree with the live host.
 - **Runtime verification needs Docker.** Without a working daemon the `--verify` gate returns `inconclusive` and the loop stops rather than assuming success — "I could not run it" never reads as "it works".
 - **Top-level extensions are in no typecheck scope.** `lib/` and every top-level `*.ts` are covered only by pi loading them; the two `tsc -p` scopes reach `mcp/` and `subagent-herdr/` alone.
+- **Top-level tests are not type-checked either.** A top-level `*.test.ts` lives in a `test/` subdirectory (the extension root itself is load-time — see `agent/extensions/AGENTS.md`), and both `tsconfig.json` files exclude `*.test.ts` and only `include` the `lib/` subpackages. bun runs them and `check.sh` §3 discovers them, but nothing type-checks them — a type slip in a top-level test surfaces at `bun test` runtime, not at `typecheck`. `quant-trader/extensions/test/` has the same property: it is a test home, not a load root, and its `*.test.ts` files sit outside both tsconfigs' `include` globs.
 
 ## Credits 🙏
 

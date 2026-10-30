@@ -33,7 +33,7 @@ all commands come from the repo root.
 
 ## CONVENTIONS
 
-- **Default export is the entry point.** `export default function (pi: ExtensionAPI) { … }` — register tools/events/shortcuts/models inside it. Minimal: `sleep.ts:205` (one `registerTool` on the next line). Richest single file: `thinking-indicator.ts:264`. Richest multi-file: `model-fallback/index.ts:207`; named factory: `kanban/index.ts:293`. Verified 2026-10-28 — these line numbers move every time a file is touched, so re-check before quoting them.
+- **Default export is the entry point.** `export default function (pi: ExtensionAPI) { … }` — register tools/events/shortcuts/models inside it. Minimal: `sleep.ts:205` (one `registerTool` on the next line). Richest single file: `thinking-indicator.ts:264`. Richest multi-file: `model-fallback/index.ts:225`; named factory: `kanban/index.ts:294`. Verified 2026-10-29 — these line numbers move every time a file is touched, so re-check before quoting them.
 - **Pi auto-loads every top-level `*.ts`; subdirectories need `index.ts`.** A bare
   `foo.ts` at this level ships into every session. `lib/` is invisible (no `index.ts`).
 - **Import siblings with `.js` extension** (`./lib/widget.js`) — that is what jiti
@@ -43,14 +43,15 @@ all commands come from the repo root.
   diagnostic, so `layout.ts` never throws and `dotenv.ts` defers `requireEnv`.
 - **Tests live in `lib/` or alongside their module; never at the top level.**
   A `*.test.ts` here imports `bun:test`, pi auto-loads it, and pi will not start.
-- **`registerTool`/`registerProvider`/`registerVirtualModel` are queued at load;
-- **Registration happens at load; the session-bound API does not exist yet.** `registerTool`/`registerProvider`/`registerVirtualModel` run when pi imports the file, so any setting a registration depends on must be read from disk at that moment (`model-fallback/index.ts:215` — "`registerVirtualModel` happens at load"). `pi.getActiveTools`/`pi.setActiveTools` are real, but are **not** members of every event's API (`dynamic-prompt.ts:188`), and a tool gained mid-run only appears on the **next** run (`dynamic-prompt.ts:118`) — so gate on `typeof pi.setActiveTools === 'function'` and expect a one-run lag, and remember there is **no `unregisterTool`** (revoking a skill's tools means `setActiveTools`, `dynamic-prompt.ts:137-149`).
-  binds context.** Configuration a registration depends on must be read from disk;
-  anything else belongs inside a handler.
+- **Registration happens at load; the session-bound API does not exist yet.** `registerTool`/`registerProvider`/`registerVirtualModel` run when pi imports the file, so any setting a registration depends on must be read from disk at that moment (`model-fallback/index.ts:233` — "`registerVirtualModel` happens at load"). `pi.getActiveTools`/`pi.setActiveTools` are real, but are **not** members of every event's API (`dynamic-prompt.ts:188`), and a tool gained mid-run only appears on the **next** run (`dynamic-prompt.ts:118`) — so gate on `typeof pi.setActiveTools === 'function'` and expect a one-run lag, and remember there is **no `unregisterTool`** (revoking a skill's tools means `setActiveTools`, `dynamic-prompt.ts:136-153`).
 - **Subdirectories split `lib.ts` (pure, tested) from `index.ts` (session wiring).**
   Become a directory when it improves interface or locality — not merely to test.
 - **Pure logic is exported and tested from `lib/`.** `sleep.ts` exports
   `validateTimeout`; `lib/sleep.test.ts` tests it. Same pattern throughout.
+
+## PROFILES
+
+A profile's `extensions/` directory (e.g. `quant-trader/extensions/`) is a **per-item symlink list of this directory** — one symlink per extension the persona loads, plus the profile's own top-level `.ts` (`quant-prompt.ts`). The repo-root `AGENTS.md` `## Profiles` section owns the rest of the profile rules (what a profile is, the symlink-not-copy rule, the `.gitignore` battery); this section covers only what a profile's `extensions/` dir means for this directory. The only exclusion is `dynamic-prompt.ts`: it replaces the system prompt in every top-level session with the orchestrator's, so a non-orchestrator profile never loads it — its own prompt extension takes that role. Sibling imports inside a symlinked extension resolve through the symlink's **realpath** (`model-fallback/index.ts` importing `./lib.js` reaches `agent/extensions/model-fallback/lib.ts`, never a profile copy), so a profile adds no second copy of anything: the agent's files are the files. A profile-local top-level `.ts` follows every convention in this file — default export, no work at module top level, `.js`-extension sibling imports, tests in a subdirectory — and `scripts/check.sh` covers it: section 1 imports it, the top-level `*.test.ts` guard applies to it, and its own `tsconfig.json` is a discovered typecheck scope. That tsconfig must name its own files only (`"include": ["quant-prompt.ts"]`), never a glob (`"include": ["*.ts"]`): a glob would match the symlinked siblings and typecheck this directory's extensions a second time under the profile's paths.
 
 ## COMMANDS
 
