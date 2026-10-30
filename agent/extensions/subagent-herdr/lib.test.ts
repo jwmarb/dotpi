@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
-import { agentsDir, skillsDir } from "../lib/layout.js";
+import { ENV_AGENT_DIR, agentsDir, skillsDir } from "../lib/layout.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { CARD_ID_PATTERN as BOARD_CARD_ID_PATTERN } from "../kanban/lib.js";
 import {
@@ -911,6 +911,36 @@ describe("buildChildEnv", () => {
     );
     expect(pinned.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b|high");
   });
+  test("forwards the parent's profile dir so the child resolves the same profile", () => {
+    // The child must run the same persona, fleet, and skill catalogue as the
+    // parent, so the profile dir crosses when — and only when — the parent has
+    // one set.
+    const prev = process.env[ENV_AGENT_DIR];
+    process.env[ENV_AGENT_DIR] = "/tmp/fakeprofile";
+    try {
+      const env = buildChildEnv({ runId: "sub-0015", agent: "worker" }, "w5:p1", "/runs/sub-0015");
+      expect(env[ENV_AGENT_DIR]).toBe("/tmp/fakeprofile");
+    } finally {
+      if (prev === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = prev;
+    }
+  });
+
+  test("leaves the profile var absent when the parent has none set", () => {
+    // An unset var must stay absent, not forwarded empty: an empty value would
+    // make the child resolve an empty agent dir, and the default profile's
+    // resolution must be untouched.
+    const prev = process.env[ENV_AGENT_DIR];
+    delete process.env[ENV_AGENT_DIR];
+    try {
+      const env = buildChildEnv({ runId: "sub-0016", agent: "worker" }, "w5:p1", "/runs/sub-0016");
+      expect(ENV_AGENT_DIR in env).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = prev;
+    }
+  });
+
 });
 
 describe("childFallbackChain", () => {

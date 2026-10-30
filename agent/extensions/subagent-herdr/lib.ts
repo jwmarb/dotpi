@@ -13,6 +13,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { type AgentInfo, frontmatterOf } from "../lib/agents.js";
+import { ENV_AGENT_DIR } from "../lib/layout.js";
 import { findSkills } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
@@ -103,6 +104,13 @@ export interface ChildLaunchOptions {
  * process's `HERDR_PANE_ID`), and the child's report tool prompts it. The
  * other vars let the child's extensions identify the run without guessing.
  *
+ * `PI_CODING_AGENT_DIR` crosses only when the parent has it set: the child must
+ * resolve the same profile as its parent, or it silently runs a different
+ * persona, agent fleet, and skill catalogue — a child spawned from a
+ * non-default profile would load the default profile's extensions, agents, and
+ * skills. An unset var stays unset, so the default profile's resolution is
+ * untouched.
+ *
  * `runDir` is passed alongside the record rather than read off it: the path is
  * derived from the run id (see `rundir.ts`), so the record does not carry it,
  * but the child is a separate process and cannot derive it without knowing
@@ -140,6 +148,12 @@ export function buildChildEnv(
     PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
+  // The child must resolve the same profile as its parent (same persona, fleet,
+  // and skill catalogue). An unset var stays unset — forwarding an empty value
+  // would make the child resolve an empty agent dir, and the default profile's
+  // resolution must be untouched when the parent has no override.
+  const dir = process.env[ENV_AGENT_DIR];
+  if (dir) env[ENV_AGENT_DIR] = dir;
   // The child always launches on `fallback/auto`, so the chain must cross
   // whenever it is non-empty — a single unpinned entry included: without the
   // var the child's router registers nothing and `fallback/auto` is
