@@ -57,7 +57,10 @@ import {
   formatReportLine,
   EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
+  hasRunId,
   isRunRecord,
+  isRunStatus,
+  RUN_STATUSES,
   isSessionFileFor,
   metaPath,
   parseNotice,
@@ -1594,14 +1597,33 @@ describe("rundir record shapes", () => {
     expect(parsed).toEqual({ type: "done", at: 4242 });
   });
 
-  test("a meta record needs only a runId to be usable", () => {
-    // loadRegistry reads every meta.json on disk, including ones truncated by a
-    // parent that crashed mid-spawn.
-    expect(isRunRecord({ runId: "sub-1" })).toBe(true);
-    expect(isRunRecord({ agent: "worker" })).toBe(false);
-    expect(isRunRecord(null)).toBe(false);
-    expect(isRunRecord("sub-1")).toBe(false);
-    expect(isRunRecord({ runId: 42 })).toBe(false);
+  test("hasRunId needs only a runId; isRunRecord also needs a known status", () => {
+    // loadRegistry and adoption read every meta.json on disk, including ones
+    // truncated by a parent that crashed mid-spawn: `hasRunId` is their guard.
+    expect(hasRunId({ runId: "sub-1" })).toBe(true);
+    expect(hasRunId({ agent: "worker" })).toBe(false);
+    expect(hasRunId(null)).toBe(false);
+    expect(hasRunId("sub-1")).toBe(false);
+    expect(hasRunId({ runId: 42 })).toBe(false);
+    // The strict reader guard (the kanban board) also refuses an unrecognised status.
+    expect(isRunRecord({ runId: "sub-1" })).toBe(false);
+    expect(isRunRecord({ runId: "sub-1", status: "running" })).toBe(true);
+    expect(isRunRecord({ runId: "sub-1", status: "bogus" })).toBe(false);
+    expect(isRunRecord({ runId: "sub-1", status: 42 })).toBe(false);
+    expect(isRunRecord({ runId: 42, status: "running" })).toBe(false);
+    for (const status of RUN_STATUSES) {
+      expect(isRunStatus(status)).toBe(true);
+      expect(isRunRecord({ runId: "sub-1", status })).toBe(true);
+    }
+    expect(isRunStatus("unknown")).toBe(false);
+  });
+
+  test("readRunRecordFromDisk adopts a record with no status", () => {
+    // Adoption uses the relaxed guard: a truncated meta.json is still a run.
+    const runs = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    mkdirSync(join(runs, "sub-00aa"));
+    writeFileSync(join(runs, "sub-00aa", "meta.json"), JSON.stringify({ runId: "sub-00aa" }));
+    expect(readRunRecordFromDisk(runs, "sub-00aa")).toEqual({ runId: "sub-00aa" } as never);
   });
 
   test("a record carries no runDir, because the path is derived", () => {
@@ -1614,7 +1636,7 @@ describe("rundir record shapes", () => {
 
   test("a present non-string healthCheckOf is accepted and treated as absent", () => {
     // Historical records carry no healthCheckOf and must stay valid.
-    expect(isRunRecord({ runId: "sub-1" })).toBe(true);
+    expect(hasRunId({ runId: "sub-1" })).toBe(true);
     // A health-check record points back at the run it is diagnosing.
     const rec = {
       runId: "sub-aaaa",

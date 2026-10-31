@@ -3,8 +3,8 @@
  * `subagent-runs/<runId>/meta.json` this extension has, plus a bounded tail
  * read of the run's session JSONL for the child's live todo counts.
  *
- * The *shape* belongs to `subagent-herdr/rundir.ts` (`metaPath`, `isRunRecord`,
- * `RunStatus`, plus `hasExitSidecar` for the completion sidecar);
+ * The *shape* belongs to `subagent-herdr/rundir.ts` (`metaPath`, the strict
+ * `isRunRecord` over `RUN_STATUSES`, plus `hasExitSidecar` for the completion sidecar);
  * this module only reads, through those, so the record grammar is still spelled
  * once. Both the extension (settle guard, `show`) and the board process import
  * it, which is why it is separate from the pure `lib.ts`.
@@ -27,8 +27,6 @@ import {
 } from "../subagent-herdr/rundir.js";
 import { counts, parseTodoState } from "../lib/todo.js";
 import { RUN_ID_PATTERN, type RunInfo, type RunInfos, type RunTodoCounts } from "./lib.js";
-
-const KNOWN_STATUS = new Set(["running", "done", "failed", "cancelled"]);
 
 /**
  * The ladder of tail windows `readRunTodos` walks on a miss: the common case
@@ -447,24 +445,26 @@ export function readRunInfo(agentDir: string, runId: string): RunInfo {
 		dropTodoCache();
 		return { status: "unknown" };
 	}
+	// Strict: a record whose status is not one of RUN_STATUSES is `unknown` whole
+	// (no agent, no todos) — the board does not render what it cannot classify.
 	if (!isRunRecord(record) || record.runId !== runId) {
 		dropTodoCache();
 		return { status: "unknown" };
 	}
 	const agent = typeof record.agent === "string" ? record.agent : undefined;
-	const status = KNOWN_STATUS.has(record.status) ? record.status : "unknown";
+	const status = record.status;
 	if (status === "running" && hasExitSidecar(dir, runId)) {
 		dropTodoCache();
 		return { status: "done", ...(agent ? { agent } : {}) };
 	}
 	// The board renders progress for live work only: a terminal run's session
 	// file is not going to grow, so it is not read.
-	if (status !== "running" && status !== "unknown") {
+	if (status !== "running") {
 		dropTodoCache();
-		return { status, ...(agent ? { agent } : {}) } as RunInfo;
+		return { status, ...(agent ? { agent } : {}) };
 	}
 	const todos = readRunTodos(dir, runId);
-	return { status, ...(agent ? { agent } : {}), ...(todos ? { todos } : {}) } as RunInfo;
+	return { status, ...(agent ? { agent } : {}), ...(todos ? { todos } : {}) };
 }
 
 /** Status for each id. Small and synchronous: a board links a handful of runs. */

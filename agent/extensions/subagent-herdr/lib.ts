@@ -43,7 +43,7 @@ import {
   type RunRecord,
   exitPath,
   formatAncestry,
-  isRunRecord,
+  hasRunId,
   isSessionFileFor,
   metaPath,
   RUN_ID_PATTERN,
@@ -253,7 +253,9 @@ export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord
   } catch {
     return undefined;
   }
-  return isRunRecord(parsed) && parsed.runId === runId ? parsed : undefined;
+  // `hasRunId`, not the strict `isRunRecord`: adoption must not drop a record
+  // whose status is missing or unrecognised (a truncated or older meta.json).
+  return hasRunId(parsed) && parsed.runId === runId ? parsed : undefined;
 }
 
 /**

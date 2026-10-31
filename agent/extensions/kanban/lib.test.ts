@@ -685,6 +685,11 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "../../etc").status).toBe("unknown");
 	});
 
+	test("a record whose status is not one of RUN_STATUSES is unknown whole", () => {
+		write("sub-0024", { runId: "sub-0024", agent: "worker", status: "weird" });
+		expect(readRunInfo(agent, "sub-0024")).toEqual({ status: "unknown" });
+	});
+
 	test("a running record whose child wrote its exit sidecar reads as done", () => {
 		expect(readRunInfo(agent, "sub-0005")).toEqual({ status: "done", agent: "explorer" });
 	});

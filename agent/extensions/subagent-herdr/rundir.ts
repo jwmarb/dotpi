@@ -144,8 +144,19 @@ export function hasExitSidecar(runDirPath: string, runId: string): boolean {
 	}
 }
 
-/** How a run ended, as recorded in `meta.json`. */
-export type RunStatus = "running" | "done" | "failed" | "cancelled";
+/**
+ * Every way a run can stand, as recorded in `meta.json` — the ONE list
+ * `RunStatus`, {@link isRunStatus} and the kanban board's reader derive from.
+ */
+export const RUN_STATUSES = ["running", "done", "failed", "cancelled"] as const;
+
+/** How a run ended (or that it has not), as recorded in `meta.json`. */
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+/** Is `v` one of {@link RUN_STATUSES}? */
+export function isRunStatus(v: unknown): v is RunStatus {
+	return (RUN_STATUSES as readonly unknown[]).includes(v);
+}
 
 /**
  * One launch attempt that failed before the run started.
@@ -199,8 +210,8 @@ export interface RunRecord {
 	 * The target run id for a programmatically spawned health-check run. Absent
 	 * for ordinary runs (the common case); when present it must be a string, and
 	 * a health-check record points back at the run it is diagnosing. A present
-	 * non-string value is ignored (treated as absent) by {@link isRunRecord};
-	 * the reading sites guard with `typeof === "string"` checks.
+	 * non-string value is ignored (treated as absent) by {@link hasRunId} and
+	 * {@link isRunRecord}; the reading sites guard with `typeof === "string"` checks.
 	 */
 	healthCheckOf?: string;
 	/**
@@ -211,7 +222,7 @@ export interface RunRecord {
 	 * sweep the run (flush sweep, liveness tick, stranded-release scan).
 	 * Absent on legacy records (pre-ownership), which are loadable but
 	 * unsweepable — they stay globally queryable, they are just never swept.
-	 * `runId` remains the only record-fatal validation: a present non-string
+	 * `runId` remains the only record-fatal validation ({@link hasRunId}): a present non-string
 	 * `ownerPane` is accepted and treated as absent at the guarded read sites
 	 * (string equality only), so a corrupted value cannot make a run invisible.
 	 */
@@ -227,21 +238,32 @@ export interface RunRecord {
 }
 
 /**
- * Is this parsed JSON a usable {@link RunRecord}?
+ * Does this parsed JSON carry a usable `runId`? The load and adoption guard.
  *
  * The registry is rebuilt by reading every `meta.json` on disk, where a record
  * can be truncated (the parent crashed mid-spawn) or predate a field. Only
- * `runId` is load-bearing for keying the registry. A present non-string
+ * `runId` is load-bearing for keying the registry, so a record with a missing
+ * or unrecognised `status` still loads. A present non-string
  * `healthCheckOf` is ignored (treated as absent) rather than record-fatal:
  * the reading sites in index.ts guard with `typeof rec.healthCheckOf ===
  * "string"` checks, so a corrupted value cannot key a bogus registry entry.
  */
-export function isRunRecord(value: unknown): value is RunRecord {
+export function hasRunId(value: unknown): value is RunRecord {
 	return (
 		typeof value === "object" &&
 		value !== null &&
 		typeof (value as { runId?: unknown }).runId === "string"
 	);
+}
+
+/**
+ * Is this parsed JSON a {@link RunRecord} whose `status` is one of
+ * {@link RUN_STATUSES}? The strict reader guard: a reader that renders the
+ * status (the kanban board) must not trust an unrecognised one. Loading and
+ * adoption use {@link hasRunId}, which does not look at `status`.
+ */
+export function isRunRecord(value: unknown): value is RunRecord {
+	return hasRunId(value) && isRunStatus((value as { status?: unknown }).status);
 }
 
 /** One child → orchestrator message, one JSON object per line of the log. */

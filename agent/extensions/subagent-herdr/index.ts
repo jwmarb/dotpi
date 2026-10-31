@@ -166,7 +166,7 @@ import {
   CARD_ID_PATTERN,
   EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
-  isRunRecord,
+  hasRunId,
   metaPath,
   type Notice,
   parseNotice,
@@ -369,7 +369,7 @@ function loadRegistry(): void {
       // joins. `d` from `readdirSync` is always a single component, which is
       // what the equality keeps a planted `runId` of `../x` off; the pattern
       // keeps a dir whose name is not a run id off.
-      if (isRunRecord(parsed) && RUN_ID_PATTERN.test(parsed.runId) && parsed.runId === d) {
+      if (hasRunId(parsed) && RUN_ID_PATTERN.test(parsed.runId) && parsed.runId === d) {
         runs.set(parsed.runId, parsed);
       }
     } catch {
