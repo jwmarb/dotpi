@@ -579,13 +579,18 @@ export const needsAttention = (card: KanbanCard, runs: RunInfos): boolean =>
  */
 export type SettleDisposition = "exempt" | "owes" | "owes-unless-board-waiting";
 
-export const SETTLE_DISPOSITION: Readonly<Record<KanbanColumn, SettleDisposition>> = {
+/**
+ * Per-column literal types (`as const`), checked against the full
+ * `Record<KanbanColumn, SettleDisposition>` shape: {@link moveClause} narrows
+ * on them, so offering a move to an `owes` column is a compile error.
+ */
+export const SETTLE_DISPOSITION = {
 	backlog: "owes-unless-board-waiting",
 	in_progress: "owes",
 	blocked: "exempt",
 	review: "owes-unless-board-waiting",
 	done: "exempt",
-};
+} as const satisfies Readonly<Record<KanbanColumn, SettleDisposition>>;
 
 /** The columns the guard always treats as accounted for, in board order. */
 export const SETTLE_EXEMPT_COLUMNS: readonly KanbanColumn[] = KANBAN_COLUMNS.filter((c) => SETTLE_DISPOSITION[c] === "exempt");
@@ -665,8 +670,11 @@ function moveClause(col: NudgeMoveTarget): string {
 			`a ${col} card is counted otherwise, so it does not settle this (a card linked to its own running run is the exempt case)`
 		);
 	}
-	// An `owes` column settles nothing — offering it would be a lie.
-	throw new Error(`nudge offers a move to ${col}, which the settle guard always counts`);
+	// An `owes` column settles nothing — offering it would be a lie. `d` is
+	// `never` here for every NUDGE_MOVE_TARGETS column today; adding an `owes`
+	// column there fails this line at compile time, before the throw can fire.
+	const impossible: never = d;
+	throw new Error(`nudge offers a move to ${col} (${String(impossible)}), which the settle guard always counts`);
 }
 
 export interface KanbanNudge {

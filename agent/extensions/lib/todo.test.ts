@@ -6,6 +6,7 @@ import {
 	counts,
 	demotedBy,
 	latestTodoCounts,
+	latestTodoCountsOfEntries,
 	emptyState,
 	openItems,
 	parseTodoState,
@@ -347,5 +348,20 @@ describe("latestTodoCounts", () => {
 
 	test("no lines, no snapshot", () => {
 		expect(latestTodoCounts([])).toBeUndefined();
+	});
+
+	test("the pre-parsed sibling applies the same rules to parsed entries", () => {
+		const lines = [
+			todo(items("done", "pending")),
+			todo({ items: "not-an-array", nextId: 2 }),
+			JSON.stringify({ type: "custom", message: { role: "toolResult", toolName: "todo", details: { state: items("done") } } }),
+			JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "bash", details: { state: items("done") } } }),
+		];
+		const parsed: unknown[] = lines.map((l) => JSON.parse(l));
+		expect(latestTodoCountsOfEntries(parsed)).toEqual(latestTodoCounts(lines));
+		expect(latestTodoCountsOfEntries(parsed)).toEqual({ total: 2, done: 1, inProgress: 0, blocked: 0, pending: 1 });
+		// Non-object entries are skipped, never thrown on.
+		expect(latestTodoCountsOfEntries([null, 7, "x", ...parsed])).toEqual(latestTodoCounts(lines));
+		expect(latestTodoCountsOfEntries([])).toBeUndefined();
 	});
 });

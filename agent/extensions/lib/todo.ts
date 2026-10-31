@@ -224,16 +224,38 @@ export function latestTodoCounts(lines: readonly string[]): TodoCounts | undefin
 		} catch {
 			continue;
 		}
-		if (typeof entry !== "object" || entry === null) continue;
-		const e = entry as {
-			type?: unknown;
-			message?: { role?: unknown; toolName?: unknown; details?: unknown };
-		};
-		if (e.type !== "message" || e.message?.role !== "toolResult" || e.message?.toolName !== "todo") continue;
-		const state = parseTodoState((e.message?.details as { state?: unknown } | undefined)?.state);
-		if (state) return counts(state);
+		const c = todoCountsOfEntry(entry);
+		if (c) return c;
 	}
 	return undefined;
+}
+
+/**
+ * {@link latestTodoCounts} over entries a caller has already parsed, so a
+ * reader that needs the parsed transcript anyway (subagent-herdr's result
+ * extraction) does not parse it twice. Same rules, applied to each entry by
+ * the same check; a non-object entry is skipped.
+ *
+ * @param entries - The parsed transcript entries, oldest first.
+ */
+export function latestTodoCountsOfEntries(entries: readonly unknown[]): TodoCounts | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const c = todoCountsOfEntry(entries[i]);
+		if (c) return c;
+	}
+	return undefined;
+}
+
+/** One entry's counts when it is a well-formed `todo` tool result, else `undefined`. */
+function todoCountsOfEntry(entry: unknown): TodoCounts | undefined {
+	if (typeof entry !== "object" || entry === null) return undefined;
+	const e = entry as {
+		type?: unknown;
+		message?: { role?: unknown; toolName?: unknown; details?: unknown };
+	};
+	if (e.type !== "message" || e.message?.role !== "toolResult" || e.message?.toolName !== "todo") return undefined;
+	const state = parseTodoState((e.message?.details as { state?: unknown } | undefined)?.state);
+	return state ? counts(state) : undefined;
 }
 
 /** The item the widget highlights: whatever is in flight. */

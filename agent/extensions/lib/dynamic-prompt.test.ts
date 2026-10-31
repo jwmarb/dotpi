@@ -553,7 +553,7 @@ describe("the kanban board section is gated on the tool existing", () => {
     expect(s).not.toContain("in dependency order");
   });
 
-  test("does not count `review` as an accounted card", () => {
+  test("forbids moving a card to silence the guard (the column list is pinned to the settle table below)", () => {
     // `actionableCards` in kanban/lib.ts keeps a `review` card actionable while nothing
     // else is waiting, so `review` may not join the accounted list: a prompt that offered
     // it as a disposition would teach the shuffle its own last sentence forbids. Which
