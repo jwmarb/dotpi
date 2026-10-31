@@ -32,27 +32,27 @@
 
   "model": {
     "provider": "litellm",
-    "id": "anthropic/claude-sonnet-5.5",
+    "id": "qwen/qwen3.8-flash-next",
     "thinking": "low",
-    "contextWindow": 1048576
+    "contextWindow": 262144
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "anthropic/claude-sonnet-5.5",
+    "id": "qwen/qwen3.8-flash-next",
     "thinking": "low",
-    "contextWindow": 1048576
+    "contextWindow": 262144
   },
   "reflectorModel": {
     "provider": "litellm",
-    "id": "anthropic/claude-sonnet-5.5",
+    "id": "qwen/qwen3.8-flash-next",
     "thinking": "low",
-    "contextWindow": 1048576
+    "contextWindow": 262144
   },
   "dropperModel": {
     "provider": "litellm",
-    "id": "anthropic/claude-sonnet-5.5",
+    "id": "qwen/qwen3.8-flash-next",
     "thinking": "low",
-    "contextWindow": 1048576
+    "contextWindow": 262144
   },
 
   "debug": false,
