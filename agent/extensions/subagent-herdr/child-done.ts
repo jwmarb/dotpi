@@ -159,10 +159,11 @@ export interface ChildDoneEffects {
   /**
    * Send a notice to the parent's pane. Must preserve detached + ignored-stdio
    * + unref behavior so the delivery survives the child's own process-group kill.
-   * `fallbacks` — the ancestor hops, nearest first — is passed only when it is
-   * non-empty, so the one-level case keeps its exact two-argument call.
+   * The whole {@link NoticeRoute} goes, in the shape it was built in: the
+   * parent's hop is `route.pane` + `route.notice`, and `route.fallbacks` — the
+   * ancestor hops, nearest first — being empty is the one-level delivery.
    */
-  sendNotice(parentPane: string, notice: string, fallbacks?: readonly NoticeHop[]): void;
+  sendNotice(route: NoticeRoute): void;
 
   /** Fire-and-forget pane close. Never throws. */
   closePane(paneId: string): void;
@@ -726,8 +727,7 @@ export function createChildDoneHandshake(
 
     const route = noticeRoute(env, "done", "");
     if (route) {
-      if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
-      else effects.sendNotice(route.pane, route.notice, route.fallbacks);
+      effects.sendNotice(route);
     }
     closePane();
     shutdown();
@@ -748,8 +748,7 @@ export function createChildDoneHandshake(
 
     const route = noticeRoute(env, "report", message);
     if (!route) return { kind: "recorded-no-parent" };
-    if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
-    else effects.sendNotice(route.pane, route.notice, route.fallbacks);
+    effects.sendNotice(route);
     return { kind: "delivered" };
   }
 
@@ -856,8 +855,7 @@ export function createChildDoneHandshake(
     if (signalled) {
       const route = noticeRoute(env, "done", "");
       if (route) {
-        if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
-        else effects.sendNotice(route.pane, route.notice, route.fallbacks);
+        effects.sendNotice(route);
       }
       closePane();
       shutdown();
@@ -976,10 +974,11 @@ export interface ChildWatchdogEffects {
   /**
    * Deliver a notice to the parent pane. Must preserve detached + ignored-stdio
    * + unref behavior so the delivery survives the child's own process-group kill.
-   * `fallbacks` — the ancestor hops, nearest first — is passed only when it is
-   * non-empty, so the one-level case keeps its exact two-argument call.
+   * The whole {@link NoticeRoute} goes, in the shape it was built in: the
+   * parent's hop is `route.pane` + `route.notice`, and `route.fallbacks` — the
+   * ancestor hops, nearest first — being empty is the one-level delivery.
    */
-  sendNotice(parentPane: string, notice: string, fallbacks?: readonly NoticeHop[]): void;
+  sendNotice(route: NoticeRoute): void;
 }
 
 /**
@@ -1156,8 +1155,7 @@ export function createChildWatchdog(
     // that cannot be delivered is a no-op, not a reason to throw from the
     // watchdog tick.
     if (!route) return;
-    if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
-    else effects.sendNotice(route.pane, route.notice, route.fallbacks);
+    effects.sendNotice(route);
   }
 
   return {
@@ -1191,7 +1189,7 @@ function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffec
       appendFileSync(path, line);
     },
 
-    sendNotice(parentPane, notice, fallbacks) {
+    sendNotice(route) {
       // `spawn` rather than `execFile`, detached and unref'd, because the `done`
       // notice races its own sender's death: `closePane()` kills this child's
       // *process group*, and a delivery still in flight would go with it — the
@@ -1204,19 +1202,18 @@ function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffec
       // A fallback-aware delivery rides the same detached process: one `sh`
       // that walks the hops in order, so the detach property holds for every
       // hop, and the walk's prompt is its own liveness probe.
-      if (fallbacks && fallbacks.length > 0) {
-        const child = spawn(
-          "sh",
-          noticeWalkArgv({ pane: parentPane, notice, fallbacks: [...fallbacks] }),
-          { detached: true, stdio: "ignore" },
-        );
+      if (route.fallbacks.length > 0) {
+        const child = spawn("sh", noticeWalkArgv(route), {
+          detached: true,
+          stdio: "ignore",
+        });
         child.on("error", () => {});
         child.unref();
         return;
       }
       const child = spawn(
         "herdr",
-        ["agent", "prompt", parentPane, notice],
+        ["agent", "prompt", route.pane, route.notice],
         { detached: true, stdio: "ignore" },
       );
       child.on("error", () => {});

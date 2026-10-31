@@ -102,12 +102,9 @@ function makeRecordingEffects(overrides: Partial<ChildDoneEffects> = {}) {
       calls.push({ name: "appendReport", args: [path, line] });
       overrides.appendReport?.(path, line);
     },
-    sendNotice(parentPane, notice, fallbacks) {
-      calls.push({
-        name: "sendNotice",
-        args: fallbacks === undefined ? [parentPane, notice] : [parentPane, notice, fallbacks],
-      });
-      overrides.sendNotice?.(parentPane, notice, fallbacks);
+    sendNotice(route) {
+      calls.push({ name: "sendNotice", args: [route] });
+      overrides.sendNotice?.(route);
     },
     closePane(paneId) {
       calls.push({ name: "closePane", args: [paneId] });
@@ -541,7 +538,7 @@ describe("agent_end answer nudge", () => {
     });
 
     const notice = calls.find((c) => c.name === "sendNotice");
-    expect(notice?.args[1]).toBe(formatNotice("run-789", "worker", "done", ""));
+    expect((notice?.args[0] as NoticeRoute).notice).toBe(formatNotice("run-789", "worker", "done", ""));
   });
 });
 
@@ -827,14 +824,15 @@ describe("agent_end truncation continuation", () => {
 
 });
 
-  test("a one-level child's notice call is exactly (parentPane, notice)", () => {
+  test("a one-level child's route has no fallbacks", () => {
     const { effects, calls } = makeRecordingEffects();
     const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
     handshake.report("m", "/tmp/run");
     const send = calls.find((c) => c.name === "sendNotice")!;
-    expect(send.args).toHaveLength(2);
-    expect(send.args[0]).toBe("parent-pane-456");
-    expect(send.args[1]).toBe(formatNotice("run-789", "worker", "report", "m"));
+    const r = send.args[0] as NoticeRoute;
+    expect(r.fallbacks).toEqual([]);
+    expect(r.pane).toBe("parent-pane-456");
+    expect(r.notice).toBe(formatNotice("run-789", "worker", "report", "m"));
   });
 
   test("a report with an ancestry keeps append → send and carries the ancestor route", () => {
@@ -845,7 +843,7 @@ describe("agent_end truncation continuation", () => {
     expect(calls.map((c) => c.name)).toEqual(["appendReport", "sendNotice"]);
     const send = calls[1];
     const route = noticeRoute(ANCESTOR_ENV, "report", "m")!;
-    expect(send.args).toEqual([route.pane, route.notice, route.fallbacks]);
+    expect(send.args).toEqual([route]);
     expect(route.fallbacks[0].pane).toBe("w1:p1");
   });
 
@@ -859,8 +857,9 @@ describe("agent_end truncation continuation", () => {
     expect(outcome.kind).toBe("completed");
     expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
     const send = calls[1];
-    expect(send.args[1]).toBe(formatNotice("sub-9331", "reviewer", "done", ""));
-    expect((send.args[2] as Array<{ pane: string }>)[0].pane).toBe("w1:p1");
+    const route = send.args[0] as NoticeRoute;
+    expect(route.notice).toBe(formatNotice("sub-9331", "reviewer", "done", ""));
+    expect(route.fallbacks[0].pane).toBe("w1:p1");
     expect(shutdownCalled).toBe(true);
   });
 
@@ -873,7 +872,7 @@ describe("agent_end truncation continuation", () => {
     }, PLAIN_PROMPT);
     expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
     const send = calls[1];
-    expect((send.args[2] as Array<{ pane: string }>)[0].pane).toBe("w1:p1");
+    expect((send.args[0] as NoticeRoute).fallbacks[0].pane).toBe("w1:p1");
     expect(shutdownCalled).toBe(true);
   });
 
@@ -1109,9 +1108,9 @@ describe("createChildWatchdog", () => {
     const fallbacks: NoticeHop[][] = [];
     const effects: ChildWatchdogEffects = {
       now: () => time,
-      sendNotice(_parentPane: string, notice: string, fb?: readonly NoticeHop[]) {
-        notices.push(notice);
-        if (fb) fallbacks.push([...fb]);
+      sendNotice(route: NoticeRoute) {
+        notices.push(route.notice);
+        if (route.fallbacks.length > 0) fallbacks.push([...route.fallbacks]);
       },
     };
     return {
