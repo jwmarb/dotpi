@@ -4,7 +4,7 @@ description: Runtime verification in a container. Runs the project's own tests/b
 tools: read, ffgrep, fffind, grep, find, ls, bash, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, worker
 skills: scrape-web-as-markdown, systematic-debugging, verification-before-completion
-model: qwen/qwen3.8-27b|low
+model: qwen/qwen3.8-flash-next
 fallback_models: openai/gpt-5.6-sol, anthropic/claude-opus-5.5|off
 ---
 

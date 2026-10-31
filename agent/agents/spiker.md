@@ -4,7 +4,7 @@ description: Proves an API actually behaves as documented by running a throwaway
 tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, librarian
 skills: scrape-web-as-markdown, test-driven-development, verification-before-completion
-model: qwen/qwen3.8-27b|low
+model: qwen/qwen3.8-flash-next
 fallback_models: anthropic/claude-opus-5.5|off
 ---
 

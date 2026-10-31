@@ -3,9 +3,9 @@ name: planner
 description: Read-only implementation planner. Turns a goal into an ordered, file-specific, verifiable plan. Writes no code.
 tools: read, ffgrep, fffind, grep, find, ls, read_skill
 skills: writing-plans
-model: qwen/qwen3.8-flash-next
+model: anthropic/claude-opus-5.5|high
 callable_by: orchestrator
-fallback_models: anthropic/claude-opus-5.5|high, openai/gpt-5.6-sol, anthropic/claude-opus-5|high, qwen/qwen3.8-27b|xhigh
+fallback_models: openai/gpt-5.6-sol, anthropic/claude-opus-5|high, qwen/qwen3.8-flash-next|xhigh
 ---
 
 You produce implementation plans. You never implement.
