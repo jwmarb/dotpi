@@ -56,14 +56,21 @@ export default function (pi: ExtensionAPI) {
 			try {
 				ctx.ui.setStatus("auto-update", "Checking for updates...");
 
-				const updateInfo = await checkForUpdate(pi);
-				if (!updateInfo) {
+				const status = await getUpdateStatus(pi, true);
+				if (status.status === "error") {
+					// Distinct from "up to date": an unreachable registry is not a
+					// clean bill of health.
+					ctx.ui.notify("Could not check for pi updates (npm view or version lookup failed).", "error");
+					ctx.ui.setStatus("auto-update", undefined);
+					return;
+				}
+				if (status.status === "current") {
 					ctx.ui.notify("pi is already up to date!", "info");
 					ctx.ui.setStatus("auto-update", undefined);
 					return;
 				}
 
-				const { currentVersion, latestVersion } = updateInfo;
+				const { currentVersion, latestVersion } = status;
 
 				const confirmed = await ctx.ui.confirm(
 					"Update pi",
@@ -123,27 +130,14 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params) {
 			if (params.action === "check") {
-				const updateInfo = await checkForUpdate(pi);
-				if (!updateInfo) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: "pi is up to date.",
-							},
-						],
-						details: {},
-					};
-				}
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Update available: ${updateInfo.currentVersion} → ${updateInfo.latestVersion}. Use /update command to install.`,
-						},
-					],
-					details: {},
-				};
+				const status = await getUpdateStatus(pi, true);
+				const text =
+					status.status === "error"
+						? "Could not check for pi updates."
+						: status.status === "current"
+							? "pi is up to date."
+							: `Update available: ${status.currentVersion} → ${status.latestVersion}. Use /update command to install.`;
+				return { content: [{ type: "text" as const, text }], details: {} };
 			}
 
 			// For install, queue the /update command
@@ -217,9 +211,11 @@ type Memo = { at: number; promise: Promise<UpdateStatus> };
 const memoStore = globalThis as unknown as Record<symbol, Memo | undefined>;
 
 /**
- * Memoised, three-way update check. Unlike `checkForUpdate`, it tells
- * "could not check" apart from "up to date". Results are reused for
- * CHECK_INTERVAL_MS (errors are not cached); pass `force` to re-check.
+ * Memoised, three-way update check: it tells "could not check" apart from
+ * "up to date" — both the session-start status and the forced `/update` and
+ * `pi_update` paths share it. Results are reused for CHECK_INTERVAL_MS
+ * (errors are not cached); pass `force` to re-check, as both user-facing
+ * paths do — a manual update request deserves a fresh answer.
  */
 export function getUpdateStatus(pi: ExtensionAPI, force = false): Promise<UpdateStatus> {
 	const memo = memoStore[MEMO_KEY];
@@ -237,49 +233,78 @@ async function computeUpdateStatus(pi: ExtensionAPI): Promise<UpdateStatus> {
 		const currentVersion = await getCurrentVersion(pi);
 		if (!currentVersion) return { status: "error" };
 		const r = await pi.exec("npm", ["view", updatePackage(), "version"], { timeout: 15000 });
-		const latestVersion = r.stdout.trim();
-		if (r.code !== 0 || !latestVersion) return { status: "error" };
-		return compareSemver(latestVersion, currentVersion) > 0
-			? { status: "available", currentVersion, latestVersion }
-			: { status: "current", currentVersion };
+		return planUpdateCheck({ current: currentVersion, latestStdout: r.stdout, code: r.code });
 	} catch {
 		return { status: "error" };
 	}
 }
 
-async function checkForUpdate(
-	pi: ExtensionAPI,
-): Promise<{ currentVersion: string; latestVersion: string } | null> {
-	// Get current installed version
-	const currentVersion = await getCurrentVersion(pi);
-	if (!currentVersion) return null;
-
-	// Get latest version from npm registry
-	const latestResult = await pi.exec(
-		"npm",
-		["view", updatePackage(), "version"],
-		{ timeout: 15000 },
-	);
-
-	if (latestResult.code !== 0) return null;
-	const latestVersion = latestResult.stdout.trim();
-
-	if (!latestVersion) return null;
-	if (currentVersion === latestVersion) return null;
-
-	// Compare versions
-	if (compareSemver(latestVersion, currentVersion) <= 0) return null;
-
-	return { currentVersion, latestVersion };
+/**
+ * The tri-state update decision, pure: what every caller asks after its
+ * `npm view` — the memoised `computeUpdateStatus` and the forced `/update`
+ * and `pi_update` checks alike. `latestStdout` is the registry's raw output
+ * and `code` its exit status; an unparseable version is an error, never a
+ * silent "up to date".
+ */
+export function planUpdateCheck(input: {
+	current: string | null;
+	latestStdout: string;
+	code: number;
+}): UpdateStatus {
+	const latest = input.latestStdout.trim();
+	if (!input.current || input.code !== 0 || !latest) return { status: "error" };
+	const cmp = compareSemver(latest, input.current);
+	if (Number.isNaN(cmp)) return { status: "error" };
+	if (cmp > 0) return { status: "available", currentVersion: input.current, latestVersion: latest };
+	return { status: "current", currentVersion: input.current };
 }
 
-function compareSemver(a: string, b: string): number {
-	const partsA = a.split(".").map(Number);
-	const partsB = b.split(".").map(Number);
+/**
+ * A version as semver §4 allows here: optional `v`, a numeric core, an
+ * optional `-prerelease`, and an optional `+build` that carries no ordering.
+ * `undefined` for anything else.
+ */
+function parseVersion(v: string): { core: number[]; pre?: string[] } | undefined {
+	const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v.trim().replace(/\+.*$/, ""));
+	if (!m) return undefined;
+	return {
+		core: [Number(m[1]), Number(m[2]), Number(m[3])],
+		...(m[4] ? { pre: m[4].split(".") } : {}),
+	};
+}
 
+/**
+ * semver §11 ordering for the prerelease parts: a release outranks its own
+ * prerelease; within prereleases, all-digit identifiers compare numerically
+ * (and rank below alphanumeric ones), the rest by ASCII, and a shorter
+ * identifier list ranks lower.
+ */
+function comparePrerelease(a: string[] | undefined, b: string[] | undefined): number {
+	if (a === undefined || b === undefined) return a === b ? 0 : a === undefined ? 1 : -1;
+	for (let i = 0; i < Math.min(a.length, b.length); i++) {
+		const x = a[i]!;
+		const y = b[i]!;
+		if (x === y) continue;
+		const xNum = /^\d+$/.test(x);
+		if (xNum !== /^\d+$/.test(y)) return xNum ? -1 : 1;
+		if (xNum) return Number(x) - Number(y);
+		return x < y ? -1 : 1;
+	}
+	return a.length - b.length;
+}
+
+/**
+ * `a` against `b`: negative, 0, positive — or `NaN` when either side is not
+ * a version, which {@link planUpdateCheck} turns into "error". Exported for
+ * tests.
+ */
+export function compareSemver(a: string, b: string): number {
+	const pa = parseVersion(a);
+	const pb = parseVersion(b);
+	if (!pa || !pb) return Number.NaN;
 	for (let i = 0; i < 3; i++) {
-		const diff = (partsA[i] ?? 0) - (partsB[i] ?? 0);
+		const diff = pa.core[i]! - pb.core[i]!;
 		if (diff !== 0) return diff;
 	}
-	return 0;
+	return comparePrerelease(pa.pre, pb.pre);
 }
