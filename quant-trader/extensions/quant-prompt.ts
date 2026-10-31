@@ -28,7 +28,7 @@ import { agentsDir, skillsDir } from './lib/layout.js';
 import { personaOverride } from './lib/persona.js';
 import { SkillActivation } from './lib/skill-activation.js';
 import { groupByCategory } from './lib/skill-categories.js';
-import { categoryFromPath } from './lib/skill-tree.js';
+import { derivePromptInputs } from './lib/prompt-inputs.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,13 +45,6 @@ import { categoryFromPath } from './lib/skill-tree.js';
 // Every tool that mutates a file, not just the two named ones: code_rewrite
 // writes when dry_run=false, and undo_last_edit rewrites the file it reverts.
 export const QUANT_REMOVED_TOOLS = new Set(['write', 'edit', 'code_rewrite', 'undo_last_edit']);
-
-/**
- * The spawn tool registered by `subagent-herdr`. The roster is gated on it: a
- * roster discovered on disk is not a capability unless the tool that spawns those
- * agents is actually offered this run.
- */
-const SUBAGENT_TOOL = 'subagent';
 
 /**
  * A model ref in the fleet is written `provider/model|effort`, so it contains a
@@ -382,21 +375,29 @@ export default function (pi: ExtensionAPI) {
       activeSkills: activation.list(),
     });
 
-    const selectedTools = opts.selectedTools ?? [];
-    const hasSubagent = selectedTools.includes(SUBAGENT_TOOL);
+    // No skill-owned tool gating here, same as before this shared derivation:
+    // the quant profile owns no `tools:` frontmatter, so `owners` is empty and
+    // `isActive` is never consulted — the gate is present only so the derivation
+    // is one function for every builder.
+    const d = derivePromptInputs({
+      selectedTools: opts.selectedTools ?? [],
+      toolSnippets: opts.toolSnippets,
+      promptGuidelines: opts.promptGuidelines,
+      skills: opts.skills ?? [],
+      contextFiles: opts.contextFiles ?? [],
+      lineage,
+      owners: new Map(),
+      isActive: () => false,
+      skillsLibrary: library,
+    });
 
     const quantPrompt = buildQuantPrompt({
       agentInventory: roster.spawnable,
-      skillInventory: (opts.skills ?? []).map((skill) => ({
-        name: skill.name,
-        description: skill.description,
-        filePath: skill.filePath,
-        pathCategory: categoryFromPath(library, skill.filePath),
-      })),
-      contextInventory: (opts.contextFiles ?? []).map((f) => ({ path: f.path })),
-      guidelines: (opts.promptGuidelines ?? []).filter((g) => g.trim().length > 0),
-      hasSubagent,
-      isSubagent: lineage.length > 0,
+      skillInventory: d.skillInventory,
+      contextInventory: d.contextInventory,
+      guidelines: d.guidelines,
+      hasSubagent: d.hasSubagent,
+      isSubagent: d.isSubagent,
       customPrompt: opts.customPrompt,
       appendSystemPrompt: opts.appendSystemPrompt,
       cwd: opts.cwd,

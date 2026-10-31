@@ -1333,10 +1333,15 @@ describe("healthcheck agent visibility in the inventory", () => {
 });
 
 // ---------------------------------------------------------------------------
-// promptInputs — the pure assembly between the handler's loads and the builder
+// promptInputs — the thin wrapper over the shared derivation
 // ---------------------------------------------------------------------------
 
 describe("promptInputs", () => {
+  // Only what the WRAPPER contributes is asserted here. The derivation itself —
+  // gating, the three inventories, the guidelines, the capability flags — moved
+  // to `lib/prompt-inputs.test.ts` when it became shared by the orchestrator, the
+  // quant handler and the persona takeover, and a test of a shared rule belongs
+  // beside the shared module.
   const agent = (name: string): AgentInfo => ({
     name,
     description: `${name} agent`,
@@ -1357,125 +1362,49 @@ describe("promptInputs", () => {
     });
   }
 
-  test("a non-empty lineage marks a subagent and advertises only .spawnable", () => {
+  test("the roster and the caller's own fields cross over verbatim", () => {
     const roster = { all: [agent("reviewer"), agent("worker")], spawnable: [agent("reviewer")] };
-    const sub = inputs({ lineage: ["worker"], roster });
-    expect(sub.buildOptions.isSubagent).toBe(true);
-    expect(sub.buildOptions.agentInventory.map((a) => a.name)).toEqual(["reviewer"]);
-
-    const top = inputs({ lineage: [], roster });
-    expect(top.buildOptions.isSubagent).toBe(false);
-  });
-
-  test("hasSubagent, hasQuestionnaire and hasKanban come from selectedTools even without a snippet", () => {
     const out = inputs({
-      systemPromptOptions: {
-        cwd: "/w",
-        selectedTools: ["read", "subagent", "questionnaire", "kanban"],
-      },
-    });
-    expect(out.buildOptions.toolInventory).toEqual([]);
-    expect(out.buildOptions.hasSubagent).toBe(true);
-    expect(out.buildOptions.hasQuestionnaire).toBe(true);
-    expect(out.buildOptions.hasKanban).toBe(true);
-
-    const none = inputs({ systemPromptOptions: { cwd: "/w", selectedTools: ["read"] } });
-    expect(none.buildOptions.hasSubagent).toBe(false);
-    expect(none.buildOptions.hasQuestionnaire).toBe(false);
-    expect(none.buildOptions.hasKanban).toBe(false);
-  });
-
-  test("a gated-out kanban tool turns hasKanban off", () => {
-    // The flag must read the GATED list, not the raw one: a skill that owns `kanban`
-    // and is not active means this session cannot call it, so a board section would be
-    // an instruction with no tool behind it. Mirrors the subagent case above.
-    const out = inputs({
-      systemPromptOptions: {
-        cwd: "/w",
-        selectedTools: ["kanban"],
-        toolSnippets: { kanban: "x" },
-      },
-      owners: new Map([["kanban", "some-skill"]]),
-    });
-    expect(out.selectedTools).toEqual([]);
-    expect(out.buildOptions.hasKanban).toBe(false);
-  });
-
-  test("gating drops only the inactive skill-owned tool, keeps order, and copies", () => {
-    const selected = ["read", "trade_journal", "subagent", "web_probe", "bash"];
-    const snapshot = [...selected];
-    const out = inputs({
-      systemPromptOptions: {
-        cwd: "/w",
-        selectedTools: selected,
-        toolSnippets: { trade_journal: "journal", subagent: "delegate", web_probe: "probe" },
-      },
-      owners: new Map([
-        ["trade_journal", "technical-analysis"],
-        ["web_probe", "research"],
-      ]),
-      isActive: (d) => d === "research",
-    });
-    expect(out.selectedTools).toEqual(["read", "subagent", "web_probe", "bash"]);
-    expect(out.selectedTools).not.toBe(selected);
-    expect(selected).toEqual(snapshot);
-    // The inventory and the subagent flag are computed after gating.
-    expect(out.buildOptions.toolInventory.map((t) => t.name)).toEqual(["subagent", "web_probe"]);
-    expect(out.buildOptions.hasSubagent).toBe(true);
-  });
-
-  test("a gated-out subagent tool turns hasSubagent off", () => {
-    const out = inputs({
-      systemPromptOptions: { cwd: "/w", selectedTools: ["subagent"], toolSnippets: { subagent: "x" } },
-      owners: new Map([["subagent", "some-skill"]]),
-    });
-    expect(out.selectedTools).toEqual([]);
-    expect(out.buildOptions.hasSubagent).toBe(false);
-  });
-
-  test("empty guidelines are dropped and context files map to {path}", () => {
-    // pi hands over each file's content too; the inventory must not carry it.
-    const contextFiles = [
-      { path: "/w/AGENTS.md", content: "secret body" },
-      { path: "/w/agent/AGENTS.md", content: "more" },
-    ];
-    const out = inputs({
-      systemPromptOptions: {
-        cwd: "/w",
-        promptGuidelines: ["Keep it short.", "", "   ", "\n\t", "Cite sources."],
-        contextFiles,
-      },
-    });
-    expect(out.buildOptions.guidelines).toEqual(["Keep it short.", "Cite sources."]);
-    expect(out.buildOptions.contextInventory).toEqual([
-      { path: "/w/AGENTS.md" },
-      { path: "/w/agent/AGENTS.md" },
-    ]);
-  });
-
-  test("skills carry their path category and pass-through fields cross verbatim", () => {
-    const out = inputs({
+      roster,
       systemPromptOptions: {
         cwd: "/work/repo",
         customPrompt: "custom",
         appendSystemPrompt: "appended",
-        skills: [
-          { name: "triage", description: "d", filePath: `${LIB}/review-and-verification/triage/SKILL.md` },
-        ],
       },
     });
-    expect(out.buildOptions.skillInventory).toEqual([
-      {
-        name: "triage",
-        description: "d",
-        filePath: `${LIB}/review-and-verification/triage/SKILL.md`,
-        pathCategory: "review-and-verification",
-      },
-    ]);
+    // Only .spawnable is advertised: an agent this process would refuse to spawn
+    // is not a capability (the same rule as the spawn guard, via delegationRoster).
+    expect(out.buildOptions.agentInventory.map((a) => a.name)).toEqual(["reviewer"]);
     expect(out.buildOptions.customPrompt).toBe("custom");
     expect(out.buildOptions.appendSystemPrompt).toBe("appended");
     expect(out.buildOptions.cwd).toBe("/work/repo");
     expect(out.buildOptions.skillsLibrary).toBe(LIB);
+  });
+
+  test("the derived fields are passed through, not recomputed", () => {
+    const out = inputs({
+      systemPromptOptions: {
+        cwd: "/w",
+        selectedTools: ["read", "kanban"],
+        toolSnippets: { read: "read a file", kanban: "the board" },
+        skills: [{ name: "triage", description: "d", filePath: `${LIB}/review/triage/SKILL.md` }],
+        contextFiles: [{ path: "/w/AGENTS.md", content: "body" }],
+        promptGuidelines: ["Be brief.", "  "],
+      },
+    });
+    expect(out.selectedTools).toEqual(["read", "kanban"]);
+    expect(out.buildOptions.toolInventory.map((t) => t.name)).toEqual(["read", "kanban"]);
+    expect(out.buildOptions.skillInventory).toEqual([
+      {
+        name: "triage",
+        description: "d",
+        filePath: `${LIB}/review/triage/SKILL.md`,
+        pathCategory: "review",
+      },
+    ]);
+    expect(out.buildOptions.contextInventory).toEqual([{ path: "/w/AGENTS.md" }]);
+    expect(out.buildOptions.guidelines).toEqual(["Be brief."]);
+    expect(out.buildOptions.hasKanban).toBe(true);
   });
 });
 

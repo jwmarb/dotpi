@@ -18,47 +18,18 @@ import {
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
 import { personaOverride } from './lib/persona.js';
+// The kanban board's per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per
+// call") is restated as a numeral in this file's prose; change the cap, change it here.
+import { KANBAN_TOOL, QUESTIONNAIRE_TOOL, derivePromptInputs } from './lib/prompt-inputs.js';
 import { groupByCategory } from './lib/skill-categories.js';
-import { categoryFromPath } from './lib/skill-tree.js';
 import {
   SkillActivation,
-  gateTools,
   loadSkillToolOwners,
 } from './lib/skill-activation.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/**
- * Name of the tool registered by the `ask-user` extension. When this tool is
- * available, the orchestrator prompt gains an explicit instruction to route
- * every user-facing question through it instead of asking in prose.
- */
-const QUESTIONNAIRE_TOOL = 'questionnaire';
-
-/**
- * Name of the tool registered by the `subagent-herdr` extension. The agent
- * sections are gated on it: a roster discovered on disk is not a capability
- * unless the tool that spawns those agents is actually offered this run.
- */
-const SUBAGENT_TOOL = 'subagent';
-
-/**
- * Name of the tool registered by the `kanban` extension. It is registered for the
- * orchestrator only — the factory returns as soon as `PI_SUBAGENT_RUN_ID` is set —
- * so this flag is naturally false in a child and needs no `isSubagent` conjunct of
- * its own. Nothing from `kanban/lib.ts` is imported here: the *capability* reaches this
- * module through `promptInputs` as a boolean, and a top-level extension taking a
- * dependency on a sibling's internals is the coupling that gate avoids — pi-tui resolves
- * at the repo root and `lib/runtime.test.ts` imports `../kanban/lib.js`, so the bar is
- * architectural, not technical. Only one cap is restated, by hand, as a numeral in the
- * prose below: the per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per call").
- * The 200-card cap is never printed — the tool's refusal names it — so it has no copy
- * to drift. Change `MAX_ADD_PER_CALL` and you change the prose here in the same commit:
- * nothing at test time can catch that drift.
- */
-const KANBAN_TOOL = 'kanban';
 
 /**
  * A model ref in the fleet is written `provider/model|effort`, so it contains a pipe. Raw, it
@@ -255,103 +226,51 @@ export interface PromptInputsResult {
 }
 
 /**
- * Assembles the orchestrator prompt's inputs from what the handler loaded:
- * gates skill-owned tools, builds the tool/skill/context inventories, and
- * derives the capability flags. Pure and synchronous — no disk, no env, and
- * the input `selectedTools` is never mutated (the handler assigns the result).
+ * Assembles the orchestrator prompt's inputs from what the handler loaded. The
+ * derivation itself — gating, the three inventories, the capability flags — is
+ * shared with the quant builder and the persona takeover and lives in
+ * {@link derivePromptInputs}; this wrapper only adds the fields that are
+ * specific to `buildOrchestratorPrompt` (the roster and the caller's own text).
+ * Pure and synchronous — no disk, no env, and the input `selectedTools` is
+ * never mutated (the handler assigns the result).
  */
 export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
   const spo = opts.systemPromptOptions;
 
-  // --- Gate skill-owned tools on their skill being active ---
-  const { kept: selectedTools } = gateTools(spo.selectedTools ?? [], opts.owners, opts.isActive);
-
-  // --- Agents ---
-  // A skill's agents become delegable once its skill is loaded (the roster was
-  // discovered for the active set), and only what THIS process may spawn is
-  // advertised: an agent its `subagent` call would refuse (a cycle, or a
-  // `callable_by` that does not name it) turns one delegation into a refusal
-  // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
-  const agentInventory = opts.roster.spawnable;
-
-  // --- Build tool inventory ---
-  // Only include tools that have a snippet available; fallback to empty description
-  const toolInventory = selectedTools
-    .filter((name) => spo.toolSnippets?.[name])
-    .map((name) => ({
-      name,
-      description: spo.toolSnippets?.[name] ?? '',
-    }));
-
-  // --- Build skill inventory ---
-  // The category comes from the skill's own path when it has one, so the tree
-  // on disk is the source of truth and refiling a skill needs no code edit.
-  // `skillsLibrary` is this repo's library; a package or project-local skill
-  // lies outside it and falls through to the name-keyed map instead.
-  const library = opts.skillsLibrary;
-  const skillInventory = (spo.skills ?? []).map((skill) => ({
-    name: skill.name,
-    description: skill.description,
-    filePath: skill.filePath,
-    pathCategory: categoryFromPath(library, skill.filePath),
-  }));
-
-  // --- Build context file inventory ---
-  const contextInventory = (spo.contextFiles ?? []).map((f) => ({
-    path: f.path,
-  }));
-
-  // --- Filter out empty guideline entries ---
-  const guidelines = (spo.promptGuidelines ?? []).filter((g) => g.trim().length > 0);
-
-  // --- Detect the ask-user extension ---
-  // ask-user.ts registers a tool named `questionnaire`. If it is loaded we
-  // instruct the orchestrator to ask the user through it.
-  const hasQuestionnaire =
-    selectedTools.includes(QUESTIONNAIRE_TOOL) ||
-    toolInventory.some((t) => t.name === QUESTIONNAIRE_TOOL);
-
-  // --- Detect the subagent-herdr extension ---
-  // `agentInventory` is read off `agents/*.md` on disk, which says nothing about
-  // whether the extension that can *spawn* them loaded. subagent-herdr imports
-  // `../model-fallback/lib.js` and typebox, and the documented failure mode when
-  // that resolution breaks is a silent load failure — leaving a prompt that
-  // mandates delegation while offering no tool to delegate with. Same rule as the
-  // questionnaire gate, one level up: an agent roster is only actionable if the
-  // tool that spawns it exists. Computed after gating, like the inventory.
-  const hasSubagent =
-    selectedTools.includes(SUBAGENT_TOOL) ||
-    toolInventory.some((t) => t.name === SUBAGENT_TOOL);
-
-  // --- Detect the kanban extension ---
-  // The same two signals as the questionnaire and subagent gates: the gated
-  // `selectedTools` AND the snippet-filtered inventory. `toolInventory` alone is the
-  // weaker signal — it lists only tools pi handed over with a snippet — so the flag
-  // is computed HERE, off the gated list, and not as a `toolInventory.some(...)`
-  // inside the builder: a builder-side check goes false on a session that really does
-  // have the tool, and a field on `buildOptions` is pinned at the call site by
-  // `Parameters<typeof buildOrchestratorPrompt>[0]`, which a bare name match is not.
-  // The retired `plan` section's gate was a bare name match, and it outlived its tool.
-  const hasKanban =
-    selectedTools.includes(KANBAN_TOOL) ||
-    toolInventory.some((t) => t.name === KANBAN_TOOL);
+  const d = derivePromptInputs({
+    selectedTools: spo.selectedTools ?? [],
+    toolSnippets: spo.toolSnippets,
+    promptGuidelines: spo.promptGuidelines,
+    skills: spo.skills ?? [],
+    contextFiles: spo.contextFiles ?? [],
+    lineage: opts.lineage,
+    owners: opts.owners,
+    isActive: opts.isActive,
+    skillsLibrary: opts.skillsLibrary,
+  });
 
   return {
-    selectedTools,
+    selectedTools: d.selectedTools,
     buildOptions: {
-      agentInventory,
-      toolInventory,
-      skillInventory,
-      contextInventory,
-      guidelines,
-      hasQuestionnaire,
-      hasSubagent,
-      hasKanban,
-      isSubagent: opts.lineage.length > 0,
+      // --- Agents ---
+      // A skill's agents become delegable once its skill is loaded (the roster was
+      // discovered for the active set), and only what THIS process may spawn is
+      // advertised: an agent its `subagent` call would refuse (a cycle, or a
+      // `callable_by` that does not name it) turns one delegation into a refusal
+      // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
+      agentInventory: opts.roster.spawnable,
+      toolInventory: d.toolInventory,
+      skillInventory: d.skillInventory,
+      contextInventory: d.contextInventory,
+      guidelines: d.guidelines,
+      hasQuestionnaire: d.hasQuestionnaire,
+      hasSubagent: d.hasSubagent,
+      hasKanban: d.hasKanban,
+      isSubagent: d.isSubagent,
       customPrompt: spo.customPrompt,
       appendSystemPrompt: spo.appendSystemPrompt,
       cwd: spo.cwd,
-      skillsLibrary: library,
+      skillsLibrary: opts.skillsLibrary,
     },
   };
 }

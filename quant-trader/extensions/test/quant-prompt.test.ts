@@ -376,6 +376,18 @@ describe("the before_agent_start handler", () => {
     expect(systemPrompt).not.toContain("## Available Agents");
     expect(systemPrompt).toContain("# Quant-Research Agent");
   });
+
+  test("a subagent tool without a snippet still shows the roster", async () => {
+    // The capability flag comes off the offered tool list, not off `toolSnippets`:
+    // pi hands over a snippet for some tools only, and a session that can spawn
+    // must still advertise the fleet it can spawn into.
+    const { systemPrompt } = await start({ selectedTools: ["read", "subagent"] });
+    expect(systemPrompt).toContain("market-scout");
+    expect(systemPrompt).toContain("backtester");
+
+    const off = await start({ selectedTools: ["read"] });
+    expect(off.systemPrompt).not.toContain("market-scout");
+  });
 });
 
 describe("the persona yield", () => {

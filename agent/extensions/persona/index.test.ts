@@ -20,6 +20,7 @@ let repoRoot: string;
 let agentDirPath: string;
 let quantReal: string;
 let researchReal: string;
+let agentReal: string;
 let originalAgentDir: string | undefined;
 let originalSubagentRunId: string | undefined;
 
@@ -45,7 +46,12 @@ beforeAll(async () => {
   writeFileSync(join(quantDir, "settings.json"), "{}");
   // The quant prompt module the `before_agent_start` takeover imports; it must
   // expose `buildQuantPrompt` so the declaration-filter path runs end to end.
-  writeFileSync(join(quantDir, "extensions", "quant-prompt.ts"), "export function buildQuantPrompt(_opts: unknown) { return 'quant'; }");
+  writeFileSync(
+    join(quantDir, "extensions", "quant-prompt.ts"),
+    "export function buildQuantPrompt(opts) { globalThis.__personaQuantOpts = opts; return 'quant'; }",
+  );
+  // The target's own AGENTS.md, so the takeover's context swap is assertable.
+  writeFileSync(join(quantDir, "AGENTS.md"), "# Quant profile context\n");
   // The target declares a `github` MCP server.
   writeFileSync(
     join(quantDir, "persona-mcp.json"),
@@ -60,9 +66,19 @@ beforeAll(async () => {
   writeFileSync(join(researchDir, "settings.json"), "{}");
   writeFileSync(
     join(researchDir, "extensions", "dynamic-prompt.ts"),
-    "export function buildOrchestratorPrompt(_opts: unknown) { return 'orchestrator'; } export function promptInputs(_opts: unknown) { return { selectedTools: [], buildOptions: {} }; }",
+    "export function buildOrchestratorPrompt(opts) { globalThis.__personaOrchOpts = opts; return 'orchestrator'; }",
+  );
+  writeFileSync(join(researchDir, "AGENTS.md"), "# Research profile context\n");
+  // A skill in the target's own library, so the skill inventory the takeover
+  // derives is assertable against a path that home does not have.
+  mkdirSync(join(researchDir, "skills", "demo-cat", "demo"), { recursive: true });
+  writeFileSync(
+    join(researchDir, "skills", "demo-cat", "demo", "SKILL.md"),
+    "---\nname: demo\ndescription: demo skill\n---\nBody.\n",
   );
   researchReal = await realpath(researchDir);
+  writeFileSync(join(agentDirPath, "AGENTS.md"), "# Home profile context\n");
+  agentReal = await realpath(agentDirPath);
   originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   originalSubagentRunId = process.env.PI_SUBAGENT_RUN_ID;
   process.env.PI_CODING_AGENT_DIR = agentDirPath;
@@ -83,6 +99,10 @@ afterAll(() => {
 
 beforeEach(() => {
   setPersonaOverride(undefined);
+  // The stub builders record what they were handed; a stale capture would make a
+  // later test pass on an earlier one's call.
+  delete (globalThis as { __personaOrchOpts?: unknown }).__personaOrchOpts;
+  delete (globalThis as { __personaQuantOpts?: unknown }).__personaQuantOpts;
 });
 
 let importCounter = 0;
@@ -337,5 +357,65 @@ describe("the W1 widening-gate binding on resume", () => {
     ) as { data: { widened: boolean; confirmed: boolean } } | undefined;
     expect(recorded?.data.widened).toBe(false);
     expect(recorded?.data.confirmed).toBe(false);
+  });
+});
+
+describe("the takeover feeds the target's inputs to the builder", () => {
+  // The switch derives the target profile's skills and AGENTS.md, then hands them
+  // to the target's own builder. When the takeover went through the *home*
+  // `promptInputs`, that work was thrown away and the prompt listed the home
+  // profile's catalogue — so the assertions are on what the builder received.
+  interface Captured {
+    skillInventory: Array<{ name: string; filePath: string }>;
+    contextInventory: Array<{ path: string }>;
+  }
+
+  async function runTakeover(
+    ext: StubPi,
+    entryOver: Record<string, unknown>,
+    contextFiles: Array<{ path: string }>,
+  ) {
+    const ctx = makeCtx([switchEntry(entryOver)]);
+    await ext.handlers.get("session_start")!({ reason: "resume" }, ctx);
+    await ext.handlers.get("before_agent_start")!({
+      messageType: "user",
+      prompt: "hi",
+      systemPromptOptions: {
+        cwd: "/w",
+        selectedTools: ["read"],
+        skills: [],
+        promptGuidelines: [],
+        contextFiles,
+      },
+    });
+  }
+
+  test("an orchestrator target gets its own skill catalogue and AGENTS.md", async () => {
+    const ext = await freshExtension();
+    await runTakeover(
+      ext,
+      { profile: "research", dir: researchReal, widened: false, confirmed: false, dropped: [] },
+      [{ path: join(agentReal, "AGENTS.md") }, { path: "/proj/AGENTS.md" }],
+    );
+    expect(personaOverride()?.name).toBe("research");
+
+    const opts = (globalThis as { __personaOrchOpts?: unknown }).__personaOrchOpts as Captured;
+    expect(
+      opts.skillInventory.map((s) => s.filePath),
+    ).toContain(join(researchReal, "skills", "demo-cat", "demo", "SKILL.md"));
+    // The home AGENTS.md entry is swapped for the target's; project context stays.
+    expect(opts.contextInventory).toEqual([
+      { path: join(researchReal, "AGENTS.md") },
+      { path: "/proj/AGENTS.md" },
+    ]);
+  });
+
+  test("a quant target gets its own AGENTS.md", async () => {
+    const ext = await freshExtension();
+    await runTakeover(ext, {}, [{ path: join(agentReal, "AGENTS.md") }, { path: "/proj/AGENTS.md" }]);
+    expect(personaOverride()?.name).toBe("quant-trader");
+
+    const opts = (globalThis as { __personaQuantOpts?: unknown }).__personaQuantOpts as Captured;
+    expect(opts.contextInventory[0]?.path).toBe(join(quantReal, "AGENTS.md"));
   });
 });

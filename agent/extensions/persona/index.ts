@@ -41,6 +41,7 @@ type QuantModule = typeof import("../../../quant-trader/extensions/quant-prompt.
 import { LINEAGE_ENV, delegationRoster, frontmatterOf, parseLineage } from "../lib/agents.js";
 import { agentDir, profileDir, repoRoot, skillsDir, agentsDir } from "../lib/layout.js";
 import { personaDenies, personaOverride, setPersonaOverride } from "../lib/persona.js";
+import { derivePromptInputs } from "../lib/prompt-inputs.js";
 import { SkillActivation, loadSkillToolOwners } from "../lib/skill-activation.js";
 import { categoryFromPath, findSkills } from "../lib/skill-tree.js";
 import {
@@ -720,39 +721,52 @@ export default function (pi: ExtensionAPI) {
       })
       .filter((f): f is { path: string } => f !== undefined);
 
-    const guidelines = (opts.promptGuidelines ?? []).filter((g) => g.trim().length > 0);
-    const selectedTools = opts.selectedTools ?? [];
+    // The target-derived inputs above are what the builder must see: the switched
+    // profile's own skills and AGENTS.md, not the process's. Deriving from them
+    // here — rather than calling the target's `promptInputs`, which re-reads
+    // `opts` — is the whole point of routing the takeover through the shared
+    // derivation.
+    const owners = quantModule
+      ? new Map<string, string>() // quant owns no skill-gated tools, same as its own handler
+      : await loadSkillToolOwners(library);
+    const d = derivePromptInputs({
+      selectedTools: opts.selectedTools ?? [],
+      toolSnippets: opts.toolSnippets,
+      promptGuidelines: opts.promptGuidelines,
+      skills: inventory,
+      contextFiles: contextInventory,
+      lineage,
+      owners,
+      isActive: (x) => activation.has(x),
+      skillsLibrary: library,
+    });
 
-    let builtPrompt: string;
-    if (quantModule) {
-      builtPrompt = quantModule.buildQuantPrompt({
-        agentInventory: roster.spawnable,
-        skillInventory: inventory,
-        contextInventory,
-        guidelines,
-        hasSubagent: selectedTools.includes("subagent"),
-        isSubagent: lineage.length > 0,
-        customPrompt: opts.customPrompt,
-        appendSystemPrompt: opts.appendSystemPrompt,
-        cwd: opts.cwd,
-        skillsLibrary: library,
-      });
-    } else {
-      const owners = await loadSkillToolOwners(library);
-      const inputs = orchestratorModule!.promptInputs({
-        systemPromptOptions: opts,
-        lineage,
-        roster,
-        owners,
-        isActive: (d) => activation.has(d),
-        skillsLibrary: library,
-      });
-      if (owners.size > 0 && Array.isArray(opts.selectedTools)) {
-        opts.selectedTools = inputs.selectedTools;
-        probeSelectedTools = [...opts.selectedTools];
-      }
-      builtPrompt = orchestratorModule!.buildOrchestratorPrompt(inputs.buildOptions);
+    // --- Apply the gate to this run (orchestrator targets only) ---
+    if (owners.size > 0 && Array.isArray(opts.selectedTools)) {
+      opts.selectedTools = d.selectedTools;
+      probeSelectedTools = [...opts.selectedTools];
     }
+
+    const shared = {
+      agentInventory: roster.spawnable,
+      skillInventory: d.skillInventory,
+      contextInventory: d.contextInventory,
+      guidelines: d.guidelines,
+      hasSubagent: d.hasSubagent,
+      isSubagent: d.isSubagent,
+      customPrompt: opts.customPrompt,
+      appendSystemPrompt: opts.appendSystemPrompt,
+      cwd: opts.cwd,
+      skillsLibrary: library,
+    };
+    const builtPrompt = quantModule
+      ? quantModule.buildQuantPrompt(shared)
+      : orchestratorModule!.buildOrchestratorPrompt({
+          ...shared,
+          toolInventory: d.toolInventory,
+          hasQuestionnaire: d.hasQuestionnaire,
+          hasKanban: d.hasKanban,
+        });
 
     return {
       systemPrompt:
