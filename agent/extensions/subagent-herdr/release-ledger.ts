@@ -50,7 +50,12 @@
  * @module subagent-herdr/release-ledger
  */
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
-import { rerouteMarker, type Notice, type RunRecord } from "./rundir.js";
+import {
+  rerouteMarker,
+  type Notice,
+  type NoticeReroute,
+  type RunRecord,
+} from "./rundir.js";
 import type { RunLifecycle, RunObservation } from "./run-lifecycle.js";
 
 /**
@@ -61,26 +66,69 @@ import type { RunLifecycle, RunObservation } from "./run-lifecycle.js";
  * finished, and tells the orchestrator the run is not one of its own — and
  * how to reach it. The run id is the notice's own, never the parent's.
  *
- * Requires `notice.reroute` (the marker is parsed by `parseNotice` from the
- * body of a notice that already matched): a notice without it is a direct
- * delivery and gets no note. It is only called with a *validated* marker —
- * {@link createReleaseLedger} strips the marker to ordinary text when the
- * record is owned by this pane (a direct delivery), when `deliveredTo` names
- * another ancestor, when the claimed parent is not a real *terminal* run
+ * Takes the validated marker explicitly (a marker is parsed by `parseNotice`
+ * from the body of a notice that already matched; a notice without one is a
+ * direct delivery and gets no note — deciding that is {@link withRerouteNote}'s
+ * job, so this function is total). It is only reached with a *validated*
+ * marker — {@link createReleaseLedger} strips the marker to ordinary text when
+ * the record is owned by this pane (a direct delivery), when `deliveredTo`
+ * names another ancestor, when the claimed parent is not a real *terminal* run
  * (`done`, `failed`, `cancelled`), or when the marker names the notice's own
  * run as its parent — so "delivered to
  * you" below is a claim that passed the receiver's plausibility check; the
  * marker text itself is still the sender's word.
  */
-export function rerouteNote(notice: Notice): string {
-  const r = notice.reroute;
-  if (!r) throw new Error(`rerouteNote requires a rerouted notice, got ${notice.runId}`);
+export function rerouteNote(
+  notice: Pick<Notice, "runId" | "agent">,
+  r: NoticeReroute,
+): string {
   return (
     `--- ${notice.runId} (${notice.agent}) rerouted ---\n` +
     `Addressed to its parent ${r.parentAgent} ${r.parentRunId}, which has finished, so it was delivered to you (${r.deliveredTo}) as the nearest surviving ancestor. ` +
     `Lineage: ${r.parentAgent} ${r.parentRunId} → ${notice.agent} ${notice.runId}. ` +
     `It is not one of your own delegations; reply with subagent_tasks (action "message", ids ["${notice.runId}"]) if it needs an answer.`
   );
+}
+
+/**
+ * A notice's own briefing block: the header naming the run and its kind, then
+ * its body (`(no message)` when it has none), then an optional trailer. The
+ * one template every branch of `compose` renders its notices through.
+ */
+const noticeBlock = (n: Notice, trailer?: string): string =>
+  `--- ${n.runId} (${n.agent}) ${n.kind} ---\n${n.text || "(no message)"}${trailer ? `\n${trailer}` : ""}`;
+
+/** The trailer for a notice whose run this process never registered. */
+const NOT_IN_REGISTRY = "(This task is not in my registry — it may predate a restart.)";
+
+/**
+ * The one reroute-note decorator: placement, dedup and suppression, spelled
+ * once for every briefing branch. `rendered` is what the notice's own branch
+ * produced (possibly several blocks — a health check and its released target);
+ * the returned array is what the flush appends.
+ *
+ * - **Suppression.** Nothing rendered, nothing to annotate: an empty
+ *   `rendered` returns no blocks at all, so a rerouted stall whose health check
+ *   launched adds no note and no wake.
+ * - **Placement.** The note precedes the blocks it annotates, so the
+ *   orchestrator reads why an unfamiliar run is on its desk before reading it.
+ * - **Dedup.** One note per run per flush (`noted` is the flush's bookkeeping):
+ *   a report + done pair for one rerouted run briefs the situation once, and
+ *   the second notice's blocks still ride — the pair must not lose the
+ *   completion. A notice with no validated `reroute` is a direct delivery and
+ *   gets no note.
+ */
+export function withRerouteNote(
+  notice: Notice,
+  rendered: readonly string[],
+  noted: Set<string>,
+): string[] {
+  if (rendered.length === 0) return [];
+  if (notice.reroute && !noted.has(notice.runId)) {
+    noted.add(notice.runId);
+    return [rerouteNote(notice, notice.reroute), ...rendered];
+  }
+  return [...rendered];
 }
 
 /**
@@ -540,9 +588,11 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
     const degraded = new Set<string>();
     const alreadyBriefed = (runId: string): boolean => composedBriefed.has(runId) || briefed.has(runId);
 
-    const renderFinished = async (observation: RunObservation): Promise<void> => {
+    const renderFinished = async (observation: RunObservation): Promise<string[]> => {
       const rec = observation.run;
-      if (alreadyBriefed(rec.runId)) return;
+      // What this observation contributes; the caller decorates it with a note.
+      const out: string[] = [];
+      if (alreadyBriefed(rec.runId)) return [];
       /** This run's result: cached, or read once through its observation. */
       const resultOfRun = async (): Promise<RunResult> => {
         // A run that transitioned in this observation (a late completion, say)
@@ -580,42 +630,40 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
         // Atomic mark: both blocks are rendered before either id is marked,
         // and the pair is marked together, so "check briefed" implies "target
         // released". A degraded target block marks neither.
-        blocks.push(await deps.renderer.done(rec, await resultOfRun()));
-        if (targetBlock !== undefined) blocks.push(targetBlock);
+        out.push(await deps.renderer.done(rec, await resultOfRun()));
+        if (targetBlock !== undefined) out.push(targetBlock);
         if (!targetDegraded) {
           composedBriefed.add(rec.runId);
           if (targetBlock !== undefined && target !== undefined) composedBriefed.add(target.runId);
         }
-        return;
+        return out;
       }
 
       const result = await resultOfRun();
       // An answered run renders; so does a cancelled one — it was deliberately
       // killed, so there is nothing for a health check to diagnose.
       if (result.answered || rec.status === "cancelled") {
-        blocks.push(await deps.renderer.done(rec, result));
+        out.push(await deps.renderer.done(rec, result));
         composedBriefed.add(rec.runId);
-        return;
+        return out;
       }
       // No answer: hold the block behind a health check. One that cannot
       // launch must not hold it — render it now. A *terminal* earlier check
       // does not block the spawn: the stall and no-answer triggers ask
       // different questions.
       const hc = await requestHealthCheck(rec, { kind: "ended-without-result" });
-      if (hc.ok) return;
-      blocks.push(await deps.renderer.done(rec, result));
+      if (hc.ok) return [];
+      out.push(await deps.renderer.done(rec, result));
       composedBriefed.add(rec.runId);
+      return out;
     };
 
-    // One reroute note per run per flush: a pair of notices for the same
-    // re-routed run (report + done) briefs the situation once.
-
+    // The note rule — placement, dedup, suppression — belongs to
+    // `withRerouteNote` (module scope); every branch below renders its blocks
+    // through `pushNoticed`. `noted` is the per-flush bookkeeping it needs.
     const noted = new Set<string>();
-    const noteReroute = (notice: Notice, before: number): void => {
-      if (notice.reroute && blocks.length > before && !noted.has(notice.runId)) {
-        noted.add(notice.runId);
-        blocks.splice(before, 0, rerouteNote(notice));
-      }
+    const pushNoticed = (notice: Notice, rendered: readonly string[]): void => {
+      blocks.push(...withRerouteNote(notice, rendered, noted));
     };
 
     for (const raw of batch) {
@@ -624,40 +672,18 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
       // marker a strip would have served never prints, and the parent read it
       // would cost is discarded with the note.
       const notice = noted.has(raw.runId) ? raw : await verifiedReroute(raw);
-      const before = blocks.length;
       const rec = lookup(notice.runId);
       if (!rec) {
-        if (notice.reroute) {
-          // A re-routed notice for a run this process never spawned: the note
-          // is the whole briefing for it — it says where the run lives and how
-          // to reach it, which the restart text cannot. The body rides with it
-          // when there is one: a rerouted report whose meta is unreadable and
-          // run dir gone is the only information available, and a note that
-          // swallows it loses it. One note per run per flush, like the
-          // registered path.
-          if (noted.has(notice.runId)) {
-            // Second notice for the same re-routed run in one flush: the note
-            // is suppressed (one per run per flush, like the registered path),
-            // but the notice itself is not — a report + done pair must not lose
-            // the completion.
-            blocks.push(
-              `--- ${notice.runId} (${notice.agent}) ${notice.kind} ---\n${
-                notice.text || "(no message)"
-              }`,
-            );
-            continue;
-          }
-          noted.add(notice.runId);
-          blocks.push(rerouteNote(notice) + (notice.text ? `\n\n${notice.text}` : ""));
-          continue;
-        }
-        // A notice for a run this process never registered (the parent
-        // restarted and the meta file was lost). Still worth surfacing.
-        blocks.push(
-          `--- ${notice.runId} (${notice.agent}) ${notice.kind} ---\n${
-            notice.text || "(no message)"
-          }\n(This task is not in my registry — it may predate a restart.)`,
-        );
+        // A notice for a run this process never registered (the parent restarted
+        // and the meta file was lost). Still worth surfacing. A re-routed one
+        // gets the note in the restart trailer's place: the note says where the
+        // run lives and how to reach it, which the restart text cannot. Its
+        // body always rides with it — a rerouted report whose meta is unreadable
+        // and whose run dir is gone is the only information available, and a
+        // briefing that swallows it loses it.
+        pushNoticed(notice, [
+          noticeBlock(notice, notice.reroute ? undefined : NOT_IN_REGISTRY),
+        ]);
         continue;
       }
       // Read before deciding: a report notice may have arrived while the child
@@ -670,30 +696,31 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
           // deliberate. The strip only downgrades the *note's* provenance
           // claim; it does not delete the child's own wording, and the
           // diagnosis should see what the child actually sent.
+          const stalledBlocks: string[] = [];
           const hc = await requestHealthCheck(rec, { kind: "stalled", detail: notice.text });
           if (!hc.ok) {
-            blocks.push(
+            // The check could not launch, so this block is the diagnosis the
+            // orchestrator gets — and a rerouted stall that DID launch its check
+            // contributes nothing at all: no block, so no note and no wake,
+            // because nothing is pending for it here.
+            stalledBlocks.push(
               `--- ${rec.runId} (${rec.agent}) stalled ---\n${notice.text || "(no detail)"}\n` +
                 `The automatic health check could not launch: ${hc.error}. ` +
                 `Look at it with subagent_tasks (action "result", ids ["${rec.runId}"]), or interrupt/cancel it.`,
             );
           }
-          // A rerouted stall that launches its health check adds no block at
-          // all — and no note, no wake: nothing is pending for it here.
-          noteReroute(notice, before);
+          pushNoticed(notice, stalledBlocks);
           continue;
         }
-        blocks.push(
+        pushNoticed(notice, [
           `--- ${rec.runId} (${notice.agent}) ${notice.kind === "report" ? "sent a mid-run report" : "sent a notice"} ---\n${notice.text || "(no message)"}\n` +
             `It is still working. Reply with subagent_tasks (action "message", ids ["${rec.runId}"]) if it needs an answer or a correction.`,
-        );
-        noteReroute(notice, before);
+        ]);
         continue;
       }
-      await renderFinished(observation);
-      noteReroute(notice, before);
+      pushNoticed(notice, await renderFinished(observation));
     }
-    for (const observation of swept) await renderFinished(observation);
+    for (const observation of swept) blocks.push(...(await renderFinished(observation)));
 
     // Ownership bounds the tail: a foreign session's running children are not
     // this orchestrator's to report on.

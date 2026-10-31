@@ -14,6 +14,7 @@ import {
   LIVENESS_BACKSTOP_MS,
   MAX_DEGRADED_RELEASE_ATTEMPTS,
   NOTICE_COALESCE_MS,
+  withRerouteNote,
   type HealthCheckSpawnOutcome,
   type ReleaseLedgerDeps,
 } from "./release-ledger.js";
@@ -906,6 +907,9 @@ describe("release ledger: reroute notes", () => {
     const text = await w.deliver(withReroute(done("sub-9331", "reviewer")));
     expect(text).toContain("rerouted ---");
     expect(text).toContain("delivered to you (orchestrator)");
+    // The note no longer *is* the whole briefing: the run's own header block
+    // rides with it, so the kind and the body survive the unregistered path.
+    expect(text).toContain("--- sub-9331 (reviewer) done ---");
     expect(text).not.toContain("predate a restart");
   });
 
@@ -995,7 +999,7 @@ describe("release ledger: reroute notes", () => {
     expect(text).toContain("[rerouted: addressed to parent worker sub-96ba");
     expect(text).toContain("found X");
     // Order: the stripped-marker report block first, then the note — the done
-    // notice's only output (its body is empty), riding after the report's
+    // notice's note + header block, riding after the report's
     // "predate a restart" text.
     expect(text!.indexOf("found X")).toBeLessThan(text!.indexOf("rerouted ---"));
     expect(text!.indexOf("rerouted ---")).toBeGreaterThan(text!.indexOf("predate a restart"));
@@ -1228,5 +1232,54 @@ describe("release ledger: reroute notes", () => {
     const text = await ledger.flush(deadline);
     expect(text).toBeDefined();
     expect(text).toContain("sub-9331");
+  });
+});
+
+describe("withRerouteNote", () => {
+  // The decorator owns placement, dedup and suppression for every briefing
+  // branch, so its three rules are pinned here directly — no ledger, no world.
+  const marker = {
+    parentAgent: "worker",
+    parentRunId: "sub-96ba",
+    deliveredTo: "orchestrator",
+  } satisfies NonNullable<Notice["reroute"]>;
+  const notice = (over: Partial<Notice> = {}): Notice => ({
+    runId: "sub-9331",
+    agent: "reviewer",
+    kind: "done",
+    text: "the body",
+    ...over,
+  });
+  const rerouted = (over: Partial<Notice> = {}): Notice => ({ ...notice(over), reroute: marker });
+
+  test("nothing rendered means nothing to annotate", () => {
+    const noted = new Set<string>();
+    expect(withRerouteNote(rerouted(), [], noted)).toEqual([]);
+    expect([...noted]).toEqual([]);
+  });
+
+  test("the note precedes the blocks it annotates, keeping their order", () => {
+    const noted = new Set<string>();
+    const out = withRerouteNote(rerouted(), ["first block", "second block"], noted);
+    expect(out.slice(1)).toEqual(["first block", "second block"]);
+    expect(out[0]).toContain("rerouted ---");
+    expect([...noted]).toEqual(["sub-9331"]);
+  });
+
+  test("the note names this pane as the delivery it claims", () => {
+    const [note] = withRerouteNote(rerouted(), ["block"], new Set<string>());
+    expect(note).toContain("sub-9331 (reviewer) rerouted ---");
+    expect(note).toContain("delivered to you (orchestrator)");
+  });
+
+  test("a second notice for one run adds no note", () => {
+    const noted = new Set<string>(["sub-9331"]);
+    expect(withRerouteNote(rerouted(), ["block"], noted)).toEqual(["block"]);
+  });
+
+  test("a direct delivery renders unchanged and notes nothing", () => {
+    const noted = new Set<string>();
+    expect(withRerouteNote(notice(), ["block"], noted)).toEqual(["block"]);
+    expect([...noted]).toEqual([]);
   });
 });
