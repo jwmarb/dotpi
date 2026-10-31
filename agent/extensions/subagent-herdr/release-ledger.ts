@@ -91,9 +91,10 @@ export function rerouteNote(
 }
 
 /**
- * A notice's own briefing block: the header naming the run and its kind, then
- * its body (`(no message)` when it has none), then an optional trailer. The
- * one template every branch of `compose` renders its notices through.
+ * The briefing block for a notice whose run this process never registered:
+ * the header naming the run and its kind, then its body (`(no message)` when
+ * it has none), then an optional trailer. Only `compose`'s unregistered
+ * branch renders through it; the registered branches build their own blocks.
  */
 const noticeBlock = (n: Notice, trailer?: string): string =>
   `--- ${n.runId} (${n.agent}) ${n.kind} ---\n${n.text || "(no message)"}${trailer ? `\n${trailer}` : ""}`;
@@ -184,7 +185,7 @@ export const MAX_DEGRADED_RELEASE_ATTEMPTS = 3;
 /**
  * The target run id a health-check record points at, or `undefined` when the
  * record is not a health check. A non-string `healthCheckOf` (a corrupted or
- * truncated meta.json) is treated as absent, matching `isRunRecord` in
+ * truncated meta.json) is treated as absent, matching `hasRunId` in
  * rundir.ts, so it can neither trip the recursion guard nor key a bogus
  * deferral.
  */
@@ -196,7 +197,7 @@ export function healthCheckOfId(rec: RunRecord): string | undefined {
  * The herdr pane id that owns a record — the spawning parent's pane, stamped
  * at spawn — or `undefined` when the record is legacy (no stamp) or carries a
  * corrupted (non-string) one. A non-string `ownerPane` is treated as absent,
- * matching `isRunRecord` in rundir.ts, so ownership is loadable but not
+ * matching `hasRunId` in rundir.ts, so ownership is loadable but not
  * sweepable: the record stays queryable, it is just never swept.
  */
 export function ownerPaneOf(rec: RunRecord): string | undefined {
@@ -590,9 +591,10 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
 
     const renderFinished = async (observation: RunObservation): Promise<string[]> => {
       const rec = observation.run;
-      // What this observation contributes; the caller decorates it with a note.
-      const out: string[] = [];
       if (alreadyBriefed(rec.runId)) return [];
+      // What this observation contributes. A notice's caller decorates it with
+      // a reroute note (`pushNoticed`); the sweep loop appends it undecorated.
+      const out: string[] = [];
       /** This run's result: cached, or read once through its observation. */
       const resultOfRun = async (): Promise<RunResult> => {
         // A run that transitioned in this observation (a late completion, say)

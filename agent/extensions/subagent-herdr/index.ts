@@ -91,7 +91,8 @@
  *   check runs; the health check's completion delivers both blocks in one
  *   briefing. A health check that cannot launch renders the no-answer block
  *   immediately, exactly as this feature's absence would.
- * - `healthCheckOf` is persisted in meta.json (`isRunRecord` validates it).
+ * - `healthCheckOf` is persisted in meta.json (`hasRunId` admits the record on
+ *   its run id alone; a non-string `healthCheckOf` is ignored, not fatal).
  *
  * The ordinary completion path is untouched: the `.exit` sidecar still
  * classifies a run, and the answer gate still decides what counts as an
@@ -445,6 +446,7 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
  * documents): a transcript (or prompt file) restored with identical size and mtime serves
  * the cached verdict, which is the right one when the bytes are in fact
  * identical. The map is never pruned: its entries are bounded by the
+ * distinct (dir, run id) pairs ever read for evidence (hundreds, not a
  * growth path). It contrasts with the parent-proof memo (positives only,
  * TTL-bounded): see `createParentProof` in parent-proof.ts.
  *
