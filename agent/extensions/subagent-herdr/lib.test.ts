@@ -4,13 +4,15 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
 import { ENV_AGENT_DIR, agentsDir, skillsDir } from "../lib/layout.js";
+import { setPersonaOverride } from "../lib/persona.js";
+import { LEASE_DIR_ENV } from "../model-fallback/concurrency.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { CARD_ID_PATTERN as BOARD_CARD_ID_PATTERN } from "../kanban/lib.js";
 import {
@@ -18,6 +20,7 @@ import {
   appendSkillCatalogue,
   buildChildArgv,
   buildChildEnv,
+  childAncestry,
   buildHealthCheckTask,
   agentNameRejection,
   childNameRejection,
@@ -33,6 +36,7 @@ import {
   spawnableAgents,
   parseLineage,
   readReports,
+  readRunRecordFromDisk,
   REPORT_TOOL_NAME,
   selectSkills,
   skillEntriesFromPi,
@@ -42,20 +46,25 @@ import {
 import { endedCleanly } from "./child-done.js";
 import { classifyExecFailure, errorPayload, paneRectFrom, probeFromCall, splitArgs, waitArgs, type HerdrCall } from "./herdr.js";
 import { createTerminalResultCache, interruptRun, launchAttempt, type Launcher } from "./index.js";
-import type { RunObservation } from "./run-lifecycle.js";
+import { completionSignal, type RunObservation } from "./run-lifecycle.js";
 import {
+  ANCESTRY_ENV,
+  ancestorLabel,
   CARD_ID_PATTERN,
   exitPath,
   formatExitSidecar,
   formatNotice,
   formatReportLine,
+  EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
   isRunRecord,
   isSessionFileFor,
   metaPath,
   parseNotice,
+  parseAncestry,
   parseReportLine,
   reportsPath,
+  formatAncestry,
   runDir,
   runsDir,
   hasResultBlock,
@@ -740,6 +749,179 @@ describe("extractRunResult", () => {
     expect(r.salvagedFrom).toBeUndefined();
   });
 
+  // -------------------------------------------------------------------------
+  // The bounded tail: `EVIDENCE_TAIL_BYTES` is the cap the factory's reroute
+  // evidence read passes in, so the salvage walk's behaviour under a cap is
+  // this suite's business, not a guess. The cap is exercised here at small
+  // sizes (500 / 300 bytes) so the fixtures stay small; that the factory
+  // passes the real cap at all — and the cap's own value — are pinned by the
+  // source-text test in the completion-predicate section below.
+  // -------------------------------------------------------------------------
+
+  test("a transcript larger than the tail cap answers from the cap's window", async () => {
+    // The window must stand on its own: the answer sits at the very end of a
+    // transcript whose head falls outside the cap, and the cap's cut lands
+    // mid-line, so the first line of the window is torn.
+    const dir = runDirWithResultPrompt();
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0201" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Filling the transcript: ".padEnd(600, "x") }],
+          stopReason: "stop",
+        },
+      }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "continue" }] } }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "<result>\nthe answer\n</result>" }],
+          stopReason: "stop",
+        },
+      }),
+    ];
+    const file = join(dir, "x_sub-0201.jsonl");
+    writeFileSync(file, lines.join("\n"));
+    const text = lines.join("\n");
+    expect(text.length).toBeGreaterThan(500); // the cap is exercised
+    // Pinned mid-line: the cut's byte is not a newline, so the first line of
+    // the window is torn. Without this the test would pass even if the cap
+    // happened to land on a line boundary, and the torn-line skip it claims to
+    // exercise would go untested.
+    expect(text[text.length - 500]).not.toBe("\n");
+
+    // The torn first line of the window is skipped, not fatal: the clean
+    // answer inside it is found.
+    const r = await extractRunResult(dir, "sub-0201", 500);
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe("<result>\nthe answer\n</result>");
+    expect(r.salvagedFrom).toBeUndefined();
+  });
+
+  test("a completion boundary found inside the tail answers from the done arguments", async () => {
+    // The done call itself must be findable in the window: its arguments
+    // carry the answer, and the walk keys the salvage on the boundary.
+    const dir = runDirWithResultPrompt();
+    const report = "<result>\nthe report from arguments\n</result>";
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0202" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Working: ".padEnd(600, "y") }],
+          stopReason: "stop",
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Done." },
+            { type: "toolCall", id: "call_1", name: "subagent_done", arguments: { message: report } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    ];
+    const file = join(dir, "x_sub-0202.jsonl");
+    writeFileSync(file, lines.join("\n"));
+    expect(statSync(file).size).toBeGreaterThan(500);
+
+    const r = await extractRunResult(dir, "sub-0202", 500);
+    expect(r.answered).toBe(true);
+    expect(r.text).toBe(report);
+    expect(r.salvagedFrom).toBe("done-arguments");
+  });
+
+  test("an answer whose head falls outside the window is not an answer at all", async () => {
+    // The report is a single JSON line: a window shorter than it starts
+    // mid-line, and the torn tail is skipped like any other torn line. So the
+    // answer is not merely "not clean" — it is not an answer at all. This is
+    // the shape where the sidecar, not the transcript, carries completion
+    // past the cap (the predicate's `hasSidecar` short-circuit).
+    const dir = runDirWithResultPrompt();
+    const full = "<result>\n" + "line of report.\n".repeat(80);
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "sub-0203" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: full }], stopReason: "stop" },
+      }),
+    ];
+    const file = join(dir, "x_sub-0203.jsonl");
+    writeFileSync(file, lines.join("\n"));
+    expect(statSync(file).size).toBeGreaterThan(300);
+
+    const r = await extractRunResult(dir, "sub-0203", 300);
+    expect(r.answered).toBe(false);
+    expect(r.text).toBe("");
+    expect(r.salvagedFrom).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // The completion predicate: spelled once in run-lifecycle.ts; the factory's
+  // evidence read consumes the same rule, and the pin below keeps the
+  // restatement from drifting back.
+  // -------------------------------------------------------------------------
+
+  test("completionSignal: the sidecar, or a clean transcript answer", () => {
+    const clean = { answered: true, text: "x", salvagedFrom: undefined };
+    const salvage = { answered: true, text: "y", salvagedFrom: "truncated-answer" };
+    const silent = { answered: false, text: "", salvagedFrom: undefined };
+    // The sidecar is the answer on its own.
+    expect(completionSignal(true, silent)).toBe(true);
+    // No sidecar: only a clean answer qualifies.
+    expect(completionSignal(false, clean)).toBe(true);
+    // A salvage proves the child produced text, not that it stopped.
+    expect(completionSignal(false, salvage)).toBe(false);
+    expect(completionSignal(false, silent)).toBe(false);
+  });
+
+  test("the lifecycle's completed() and the factory's evidence read call the same predicate, bounded by the shared cap", () => {
+    // The completion predicate is spelled once in run-lifecycle.ts. This pin
+    // fails if either call site drifts back to restating the rule. The regexes
+    // pin the rule — a one-line delegation, and the factory's evidence read
+    // passing the sidecar it checked itself (the local, `false` at that point)
+    // — not the formatting (variable names, line layout), so a layout change
+    // does not break the pin.
+    const lifecycle = readFileSync(new URL("./run-lifecycle.ts", import.meta.url), "utf-8");
+    const factory = readFileSync(new URL("./index.ts", import.meta.url), "utf-8");
+    expect(/const completed = \(rec: RunRecord, result: RunResult\): boolean =>\s*completionSignal\(/.test(lifecycle)).toBe(true);
+    expect(/completionSignal\(sidecar,/.test(factory)).toBe(true);
+    // The wake path's evidence read is bounded: the factory passes the shared
+    // cap as the tail argument. Without it `extractRunResult` reverts to a
+    // whole-transcript read on the serialized flush path (the corpus max is
+    // 7.90 MB) and every test in this suite would still pass — so the call
+    // site is pinned, not just the predicate.
+    // A trailing comma is allowed: the pin guards the ARGUMENT, not the formatting.
+    expect(/extractRunResult\([\s\S]{0,60}?EVIDENCE_TAIL_BYTES\s*,?\s*\)/.test(factory)).toBe(true);
+    // And the cap itself: defined, and at most 4 MB — the corpus max (7.90
+    // MB, measured 2026-10-30) is what the bound keeps off the serialized
+    // path, so a cap above 4 MB is a whole-file read in disguise.
+    expect(EVIDENCE_TAIL_BYTES).toBeGreaterThan(0);
+    expect(EVIDENCE_TAIL_BYTES).toBeLessThanOrEqual(4 * 1024 * 1024);
+  });
+
+  test("the wake path's proof memo stores positives only: the set sits under if (proof.finished)", () => {
+    // The approved semantics of `parentProofMemo`, pinned against drift: a
+    // `false` is a liveness inference that goes stale the moment the parent
+    // exits, so it is computed, returned and not stored. Serving a cached
+    // negative would silently delete a reroute note, so the only
+    // `parentProofMemo.set` must sit under the `proof.finished` guard — a
+    // refactor that caches every verdict (or moves the set) fails this pin.
+    const factory = readFileSync(new URL("./index.ts", import.meta.url), "utf-8");
+    // A block body is allowed: the pin guards the GUARD, not the formatting.
+    expect(/if\s*\(proof\.finished\)\s*\{?\s*parentProofMemo\.set\(/.test(factory)).toBe(true);
+    // "Only" is part of the pin: a second `.set(` caching every verdict
+    // would pass the guard's regex, so the call count is pinned too.
+    expect((factory.match(/parentProofMemo\.set\(/g) ?? []).length).toBe(1);
+  });
+
   test("an agent with no <result> contract is still answered by plain prose", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
     writeFileSync(systemPromptPath(dir), "Record one journal observation and reply with its id.");
@@ -856,15 +1038,27 @@ describe("buildHealthCheckTask", () => {
 
 describe("buildChildEnv", () => {
   test("carries the run identity and the parent pane when known", () => {
-    const env = buildChildEnv({ runId: "sub-0008", agent: "worker" }, "w5:p1", "/runs/sub-0008");
-    expect(env).toEqual({
-      PI_SUBAGENT_RUN_ID: "sub-0008",
-      PI_SUBAGENT_AGENT: "worker",
-      PI_SUBAGENT_RUN_DIR: "/runs/sub-0008",
-      PI_SUBAGENT_PARENT_PANE: "w5:p1",
-      // The delegation-tree bound travels with every child (see lineageRejection).
-      PI_SUBAGENT_LINEAGE: "worker",
-    });
+    // The profile dir crosses with every child, so the var is isolated exactly
+    // as the sibling tests do: set here, asserted forwarded, restored after.
+    const prev = process.env[ENV_AGENT_DIR];
+    try {
+      process.env[ENV_AGENT_DIR] = "/tmp/fakeprofile";
+      const env = buildChildEnv({ runId: "sub-0008", agent: "worker" }, "w5:p1", "/runs/sub-0008");
+      expect(env).toEqual({
+        PI_SUBAGENT_RUN_ID: "sub-0008",
+        PI_SUBAGENT_AGENT: "worker",
+        PI_SUBAGENT_RUN_DIR: "/runs/sub-0008",
+        PI_SUBAGENT_PARENT_PANE: "w5:p1",
+        // The delegation-tree bound travels with every child (see lineageRejection).
+        PI_SUBAGENT_LINEAGE: "worker",
+        // And so does the profile dir — the child must resolve the same
+        // profile its parent is running, whatever the ambient env says.
+        [ENV_AGENT_DIR]: "/tmp/fakeprofile",
+      });
+    } finally {
+      if (prev === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = prev;
+    }
   });
 
   test("omits the parent pane when the orchestrator has none", () => {
@@ -873,6 +1067,25 @@ describe("buildChildEnv", () => {
     expect(env.PI_SUBAGENT_RUN_ID).toBe("sub-0009");
   });
 
+  test("stamps the full chain into the child's env", () => {
+    const ancestry = [
+      { pane: "w5:p3", runId: "sub-96ba", agent: "worker" },
+      { pane: "w1:p1", runId: "", agent: "" },
+    ];
+    const env = buildChildEnv(
+      { runId: "sub-9331", agent: "reviewer" },
+      "w5:p3",
+      "/runs/sub-9331",
+      ["worker", "reviewer"],
+      undefined,
+      undefined,
+      ancestry,
+    );
+    expect(env["PI_SUBAGENT_ANCESTRY"]).toBe("w5:p3|sub-96ba|worker;w1:p1||");
+    // An empty chain crosses nothing: today's env, byte for byte.
+    const bare = buildChildEnv({ runId: "sub-9332", agent: "reviewer" }, "w5:p3", "/runs/sub-9332");
+    expect(bare["PI_SUBAGENT_ANCESTRY"]).toBeUndefined();
+  });
   test("carries the runtime fallback chain when the child has one", () => {
     // The chain is what makes a running child hop on error rather than
     // re-asking the model that just failed.
@@ -938,6 +1151,21 @@ describe("buildChildEnv", () => {
     } finally {
       if (prev === undefined) delete process.env[ENV_AGENT_DIR];
       else process.env[ENV_AGENT_DIR] = prev;
+    }
+  });
+
+  test("an in-session profile switch crosses to the child, and so does the lease dir", () => {
+    // The switch retargets the fleet without moving the process's own dir, so
+    // the child's profile dir must come from the switch, not the env var —
+    // and the router's machine-wide cap leases in the process's own cache,
+    // which the child must share rather than split.
+    setPersonaOverride({ name: "q", dir: "/tmp/q", deniedTools: new Set() });
+    try {
+      const env = buildChildEnv({ runId: "sub-0017", agent: "worker" }, "w5:p1", "/runs/sub-0017");
+      expect(env[ENV_AGENT_DIR]).toBe("/tmp/q");
+      expect(env[LEASE_DIR_ENV]).toBeDefined();
+    } finally {
+      setPersonaOverride(undefined);
     }
   });
 
@@ -1191,6 +1419,60 @@ describe("readReports", () => {
   test("returns [] when the child never reported", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
     expect(await readReports(dir)).toEqual([]);
+  });
+});
+
+describe("readRunRecordFromDisk", () => {
+  const record = (runId: string) => ({
+    runId,
+    agent: "reviewer",
+    task: "t",
+    pane: "w3:p2",
+    workspace: "/tmp/x",
+    startedAt: 1,
+    finishedAt: 2,
+    status: "done" as const,
+    profileName: "work",
+  });
+
+  /** A runs dir (the reader's base) holding one run dir with a meta. */
+  const runsDirWith = (runId: string, meta: unknown): string => {
+    const runsDir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    const runDir = join(runsDir, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "meta.json"), typeof meta === "string" ? meta : JSON.stringify(meta));
+    return runsDir;
+  };
+
+  test("reads a valid meta whose runId matches the dir name", () => {
+    const runsDir = runsDirWith("sub-a3f1", record("sub-a3f1"));
+    expect(readRunRecordFromDisk(runsDir, "sub-a3f1")).toEqual(record("sub-a3f1"));
+  });
+
+  test("rejects a meta whose runId does not match the dir name", () => {
+    const runsDir = runsDirWith("sub-a3f1", record("sub-other"));
+    expect(readRunRecordFromDisk(runsDir, "sub-a3f1")).toBeUndefined();
+  });
+
+  test("a missing or unreadable dir is undefined", () => {
+    const runsDir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
+    expect(readRunRecordFromDisk(runsDir, "sub-a3f1")).toBeUndefined();
+    const partial = runsDirWith("sub-a3f1", "{" /* partial */);
+    expect(readRunRecordFromDisk(partial, "sub-a3f1")).toBeUndefined();
+  });
+
+  test("a meta without a string runId is not a record", () => {
+    const runsDir = runsDirWith("sub-a3f1", { agent: "x" });
+    expect(readRunRecordFromDisk(runsDir, "sub-a3f1")).toBeUndefined();
+  });
+
+  test("an id outside the run-id shape is refused before the filesystem", () => {
+    // The reader derives the dir from the id, so `../x` would resolve outside
+    // the runs dir; the shape check keeps it off the filesystem entirely.
+    const runsDir = runsDirWith("sub-a3f1", record("sub-a3f1"));
+    expect(readRunRecordFromDisk(runsDir, "../x")).toBeUndefined();
+    // And the same id still reads when it is well-formed.
+    expect(readRunRecordFromDisk(runsDir, "sub-a3f1")).toEqual(record("sub-a3f1"));
   });
 });
 
@@ -1657,6 +1939,67 @@ describe("formatNotice / parseNotice", () => {
 
 });
 
+describe("rerouted notices", () => {
+  const reroute = { parentAgent: "worker", parentRunId: "sub-96ba", deliveredTo: "orchestrator" };
+
+  test("formatNotice with a reroute emits the exact marker", () => {
+    expect(
+      formatNotice("sub-9331", "reviewer", "report", "found X", reroute),
+    ).toBe(
+      "[subagent sub-9331 (reviewer) report] [rerouted: addressed to parent worker sub-96ba, which has finished; delivered to ancestor orchestrator] found X",
+    );
+  });
+
+  test("parseNotice round-trips the reroute fields", () => {
+    expect(parseNotice(formatNotice("sub-9331", "reviewer", "report", "found X", reroute))).toEqual({
+      runId: "sub-9331",
+      agent: "reviewer",
+      kind: "report",
+      text: "found X",
+      reroute,
+    });
+  });
+
+  test("a rerouted bare done has an empty text", () => {
+    const parsed = parseNotice(formatNotice("sub-9331", "reviewer", "done", "", reroute))!;
+    expect(parsed.text).toBe("");
+    expect(parsed.reroute).toEqual(reroute);
+  });
+
+  test("a reroute to a named ancestor round-trips", () => {
+    const parsed = parseNotice(
+      formatNotice("sub-9331", "reviewer", "report", "m", {
+        ...reroute,
+        deliveredTo: "lead sub-1234",
+      }),
+    )!;
+    expect(parsed.reroute?.deliveredTo).toBe("lead sub-1234");
+    expect(parsed.text).toBe("m");
+  });
+
+  test("a normal notice has no reroute key", () => {
+    const parsed = parseNotice(formatNotice("sub-9331", "reviewer", "done"))!;
+    expect(parsed).not.toHaveProperty("reroute");
+  });
+
+  test("formatNotice without a reroute is unchanged", () => {
+    expect(formatNotice("sub-9331", "reviewer", "report", "m")).toBe("[subagent sub-9331 (reviewer) report] m");
+  });
+
+  test("the reroute marker alone is not a notice", () => {
+    expect(
+      parseNotice(
+        "[rerouted: addressed to parent worker sub-96ba, which has finished; delivered to ancestor orchestrator] hi",
+      ),
+    ).toBeUndefined();
+  });
+
+  test("a malformed marker stays in the text", () => {
+    const parsed = parseNotice("[subagent sub-9331 (reviewer) report] [rerouted: by someone] x")!;
+    expect(parsed.text).toBe("[rerouted: by someone] x");
+    expect(parsed).not.toHaveProperty("reroute");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // errorPayload — the failure-path parse
@@ -2688,6 +3031,51 @@ describe("buildChildEnv lineage stamping", () => {
     const asChildSees = parseLineage(stamped["PI_SUBAGENT_LINEAGE"]);
     expect(lineageRejection("librarian", ["any"], asChildSees)).toBeDefined();
     expect(lineageRejection("spiker", ["librarian"], asChildSees)).toBeUndefined();
+  });
+});
+
+describe("ancestry env", () => {
+  test("formatAncestry/parseAncestry round-trip", () => {
+    const entries = [
+      { pane: "w5:p3", runId: "sub-96ba", agent: "worker" },
+      { pane: "w1:p1", runId: "", agent: "" },
+    ];
+    expect(parseAncestry(formatAncestry(entries))).toEqual(entries);
+  });
+
+  test("parseAncestry drops malformed entries", () => {
+    expect(parseAncestry("w5:p3|sub-zz|worker;w1 p1||;w2:p2|sub-1234|")).toEqual([]);
+  });
+
+  test("childAncestry prepends this process", () => {
+    expect(
+      childAncestry({
+        HERDR_PANE_ID: "w5:p3",
+        PI_SUBAGENT_RUN_ID: "sub-96ba",
+        PI_SUBAGENT_AGENT: "worker",
+        [ANCESTRY_ENV]: "w1:p1||",
+      } as NodeJS.ProcessEnv),
+    ).toEqual([
+      { pane: "w5:p3", runId: "sub-96ba", agent: "worker" },
+      { pane: "w1:p1", runId: "", agent: "" },
+    ]);
+  });
+
+  test("childAncestry of the orchestrator is its pane alone", () => {
+    expect(childAncestry({ HERDR_PANE_ID: "w1:p1" } as NodeJS.ProcessEnv)).toEqual([
+      { pane: "w1:p1", runId: "", agent: "" },
+    ]);
+  });
+
+  test("childAncestry without a pane passes the chain through", () => {
+    expect(
+      childAncestry({ [ANCESTRY_ENV]: "w5:p3|sub-96ba|worker" } as NodeJS.ProcessEnv),
+    ).toEqual([{ pane: "w5:p3", runId: "sub-96ba", agent: "worker" }]);
+  });
+
+  test("ancestorLabel names the root as the orchestrator", () => {
+    expect(ancestorLabel({ pane: "w1:p1", runId: "", agent: "" })).toBe("orchestrator");
+    expect(ancestorLabel({ pane: "w5:p3", runId: "sub-96ba", agent: "worker" })).toBe("worker sub-96ba");
   });
 });
 

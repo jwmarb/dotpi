@@ -136,6 +136,7 @@ import {
   buildChildArgv,
   buildChildEnv,
   buildHealthCheckTask,
+  childAncestry,
   childNameRejection,
   discoverSkills,
   extractRunResult,
@@ -144,6 +145,7 @@ import {
   parseLineage,
   pickSessionName,
   readReports,
+  readRunRecordFromDisk,
   type HealthCheckTrigger,
   type RunResult,
   selectSkills,
@@ -157,14 +159,18 @@ import {
   type AgentInfo,
   delegationRoster,
 } from "../lib/agents.js";
-import { agentDir, agentsDir, skillsDir } from "../lib/layout.js";
+import { agentDir, agentsDir, profileDir, skillsDir } from "../lib/layout.js";
+import { personaOverride } from "../lib/persona.js";
 import {
+  ancestorLabel,
   CARD_ID_PATTERN,
+  EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
   isRunRecord,
   metaPath,
   type Notice,
   parseNotice,
+  RUN_ID_PATTERN,
   type RunRecord,
   runDir,
   runsDir,
@@ -187,6 +193,7 @@ import {
 } from "./herdr.js";
 import { piShimDir, prependPathCommand, runningCompiled } from "../lib/runtime.js";
 import {
+  completionSignal,
   createRunLifecycle,
   type PaneObservation,
   type RunLifecycle,
@@ -212,8 +219,22 @@ export { createTerminalResultCache, type TerminalResultCache } from "./release-l
 /** Where every run's session, sidecar and metadata live (gitignored). */
 const RUNS_DIR = runsDir(agentDir());
 
-/** This run's directory, derived from its id rather than stored on the record. */
-const dirFor = (runId: string): string => runDir(agentDir(), runId);
+/**
+ * The run dir of a run adopted from a directory that is not this process's
+ * own (see {@link adoptRunFromDisk}). An in-session profile switch retargets
+ * the children's run dir to the switched profile, so an adopted run's
+ * transcript, sidecar and meta live there — every read and write for that run
+ * must go there, not where this process's dir says they should.
+ */
+const adoptedRunDirs = new Map<string, string>();
+
+/**
+ * This run's directory, derived from its id rather than stored on the record.
+ * A run this process spawned lives under its own agent dir; a run adopted
+ * from a switched profile's runs dir is answered from `adoptedRunDirs`, where
+ * its files actually are.
+ */
+const dirFor = (runId: string): string => adoptedRunDirs.get(runId) ?? runDir(agentDir(), runId);
 
 /** Directory of this extension, so `child-done.ts` can be passed to a child by absolute path. */
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
@@ -335,7 +356,17 @@ function loadRegistry(): void {
       const parsed: unknown = JSON.parse(
         readFileSync(metaPath(join(RUNS_DIR, d)), "utf-8"),
       );
-      if (isRunRecord(parsed)) runs.set(parsed.runId, parsed);
+      // The load-time trust gate, mirroring `readRunRecordFromDisk` (pattern
+      // plus dir-name equality): the shared runs dir is writable by every pi
+      // process, so a planted `meta.json` is a realistic input — and `dirFor`
+      // joins the id into a path, so an id outside the run-id shape, or one
+      // that is not its own dir's name, must not reach the display arms' path
+      // joins. `d` from `readdirSync` is always a single component, which is
+      // what the equality keeps a planted `runId` of `../x` off; the pattern
+      // keeps a dir whose name is not a run id off.
+      if (isRunRecord(parsed) && RUN_ID_PATTERN.test(parsed.runId) && parsed.runId === d) {
+        runs.set(parsed.runId, parsed);
+      }
     } catch {
       // Partial dir (crashed mid-spawn): ignored.
     }
@@ -345,8 +376,153 @@ function loadRegistry(): void {
 loadRegistry();
 
 /**
- * A cheap fingerprint of a run's completion evidence: its session file's size
- * and mtime. Revival extracts a failed run's transcript only when this moved.
+ * The bases a run this process may never have spawned can live in: this
+ * process's own runs dir, plus the switched profile's dir when an in-session
+ * profile switch retargeted the children's run dir there. The two deliberate
+ * exceptions to own-dir reads in `../lib/layout.ts` — `adoptRunFromDisk`'s
+ * rescue retry and the ledger's `parentRunIsFinished` parent lookup — both
+ * read through these.
+ */
+const runDirBases = (): string[] => {
+  const bases = [RUNS_DIR];
+  const switched = runsDir(profileDir());
+  if (switched !== RUNS_DIR) bases.push(switched);
+  return bases;
+};
+
+/**
+ * The claimed parent's record and the run dir it lives in, from {@link runDirBases} —
+ * the first base that has it. Reads the record *without* registering it (no
+ * `runs.set`, no `adoptedRunDirs` entry): a reroute marker's `parentRunId` is
+ * model text, not a notice addressed to this pane, so it must not enter the
+ * registry where `subagent_tasks list` would surface it and `cancel`/
+ * `interrupt` could address it. The local `join(base, runId)` is the dir the
+ * evidence reads need, standing in for `dirFor` without the mapping.
+ */
+const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } | undefined => {
+  for (const base of runDirBases()) {
+    const rec = readRunRecordFromDisk(base, runId);
+    if (rec) return { rec, dir: join(base, runId) };
+  }
+  return undefined;
+};
+
+/**
+ * The completion evidence for one run dir, read *without settling*: the
+ * `.exit` sidecar, or a clean transcript answer read as a bounded tail — the
+ * {@link completionSignal} rule, spelled once. `parentRunIsFinished` (the
+ * reroute proof) and the display-only answer for a foreign `running` record
+ * in `status`/`result` both consume it. A read, never a write: no transition,
+ * no meta save, no pane close — so a run this pane does not own is never
+ * settled by it, and the owning pane's process stays the one to do that.
+ *
+ * `result` is the extraction the decision rested on (absent when the sidecar
+ * decided, since the transcript need not be read), so a caller that renders
+ * the answer does not read the transcript twice. The negative arm carries
+ * none: no caller renders a negative's extraction (the display arms render
+ * mid-run reports from `reports.jsonl` instead), so it is not stored.
+ *
+ * `from` names the evidence the verdict rested on, `sidecar` or `answer`;
+ * the negative arm carries none, and no caller consults `from` without a
+ * `finished: true`.
+ *
+ * Memoized on the dir plus the run id, stamped on the session file's and
+ * the prompt file's size/mtime (`evidenceStamp`): without the memo, the display path would
+ * pay a bounded 4 MB tail read plus the `system-prompt.md` read for every
+ * foreign `running` record on every `status`/`result` call, serially in
+ * the id loop — on the answer branch; the sidecar branch pays neither,
+ * with or without the memo, because `hasExitSidecar` decides first. The
+ * sidecar check runs before the memo, so a sidecar that arrives re-proves;
+ * the stamp re-proves a transcript (or prompt file) that moves. No TTL:
+ * the verdict is a function of the on-disk bytes the read sees, and both
+ * movers invalidate the stamp — the one byte mover the stamp cannot see
+ * is an equal-size restore (the Nextcloud sync restore `readSessionTail`
+ * documents): a transcript (or prompt file) restored with identical size and mtime serves
+ * the cached verdict, which is the right one when the bytes are in fact
+ * identical. The map is never pruned: its entries are bounded by the
+ * distinct (dir, run id) pairs ever read for evidence (hundreds, not a
+ * growth path) — the same bound as `parentProofMemo`, which it contrasts:
+ * `parentProofMemo` caches positives only, because a `false` rests on pane
+ * liveness the stamp cannot see, so it is never stored, and a cached
+ * positive is TTL-bounded — and it stays keyed on the run id alone.
+ *
+ * The dir is in the key, not left to `dirFor`: `agentDir()` reads
+ * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a profile
+ * switch, no `adoptedRunDirs` entry) must not serve a verdict stamped in
+ * the other dir.
+ */
+type CompletionEvidence =
+  | { finished: true; from: "sidecar" | "answer"; result?: RunResult }
+  | { finished: false };
+
+const completionEvidenceMemo = new Map<
+  string,
+  { stamp: string | undefined; value: CompletionEvidence }
+>();
+
+const completionEvidence = async (
+  dir: string,
+  runId: string,
+): Promise<CompletionEvidence> => {
+  const sidecar = hasExitSidecar(dir, runId);
+  if (sidecar) return { finished: true, from: "sidecar" };
+  const stamp = evidenceStamp(dir, runId);
+  const key = `${dir}\u0000${runId}`;
+  const hit = completionEvidenceMemo.get(key);
+  if (hit !== undefined && hit.stamp === stamp) return hit.value;
+  const result = await extractRunResult(dir, runId, EVIDENCE_TAIL_BYTES);
+  const value: CompletionEvidence = completionSignal(sidecar, result)
+    ? { finished: true, from: "answer", result }
+    : { finished: false };
+  completionEvidenceMemo.set(key, { stamp, value });
+  return value;
+};
+
+/**
+ * Registers a run from its on-disk run dir — the rescue path for a notice
+ * that arrives after a parent restart, when the meta file was lost but the
+ * run dir (and its session transcript) survived.
+ *
+ * The meta.json's runId must match the dir name: that identity is what the
+ * run dir layout assumes. The pane is not probed here — liveness
+ * classification is the same lazy job `loadRegistry` leaves to the next
+ * `status` / `wait` / `result` call.
+ *
+ * The id gate lives in `readRunRecordFromDisk` (the reader derives the dir
+ * from the id and validates it), so a model-supplied `../x` never reaches the
+ * filesystem through this path. `RUNS_DIR` is this process's own dir, and an
+ * in-session profile switch retargets a child's run dir to the switched
+ * profile, so a miss here is retried through `profileDir()` — the one other
+ * dir the retry covers. Without the retry, a rerouted grandchild notice would
+ * brief as an unregistered run. A run found in the switched dir is recorded in
+ * `adoptedRunDirs`, so `dirFor` keeps its transcript, sidecar and meta reads
+ * where they actually are. (A switch inside a *child's own* session would put
+ * a great-grandchild's run dir in a third dir neither base looks, so that
+ * notice briefs as unregistered — low likelihood, deep chain.)
+ */
+function adoptRunFromDisk(runId: string): RunRecord | undefined {
+  const existing = runs.get(runId);
+  if (existing) return existing;
+  for (const base of runDirBases()) {
+    const rec = readRunRecordFromDisk(base, runId);
+    if (!rec) continue;
+    runs.set(runId, rec);
+    const dir = join(base, runId);
+    if (dir !== dirFor(runId)) adoptedRunDirs.set(runId, dir);
+    return rec;
+  }
+  return undefined;
+}
+
+/**
+ * A cheap fingerprint of a run's completion evidence: its session file's and
+ * its `system-prompt.md`'s size and mtime. Revival extracts a failed run's
+ * transcript only when this moved, and the memoized evidence verdict re-proves
+ * the same way. The prompt file is part of the verdict — it decides the
+ * `<result>` contract the answer is judged against — so a rewrite of it must
+ * move the fingerprint too; its absence is a stamp value, not an error, a
+ * missing prompt degrades the verdict to the weaker rule, and that
+ * (non)existence is part of what the verdict rests on.
  */
 function evidenceStamp(runDirPath: string, runId: string): string | undefined {
   try {
@@ -356,7 +532,14 @@ function evidenceStamp(runDirPath: string, runId: string): string | undefined {
     const name = pickSessionName(readdirSync(runDirPath), runId);
     if (!name) return undefined;
     const stat = statSync(join(runDirPath, name));
-    return `${stat.size}:${stat.mtimeMs}`;
+    let promptStamp: string;
+    try {
+      const prompt = statSync(systemPromptPath(runDirPath));
+      promptStamp = `${prompt.size}:${prompt.mtimeMs}`;
+    } catch {
+      promptStamp = "absent";
+    }
+    return `${stat.size}:${stat.mtimeMs}\u0000${promptStamp}`;
   } catch {
     return undefined;
   }
@@ -492,6 +675,7 @@ export async function launchAttempt(
     [...parseLineage(process.env[LINEAGE_ENV]), rec.agent],
     fallbackChain,
     rec.card,
+    childAncestry(process.env),
   );
   const label = `${agent.name} ${rec.runId}`;
   const pane = await launcher.createChildPane(rec.cwd, label, env);
@@ -707,8 +891,13 @@ async function launchRegisteredRun(
   if (agent.skills && agent.skills.length > 0) {
     // pi's own resolved list covers packages and project scope and has the
     // human's resource filters already applied; scanning `agent/skills/` is the
-    // fallback for the case where no turn has started yet.
-    const available = piSkillCatalogue ?? (await discoverSkills(skillsDir()));
+    // fallback for the case where no turn has started yet. Under a profile
+    // switch the process's catalogue is the *home* profile's, not the
+    // target's, so the switch always scans the (retargeted) skills dir
+    // instead of reusing it.
+    const available = personaOverride()
+      ? await discoverSkills(skillsDir())
+      : (piSkillCatalogue ?? (await discoverSkills(skillsDir())));
     const selected = selectSkills(agent.skills, available);
     const canRead = !agent.tools || agent.tools.length === 0 ||
       agent.tools.some((t) => READING_TOOLS.has(t));
@@ -895,18 +1084,23 @@ async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Pushes one completed run's block (header, salvage note, todos line,
- * answer text, diagnostics, reports)
+ * Pushes one completed run's block (header, optional inference note, salvage
+ * note, todos line, answer text, diagnostics, reports)
  * onto the caller's output array. The caller must have already brought the
- * record up to date (`lifecycle.read`, or a sweep).
+ * record up to date (`lifecycle.read`, or a sweep) — except the display-only
+ * foreign-record path, which passes its inference note: the status is inferred
+ * from on-disk evidence, not settled by this pane.
  */
 async function renderResultBlock(
   rec: RunRecord,
   out: string[],
   /** Pre-fetched result, when the caller already ran the no-answer gate. */
   result?: RunResult,
+  /** Display-only note under the header (the foreign-record inference label). */
+  note?: string,
 ): Promise<void> {
   out.push(formatResultHeader(rec));
+  if (note) out.push(note);
   const resolved = result ?? (await extractRunResult(dirFor(rec.runId), rec.runId));
   // A salvaged answer is labelled rather than passed off as a clean report: the
   // orchestrator should know it is reading something the child stranded in the
@@ -1019,12 +1213,58 @@ function fallbackBriefing(
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+/**
+/**
+ * Patience for the wake path's parent probe. `probeAgent` shares the
+ * module-wide 30 s herdr timeout, but this probe runs on the serialized
+ * wake path — one probe per marker-carrying notice whose parent is not
+ * proven finished, each bounded at `WAKE_PROBE_TIMEOUT_MS` (5 s) — so a
+ * hung herdr would stall every briefing behind it. 5 s is far longer than
+ * a healthy local round-trip (measured sub-millisecond) and far shorter
+ * than the stall it bounds; a timeout kills the CLI with no reply document,
+ * so `probeFromCall` answers `unreachable` (herdr.ts behaviour 10) — "not
+ * gone", the conservative direction: the note is stripped, never a pane
+ * proven gone.
+ */
+export const WAKE_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long a cached POSITIVE inference from the running-parent proof
+ * stands. A foreign `running` parent no process ever ticks (the documented
+ * nested-owner case) would otherwise re-probe on every flush. The memo is
+ * reached only after the terminal-status return, so every cached value is a
+ * `true`: a `true` proven by the `.exit` sidecar is a completion record and
+ * stands without the expiry (terminal is terminal); a `true` inferred from
+ * the transcript tail is an inference, not a record, and it expires here —
+ * a hit past the TTL re-proves. `false` answers are never cached: a
+ * negative is a liveness inference that goes stale the moment the parent
+ * exits, and serving it silently deletes a reroute note, so a notice from a
+ * live parent pays one probe — `probeAgent` at `WAKE_PROBE_TIMEOUT_MS` (5 s
+ * cap) — and that runs only for notices that carry a reroute marker, which
+ * is rare. One liveness tick: the wake path's own clocks are the 1.2 s
+ * coalesce window and this 60 s tick, so a stale entry dies within a tick
+ * of whatever re-proves it.
+ */
+export const PARENT_PROOF_TTL_MS = LIVENESS_BACKSTOP_MS;
+
 export default function (pi: ExtensionAPI): void {
   // This process's herdr pane, captured once at factory time: ownership is
   // stamped at spawn and compared at sweep time, and the env is the one fact
   // a restarted process can trust to identify itself. `undefined` (no herdr
   // pane) owns nothing — autonomous sweeps are a no-op, queries are not.
   const ownerPane = process.env.HERDR_PANE_ID;
+  // The label the delivery walker stamps on a notice it delivers to THIS
+  // process — `orchestrator` for the root, `agent runId` for a nested child.
+  // The ledger compares it against a reroute marker's `deliveredTo` before
+  // the note prints the marker as measured provenance; a process with no pane
+  // has no label, and receives no herdr prompt in the first place.
+  const selfLabel = process.env.HERDR_PANE_ID
+    ? ancestorLabel({
+        pane: process.env.HERDR_PANE_ID,
+        runId: process.env.PI_SUBAGENT_RUN_ID ?? "",
+        agent: process.env.PI_SUBAGENT_AGENT ?? "",
+      })
+    : undefined;
 
   // -------------------------------------------------------------------------
   // Skill catalogue capture
@@ -1167,8 +1407,27 @@ export default function (pi: ExtensionAPI): void {
 
   // -------------------------------------------------------------------------
   // The wake path: a child's notice arrives here as ordinary input
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
+  // Cross-flush memo for the running-parent proof, keyed on the id alone:
+  // the memo is reached only on the `running` branch (a terminal answer
+  // skips it entirely — the status check precedes it), so a status in the
+  // key would be a constant. It caches ONLY `finished: true` proofs: a
+  // `false` is a liveness inference that goes stale the moment the parent
+  // exits, and serving it silently deletes a reroute note — a pair's done
+  // lands inside the 1.2 s coalesce window, so a parent that finishes
+  // between the pair's report and its done would lose the note for the
+  // whole TTL — while a positive is terminal. The entry records the proof's
+  // source, because that decides the expiry: a sidecar-proven `true` is a
+  // completion record and stands; an answer-inferred `true` expires with
+  // `PARENT_PROOF_TTL_MS`. The map is never pruned, so a sidecar-proven
+  // entry lives for the process lifetime — fine: it is bounded by the
+  // distinct run ids ever proven (hundreds, not a growth path), and keying
+  // on `runId` alone already shrank it versus the old `${id}:${status}` key.
+  const parentProofMemo = new Map<
+    string,
+    { at: number; from: "sidecar" | "answer" }
+  >();
   // The policy — coalescing, dedup, health-check pairing, ownership, the
   // liveness tick — is the ledger's (release-ledger.ts). The factory keeps
   // only what the ledger must not touch: the timers, the clock, and pi.
@@ -1176,6 +1435,119 @@ export default function (pi: ExtensionAPI): void {
     records: () => [...runs.values()],
     lifecycle,
     ownerPane,
+    selfLabel,
+    // Parent-side half of the reroute marker's provenance: the claimed parent
+    // must resolve to a real *terminal* run — `done`, `failed` and `cancelled`
+    // all count; the parent has stopped, which is all the note claims. The
+    // registry copy is trusted only when it is this pane's own and already
+    // terminal: `loadRegistry` runs once at module load and never refreshes a
+    // record this pane does not sweep, so after a restart a foreign `running`
+    // copy — and an owned one the same one-shot load left behind — sits stale
+    // in exactly the `running` → terminal direction, and a stale `running`
+    // strips every genuine reroute from a finished parent's child. Anything
+    // else falls through to the disk read (this pane's own dir and the
+    // in-session switch target) — read *without registering*: the id comes
+    // from a model-authored marker, not a notice addressed to this pane, so
+    // the parent must not enter `runs` (where `subagent_tasks list` would
+    // surface it) or become addressable by `cancel`/`interrupt`; registration
+    // is what the notices this pane was addressed to get. A record that
+    // resolves but is still `running` is answered from the pane first — a
+    // probe is a pure read, so it touches none of the ownership rules — and
+    // any state that is not `gone` answers `false`: a live pane (any state,
+    // including `done`, which is readiness) is the parent's own process still
+    // running, and `unreachable` says nothing about the child, mirroring
+    // `readNow`. Only a `gone` pane (or a paneless record) leaves the
+    // completion evidence the one completion predicate (`completionSignal`,
+    // the rule the lifecycle's `completed()` applies) consumes — the `.exit`
+    // sidecar, or a clean transcript answer read as a bounded tail — as the
+    // answer, read *without settling* in either case: a foreign parent the
+    // receiver never writes or closes (the scrollback is the failure
+    // evidence), and an owned one whose own notice settles it through the
+    // ordinary path, not this proof. A `running` record whose pane is alive,
+    // or whose evidence is absent, is answered `false` — conservative, and
+    // exactly what an unreachable herdr already means. The pane probe runs
+    // at `WAKE_PROBE_TIMEOUT_MS`, not the module-wide 30 s, because it sits
+    // on the serialized wake path: a hung herdr would stall every briefing
+    // behind it, and a timeout answers `unreachable` — the same
+    // conservative `false` (herdr.ts behaviour 10). The running-parent
+    // proof (probe + evidence) is memoized cross-flush in `parentProofMemo`
+    // under the id, positives only: a sidecar-proven `true` stands (terminal
+    // is terminal), an answer-inferred `true` never outlives
+    // `PARENT_PROOF_TTL_MS`, and a `false` is computed, returned and not
+    // stored — a liveness inference that goes stale the moment the parent
+    // exits, and serving it would silently delete a reroute note (a pair's
+    // done lands inside the 1.2 s coalesce window).
+    // The lookup is total — an evidence read that throws answers `false`
+    // from the record in hand (its observed status) — so the flush can
+    // never reject on it. Ownership is deliberately not part
+    // of the *test* (a foreign parent is valid lineage; in the canonical
+    // single-hop case the receiver IS the parent's owner, and the live-parent
+    // forge is the `direct` check's job, not this one's) — it is part of the
+    // cache *trust* only. I/O lives here, keeping the ledger free of
+    // filesystem reads. The answer carries the status it was read from
+    // (the record's, or `"absent"` when nothing resolves) for the caller's
+    // log line. The memo below is keyed on the run id ALONE — a status in the
+    // key would be a constant, since the terminal early return runs before the
+    // lookup, so the memo is reached only on the `running` branch. That order
+    // is what keeps a status out of the key (a status component would be the
+    // constant `running`).
+    // The memo caches positives only, so a re-probe of a running parent is
+    // suppressed for at most `PARENT_PROOF_TTL_MS` while a proven `true`
+    // stands: a `false` is never stored, so a parent that finishes between
+    // a pair's two notices (one 1.2 s coalesce window) is re-proven for the
+    // second, and the note is not served away — `wake.test.ts` pins exactly
+    // that (both notices keep the note; a live parent pays one probe per
+    // notice). What the ledger guarantees is narrower: it memoizes nothing,
+    // so each notice pays its own call.
+    parentRunIsFinished: async (runId) => {
+      let status: RunRecord["status"] | "absent" = "absent";
+      try {
+        const cached = runs.get(runId);
+        const found =
+          cached !== undefined && cached.status !== "running" && isOwnedBy(cached, ownerPane)
+            ? { rec: cached, dir: dirFor(runId) }
+            : findRunRecordInAnyBase(runId);
+        if (found === undefined) return { finished: false, status };
+        const { rec, dir } = found;
+        status = rec.status;
+        if (rec.status !== "running") return { finished: true, status };
+        const at = Date.now();
+        const hit = parentProofMemo.get(runId);
+        if (
+          hit !== undefined &&
+          (hit.from === "sidecar" || at - hit.at < PARENT_PROOF_TTL_MS)
+        ) {
+          return { finished: true, status };
+        }
+        const proof = await (async (): Promise<
+          | { finished: true; from: "sidecar" | "answer" }
+          | { finished: false }
+        > => {
+          if (rec.paneId !== undefined) {
+            const pane = await probeAgent(rec.paneId, WAKE_PROBE_TIMEOUT_MS);
+            if (pane.kind !== "gone") return { finished: false };
+          }
+          const evidence = await completionEvidence(dir, runId);
+          return evidence.finished
+            ? { finished: true, from: evidence.from }
+            : { finished: false };
+        })();
+        // Positives only: a `false` is a liveness inference that goes stale
+        // the moment the parent exits, and serving it silently deletes a
+        // reroute note (a pair's done lands inside the 1.2 s coalesce
+        // window), so it is computed, returned and not stored.
+        if (proof.finished) parentProofMemo.set(runId, { at, from: proof.from });
+        return { finished: proof.finished, status };
+      } catch {
+        // Last resort, not a failure path: `findRunRecordInAnyBase`,
+        // `probeAgent`, `hasExitSidecar` and `extractRunResult` each
+        // swallow their own failures (a missing record, an unreachable
+        // herdr, an unreadable sidecar, an unreadable transcript are all
+        // answers, not throws), so a throw reaching here means a real bug.
+        // The flush contract still gets its conservative `false`.
+        return { finished: false, status };
+      }
+    },
     spawnHealthCheck: spawnHealthCheckRun,
     extractRunResult: (rec) => extractRunResult(dirFor(rec.runId), rec.runId),
     renderer: { done: doneBlock, degraded: degradedBlock, fallback: fallbackBriefing },
@@ -1304,6 +1676,11 @@ export default function (pi: ExtensionAPI): void {
   pi.on("input", (event) => {
     const notice = parseNotice(event.text);
     if (!notice) return { action: "continue" as const };
+    // Every parsed notice names a run this process may have lost — always the
+    // case for a re-routed one, often for a direct one after a parent restart:
+    // adopt it from the run dir (transcript and all) before it is enqueued, so
+    // the briefing renders the real block instead of the unregistered-run text.
+    if (RUN_ID_PATTERN.test(notice.runId)) adoptRunFromDisk(notice.runId);
     enqueueNotice(notice);
 
     return { action: "handled" as const };
@@ -1485,6 +1862,9 @@ async function dispatchTasks(
     };
   }
 
+  // A run lost to a parent restart may still exist on disk (run dir and
+  // transcript); the ids here came from a notice, so they are worth a read.
+  for (const id of ids) if (RUN_ID_PATTERN.test(id)) adoptRunFromDisk(id);
   const unknown = ids.filter((id) => !runs.has(id));
   const recs = ids.map((id) => runs.get(id)).filter((r): r is RunRecord => !!r);
   const unknownNote = unknown.length > 0 ? `Unknown task ids: ${unknown.join(", ")}.\n` : "";
@@ -1502,6 +1882,33 @@ async function dispatchTasks(
         // untouched. The displayed herdr state comes from that same probe.
         const owned = isOwnedBy(rec, ownerPane);
         const observation = owned ? await lifecycle.read(rec) : undefined;
+        if (!owned && rec.status === "running") {
+          // A foreign (or legacy) record is never settled by this pane —
+          // settling is a write, and the write is the owner's — so
+          // `running` is its on-disk state, not a live probe. The run may
+          // have finished since its owner stopped settling it (a record
+          // adopted from disk by a grandchild's rerouted notice is exactly
+          // that), so answer from the completion evidence already on disk:
+          // display-only, no transition, no meta write, no pane close; the
+          // `result` arm below nests the same evidence test.
+          const evidence = await completionEvidence(dirFor(rec.runId), rec.runId);
+          if (evidence.finished) {
+            lines.push(
+              `${rec.runId} (${rec.agent}): done (${
+                evidence.from === "sidecar"
+                  ? "the .exit sidecar is on disk"
+                  : "final answer in transcript"
+              }, not settled by this pane)`,
+            );
+            details[rec.runId] = {
+              status: "done",
+              herdr: null,
+              owned: false,
+              inferredFrom: evidence.from,
+            };
+            continue;
+          }
+        }
         const live = observation && rec.status === "running" ? paneStateLabel(observation.pane) : null;
         lines.push(`${rec.runId} (${rec.agent}): ${rec.status}${live ? ` [herdr: ${live}]` : ""}`);
         details[rec.runId] = { status: rec.status, herdr: live, owned };
@@ -1555,6 +1962,27 @@ async function dispatchTasks(
         const owned = isOwnedBy(rec, ownerPane);
         const observation = owned ? await lifecycle.read(rec) : undefined;
         if (rec.status === "running") {
+          if (!owned) {
+            // A foreign (or legacy) record is never settled by this pane —
+            // settling is a write (the transition, the meta save, the pane
+            // close), and the write is the owner's — so `running` is its
+            // on-disk state. The run may have finished since its owner
+            // stopped settling it (a record adopted from disk by a
+            // grandchild's rerouted notice is exactly that), so answer from
+            // the completion evidence already on disk, display-only: the
+            // record is not touched, so the owning pane's process stays the
+            // one to settle it. The label says the status is inferred.
+            const evidence = await completionEvidence(dirFor(rec.runId), rec.runId);
+            if (evidence.finished) {
+              const note =
+                evidence.from === "sidecar"
+                  ? "completed (the .exit sidecar is on disk, not settled by this pane)"
+                  : "completed (final answer in transcript, not settled by this pane)";
+              await renderResultBlock(rec, out, evidence.result, note);
+              details[rec.runId] = { status: "done", owned: false, inferredFrom: evidence.from };
+              continue;
+            }
+          }
           const live = observation ? paneStateLabel(observation.pane) : null;
           // A foreign or legacy record was not probed: the marker keeps its
           // "still running" legible as unverified on-disk state, not a live

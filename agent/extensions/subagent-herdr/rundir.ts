@@ -323,6 +323,23 @@ export function formatExitSidecar(at: number = Date.now()): string {
  */
 export type NoticeKind = "report" | "done" | "stalled";
 
+/**
+ * The reroute annotation of a notice whose parent pane was gone: the original
+ * parent it was addressed to, and the ancestor that received it. Present only
+ * on a notice the child's delivery walker re-routed (`child-done.ts`).
+ */
+export interface NoticeReroute {
+	/** The original parent's agent name. */
+	parentAgent: string;
+	/** The original parent's run id. */
+	parentRunId: string;
+	/**
+	 * The surviving ancestor that received the notice, human-readable:
+	 * `orchestrator` for the root, or `agent runId`.
+	 */
+	deliveredTo: string;
+}
+
 /** A parsed wake notice. */
 export interface Notice {
 	runId: string;
@@ -330,6 +347,8 @@ export interface Notice {
 	kind: NoticeKind;
 	/** The message body; empty for a bare `done`. */
 	text: string;
+	/** Set when the notice was re-routed to a surviving ancestor. */
+	reroute?: NoticeReroute;
 }
 
 /**
@@ -349,9 +368,29 @@ export function formatNotice(
 	agent: string,
 	kind: NoticeKind,
 	message = "",
+	reroute?: NoticeReroute,
 ): string {
 	const head = `[subagent ${runId} (${agent}) ${kind}]`;
-	return message ? `${head} ${message}` : head;
+	if (!reroute) return message ? `${head} ${message}` : head;
+	const marker = rerouteMarker(reroute);
+	return message ? `${head} ${marker} ${message}` : `${head} ${marker}`;
+}
+
+/**
+ * The reroute marker {@link formatNotice} prepends to the body.
+ *
+ * Spelled here — not inside `formatNotice` — because the receiver can have to
+ * reconstitute it: a marker the receiver decides to treat as ordinary text (a
+ * direct delivery whose body happens to carry the marker shape) must come back
+ * out of the briefing byte-for-byte the way the child's model typed it, and a
+ * second spelling of the marker in the receiver is the drift this module
+ * exists to prevent.
+ */
+export function rerouteMarker(r: NoticeReroute): string {
+	return (
+		`[rerouted: addressed to parent ${r.parentAgent} ${r.parentRunId}, ` +
+		`which has finished; delivered to ancestor ${r.deliveredTo}]`
+	);
 }
 
 /**
@@ -365,6 +404,17 @@ const NOTICE_RE =
 	/^\[subagent (sub-[0-9a-f]{4}) \(([a-z][a-z0-9_-]{0,31})\) (report|done|stalled)\][ \t]?([\s\S]*)$/;
 
 /**
+ * The reroute marker {@link formatNotice} prepends to the body.
+ *
+ * Applied only to the body of a notice that already matched {@link NOTICE_RE} —
+ * the marker alone is not a notice, and widening `NOTICE_RE` to carry it is
+ * the anti-pattern this split exists to avoid (a marker in a human's message
+ * must not make the input hook swallow the input).
+ */
+const REROUTE_RE =
+	/^\[rerouted: addressed to parent ([a-z][a-z0-9_-]{0,31}) (sub-[0-9a-f]{4}), which has finished; delivered to ancestor (orchestrator|[a-z][a-z0-9_-]{0,31} sub-[0-9a-f]{4})\][ \t]?([\s\S]*)$/;
+
+/**
  * Parse one wake notice, or `undefined` when the text is not one.
  *
  * `undefined` is the safe answer: the caller passes the input through to the
@@ -375,7 +425,102 @@ const NOTICE_RE =
 export function parseNotice(text: string): Notice | undefined {
 	const m = NOTICE_RE.exec(text.trim());
 	if (!m) return undefined;
+	const reroute = REROUTE_RE.exec(m[4]);
+	if (reroute) {
+		return {
+			runId: m[1],
+			agent: m[2],
+			kind: m[3] as NoticeKind,
+			text: reroute[4].trim(),
+			reroute: {
+				parentAgent: reroute[1],
+				parentRunId: reroute[2],
+				deliveredTo: reroute[3],
+			},
+		};
+	}
 	return { runId: m[1], agent: m[2], kind: m[3] as NoticeKind, text: m[4].trim() };
+}
+
+// ---------------------------------------------------------------------------
+// The ancestry chain: what a parent stamps into its child
+// ---------------------------------------------------------------------------
+
+/**
+ * The env var carrying the delegation ancestry: each ancestor process's pane,
+ * run id, and agent, nearest first, `pane|runId|agent` per entry, entries
+ * joined by `;`.
+ *
+ * Stamped by processes, never read from model output — the same rule as
+ * `PI_SUBAGENT_LINEAGE` (`../lib/agents.ts`): the parent writes it, the child
+ * reads it one process later, so nothing a model says can forge its own
+ * ancestry.
+ *
+ * The delimiters: `;` separates entries because a pane id carries `:` (and an
+ * agent name may carry `-`/`_`), and `|` separates fields because none of the
+ * three fields may contain it. `PI_SUBAGENT_LINEAGE` owns `,` in
+ * `../lib/agents.ts` (`parseLineage`), so the two chains cannot be conflated
+ * by a reader that splits on the wrong byte.
+ *
+ * This lives in `rundir.ts` — not in `../lib/agents.ts` beside the lineage —
+ * because both halves of *this* module read it (the parent stamps it via
+ * `lib.ts`, the child walks it in `child-done.ts`), and `dynamic-prompt.ts`
+ * does not need it.
+ */
+export const ANCESTRY_ENV = "PI_SUBAGENT_ANCESTRY";
+
+/** The parsed chain's bound: the delivery route has at most this many hops plus the parent. */
+export const MAX_ANCESTRY = 8;
+
+/** The run-id shape shared with the notice grammar (`sub-` + four hex). */
+export const RUN_ID_PATTERN = /^sub-[0-9a-f]{4}$/;
+
+/** One link in the ancestry chain, nearest ancestor first. */
+export interface AncestorEntry {
+	/** The ancestor process's herdr pane id. */
+	pane: string;
+	/** Its run id; `""` for the human's orchestrator (which has no run). */
+	runId: string;
+	/** Its agent name; `""` for the human's orchestrator. */
+	agent: string;
+}
+
+/** Serialise an ancestry chain for {@link ANCESTRY_ENV}. */
+export function formatAncestry(entries: readonly AncestorEntry[]): string {
+	return entries.map((e) => `${e.pane}|${e.runId}|${e.agent}`).join(";");
+}
+
+/**
+ * Parse an {@link ANCESTRY_ENV} value, dropping malformed entries and
+ * truncating to {@link MAX_ANCESTRY}.
+ *
+ * An entry is well-formed when its pane matches herdr's pane-id alphabet and
+ * its runId/agent pair is either both empty (the human's orchestrator) or a
+ * valid run id plus a valid agent name. Anything else is dropped rather than
+ * fatal: a chain that cannot be read is no chain, and the child then behaves
+ * exactly as one whose parent stamped nothing.
+ */
+export function parseAncestry(raw: string | undefined): AncestorEntry[] {
+	if (!raw) return [];
+	const out: AncestorEntry[] = [];
+	for (const entry of raw.split(";")) {
+		if (!entry) continue;
+		const [pane, runId, agent] = entry.split("|");
+		if (pane === undefined || !/^[A-Za-z0-9:._-]+$/.test(pane)) continue;
+		const r = runId ?? "";
+		const a = agent ?? "";
+		if (r === "" && a === "") {
+			out.push({ pane, runId: "", agent: "" });
+		} else if (RUN_ID_PATTERN.test(r) && /^[a-z][a-z0-9_-]{0,31}$/.test(a)) {
+			out.push({ pane, runId: r, agent: a });
+		}
+	}
+	return out.slice(0, MAX_ANCESTRY);
+}
+
+/** The human-facing name of a chain entry: `orchestrator`, or `agent runId`. */
+export function ancestorLabel(e: AncestorEntry): string {
+	return e.runId === "" ? "orchestrator" : `${e.agent} ${e.runId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +634,26 @@ export function qualifiesAsAnswer(text: string, systemPrompt: string | undefined
  * above the filler and far below the reports.
  */
 export const SUBSTANTIAL_ANSWER_CHARS = 400;
+
+/**
+ * The cap on the transcript tail a completion-evidence read may take.
+ *
+ * The completion boundary (the `subagent_done` call, or the last assistant
+ * message) sits at the end of a finished run's transcript, so a bounded tail
+ * is enough to find a clean answer — and the read can sit on a serialized
+ * path (the wake path's parent proof, the board's ladder) where a
+ * multi-megabyte whole-file read would block every briefing. Two readers
+ * bound at the same 4 MB and share this one name so they cannot drift: the
+ * wake path's evidence read (`index.ts`) and the kanban board's ladder top
+ * rung (`kanban/runs.ts`). Measured 2026-10-30 over the recorded corpus
+ * (554 run dirs, 546 session transcripts — `2026*.jsonl`, not the `*.jsonl` glob, which counts the `reports.jsonl` sidecars), each quantity labelled: max transcript
+ * 7.90 MB (file size, not the gating quantity), p90 transcript ~1.0 MB,
+ * largest single line 985 KiB (1,008,398 B), max gap from EOF to a todo snapshot's line
+ * start 2.67 MiB (~2.7 MB) — the gap, not the size, is what the cap gates.
+ * Every transcript past the cap carries a `.exit` sidecar and keeps its
+ * completion boundary inside the last 4 MB, so the cap is safe today.
+ */
+export const EVIDENCE_TAIL_BYTES = 4 * 1024 * 1024;
 
 /**
  * Is this *salvaged* text worth showing the orchestrator?

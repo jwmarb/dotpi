@@ -10,6 +10,10 @@
  * tool phases, nested/parallel tool-call isolation, and the tick wiring.
  */
 import { describe, expect, mock, test } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 
 import childDone, {
   askExecute,
@@ -24,6 +28,11 @@ import childDone, {
   continuationMessage,
   MAX_ASKS_PER_RUN,
   MAX_CONTINUATIONS,
+  NOTICE_WALK_SCRIPT,
+  noticeRoute,
+  noticeWalkArgv,
+  type NoticeHop,
+  type NoticeRoute,
   STREAMING_STALL_MS,
   TOOL_STALL_MS,
   WATCHDOG_TICK_MS,
@@ -93,9 +102,12 @@ function makeRecordingEffects(overrides: Partial<ChildDoneEffects> = {}) {
       calls.push({ name: "appendReport", args: [path, line] });
       overrides.appendReport?.(path, line);
     },
-    sendNotice(parentPane, notice) {
-      calls.push({ name: "sendNotice", args: [parentPane, notice] });
-      overrides.sendNotice?.(parentPane, notice);
+    sendNotice(parentPane, notice, fallbacks) {
+      calls.push({
+        name: "sendNotice",
+        args: fallbacks === undefined ? [parentPane, notice] : [parentPane, notice, fallbacks],
+      });
+      overrides.sendNotice?.(parentPane, notice, fallbacks);
     },
     closePane(paneId) {
       calls.push({ name: "closePane", args: [paneId] });
@@ -116,6 +128,16 @@ const BASE_ENV: NodeJS.ProcessEnv = {
   PI_SUBAGENT_PARENT_PANE: "parent-pane-456",
   PI_SUBAGENT_RUN_ID: "run-789",
   PI_SUBAGENT_AGENT: "worker",
+};
+
+// The child of a worker that was itself delegated: the stamped chain's head is
+// the parent pane with a real run id, and one ancestor above it.
+const ANCESTOR_ENV: NodeJS.ProcessEnv = {
+  ...BASE_ENV,
+  PI_SUBAGENT_RUN_ID: "sub-9331",
+  PI_SUBAGENT_AGENT: "reviewer",
+  PI_SUBAGENT_PARENT_PANE: "w5:p3",
+  PI_SUBAGENT_ANCESTRY: "w5:p3|sub-96ba|worker;w1:p1||",
 };
 
 // ---------------------------------------------------------------------------
@@ -805,6 +827,265 @@ describe("agent_end truncation continuation", () => {
 
 });
 
+  test("a one-level child's notice call is exactly (parentPane, notice)", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
+    handshake.report("m", "/tmp/run");
+    const send = calls.find((c) => c.name === "sendNotice")!;
+    expect(send.args).toHaveLength(2);
+    expect(send.args[0]).toBe("parent-pane-456");
+    expect(send.args[1]).toBe(formatNotice("run-789", "worker", "report", "m"));
+  });
+
+  test("a report with an ancestry keeps append → send and carries the ancestor route", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...ANCESTOR_ENV });
+    const outcome = handshake.report("m", "/tmp/run");
+    expect(outcome.kind).toBe("delivered");
+    expect(calls.map((c) => c.name)).toEqual(["appendReport", "sendNotice"]);
+    const send = calls[1];
+    const route = noticeRoute(ANCESTOR_ENV, "report", "m")!;
+    expect(send.args).toEqual([route.pane, route.notice, route.fallbacks]);
+    expect(route.fallbacks[0].pane).toBe("w1:p1");
+  });
+
+  test("subagent_done with an ancestry keeps sidecar → notice → close and carries the route", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...ANCESTOR_ENV });
+    let shutdownCalled = false;
+    const outcome = handshake.complete("/tmp/session.jsonl", () => {
+      shutdownCalled = true;
+    });
+    expect(outcome.kind).toBe("completed");
+    expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
+    const send = calls[1];
+    expect(send.args[1]).toBe(formatNotice("sub-9331", "reviewer", "done", ""));
+    expect((send.args[2] as Array<{ pane: string }>)[0].pane).toBe("w1:p1");
+    expect(shutdownCalled).toBe(true);
+  });
+
+  test("a clean agent_end with an ancestry carries the route", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, { ...ANCESTOR_ENV });
+    let shutdownCalled = false;
+    handshake.onAgentEnd([withText("done")], "/tmp/s.jsonl", () => {
+      shutdownCalled = true;
+    }, PLAIN_PROMPT);
+    expect(calls.map((c) => c.name)).toEqual(["writeExitSidecar", "sendNotice", "closePane"]);
+    const send = calls[1];
+    expect((send.args[2] as Array<{ pane: string }>)[0].pane).toBe("w1:p1");
+    expect(shutdownCalled).toBe(true);
+  });
+
+  test("no parent pane still records the report without sending", () => {
+    const { effects, calls } = makeRecordingEffects();
+    const handshake = createChildDoneHandshake(effects, {
+      ...ANCESTOR_ENV,
+      PI_SUBAGENT_PARENT_PANE: undefined,
+    });
+    const outcome = handshake.report("m", "/tmp/run");
+    expect(outcome.kind).toBe("recorded-no-parent");
+    expect(calls.filter((c) => c.name === "sendNotice")).toHaveLength(0);
+    expect(calls.filter((c) => c.name === "appendReport")).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // The delivery route
+  // ---------------------------------------------------------------------------
+
+  describe("noticeRoute", () => {
+    test("walks the ancestry above the parent with annotated notices", () => {
+      const route = noticeRoute(ANCESTOR_ENV, "report", "m")!;
+      expect(route.pane).toBe("w5:p3");
+      expect(route.notice).toBe(formatNotice("sub-9331", "reviewer", "report", "m"));
+      expect(route.fallbacks).toEqual([
+        {
+          pane: "w1:p1",
+          notice: formatNotice("sub-9331", "reviewer", "report", "m", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        },
+      ]);
+    });
+
+    test("ignores an ancestry whose head is not the parent pane", () => {
+      const route = noticeRoute(
+        { ...ANCESTOR_ENV, PI_SUBAGENT_ANCESTRY: "w9:p9|sub-1111|worker;w1:p1||" },
+        "report",
+        "m",
+      )!;
+      expect(route.fallbacks).toEqual([]);
+    });
+
+    test("a root-only ancestry has no fallbacks", () => {
+      const route = noticeRoute({ ...ANCESTOR_ENV, PI_SUBAGENT_ANCESTRY: "w5:p3||" }, "report", "m")!;
+      expect(route.fallbacks).toEqual([]);
+    });
+
+    test("no parent pane is no route", () => {
+      expect(
+        noticeRoute({ ...ANCESTOR_ENV, PI_SUBAGENT_PARENT_PANE: undefined }, "report", "m"),
+      ).toBeUndefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // The detached walk
+  // ---------------------------------------------------------------------------
+
+  describe("NOTICE_WALK_SCRIPT", () => {
+    /**
+     * The fake herdr on PATH: records the pane it was prompted for, refuses
+     * `DEAD` panes with the measured not-found code and `FLAKY` panes with a
+     * timeout, accepts everything else, and writes the notice text to
+     * `NOTICE_FILE`.
+     */
+    const FAKE_HERDR = `#!/bin/sh
+echo "$3" >> "$LOG"
+for dd in $DEAD; do [ "$dd" = "$3" ] && { if [ "$STREAM" = "stdout" ]; then printf '{"error":{"code":"agent_not_found","message":"x"}}'; else printf '{"error":{"code":"agent_not_found","message":"x"}}' 1>&2; fi; exit 1; }; done
+for ff in $FLAKY; do [ "$ff" = "$3" ] && { if [ "$STREAM" = "stdout" ]; then printf '{"error":{"code":"timeout"}}'; else printf '{"error":{"code":"timeout"}}' 1>&2; fi; exit 1; }; done
+printf '%s' "$4" > "$NOTICE_FILE"
+exit 0
+`;
+
+    function runWalk(
+      route: NoticeRoute,
+      opts: {
+        dead?: string;
+        flaky?: string;
+        stream?: "stdout" | "stderr";
+        /** Write the fake `timeout(1)` shim into the walk dir; its bound is recorded in this file. */
+        timeoutLog?: string;
+        /** PATH is the walk dir alone (no host PATH): `timeout(1)` is absent, so the probe is bare. */
+        barePath?: boolean;
+      } = {},
+    ) {
+      const d = mkdtempSync(join(tmpdir(), "walk-"));
+      const logFile = join(d, "log");
+      const noticeFile = join(d, "notice");
+      writeFileSync(join(d, "herdr"), FAKE_HERDR);
+      chmodSync(join(d, "herdr"), 0o755);
+      if (opts.timeoutLog) {
+        // A fake timeout(1): records the bound it was given, then delegates.
+        writeFileSync(join(d, "timeout"), `#!/bin/sh\necho "$@" >> "$TIMEOUT_LOG"\nshift 1\nexec "$@"\n`);
+        chmodSync(join(d, "timeout"), 0o755);
+      }
+      const env: NodeJS.ProcessEnv = opts.barePath
+        ? {
+            PATH: d,
+            LOG: logFile,
+            NOTICE_FILE: noticeFile,
+            DEAD: opts.dead ?? "",
+            FLAKY: opts.flaky ?? "",
+            // The `timeout` shim logs its bound to `$TIMEOUT_LOG`; with
+            // `barePath` the env is built from scratch, so the log target must
+            // be defined there too — an unset var would write to `""`.
+            ...(opts.timeoutLog ? { TIMEOUT_LOG: opts.timeoutLog } : {}),
+          }
+        : {
+            ...process.env,
+            PATH: `${d}:${process.env.PATH}`,
+            LOG: logFile,
+            NOTICE_FILE: noticeFile,
+            DEAD: opts.dead ?? "",
+            FLAKY: opts.flaky ?? "",
+            STREAM: opts.stream ?? "stderr",
+            ...(opts.timeoutLog ? { TIMEOUT_LOG: opts.timeoutLog } : {}),
+          };
+      const res = spawnSync(opts.barePath ? "/bin/sh" : "sh", noticeWalkArgv(route), {
+        env,
+        encoding: "utf-8",
+      });
+      const hops = existsSync(logFile) ? readFileSync(logFile, "utf-8").trim().split("\n") : [];
+      return {
+        status: res.status,
+        hops,
+        notice: existsSync(noticeFile) ? readFileSync(noticeFile, "utf-8") : undefined,
+      };
+    }
+
+    const route: NoticeRoute = {
+      pane: "p0",
+      notice: "n0",
+      fallbacks: [{ pane: "p1", notice: "n1" }],
+    };
+
+    test("the argv embeds the script and the hops as positional args", () => {
+      const argv = noticeWalkArgv(route);
+      expect(argv[0]).toBe("-c");
+      expect(argv[1]).toBe(NOTICE_WALK_SCRIPT);
+      expect(argv.slice(3)).toEqual(["p0", "n0", "p1", "n1"]);
+    });
+
+    test("stops at the first accepting hop", () => {
+      const r = runWalk(route);
+      expect(r.status).toBe(0);
+      expect(r.hops).toEqual(["p0"]);
+    });
+
+    test("skips a gone hop and delivers to the next", () => {
+      const r = runWalk(route, { dead: "p0" });
+      expect(r.status).toBe(0);
+      expect(r.hops).toEqual(["p0", "p1"]);
+      // The hop-1 notice is the annotated hop's own text, not the bare parent
+      // notice: the walk delivers what each hop was given.
+      expect(r.notice).toBe("n1");
+    });
+
+    test("skips a gone hop whose refusal code arrives on stdout, not stderr", () => {
+      // The repo convention is to read the {"error":{"code"}} document off
+      // either stream; a herdr version that moves the code to stdout must not
+      // stop the walk at hop 0.
+      const r = runWalk(route, { dead: "p0", stream: "stdout" });
+      expect(r.status).toBe(0);
+      expect(r.hops).toEqual(["p0", "p1"]);
+      expect(r.notice).toBe("n1");
+    });
+
+    test("stops on any other error without trying the next hop", () => {
+      const r = runWalk(route, { flaky: "p0" });
+      expect(r.status).toBe(1);
+      expect(r.hops).toEqual(["p0"]);
+    });
+
+    test("all gone exits 1 after the last hop", () => {
+      const r = runWalk(route, { dead: "p0 p1" });
+      expect(r.status).toBe(1);
+      expect(r.hops).toEqual(["p0", "p1"]);
+    });
+
+    test("the walker passes notice text verbatim", () => {
+      const tricky = `she said "hi" and $HOME and \`backtick\`
+line two`;
+      const r = runWalk({ pane: "p0", notice: tricky, fallbacks: [] });
+      expect(r.status).toBe(0);
+      expect(r.notice).toBe(tricky);
+    });
+
+    test("each probe is bounded by timeout(1) at 30 s", () => {
+      const d = mkdtempSync(join(tmpdir(), "walk-"));
+      const r = runWalk(route, { timeoutLog: join(d, "timeouts") });
+      expect(r.status).toBe(0);
+      expect(r.notice).toBe("n0");
+      // The bound is 30 s (the repo's single-round-trip patience), and the
+      // non-wait probe is what herdr is asked for — herdr's own `--timeout`
+      // cannot carry it (it refuses without `--wait`).
+      expect(readFileSync(join(d, "timeouts"), "utf-8")).toContain("30 herdr agent prompt p0 n0");
+    });
+
+    test("without timeout(1) on PATH the probe runs unbounded and the walk still delivers", () => {
+      // A PATH that holds only the fake herdr: `command -v timeout` fails, so
+      // the probe is the bare call — the pre-bound behaviour, which must not
+      // break delivery.
+      const r = runWalk(route, { barePath: true });
+      expect(r.status).toBe(0);
+      expect(r.notice).toBe("n0");
+      expect(r.hops).toEqual(["p0"]);
+    });
+  });
+
 // ---------------------------------------------------------------------------
 // createChildWatchdog: one-shot stall detection
 // ---------------------------------------------------------------------------
@@ -825,20 +1106,36 @@ describe("createChildWatchdog", () => {
   function harness(env: NodeJS.ProcessEnv = ENV) {
     let time = 0;
     const notices: string[] = [];
+    const fallbacks: NoticeHop[][] = [];
     const effects: ChildWatchdogEffects = {
       now: () => time,
-      sendNotice(_parentPane: string, notice: string) {
+      sendNotice(_parentPane: string, notice: string, fb?: readonly NoticeHop[]) {
         notices.push(notice);
+        if (fb) fallbacks.push([...fb]);
       },
     };
     return {
       notices,
+      fallbacks,
       set: (t: number) => {
         time = t;
       },
       watchdog: createChildWatchdog(effects, env),
     };
   }
+
+  test("a stall with an ancestry carries the ancestor route", () => {
+    const { watchdog, set, notices, fallbacks } = harness({
+      ...ENV,
+      PI_SUBAGENT_ANCESTRY: "parent-pane-456|sub-96ba|worker;w1:p1||",
+    });
+    watchdog.onToolExecutionStart("t1", "bash");
+    set(TOOL_STALL_MS);
+    watchdog.check();
+    expect(notices).toHaveLength(1);
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0][0].pane).toBe("w1:p1");
+  });
 
   test("streaming emits nothing below the threshold", () => {
     const { watchdog, set, notices } = harness();

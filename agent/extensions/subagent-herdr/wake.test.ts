@@ -16,7 +16,17 @@
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/wake.test.ts`
  */
 import { afterAll, afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,9 +70,14 @@ afterAll(() => {
 });
 
 import * as realHerdr from "./herdr.js";
-import { formatExitSidecar, formatNotice, systemPromptPath, type RunRecord } from "./rundir.js";
-import type { PROMPT_SETTLE_MS as PromptSettleMs } from "./index.js";
+import { formatExitSidecar, formatNotice, formatReportLine, systemPromptPath, type RunRecord } from "./rundir.js";
+import type {
+  PARENT_PROOF_TTL_MS as ParentProofTtlMs,
+  PROMPT_SETTLE_MS as PromptSettleMs,
+  WAKE_PROBE_TIMEOUT_MS as WakeProbeTimeoutMs,
+} from "./index.js";
 import { LIVENESS_BACKSTOP_MS, NOTICE_COALESCE_MS } from "./release-ledger.js";
+import { setPersonaOverride } from "../lib/persona.js";
 // ---------------------------------------------------------------------------
 // herdr CLI mock
 // ---------------------------------------------------------------------------
@@ -89,7 +104,7 @@ const herdrState = {
   sendKeys: async (): Promise<boolean> => true,
   waitAgentWorking: async (): Promise<boolean> => true,
   closePane: async (): Promise<boolean> => true,
-  probeAgent: async (_paneId: string): Promise<realHerdr.AgentProbe> => GONE,
+  probeAgent: async (_paneId: string, _timeoutMs?: number): Promise<realHerdr.AgentProbe> => GONE,
   paneLabel: async (): Promise<string | undefined> => undefined,
   readAgent: async (): Promise<string | null> => null,
 };
@@ -106,7 +121,7 @@ mock.module("./herdr.js", () => ({
   waitAgentWorking: (paneId: string, timeoutMs: number) =>
     herdrState.waitAgentWorking(paneId, timeoutMs),
   closePane: (paneId: string, timeoutMs?: number) => herdrState.closePane(paneId, timeoutMs),
-  probeAgent: (paneId: string) => herdrState.probeAgent(paneId),
+  probeAgent: (paneId: string, timeoutMs?: number) => herdrState.probeAgent(paneId, timeoutMs),
   paneLabel: (paneId: string, timeoutMs?: number) => herdrState.paneLabel(paneId, timeoutMs),
   readAgent: (paneId: string, lines?: number) => herdrState.readAgent(paneId, lines),
 }));
@@ -246,6 +261,17 @@ async function freshExtensionWithDir(runs: RunFixture[]) {
 async function freshExtension(runs: RunFixture[]) {
   return (await freshExtensionWithDir(runs)).factory;
 }
+/**
+ * Writes a run's meta.json into an already-loaded extension's runs dir, so the
+ * record exists on disk but was never in this process's `runs` map: loadRegistry
+ * ran at module import, before this write. This is the on-disk shape of a run
+ * spawned by another process (a finished worker's reviewer).
+ */
+function writeMetaAfterLoad(dir: string, meta: Record<string, unknown>): void {
+  const runDir = join(dir, "subagent-runs", meta.runId as string);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, "meta.json"), JSON.stringify(meta, null, 2));
+}
 /** Minimal pi ExtensionAPI stub. */
 function stubPi() {
   const sent: Array<{ text: string; options?: { deliverAs?: string } }> = [];
@@ -308,11 +334,45 @@ async function listTasks(stub: ReturnType<typeof stubPi>): Promise<Array<Record<
 
 /**
  * spawnRun's settle between `agent start` and the first prompt. Mirrors the
- * exported `PROMPT_SETTLE_MS` in index.ts (the type pins the literal, so a
- * change there fails to typecheck here); a value import would load a module
- * instance outside the per-test query-string bust.
+ * exported `PROMPT_SETTLE_MS` in index.ts; a value import would load a module
+ * instance outside the per-test query-string bust. The `typeof` pin does not
+ * get typechecked by the gate (the tsconfig excludes the test files), so the
+ * runtime assertion below is what `bun test` enforces.
  */
 const PROMPT_SETTLE_MS: typeof PromptSettleMs = 1500;
+
+/**
+ * The wake path's parent-probe patience. Mirrors the exported
+ * `WAKE_PROBE_TIMEOUT_MS` in index.ts; a value import would load a module
+ * instance outside the per-test query-string bust. The `typeof` pin does not
+ * get typechecked by the gate (the tsconfig excludes the test files), so the
+ * runtime assertion below is what `bun test` enforces.
+ */
+const WAKE_PROBE_TIMEOUT_MS: typeof WakeProbeTimeoutMs = 5_000;
+
+/**
+ * How long a cached positive parent proof stands. Mirrors the exported
+ * `PARENT_PROOF_TTL_MS` in index.ts; a value import would load a module
+ * instance outside the per-test query-string bust. The `typeof` pin does not
+ * get typechecked by the gate (the tsconfig excludes the test files), so the
+ * runtime assertion below is what `bun test` enforces.
+ */
+const PARENT_PROOF_TTL_MS: typeof ParentProofTtlMs = 60_000;
+
+test("the mirrored wake-path constants match the module's exports", async () => {
+  // The gate's tsconfig does not include this file, so the `typeof` pins
+  // above only bite where someone typechecks the tests (an IDE, a hand
+  // tsc). This runtime pin is what `bun test` enforces: a changed export in
+  // index.ts fails it. The import is busted like every other in this file.
+  const mod = await import(`./index.js?wake=${++importCounter}`);
+  expect(PROMPT_SETTLE_MS).toBe(mod.PROMPT_SETTLE_MS);
+  expect(WAKE_PROBE_TIMEOUT_MS).toBe(mod.WAKE_PROBE_TIMEOUT_MS);
+  expect(PARENT_PROOF_TTL_MS).toBe(mod.PARENT_PROOF_TTL_MS);
+  // The approved identity, pinned against the shared constant directly
+  // (already value-imported, so no extra module instance): the
+  // answer-inferred TTL is the 60 s liveness backstop.
+  expect(PARENT_PROOF_TTL_MS).toBe(LIVENESS_BACKSTOP_MS);
+});
 
 /**
  * Lets real I/O settle while timers are faked.
@@ -372,6 +432,11 @@ afterEach(() => {
   // A failed test must not leak its factory's interval into a sibling.
   jest.clearAllTimers();
   jest.useRealTimers();
+  // Defence in depth for the profile-switch tests: a persona override is
+  // module-global (`../lib/persona.js`) and retargets every run-dir read, so a
+  // leak would silently point sibling tests at the wrong dir. The tests reset
+  // it in their `finally`; this makes the clean-state invariant explicit.
+  setPersonaOverride(undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -443,6 +508,76 @@ describe("wake path (extension factory)", () => {
     expect(sent.length).toBe(0);
     getShutdownHandler()();
   });
+
+  test(
+    "a nested child's selfLabel validates a reroute marker end-to-end",
+    async () => {
+      // The suite plays the root orchestrator (selfLabel "orchestrator"). A
+      // nested child — PI_SUBAGENT_RUN_ID set — has selfLabel "worker sub-9abc",
+      // not "orchestrator". A marker naming that hop survives; one naming the
+      // root is stripped. The factory (not just ancestorLabel) is what's pinned.
+      const savedRunId = process.env.PI_SUBAGENT_RUN_ID;
+      const savedAgent = process.env.PI_SUBAGENT_AGENT;
+      process.env.PI_SUBAGENT_RUN_ID = "sub-9abc";
+      process.env.PI_SUBAGENT_AGENT = "worker";
+      try {
+        // sub-96ba is the finished parent the marker claims — owned by this
+        // pane, the one that spawned it (the realistic single-hop shape);
+        // sub-9331 is the unregistered grandchild the notice is about.
+        const parentFixture = {
+          runId: "sub-96ba",
+          agent: "worker",
+          status: "done" as const,
+          ownerPane: TEST_OWN_PANE,
+        };
+
+        // deliveredTo names this child's own label: the marker survives.
+        const createExtension = await freshExtension([parentFixture]);
+        const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+        createExtension(pi);
+        getInputHandler()({
+          text: formatNotice(
+            "sub-9331",
+            "reviewer",
+            "report",
+            "[rerouted: addressed to parent worker sub-96ba, which has finished; delivered to ancestor worker sub-9abc] interim",
+          ),
+        });
+        await flushWindow();
+        expect(sent.length).toBe(1);
+        expect(sent[0].text).toContain("delivered to you (worker sub-9abc)");
+        getShutdownHandler()();
+
+        // A fresh nested factory: deliveredTo names the root, not this child —
+        // the marker is not this delivery's, so it is stripped to body text.
+        const createExtension2 = await freshExtension([parentFixture]);
+        const {
+          pi: pi2,
+          sent: sent2,
+          getInputHandler: getHandler2,
+          getShutdownHandler: shutdown2,
+        } = stubPi();
+        createExtension2(pi2);
+        getHandler2()({
+          text: formatNotice(
+            "sub-9331",
+            "reviewer",
+            "report",
+            "[rerouted: addressed to parent worker sub-96ba, which has finished; delivered to ancestor orchestrator] interim",
+          ),
+        });
+        await flushWindow();
+        expect(sent2.length).toBe(1);
+        expect(sent2[0].text).not.toContain("delivered to you (worker sub-9abc)");
+        shutdown2();
+      } finally {
+        if (savedRunId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
+        else process.env.PI_SUBAGENT_RUN_ID = savedRunId;
+        if (savedAgent === undefined) delete process.env.PI_SUBAGENT_AGENT;
+        else process.env.PI_SUBAGENT_AGENT = savedAgent;
+      }
+    },
+  );
 
   // -------------------------------------------------------------------------
   // Health checks
@@ -621,10 +756,12 @@ describe("wake path (extension factory)", () => {
         // The release notice is lost: the session goes away before the coalesce
         // window fires, clearing `pending`.
       } finally {
+        // Restored first: a failing assertion must leave `herdrState` clean
+        // even if the shutdown handler below throws.
+        herdrState.probeAgent = savedProbeAgent;
         // In the `finally` so the 60 s setInterval is cleared even on a
         // failing assertion.
         stub.getShutdownHandler()();
-        herdrState.probeAgent = savedProbeAgent;
       }
       // The orchestrator restarts from DISK: a fresh module instance (so the
       // top-level `loadRegistry` re-runs) pointed at the same temp agent dir,
@@ -1180,24 +1317,24 @@ describe("run ownership (cross-process sweep)", () => {
     "ownership is an autonomous-sweep boundary, not an authorization boundary",
     async () => {
       const createExtension = await freshExtension([
-        { runId: "sub-o111", agent: "explorer", answer: "owned result", hasSession: true, hasSidecar: true, status: "done", paneId: "w9:pO" },
+        { runId: "sub-0111", agent: "explorer", answer: "owned result", hasSession: true, hasSidecar: true, status: "done", paneId: "w9:pO" },
         { runId: "sub-f222", agent: "worker", answer: "foreign result", hasSession: true, hasSidecar: true, status: "done", paneId: "w9:pF", ownerPane: "w9:pForeign" },
-        { runId: "sub-l333", agent: "librarian", answer: "legacy result", hasSession: true, hasSidecar: true, status: "done", paneId: "w9:pL", ownerPane: "legacy" },
+        { runId: "sub-c333", agent: "librarian", answer: "legacy result", hasSession: true, hasSidecar: true, status: "done", paneId: "w9:pL", ownerPane: "legacy" },
       ]);
       const stub = stubPi();
       createExtension(stub.pi);
 
       // list returns every run, owned or not — the registry is global.
       const list = await listTasks(stub as any);
-      expect(list.map((t) => t.task).sort()).toEqual(["sub-f222", "sub-l333", "sub-o111"]);
+      expect(list.map((t) => t.task).sort()).toEqual(["sub-0111", "sub-c333", "sub-f222"]);
 
       // status works for foreign and legacy ids.
-      const status = (await stub.getTool("subagent_tasks").execute("t1", { action: "status", ids: ["sub-f222", "sub-l333"] }, undefined, () => {}, {})) as { content: { text: string }[] };
+      const status = (await stub.getTool("subagent_tasks").execute("t1", { action: "status", ids: ["sub-f222", "sub-c333"] }, undefined, () => {}, {})) as { content: { text: string }[] };
       expect(status.content[0].text).toContain("sub-f222 (worker): done");
-      expect(status.content[0].text).toContain("sub-l333 (librarian): done");
+      expect(status.content[0].text).toContain("sub-c333 (librarian): done");
 
       // result works for foreign and legacy ids too.
-      const result = (await stub.getTool("subagent_tasks").execute("t1", { action: "result", ids: ["sub-f222", "sub-l333"] }, undefined, () => {}, {})) as { content: { text: string }[] };
+      const result = (await stub.getTool("subagent_tasks").execute("t1", { action: "result", ids: ["sub-f222", "sub-c333"] }, undefined, () => {}, {})) as { content: { text: string }[] };
       expect(result.content[0].text).toContain("foreign result");
       expect(result.content[0].text).toContain("legacy result");
       stub.getShutdownHandler()();
@@ -1262,7 +1399,7 @@ describe("run ownership (cross-process sweep)", () => {
       const createExtension = await freshExtension([
         // Legacy: no ownerPane. Running, pane gone — a query that reconciled
         // it would probe herdr and classify it from disk.
-        { runId: "sub-l999", agent: "worker", hasSession: false, hasSidecar: false, status: "running", paneId: "w9:pL9", ownerPane: "legacy" },
+        { runId: "sub-d999", agent: "worker", hasSession: false, hasSidecar: false, status: "running", paneId: "w9:pL9", ownerPane: "legacy" },
       ]);
       const stub = stubPi();
       createExtension(stub.pi);
@@ -1275,15 +1412,15 @@ describe("run ownership (cross-process sweep)", () => {
       };
 
       try {
-        const status = (await stub.getTool("subagent_tasks").execute("t1", { action: "status", ids: ["sub-l999"] }, undefined, () => {}, {})) as { content: { text: string }[]; details: Record<string, unknown> };
+        const status = (await stub.getTool("subagent_tasks").execute("t1", { action: "status", ids: ["sub-d999"] }, undefined, () => {}, {})) as { content: { text: string }[]; details: Record<string, unknown> };
         // On-disk state, reported without probing herdr — and the details
         // say so (`owned: false`), so the orchestrator can tell it from a
         // probed status.
-        expect(status.content[0].text).toBe("sub-l999 (worker): running");
-        expect(status.details["sub-l999"]).toEqual({ status: "running", herdr: null, owned: false });
+        expect(status.content[0].text).toBe("sub-d999 (worker): running");
+        expect(status.details["sub-d999"]).toEqual({ status: "running", herdr: null, owned: false });
         expect(probed).not.toContain("w9:pL9");
 
-        const result = (await stub.getTool("subagent_tasks").execute("t1", { action: "result", ids: ["sub-l999"] }, undefined, () => {}, {})) as { content: { text: string }[] };
+        const result = (await stub.getTool("subagent_tasks").execute("t1", { action: "result", ids: ["sub-d999"] }, undefined, () => {}, {})) as { content: { text: string }[] };
         // The legacy arm of the "not probed" marker: no ownerPane is
         // recorded, which is named distinctly from foreign ownership.
         expect(result.content[0].text).toContain("still running");
@@ -1292,13 +1429,2392 @@ describe("run ownership (cross-process sweep)", () => {
 
         // The record is untouched on disk.
         const meta = JSON.parse(
-          readFileSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", "sub-l999", "meta.json"), "utf-8"),
+          readFileSync(join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", "sub-d999", "meta.json"), "utf-8"),
         ) as Record<string, unknown>;
         expect(meta.status).toBe("running");
       } finally {
         herdrState.probeAgent = savedProbeAgent;
       }
       stub.getShutdownHandler()();
+    },
+  );
+});
+describe("foreign running records answered from completion evidence (display-only)", () => {
+  // The bug, reproduced on live tool output (2026-10-30): `subagent_tasks`
+  // `status`/`result` answered "still running [not probed: …]" for a run that
+  // had finished — its report was readable from disk a minute earlier. A
+  // record adopted from disk by a non-owning pane (its `ownerPane` is the
+  // worker's pane, not this one) is never settled here: the liveness tick
+  // settles only this pane's direct children, so the on-disk `running` stays
+  // stale. These tests pin the fix: for a foreign `running` record,
+  // `status`/`result` answer from the completion evidence already on disk —
+  // the `.exit` sidecar, or a clean transcript answer read as a bounded tail,
+  // the `completionSignal` rule — display-only: no transition, no meta write,
+  // no pane close, no herdr round-trip — and the no-evidence case is
+  // byte-identical to the pre-fix output.
+
+  test(
+    "a foreign running record with the .exit sidecar reports done in status and result, and result prints the answer",
+    async () => {
+      const createExtension = await freshExtension([
+        {
+          runId: "sub-e001",
+          agent: "reviewer",
+          answer: "foreign final answer",
+          hasSession: true,
+          hasSidecar: true,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e001"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      // The sidecar is evidence the run finished, and the label says this
+      // pane did not settle it.
+      expect(status.content[0].text).toBe(
+        "sub-e001 (reviewer): done (the .exit sidecar is on disk, not settled by this pane)",
+      );
+      expect(status.details["sub-e001"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "sidecar",
+      });
+
+      const result = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e001"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      // The documented pairing, pinned byte-for-byte: the note sits under
+      // the result block's header, which itself still shows the record's
+      // on-disk `running` status — this pane never wrote a `done` status, so
+      // a header that claimed one would be a lie.
+      expect(result.content[0].text).toContain(
+        "=== sub-e001 (reviewer) — running […] ===\n" +
+          "\n" +
+          "completed (the .exit sidecar is on disk, not settled by this pane)",
+      );
+      expect(result.content[0].text).toContain("foreign final answer");
+      expect(result.details["sub-e001"]).toEqual({ status: "done", owned: false, inferredFrom: "sidecar" });
+
+      // The record itself is untouched: the evidence is read, not settled.
+      const meta = JSON.parse(
+        readFileSync(
+          join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", "sub-e001", "meta.json"),
+          "utf-8",
+        ),
+      ) as Record<string, unknown>;
+      expect(meta.status).toBe("running");
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a foreign running record whose transcript ends in a clean <result> reports done, labelled as inferred",
+    async () => {
+      const createExtension = await freshExtension([
+        {
+          runId: "sub-e002",
+          agent: "reviewer",
+          answer: "<result>\n## Completed\nthe answer text\n</result>",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e002"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status.content[0].text).toBe(
+        "sub-e002 (reviewer): done (final answer in transcript, not settled by this pane)",
+      );
+      expect(status.details["sub-e002"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "answer",
+      });
+
+      const result = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e002"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+      };
+      // The status is inferred from the clean final answer — the reader can
+      // see it was not settled by this pane — and the answer prints.
+      // The documented pairing, pinned byte-for-byte: header (the record's
+      // on-disk `running` status) then note — this pane never wrote the
+      // `done` status, so the header must not claim it.
+      expect(result.content[0].text).toContain(
+        "=== sub-e002 (reviewer) — running […] ===\n" +
+          "\n" +
+          "completed (final answer in transcript, not settled by this pane)",
+      );
+      expect(result.content[0].text).toContain("the answer text");
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a foreign running record with no completion evidence stays byte-identical to the pre-fix output",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e003",
+          agent: "worker",
+          // Short, untagged, under the 400-char salvage bar: a mid-run note,
+          // not an answer (it extracts as non-conforming salvage, which is
+          // never a completion signal).
+          answer: "Checking the pane now",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      // A mid-run report: the only thing a running task has to show.
+      writeFileSync(
+        join(dir, "subagent-runs", "sub-e003", "reports.jsonl"),
+        formatReportLine("mid-run report"),
+      );
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e003"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status.content[0].text).toBe("sub-e003 (worker): running");
+      expect(status.details["sub-e003"]).toEqual({ status: "running", herdr: null, owned: false });
+
+      const result = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e003"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+      };
+      // Byte-identical to the pre-fix output: the "not probed" marker, and
+      // the mid-run reports.
+      expect(result.content[0].text).toBe(
+        "=== sub-e003 (worker) — running […] ===\n" +
+          "still running [not probed: owned by another session]\n" +
+          "\n" +
+          "--- reports sent to you by worker during the run (1) ---\n" +
+          "- mid-run report",
+      );
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "status and result over a foreign running record write nothing: meta byte-identical, registry unchanged, no pane effect",
+    async () => {
+      // The no-write proof that pins the ownership rule: the display path
+      // must not mutate anything a live session owns.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e004",
+          agent: "worker",
+          answer: "foreign final answer",
+          hasSession: true,
+          hasSidecar: true,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const metaFile = join(dir, "subagent-runs", "sub-e004", "meta.json");
+      const metaBefore = readFileSync(metaFile, "utf-8");
+      const mtimeBefore = statSync(metaFile).mtimeMs;
+
+      const probed: string[] = [];
+      const closed: string[] = [];
+      const entered: string[][] = [];
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      const savedSendKeys = herdrState.sendKeys;
+      herdrState.probeAgent = async (paneId: string) => {
+        probed.push(paneId);
+        return GONE;
+      };
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return true;
+      };
+
+      try {
+        // Both arms, through the evidence branch: the sidecar decides.
+        const status = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "status", ids: ["sub-e004"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(status.content[0].text).toContain("not settled by this pane");
+        const result = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "result", ids: ["sub-e004"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(result.content[0].text).toContain("foreign final answer");
+
+        // meta.json is byte-identical in content AND mtime: no saveMeta.
+        expect(readFileSync(metaFile, "utf-8")).toBe(metaBefore);
+        expect(statSync(metaFile).mtimeMs).toBe(mtimeBefore);
+        // The registry is unchanged: the record was already loaded at module
+        // load, and the display path adds nothing to it.
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([["sub-e004", "running"]]);
+        // No herdr round-trip, no pane close, no key sent.
+        expect(probed).toEqual([]);
+        expect(closed).toEqual([]);
+        expect(entered).toEqual([]);
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+        herdrState.sendKeys = savedSendKeys;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a record this pane owns is unaffected: it still settles through lifecycle.read",
+    async () => {
+      const createExtension = await freshExtension([
+        {
+          runId: "sub-e005",
+          agent: "worker",
+          answer: "owned final answer",
+          hasSession: true,
+          hasSidecar: true,
+          status: "running",
+          paneId: "w9:pO",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const closed: string[] = [];
+      const savedClosePane = herdrState.closePane;
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+
+      try {
+        // The owned record settles through the ordinary path: the read
+        // probes (gone), reads the sidecar, persists the transition, and
+        // closes the pane.
+        const status = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "status", ids: ["sub-e005"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(status.content[0].text).toBe("sub-e005 (worker): done");
+
+        const result = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "result", ids: ["sub-e005"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(result.content[0].text).toContain("owned final answer");
+        // No inference label: this pane settled the record itself.
+        expect(result.content[0].text).not.toContain("not settled by this pane");
+
+        const meta = JSON.parse(
+          readFileSync(
+            join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs", "sub-e005", "meta.json"),
+            "utf-8",
+          ),
+        ) as Record<string, unknown>;
+        expect(meta.status).toBe("done");
+        expect(closed).toEqual(["w9:pO"]);
+      } finally {
+        herdrState.closePane = savedClosePane;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+  test(
+    "status and result over a foreign running record whose answer is in the transcript write nothing",
+    async () => {
+      // The no-write proof over the ANSWER branch — the only one that runs
+      // `extractRunResult`, and the natural site for a future "reconcile
+      // then report" (`lifecycle.read`) insertion: the exact mutation the
+      // ownership rule forbids. The sidecar branch's proof (sub-e004) does
+      // not cover it, because the sidecar decides before the transcript is
+      // read.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e006",
+          agent: "reviewer",
+          answer: "<result>\n## Completed\nthe answer text\n</result>",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const metaFile = join(dir, "subagent-runs", "sub-e006", "meta.json");
+      const metaBefore = readFileSync(metaFile, "utf-8");
+      const mtimeBefore = statSync(metaFile).mtimeMs;
+
+      const probed: string[] = [];
+      const closed: string[] = [];
+      const entered: string[][] = [];
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      const savedSendKeys = herdrState.sendKeys;
+      herdrState.probeAgent = async (paneId: string) => {
+        probed.push(paneId);
+        return GONE;
+      };
+      herdrState.closePane = async (paneId: string) => {
+        closed.push(paneId);
+        return true;
+      };
+      herdrState.sendKeys = async (paneId: string, ...keys: string[]) => {
+        entered.push([paneId, ...keys]);
+        return true;
+      };
+
+      try {
+        // Both arms, through the answer branch: the clean <result> tail decides.
+        const status = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "status", ids: ["sub-e006"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(status.content[0].text).toContain("not settled by this pane");
+        const result = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "result", ids: ["sub-e006"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+        };
+        expect(result.content[0].text).toContain("the answer text");
+
+        // meta.json is byte-identical in content AND mtime: no saveMeta.
+        expect(readFileSync(metaFile, "utf-8")).toBe(metaBefore);
+        expect(statSync(metaFile).mtimeMs).toBe(mtimeBefore);
+        // The registry is unchanged: the record was already loaded at module
+        // load, and the display path adds nothing to it.
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => [t.task, t.status])).toEqual([["sub-e006", "running"]]);
+        // No herdr round-trip, no pane close, no key sent.
+        expect(probed).toEqual([]);
+        expect(closed).toEqual([]);
+        expect(entered).toEqual([]);
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+        herdrState.sendKeys = savedSendKeys;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a legacy running record (no ownerPane) with the .exit sidecar reports done, not [not probed]",
+    async () => {
+      // Legacy records (no `ownerPane`) are loadable but unsweepable, so a
+      // stale `running` is answered from the same completion evidence as a
+      // foreign one — with the inferred label, not the "no owner recorded"
+      // marker.
+      const createExtension = await freshExtension([
+        {
+          runId: "sub-e501",
+          agent: "worker",
+          answer: "legacy sidecar final answer",
+          hasSession: true,
+          hasSidecar: true,
+          status: "running",
+          paneId: "w9:pL9",
+          ownerPane: "legacy",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e501"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status.content[0].text).toBe(
+        "sub-e501 (worker): done (the .exit sidecar is on disk, not settled by this pane)",
+      );
+      expect(status.details["sub-e501"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "sidecar",
+      });
+
+      const result = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e501"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      // The evidence found, so the "not probed" marker does not print.
+      expect(result.content[0].text).toContain(
+        "completed (the .exit sidecar is on disk, not settled by this pane)",
+      );
+      expect(result.content[0].text).toContain("legacy sidecar final answer");
+      expect(result.content[0].text).not.toContain("[not probed: no owner recorded]");
+      expect(result.details["sub-e501"]).toEqual({
+        status: "done",
+        owned: false,
+        inferredFrom: "sidecar",
+      });
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a legacy running record (no ownerPane) whose transcript ends in a clean <result> reports done, labelled as inferred",
+    async () => {
+      const createExtension = await freshExtension([
+        {
+          runId: "sub-e502",
+          agent: "worker",
+          answer: "<result>\n## Completed\nthe legacy answer text\n</result>",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pL9",
+          ownerPane: "legacy",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      createExtension(stub.pi);
+
+      const status = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e502"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status.content[0].text).toBe(
+        "sub-e502 (worker): done (final answer in transcript, not settled by this pane)",
+      );
+      expect(status.details["sub-e502"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "answer",
+      });
+
+      const result = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e502"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(result.content[0].text).toContain(
+        "completed (final answer in transcript, not settled by this pane)",
+      );
+      expect(result.content[0].text).toContain("the legacy answer text");
+      expect(result.content[0].text).not.toContain("[not probed: no owner recorded]");
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a foreign running record adopted from a switched profile's dir answers from its evidence there",
+    async () => {
+      // The switched-dir case for the display arms: the record's meta,
+      // transcript and sidecar all live in the switched profile's runs dir,
+      // so the evidence read must follow the adoption's `dirFor` — a
+      // hardcoded home-dir read would miss the evidence and answer "not
+      // probed".
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const stub = stubPi();
+
+      const switchedDir = mkdtempSync(join(tmpdir(), "herdr-wake-switched-"));
+      setPersonaOverride({ name: "switched", dir: switchedDir, deniedTools: new Set() });
+      const probed: string[] = [];
+      const savedProbeAgent = herdrState.probeAgent;
+      herdrState.probeAgent = async (paneId: string) => {
+        probed.push(paneId);
+        return live("working");
+      };
+      try {
+        factory(stub.pi);
+
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-e401",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+        const runDirPath = join(switchedDir, "subagent-runs", "sub-e401");
+        const sessionFile = join(runDirPath, "1750000000000_sub-e401.jsonl");
+        writeFileSync(
+          sessionFile,
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "the switched-dir final answer" }],
+              stopReason: "stop",
+            },
+          }) + "\n",
+        );
+        writeFileSync(sessionFile + ".exit", formatExitSidecar());
+
+        const status = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "status", ids: ["sub-e401"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+          details: Record<string, unknown>;
+        };
+        expect(status.content[0].text).toBe(
+          "sub-e401 (reviewer): done (the .exit sidecar is on disk, not settled by this pane)",
+        );
+        expect(status.details["sub-e401"]).toEqual({
+          status: "done",
+          herdr: null,
+          owned: false,
+          inferredFrom: "sidecar",
+        });
+
+        const result = (await stub
+          .getTool("subagent_tasks")
+          .execute("t1", { action: "result", ids: ["sub-e401"] }, undefined, () => {}, {})) as {
+          content: { text: string }[];
+          details: Record<string, unknown>;
+        };
+        expect(result.content[0].text).toContain(
+          "completed (the .exit sidecar is on disk, not settled by this pane)",
+        );
+        expect(result.content[0].text).toContain("the switched-dir final answer");
+        expect(result.details["sub-e401"]).toEqual({
+          status: "done",
+          owned: false,
+          inferredFrom: "sidecar",
+        });
+
+        // Nothing was written to this process's own dir, and no herdr
+        // round-trip happened for the foreign record.
+        expect(existsSync(join(dir, "subagent-runs", "sub-e401", "meta.json"))).toBe(false);
+        expect(probed).toEqual([]);
+      } finally {
+        setPersonaOverride(undefined);
+        herdrState.probeAgent = savedProbeAgent;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a memoized negative verdict re-proves when the transcript grows into a clean <result>",
+    async () => {
+      // The stamp check, negative side: the first read stores a `running`
+      // verdict stamped on the transcript's size/mtime; appending a clean
+      // `<result>` assistant message moves the stamp, so the second read
+      // re-proves instead of serving the memo. Without the stamp check the
+      // memo would be unconditional and the verdict would stay `running`.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e601",
+          agent: "reviewer",
+          answer: "Checking the pane now",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const status1 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e601"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status1.content[0].text).toBe("sub-e601 (reviewer): running");
+
+      const sessionFile = join(
+        dir,
+        "subagent-runs",
+        "sub-e601",
+        "1750000000000_sub-e601.jsonl",
+      );
+      appendFileSync(
+        sessionFile,
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "<result>\n## Completed\nthe late answer\n</result>" }],
+            stopReason: "stop",
+          },
+        }) + "\n",
+      );
+
+      const status2 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e601"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status2.content[0].text).toBe(
+        "sub-e601 (reviewer): done (final answer in transcript, not settled by this pane)",
+      );
+      expect(status2.details["sub-e601"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "answer",
+      });
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a memoized negative verdict does not hide a sidecar that lands after it",
+    async () => {
+      // The sidecar check runs before the memo, so a sidecar that arrives
+      // after a negative is memoized re-proves: the display path answers
+      // done-via-sidecar, not the memoized `running`. The stamp cannot catch
+      // this mover — the sidecar does not move the transcript's stamp — so
+      // what pins the ordering is the sidecar check itself: moving the memo
+      // ahead of it would serve the stale negative (verified: this test
+      // fails on that reordering, while it passes with the stamp check
+      // alone removed).
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e602",
+          agent: "worker",
+          answer: "Checking the pane now",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const status1 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e602"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status1.content[0].text).toBe("sub-e602 (worker): running");
+
+      const sessionFile = join(
+        dir,
+        "subagent-runs",
+        "sub-e602",
+        "1750000000000_sub-e602.jsonl",
+      );
+      writeFileSync(sessionFile + ".exit", formatExitSidecar());
+
+      const status2 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e602"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status2.content[0].text).toBe(
+        "sub-e602 (worker): done (the .exit sidecar is on disk, not settled by this pane)",
+      );
+      expect(status2.details["sub-e602"]).toEqual({
+        status: "done",
+        herdr: null,
+        owned: false,
+        inferredFrom: "sidecar",
+      });
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a memoized positive verdict re-proves to running when the tail no longer qualifies",
+    async () => {
+      // The stamp check, positive side: the first read stores the clean
+      // answer's verdict stamped on the transcript; growing the transcript
+      // past the evidence tail cap (`EVIDENCE_TAIL_BYTES`, 4 MB) pushes the
+      // clean `<result>` out of the window the read sees, so the second read
+      // re-proves and the verdict falls back to the pre-fix
+      // `still running [not probed: …]` text. Without the stamp check the
+      // memo would serve the stale positive.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e603",
+          agent: "reviewer",
+          answer: "<result>\n## Completed\nthe answer text\n</result>",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const status1 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e603"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status1.content[0].text).toBe(
+        "sub-e603 (reviewer): done (final answer in transcript, not settled by this pane)",
+      );
+
+      const sessionFile = join(
+        dir,
+        "subagent-runs",
+        "sub-e603",
+        "1750000000000_sub-e603.jsonl",
+      );
+      // A filler assistant message 4.5 MB in: past the 4 MB tail cap, so the
+      // clean <result> line is no longer in the window the evidence read sees.
+      appendFileSync(
+        sessionFile,
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "f".repeat(4_500_000) }],
+            stopReason: "stop",
+          },
+        }) + "\n",
+      );
+
+      const status2 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e603"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status2.content[0].text).toBe("sub-e603 (reviewer): running");
+      expect(status2.details["sub-e603"]).toEqual({ status: "running", herdr: null, owned: false });
+
+      const result2 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "result", ids: ["sub-e603"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+      };
+      expect(result2.content[0].text).toContain(
+        "still running [not probed: owned by another session]",
+      );
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a memoized verdict re-proves when only the prompt file moves",
+    async () => {
+      // The stamp check, prompt-file side: the first read stores the clean
+      // answer's verdict stamped on the transcript's and the prompt file's
+      // size/mtime. Rewriting only `system-prompt.md` (the transcript stays
+      // byte-identical) moves the stamp, so the second read re-proves: the
+      // rewritten prompt puts the answer under the `<result>` contract, the
+      // plain text no longer qualifies, and the verdict falls back to
+      // `running`. Without the prompt half of the stamp the memo would serve
+      // the stale `done`.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-e604",
+          agent: "reviewer",
+          answer: "the plain answer",
+          hasSession: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w9:pF",
+          ownerPane: "w9:pForeign",
+          systemPrompt: "You review a run. No block contract here.",
+        },
+      ]);
+      const stub = stubPi();
+      factory(stub.pi);
+
+      const status1 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e604"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status1.content[0].text).toBe(
+        "sub-e604 (reviewer): done (final answer in transcript, not settled by this pane)",
+      );
+
+      // Only the prompt moves: the transcript stays byte-identical.
+      writeFileSync(
+        systemPromptPath(join(dir, "subagent-runs", "sub-e604")),
+        "You review a run. Only what is inside `<result>` reaches the orchestrator.",
+      );
+
+      const status2 = (await stub
+        .getTool("subagent_tasks")
+        .execute("t1", { action: "status", ids: ["sub-e604"] }, undefined, () => {}, {})) as {
+        content: { text: string }[];
+        details: Record<string, unknown>;
+      };
+      expect(status2.content[0].text).toBe("sub-e604 (reviewer): running");
+      expect(status2.details["sub-e604"]).toEqual({ status: "running", herdr: null, owned: false });
+      stub.getShutdownHandler()();
+    },
+  );
+  test(
+    "loadRegistry registers only a meta whose runId is a run id and equals its dir name",
+    async () => {
+      // The load-time trust gate: the shared runs dir is writable by every pi
+      // process, so a planted `meta.json` is not an exotic attacker — and
+      // `dirFor` joins the id into a path, so an ungated id would reach the
+      // display arms' `readdirSync`/`statSync`/tail reads. The gate is
+      // `RUN_ID_PATTERN` plus the dir-name equality, mirroring
+      // `readRunRecordFromDisk`: a valid-shape id in a mismatched dir fails
+      // the equality, a matching id in a non-run-id dir fails the pattern.
+      const dir = mkdtempSync(join(tmpdir(), "herdr-wake-"));
+      const writeMeta = (name: string, runId: string): void => {
+        const runDir = join(dir, "subagent-runs", name);
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(
+          join(runDir, "meta.json"),
+          JSON.stringify({
+            runId,
+            agent: "worker",
+            task: "test task",
+            cwd: "/",
+            status: "running",
+            startedAt: Date.now(),
+          }),
+        );
+      };
+      writeMeta("sub-abcd", "sub-abcd"); // the control: registered
+      writeMeta("sub-abce", "sub-ffff"); // the meta's id is not the dir name
+      writeMeta("not-a-run", "not-a-run"); // the dir name is not a run id
+      const factory = await loadExtensionInDir(dir);
+      const stub = stubPi();
+      factory(stub.pi);
+      const tasks = await listTasks(stub);
+      expect(tasks.map((t) => t.task)).toContain("sub-abcd");
+      expect(tasks.map((t) => t.task)).not.toContain("sub-ffff");
+      expect(tasks.map((t) => t.task)).not.toContain("not-a-run");
+      stub.getShutdownHandler()();
+    },
+  );
+
+});
+
+describe("adopting a run this process never spawned (adoptRunFromDisk)", () => {
+  // `loadRegistry` runs once at module import, so a run written to disk after
+  // the factory is loaded is on disk but absent from this process's `runs`.
+  // `adoptRunFromDisk` is what rescues it. These tests pin the *wiring*: that
+  // the input hook adopts before enqueueing, that `subagent_tasks` adopts
+  // before answering, and that the `RUN_ID_PATTERN` gate keeps a model-supplied
+  // id off the filesystem. The pure reader (`readRunRecordFromDisk`) is pinned
+  // in lib.test.ts.
+
+  test(
+    "a rerouted report for a run another process spawned is loaded from disk and briefed with its reroute",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+
+        // The foreign pane is alive and working, so the adopted running record
+        // stays running through the flush's read (the report block renders).
+        herdrState.probeAgent = async () => live("working");
+
+        // Write the meta AFTER the factory is loaded: on disk, not in `runs`.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        // The claimed parent, terminal, the way a real finished parent's meta
+        // sits on disk: without it the marker's lineage check fails, the marker
+        // is stripped to body text, and the note below never prints. Realistic
+        // shape: its `ownerPane` is the pane that spawned it — this process's
+        // pane in the single-hop case, not the record's own.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 2000,
+          finishedAt: Date.now() - 1000,
+          ownerPane: TEST_OWN_PANE,
+          paneId: "w5:p3",
+        });
+
+        // A rerouted report notice, delivered past a finished parent.
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        expect(sent[0].options?.deliverAs).toBe("steer");
+        const text = sent[0].text;
+        // The reroute note is what prints for a validated marker — its header
+        // and its "delivered to you" clause. The bare "which has finished"
+        // substring cannot prove the note: a STRIPPED marker is reconstituted
+        // into the body, where it carries the same phrase.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        // ...and the run was adopted from disk, so its real block renders. The
+        // report body and the "sent a mid-run report" line exist only for a run
+        // the ledger can find in `runs` — without adoption they would be absent.
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+        expect(text).toContain("found X");
+        // Not the unregistered-run text: adoption found the record.
+        expect(text).not.toContain("not in my registry");
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+
+  test(
+    "subagent_tasks status reads a descendant run from disk",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, getTool, getShutdownHandler } = stubPi();
+      factory(pi);
+
+      writeMetaAfterLoad(dir, {
+        runId: "sub-9331",
+        agent: "reviewer",
+        task: "test task",
+        cwd: "/",
+        status: "running",
+        startedAt: Date.now(),
+        ownerPane: "w5:p3",
+        paneId: "w5:p3",
+      });
+
+      // Foreign-owned: reported from on-disk state, not probed, owned: false.
+      const status = (await getTool("subagent_tasks").execute(
+        "t1",
+        { action: "status", ids: ["sub-9331"] },
+        undefined,
+        () => {},
+        {},
+      )) as { content: { text: string }[]; details: Record<string, unknown> };
+      expect(status.content[0].text).toBe("sub-9331 (reviewer): running");
+      expect(status.details["sub-9331"]).toEqual({ status: "running", herdr: null, owned: false });
+      expect(status.content[0].text).not.toContain("Unknown task ids");
+      getShutdownHandler()();
+    },
+  );
+  test(
+    "a notice for a run written to a switched profile's runs dir is adopted from there",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+
+      // An in-session profile switch retargets the children's runs dir to the
+      // switched profile; this run wrote its meta there, not to this process's
+      // own dir — so the miss in `RUNS_DIR` is what triggers the retry.
+      const switchedDir = mkdtempSync(join(tmpdir(), "herdr-wake-switched-"));
+      setPersonaOverride({ name: "switched", dir: switchedDir, deniedTools: new Set() });
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+        // The foreign pane is alive and working, so the adopted running record
+        // stays running through the flush's read (the report block renders).
+        herdrState.probeAgent = async () => live("working");
+
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+        // The claimed parent, terminal, seeded in the switched dir (the
+        // rerouted grandchild's world): without it the marker's lineage
+        // check fails, the marker is stripped to body text, and the note
+        // below never prints. Realistic shape: its `ownerPane` is the pane
+        // that spawned it — this process's pane in the single-hop case, not
+        // the record's own.
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 2000,
+          finishedAt: Date.now() - 1000,
+          ownerPane: TEST_OWN_PANE,
+          paneId: "w5:p3",
+        });
+
+        expect(existsSync(join(dir, "subagent-runs", "sub-9331", "meta.json"))).toBe(false);
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // The note (foreign record, delivered to this pane) and the adopted
+        // run's real block — adoption came from the switched profile's dir.
+        // The note is proven by its header and its "delivered to you" clause:
+        // the bare "which has finished" also appears in a stripped marker's
+        // reconstituted body text.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+        expect(text).toContain("found X");
+        expect(text).not.toContain("not in my registry");
+      } finally {
+        setPersonaOverride(undefined);
+        herdrState.probeAgent = savedProbeAgent;
+      }
+      getShutdownHandler()();
+    },
+  );
+  test(
+    "a reroute is not stripped by a stale running registry copy of a parent that finished on disk",
+    async () => {
+      // `loadRegistry` ran at module load: its `running` copy of the parent is
+      // what the registry holds. The parent has since finished on disk, and
+      // the predicate must see the disk, not the stale copy — a stale
+      // `running` strips every genuine reroute from this parent's child.
+      // Foreign-owned, so the flush's sweep (owned records only) leaves the
+      // stale copy alone.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-96ba",
+          agent: "worker",
+          hasSession: false,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w5:pA",
+          ownerPane: "w5:p3",
+        },
+      ]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+
+        // The parent finished on disk after the load.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 2000,
+          finishedAt: Date.now() - 1000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+
+        // The grandchild: on disk, foreign-owned, running, live pane.
+        herdrState.probeAgent = async () => live("working");
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // The note prints: the disk's terminal record is what the predicate saw.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+  test(
+    "a reroute survives a running parent whose owner never settles it: the receiver proves the parent without touching it",
+    async () => {
+      // The nested-owner case: the claimed parent is owned by another child
+      // process ("w5:p3"), and a nested process never ticks — its registry
+      // copy stays `running` forever, and the disk meta is stale in the same
+      // way (the parent finished, but nobody rewrote its meta). The parent's
+      // pane is gone and its completion evidence is on disk, so the marker's
+      // lineage holds — but the receiver is not the parent's owner, and it
+      // must prove the parent from that evidence without writing the record
+      // or closing the pane (the scrollback is the failure evidence).
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-96ba",
+          agent: "worker",
+          hasSession: true,
+          visibleAnswer: true,
+          hasSidecar: true,
+          status: "running",
+          paneId: "w5:pA",
+          ownerPane: "w5:p3",
+        },
+      ]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(pi);
+        // The close the receiver must not perform: a foreign record's pane is
+        // its owner's to close, and herdr destroys scrollback when it does.
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+
+        // The grandchild: on disk, foreign-owned, running, live pane; the
+        // parent's pane is gone.
+        herdrState.probeAgent = async (paneId: string) => (paneId === "w5:pA" ? GONE : live("working"));
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // The note prints: the parent's completion evidence (the sidecar and
+        // the clean answer) is on disk, so the marker's lineage holds.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        // ...and the proof was non-mutating: the parent's meta is exactly as
+        // it was written (still `running` — its owner has never settled it),
+        // and no pane closed on the receiver's say-so.
+        const parentMeta = JSON.parse(
+          readFileSync(join(dir, "subagent-runs", "sub-96ba", "meta.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(parentMeta.status).toBe("running");
+        expect(closed).toEqual([]);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+    },
+  );
+  test(
+    "a marker is stripped when the claimed parent is running with a live pane: no note, no write, no close",
+    async () => {
+      // The branch the non-mutating proof turns on: the parent resolves
+      // `running` with a live pane and no completion evidence — herdr's agent
+      // name can clear while the agent keeps running, and a walk that advanced
+      // past a live parent is not provenance. The receiver answers `false`
+      // from the evidence the record does not have: the marker strips to
+      // ordinary body text, and the proof pays nothing the record does not
+      // already cost — no settle, no meta write, no pane close.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-96ba",
+          agent: "worker",
+          hasSession: false,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w5:pA",
+          ownerPane: "w5:p3",
+        },
+      ]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(pi);
+
+        // The parent's pane is live, so a probe would say the parent is alive;
+        // the evidence read must not need to go there at all.
+        herdrState.probeAgent = async () => live("working");
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+
+        // The grandchild: on disk, foreign-owned, running, live pane.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // No note: the claimed parent is not a finished run, so the marker is
+        // ordinary body text. The run's own block still renders, with the
+        // stripped marker reconstituted into it.
+        expect(text).not.toContain("rerouted ---");
+        expect(text).toContain("[rerouted: addressed to parent worker sub-96ba");
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+        expect(text).toContain("found X");
+        // The proof was non-mutating: the parent's meta is unchanged, and no
+        // pane closed on the receiver's say-so.
+        const parentMeta = JSON.parse(
+          readFileSync(join(dir, "subagent-runs", "sub-96ba", "meta.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(parentMeta.status).toBe("running");
+        expect(closed).toEqual([]);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+    },
+  );
+  test(
+    "a live working parent with a clean answer in its transcript is not finished: the marker strips",
+    async () => {
+      // The branch the pane probe turns on: the parent resolves `running` with
+      // a live working pane, and its transcript already carries a clean answer
+      // at the boundary — the `subagent_done` refusal (which deliberately
+      // writes no sidecar) and the transcript-write/sidecar race both land
+      // here. The evidence read alone would answer `true` and print the note's
+      // "which has finished" for a parent that is still running; the probe
+      // answers `false` first, so the marker strips to ordinary body text.
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-96ba",
+          agent: "worker",
+          hasSession: true,
+          visibleAnswer: true,
+          hasSidecar: false,
+          status: "running",
+          paneId: "w5:pA",
+          ownerPane: "w5:p3",
+        },
+      ]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(pi);
+
+        // The parent's pane is live and working: the probe is the answer.
+        herdrState.probeAgent = async () => live("working");
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+
+        // The grandchild: on disk, foreign-owned, running, live pane.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // No note: the parent is live, so the marker is ordinary body text. The
+        // run's own block still renders, with the stripped marker reconstituted.
+        expect(text).not.toContain("rerouted ---");
+        expect(text).toContain("[rerouted: addressed to parent worker sub-96ba");
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+        expect(text).toContain("found X");
+        // The proof was non-mutating: the parent's meta is unchanged, and no
+        // pane closed on the receiver's say-so.
+        const parentMeta = JSON.parse(
+          readFileSync(join(dir, "subagent-runs", "sub-96ba", "meta.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(parentMeta.status).toBe("running");
+        expect(closed).toEqual([]);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+    },
+  );
+
+  test(
+    "the wake-path parent probe runs at its short bound, and a timed-out probe strips, never proves gone",
+    async () => {
+      // The probe runs on the serialized wake path, so it is bounded at
+      // WAKE_PROBE_TIMEOUT_MS, not the module-wide 30 s: a hung herdr must
+      // not stall every briefing behind it. A timeout kills the CLI with no
+      // reply document, so the probe answers `unreachable` — "not gone", the
+      // conservative direction: the marker strips, the note is lost, and
+      // nothing is classified from the timeout (herdr.ts behaviour 10).
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const probes: Array<[string, number | undefined]> = [];
+      try {
+        factory(pi);
+        // The parent: on disk, foreign-owned, running, live pane; the
+        // grandchild: on disk, foreign-owned, running.
+        herdrState.probeAgent = async (paneId: string, timeoutMs?: number) => {
+          probes.push([paneId, timeoutMs]);
+          return paneId === "w5:pA"
+            ? { kind: "unreachable", error: "Command failed: herdr agent get w5:pA" }
+            : live("working");
+        };
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "interim", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+        await flushWindow();
+        expect(sent.length).toBe(1);
+        // The marker stripped: an unreachable probe says nothing about the
+        // parent, so the note is not proven.
+        expect(sent[0].text).not.toContain("rerouted ---");
+        expect(sent[0].text).toContain("interim");
+        // The bound is pinned: the parent's probe ran at WAKE_PROBE_TIMEOUT_MS,
+        // not the module-wide 30 s default.
+        const parentProbe = probes.find(([id]) => id === "w5:pA");
+        expect(parentProbe).toBeDefined();
+        expect(parentProbe![1]).toBe(WAKE_PROBE_TIMEOUT_MS);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+
+  test(
+    "a coalesced report+done pair whose parent finishes between the notices keeps the note on both",
+    async () => {
+      // The point of positive-only caching: the pair coalesces into ONE batch
+      // inside the 1.2 s window, so the done's proof runs in the same flush
+      // as the report's. The parent's `.exit` sidecar lands between the two
+      // notices (and the probe flips to `gone` with it — herdr's detection
+      // lag), so the done's pass must observe it: a `false` served from the
+      // report's pass would silently delete the note.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(pi);
+        // The parent finishes between the pair's two proofs, inside the one
+        // flush: on the second probe the sidecar lands and herdr's detection
+        // clears the agent's name, so the report's pass sees a live pane and
+        // the done's pass a gone one with the evidence on disk.
+        let parentProbes = 0;
+        const sessionFile = join(
+          dir,
+          "subagent-runs",
+          "sub-96ba",
+          "1750000000000_sub-96ba.jsonl",
+        );
+        herdrState.probeAgent = async (paneId: string) => {
+          if (paneId !== "w5:pA") return live("working");
+          parentProbes++;
+          if (parentProbes === 2) {
+            writeFileSync(
+              sessionFile,
+              JSON.stringify({
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "<result>the parent's answer.</result>" }],
+                  stopReason: "stop",
+                },
+              }) + "\n",
+            );
+            writeFileSync(sessionFile + ".exit", formatExitSidecar());
+          }
+          return parentProbes >= 2 ? GONE : live("working");
+        };
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+        // The parent: on disk, foreign-owned, running, live pane — no
+        // completion evidence yet.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        // The grandchild: on disk, foreign-owned, running, live pane.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const report = formatNotice("sub-9331", "reviewer", "report", "interim", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        const done = formatNotice("sub-9331", "reviewer", "done", "", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        // Both notices land inside one coalesce window: one batch.
+        getInputHandler()({ text: report });
+        getInputHandler()({ text: done });
+        await flushWindow();
+        // One briefing for the pair — and it carries the note: the done's
+        // pass re-proved the parent instead of serving a cached `false`.
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        // Both notices are in the batch, under the note.
+        expect(text).toContain("sent a mid-run report");
+        expect(text).toContain("sent a notice");
+        expect(closed).toEqual([]);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+    },
+  );
+
+  test(
+    "a live parent that never finishes pays one probe per notice of a coalesced pair, at the wake probe's timeout",
+    async () => {
+      // The cost of not caching negatives, pinned: a `false` is computed,
+      // returned and not stored, so each notice that carries a reroute marker
+      // re-probes — the pair costs two probes, and every probe runs at
+      // WAKE_PROBE_TIMEOUT_MS, the bound that keeps a hung herdr off the
+      // serialized wake path.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+        const parentProbes: number[] = [];
+        herdrState.probeAgent = async (paneId: string, timeoutMs?: number) => {
+          if (paneId === "w5:pA") parentProbes.push(timeoutMs ?? -1);
+          return live("working");
+        };
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const report = formatNotice("sub-9331", "reviewer", "report", "interim", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        const done = formatNotice("sub-9331", "reviewer", "done", "", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        getInputHandler()({ text: report });
+        getInputHandler()({ text: done });
+        await flushWindow();
+        // One probe per notice — the `false` was not stored — and every
+        // probe at the wake probe's timeout.
+        expect(parentProbes).toEqual([WAKE_PROBE_TIMEOUT_MS, WAKE_PROBE_TIMEOUT_MS]);
+        expect(sent.length).toBe(1);
+        expect(sent[0].text).not.toContain("rerouted ---");
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+
+  test(
+    "a running parent's negative proof is never cached: every notice re-proves, inside the TTL",
+    async () => {
+      // The rewrite of the old "served within the TTL" pin to the new truth:
+      // a `false` is a liveness inference, and the parent can exit at any
+      // moment, so it is computed and returned, never stored. A foreign
+      // `running` parent no process ever ticks re-probes on every notice —
+      // the cost is one `probeAgent` call per notice carrying a reroute
+      // marker, which is rare.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      let parentProbes = 0;
+      try {
+        factory(pi);
+        // The parent: on disk, foreign-owned, running, live pane — the proof
+        // is the live probe, answered `false`.
+        herdrState.probeAgent = async (paneId: string) => {
+          if (paneId === "w5:pA") parentProbes++;
+          return live("working");
+        };
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const report = formatNotice("sub-9331", "reviewer", "report", "interim", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        // Flush 1: the proof runs — one probe.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[0].text).not.toContain("rerouted ---");
+        // Flush 2, still inside the TTL: the `false` was not cached, so the
+        // proof re-runs.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(2);
+        expect(sent[1].text).not.toContain("rerouted ---");
+        // Flush 3, past the TTL: still a re-proof — negatives never stand.
+        await advance(PARENT_PROOF_TTL_MS);
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(3);
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+
+  test(
+    "a running parent's true proof is cached across flushes: no re-proof while the record stays running",
+    async () => {
+      // The parent finished on disk (the sidecar proves it) but its meta never
+      // moved — its owner never settles it, and the receiver proves the finish
+      // without writing the record. The proof's `true` is cached (terminal is
+      // terminal): the second flush pays no probe at all.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      let parentProbes = 0;
+      try {
+        factory(pi);
+        herdrState.probeAgent = async (paneId: string) => {
+          if (paneId === "w5:pA") parentProbes++;
+          return paneId === "w5:pA" ? GONE : live("working");
+        };
+        // The parent: on disk, foreign-owned, stale `running` in its meta, pane
+        // gone — the completion evidence (the sidecar) is what proves it.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        const parentRunDir = join(dir, "subagent-runs", "sub-96ba");
+        const sessionFile = join(parentRunDir, "1750000000000_sub-96ba.jsonl");
+        writeFileSync(
+          sessionFile,
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "<result>the parent's answer.</result>" }],
+              stopReason: "stop",
+            },
+          }) + "\n",
+        );
+        writeFileSync(sessionFile + ".exit", formatExitSidecar());
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const report = formatNotice("sub-9331", "reviewer", "report", "found X", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        // Flush 1: the proof runs — one probe — and the note prints.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[0].text).toContain("rerouted ---");
+        // Flush 2: the record is still `running` on disk, but the cached
+        // `true` stands — no second probe.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[1].text).toContain("rerouted ---");
+        // Past the TTL: a sidecar-proven `true` is a completion record, not
+        // an inference — it stands without the expiry, so no third probe.
+        await advance(PARENT_PROOF_TTL_MS);
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[2].text).toContain("rerouted ---");
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+  test(
+    "an answer-derived true proof is re-proven past the TTL, a sidecar's is not",
+    async () => {
+      // The parent finished on disk (a clean transcript answer proves it) but
+      // its meta never moved — its owner never settles it, and the receiver
+      // proves the finish without writing the record. That `true` is an
+      // inference, not a completion record: unlike the sidecar's (the sibling
+      // test pins the sidecar half — no re-proof at all), it never outlives
+      // `PARENT_PROOF_TTL_MS`, so the proof re-runs past it and a later `gone`
+      // for a live parent (herdr's detection lag, a restart that drops pane
+      // ids) cannot be served forever.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      let parentProbes = 0;
+      try {
+        factory(pi);
+        herdrState.probeAgent = async (paneId: string) => {
+          if (paneId === "w5:pA") parentProbes++;
+          return paneId === "w5:pA" ? GONE : live("working");
+        };
+        // The parent: on disk, foreign-owned, stale `running` in its meta,
+        // pane gone — the completion evidence is a clean transcript answer,
+        // with NO sidecar (that is the sibling test's shape).
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        const parentRunDir = join(dir, "subagent-runs", "sub-96ba");
+        const sessionFile = join(parentRunDir, "1750000000000_sub-96ba.jsonl");
+        writeFileSync(
+          sessionFile,
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "<result>the parent's answer.</result>" }],
+              stopReason: "stop",
+            },
+          }) + "\n",
+        );
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const report = formatNotice("sub-9331", "reviewer", "report", "found X", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        // Flush 1: the proof runs — one probe — and the note prints.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[0].text).toContain("rerouted ---");
+        // Flush 2, inside the TTL: the inferred `true` stands — no probe.
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(1);
+        expect(sent[1].text).toContain("rerouted ---");
+        // Past the TTL: the inferred `true` is stale, and the proof re-runs.
+        await advance(PARENT_PROOF_TTL_MS);
+        getInputHandler()({ text: report });
+        await flushWindow();
+        expect(parentProbes).toBe(2);
+        expect(sent[2].text).toContain("rerouted ---");
+        getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+  test(
+    "a foreign parent's coalesced pair keeps the note on both notices and the proof writes nothing",
+    async () => {
+      // The ownership hard rules on the transition path: the parent is not
+      // owned by this pane, so the proof must answer from disk without
+      // settling it — the parent's meta stays byte-identical, the parent
+      // never enters this process's registry (a marker id is not a notice
+      // addressed to this pane), and no pane closes on a foreign record (the
+      // scrollback is the failure evidence).
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const stub = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(stub.pi);
+        // The parent finishes between the pair's two proofs, inside the one
+        // flush: on the second probe the sidecar lands and herdr's detection
+        // clears the agent's name, so the report's pass sees a live pane and
+        // the done's pass a gone one with the evidence on disk.
+        let parentProbes = 0;
+        const sessionFile = join(
+          dir,
+          "subagent-runs",
+          "sub-96ba",
+          "1750000000000_sub-96ba.jsonl",
+        );
+        herdrState.probeAgent = async (paneId: string) => {
+          if (paneId !== "w5:pA") return live("working");
+          parentProbes++;
+          if (parentProbes === 2) {
+            writeFileSync(
+              sessionFile,
+              JSON.stringify({
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "<result>the parent's answer.</result>" }],
+                  stopReason: "stop",
+                },
+              }) + "\n",
+            );
+            writeFileSync(sessionFile + ".exit", formatExitSidecar());
+          }
+          return parentProbes >= 2 ? GONE : live("working");
+        };
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 60000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pB",
+        });
+        const parentMeta = join(dir, "subagent-runs", "sub-96ba", "meta.json");
+        const metaBefore = readFileSync(parentMeta, "utf-8");
+        const report = formatNotice("sub-9331", "reviewer", "report", "interim", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        const done = formatNotice("sub-9331", "reviewer", "done", "", {
+          parentAgent: "worker",
+          parentRunId: "sub-96ba",
+          deliveredTo: "orchestrator",
+        });
+        stub.getInputHandler()({ text: report });
+        stub.getInputHandler()({ text: done });
+        await flushWindow();
+        // The note prints on the pair ...
+        expect(stub.sent.length).toBe(1);
+        expect(stub.sent[0].text).toContain("rerouted ---");
+        expect(stub.sent[0].text).toContain("delivered to you (orchestrator)");
+        // Both notices are in the one briefing: the report block, then the
+        // note (spliced before the block of the notice that verified it —
+        // the done), then the done block.
+        expect(stub.sent[0].text).toContain("sent a mid-run report");
+        expect(stub.sent[0].text).toContain("sent a notice");
+        // ...and the proof wrote nothing: the parent's meta is byte-identical,
+        // the registry holds neither parent nor child, and no pane closed.
+        expect(readFileSync(parentMeta, "utf-8")).toBe(metaBefore);
+        const tasks = await listTasks(stub);
+        // `listRuns` exposes the id as `task`, not `runId`: the input hook
+        // adopts the notice's OWN run from disk (the grandchild, whose notice
+        // is addressed to this pane), so the registry holds exactly it — and
+        // only it. The parent is a marker id the proof read from disk without
+        // registering; a `runId` field would have been undefined for every
+        // task, making the old `toEqual([])` vacuous.
+        expect(tasks.map((t) => t.task)).toContain("sub-9331");
+        expect(tasks.map((t) => t.task)).not.toContain("sub-96ba");
+        expect(closed).toEqual([]);
+        stub.getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+    },
+  );
+
+  test(
+    "a reroute marker's parent is read from disk without registering: it stays out of subagent_tasks list",
+    async () => {
+      // The marker's `parentRunId` is model text. The predicate reads the
+      // parent from disk to prove the lineage, but must not register it in
+      // `runs`: a notice addressed to this pane is what adopts a run, and a
+      // marker id is not. Registered, the parent would surface in
+      // `subagent_tasks list` and become addressable by cancel/interrupt.
+      // The note still prints (the parent is terminal), proving the read
+      // happened; the list assertion proves it did not register.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const stub = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(stub.pi);
+
+        // The parent: on disk, foreign-owned, done, gone pane.
+        herdrState.probeAgent = async (paneId: string) =>
+          paneId === "w5:pA" ? GONE : live("working");
+        writeMetaAfterLoad(dir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 2000,
+          finishedAt: Date.now() - 1000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+
+        // The grandchild: on disk, foreign-owned, running, live pane.
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = stub.getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(stub.sent.length).toBe(1);
+        // The note printed: the predicate read the parent from disk and it was
+        // terminal, so the marker's lineage held.
+        expect(stub.sent[0].text).toContain("rerouted ---");
+        // ...but the parent was never registered, so it is not in the list.
+        const tasks = await listTasks(stub);
+        expect(tasks.map((t) => t.task)).not.toContain("sub-96ba");
+        stub.getShutdownHandler()();
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+    },
+  );
+
+  test(
+    "a terminal registry copy owned by this pane is the answer: no disk meta, salvage-only evidence",
+    async () => {
+      // The trust rule's positive half: a registry record this pane owns and
+      // has already finished answers from the registry alone — the disk read
+      // is skipped, so a lost `saveMeta` (best-effort) and salvage-only
+      // transcript evidence cannot strip the note. Every other
+      // registry-seeded parent fixture here is running and foreign-owned, so
+      // this is the one that pins "owned AND terminal".
+      const { factory, dir } = await freshExtensionWithDir([
+        {
+          runId: "sub-96ba",
+          agent: "worker",
+          hasSession: true,
+          answer: "x".repeat(420),
+          hasSidecar: false,
+          status: "done",
+          paneId: "w5:pA",
+          ownerPane: TEST_OWN_PANE,
+          systemPrompt: "Only what is inside `<result>` reaches the orchestrator.",
+          rawMeta: { finishedAt: Date.now() - 1000 },
+        },
+      ]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+        // `saveMeta` is best-effort: the transition's meta write can be lost,
+        // so the registry copy is the only record left. The run dir keeps
+        // only its transcript — salvage-only under the `<result>` contract.
+        rmSync(join(dir, "subagent-runs", "sub-96ba", "meta.json"));
+        // The grandchild's pane is live; the parent's is never probed, because
+        // its owned terminal registry copy answers before any probe.
+        herdrState.probeAgent = async () => live("working");
+        writeMetaAfterLoad(dir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // The note prints: the predicate answered from the owned terminal
+        // registry copy — the disk read it would otherwise need found no
+        // meta at all.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+      } finally {
+        herdrState.probeAgent = savedProbeAgent;
+      }
+      getShutdownHandler()();
+    },
+  );
+  test(
+    "a reroute proves a running parent from the switched profile's run dir",
+    async () => {
+      // The foreign-dir case: the parent's meta and its completion evidence
+      // live in the switched profile's runs dir, not this process's. The
+      // predicate must adopt the record so `dirFor` follows it — evaluated
+      // against the home dir the evidence misses (a false strip), and a write
+      // would land a phantom record in `RUNS_DIR` that shadows the real one.
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+
+      const switchedDir = mkdtempSync(join(tmpdir(), "herdr-wake-switched-"));
+      setPersonaOverride({ name: "switched", dir: switchedDir, deniedTools: new Set() });
+      const savedProbeAgent = herdrState.probeAgent;
+      const savedClosePane = herdrState.closePane;
+      try {
+        factory(pi);
+        // The parent's pane is gone; the grandchild's is live.
+        herdrState.probeAgent = async (paneId: string) =>
+          paneId === "w5:pA" ? GONE : live("working");
+        const closed: string[] = [];
+        herdrState.closePane = async (paneId: string) => {
+          closed.push(paneId);
+          return true;
+        };
+
+        // The parent: on disk in the switched dir, stale `running`, with its
+        // completion evidence (session + sidecar) beside its meta.
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now() - 2000,
+          ownerPane: "w5:p3",
+          paneId: "w5:pA",
+        });
+        const parentRunDir = join(switchedDir, "subagent-runs", "sub-96ba");
+        const sessionFile = join(parentRunDir, "1750000000000_sub-96ba.jsonl");
+        writeFileSync(
+          sessionFile,
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "<result>the parent's answer.</result>" }],
+              stopReason: "stop",
+            },
+          }) + "\n",
+        );
+        writeFileSync(sessionFile + ".exit", formatExitSidecar());
+
+        // The grandchild: on disk in the switched dir, foreign-owned, running.
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "running",
+          startedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "report", "found X", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        // The note prints: the parent's evidence was found where its record
+        // lives — the switched dir, through the adoption's `dirFor`.
+        expect(text).toContain("rerouted ---");
+        expect(text).toContain("delivered to you (orchestrator)");
+        expect(text).toContain("sub-9331 (reviewer) sent a mid-run report");
+        // ...and the proof was non-mutating: the parent's meta is unchanged in
+        // the switched dir, no phantom meta shadowed it in the home dir, and
+        // no pane closed on the receiver's say-so.
+        const parentMeta = JSON.parse(
+          readFileSync(join(switchedDir, "subagent-runs", "sub-96ba", "meta.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(parentMeta.status).toBe("running");
+        expect(existsSync(join(dir, "subagent-runs", "sub-96ba", "meta.json"))).toBe(false);
+        expect(closed).toEqual([]);
+      } finally {
+        setPersonaOverride(undefined);
+        herdrState.probeAgent = savedProbeAgent;
+        herdrState.closePane = savedClosePane;
+      }
+      getShutdownHandler()();
+    },
+  );
+
+  test(
+    "an adopted done run reads its transcript from the switched profile's run dir",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+
+      const switchedDir = mkdtempSync(join(tmpdir(), "herdr-wake-switched-"));
+      setPersonaOverride({ name: "switched", dir: switchedDir, deniedTools: new Set() });
+      const savedProbeAgent = herdrState.probeAgent;
+      try {
+        factory(pi);
+        herdrState.probeAgent = async () => live("working");
+
+        // A terminal run whose meta and transcript live only in the switched
+        // profile's runs dir — the shape of a rerouted grandchild that
+        // finished under a profile switch.
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-9331",
+          agent: "reviewer",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 1000,
+          finishedAt: Date.now(),
+          ownerPane: "w5:p3",
+          paneId: "w5:p3",
+        });
+        // The marker claims a finished parent; the parent-side
+        // provenance check requires it to resolve to a real terminal record,
+        // so seed it in the switched dir (the rerouted grandchild's world).
+        // Realistic shape: its `ownerPane` is the pane that spawned it — this
+        // process's pane in the single-hop case, not the record's own.
+        writeMetaAfterLoad(switchedDir, {
+          runId: "sub-96ba",
+          agent: "worker",
+          task: "test task",
+          cwd: "/",
+          status: "done",
+          startedAt: Date.now() - 2000,
+          finishedAt: Date.now() - 1000,
+          ownerPane: TEST_OWN_PANE,
+          paneId: "w5:p3",
+        });
+        const runDirPath = join(switchedDir, "subagent-runs", "sub-9331");
+        writeFileSync(
+          join(runDirPath, "1750000000000_sub-9331.jsonl"),
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "<result>The switched-dir final answer.</result>" }],
+              stopReason: "stop",
+            },
+          }) + "\n",
+        );
+
+        const handled = getInputHandler()({
+          text: formatNotice("sub-9331", "reviewer", "done", "", {
+            parentAgent: "worker",
+            parentRunId: "sub-96ba",
+            deliveredTo: "orchestrator",
+          }),
+        });
+        expect(handled).toEqual({ action: "handled" });
+
+        await flushWindow();
+
+        expect(sent.length).toBe(1);
+        const text = sent[0].text;
+        expect(text).toContain("rerouted ---");
+        // The final answer came from the SWITCHED dir: `dirFor` answered the
+        // adopted run's transcript where its files actually are, not where
+        // this process's dir says they should be.
+        expect(text).toContain("The switched-dir final answer.");
+        expect(text).not.toContain("(no final answer in transcript)");
+      } finally {
+        setPersonaOverride(undefined);
+        herdrState.probeAgent = savedProbeAgent;
+      }
+      getShutdownHandler()();
+      // `dir` is unused here on purpose: the whole point is that nothing in
+      // this process's own runs dir is consulted.
+      expect(existsSync(join(dir, "subagent-runs", "sub-9331", "meta.json"))).toBe(false);
+    },
+  );
+
+  test(
+    "a traversal id is unknown, not read",
+    async () => {
+      const { factory, dir } = await freshExtensionWithDir([]);
+      const { pi, getTool, getShutdownHandler } = stubPi();
+      factory(pi);
+
+      // A model-supplied id outside the runs-dir shape must be refused by the
+      // RUN_ID_PATTERN gate before it reaches the filesystem: no read, no
+      // adoption, the id comes back unknown.
+      const status = (await getTool("subagent_tasks").execute(
+        "t1",
+        { action: "status", ids: ["../x"] },
+        undefined,
+        () => {},
+        {},
+      )) as { content: { text: string }[] };
+      expect(status.content[0].text).toBe("Unknown task ids: ../x.\n");
+      // The gate kept the id off the filesystem: nothing was created or read
+      // at <runsDir>/../x, i.e. <agentDir>/x.
+      expect(existsSync(join(dir, "x", "meta.json"))).toBe(false);
+      getShutdownHandler()();
+    },
+  );
+
+  test(
+    "a notice for a run with no meta on disk keeps the restart text",
+    async () => {
+      const createExtension = await freshExtension([]);
+      const { pi, sent, getInputHandler, getShutdownHandler } = stubPi();
+      createExtension(pi);
+
+      // A direct (non-rerouted) report for an id with no run dir on disk:
+      // adoption finds nothing, so the briefing keeps the existing "predate a
+      // restart" text.
+      getInputHandler()({
+        text: formatNotice("sub-9332", "reviewer", "report", "interim note"),
+      });
+      await flushWindow();
+
+      expect(sent.length).toBe(1);
+      expect(sent[0].text).toContain("predate a restart");
+      expect(sent[0].text).toContain("not in my registry");
+      expect(sent[0].text).toContain("sub-9332 (reviewer) report");
+      getShutdownHandler()();
     },
   );
 });
@@ -1374,7 +3890,7 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
     "an examined failed run is quiet while its transcript is unchanged, and revives once it changes",
     async () => {
       const { factory, dir } = await freshExtensionWithDir([
-        { runId: "sub-s7a1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pS", rawMeta: { finishedAt: Date.now() - 10000 } },
+        { runId: "sub-57a1", agent: "worker", hasSession: true, hasSidecar: false, visibleAnswer: false, status: "failed", paneId: "w9:pS", rawMeta: { finishedAt: Date.now() - 10000 } },
       ]);
       herdrState.probeAgent = async () => GONE;
       const stub = stubPi();
@@ -1386,16 +3902,16 @@ describe("issue #1: done-pane completion signals and late-completion revival", (
       expect(stub.sent.length).toBe(0);
 
       // The late report rewrites the session file: size and mtime move.
-      const runDir = join(dir, "subagent-runs", "sub-s7a1");
+      const runDir = join(dir, "subagent-runs", "sub-57a1");
       writeFileSync(systemPromptPath(runDir), RESULT_PROMPT);
-      writeResultTranscript(runDir, "sub-s7a1", "<result>The late report for sub-s7a1.</result>");
+      writeResultTranscript(runDir, "sub-57a1", "<result>The late report for sub-57a1.</result>");
 
       await livenessInterval();
       await flushWindow();
-      const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-s7a1");
+      const rec = (await listTasks(stub as any)).find((t) => t.task === "sub-57a1");
       expect(rec?.status).toBe("done");
       expect(stub.sent.length).toBe(1);
-      expect(stub.sent[0].text).toContain("late report for sub-s7a1");
+      expect(stub.sent[0].text).toContain("late report for sub-57a1");
       stub.getShutdownHandler()();
     },
   );
@@ -1841,7 +4357,6 @@ describe("the launch window (registered, pane not yet attached)", () => {
       }
     },
   );
-
 
   test(
     "cancellation during a recovery wait stops further Enter attempts and closes the pane once",

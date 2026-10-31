@@ -17,7 +17,14 @@
 import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { hasExitSidecar, isRunRecord, isSessionFileFor, metaPath, runDir } from "../subagent-herdr/rundir.js";
+import {
+	hasExitSidecar,
+	isRunRecord,
+	isSessionFileFor,
+	metaPath,
+	runDir,
+	EVIDENCE_TAIL_BYTES,
+} from "../subagent-herdr/rundir.js";
 import { counts, parseTodoState } from "../lib/todo.js";
 import { RUN_ID_PATTERN, type RunInfo, type RunInfos, type RunTodoCounts } from "./lib.js";
 
@@ -28,15 +35,28 @@ const KNOWN_STATUS = new Set(["running", "done", "failed", "cancelled"]);
  * is a recent `todo` op near the end of the transcript, so the first pass is
  * small; a miss expands the window before "no list" is concluded, to the cap.
  *
- * The bounds are measured, not assumed: re-measured over 450 transcripts in
- * 443 recorded run dirs, 37 carry a todo snapshot — 15 sit >32 KB from EOF,
- * the p90 gap is ~1.0 MB, the max ~2.8 MB, and the largest single line ~1.0
- * MB. The 4 MB cap covers 37/37 recorded runs with ~1.2 MB of headroom; a
- * miss with the window already at the cap is evidence the transcript really
- * has no list. A first pass that misses is evidence the window was too small,
- * not that the child never built a list.
+ * The top rung is the shared `EVIDENCE_TAIL_BYTES` — the cap the wake
+ * path's evidence read passes — so the two readers bound at the same 4 MB
+ * and cannot drift.
+ *
+ * The bounds are measured, not assumed, 2026-10-30 over the 546 session
+ * transcripts (`2026*.jsonl`) in 554 recorded run dirs — a `reports.jsonl`
+ * sidecar is not a transcript, so a `*.jsonl` glob inflates that count.
+ * The quantity the cap gates is the gap from EOF to
+ * the newest snapshot's line start — not the transcript's size: a
+ * transcript can be big and its list fresh. Measured, each labelled by
+ * quantity: max transcript 7.90 MB (file size, not the gating quantity),
+ * p90 transcript ~1.0 MB, max gap from EOF to a snapshot's line start
+ * 2.67 MiB (~2.7 MB), p90 gap 0.38 MB, largest single line 985 KiB (the same
+ * 1,008,398 B figure the reach bound is derived from). 80 transcripts carry a
+ * `todo` snapshot, 19 sit >32 KB from EOF, and the 4 MB cap covers all 80
+ * (7 transcripts sit past the cap in size, every one
+ * carrying a `.exit` sidecar). A miss with the window already at the cap
+ * is evidence the transcript really has no list. A first pass that misses
+ * is evidence the window was too small, not that the child never built a
+ * list.
  */
-const TODO_TAIL_STEPS = [32 * 1024, 512 * 1024, 4 * 1024 * 1024];
+const TODO_TAIL_STEPS = [32 * 1024, 512 * 1024, EVIDENCE_TAIL_BYTES];
 
 /**
  * One run's todo progress, read off its session file: the newest `todo` tool
@@ -101,8 +121,9 @@ const todoFileOf = new Map<string, string>();
  * 4 MB read AND parsed, synchronously in pi's main loop) on every append, at
  * any size — including a transcript first read past the cap (board restart
  * mid-run, the 60 s liveness tick); there the ladder's 4 MB tail simply never
- * reaches farther from EOF, the measured tradeoff (max gap 2.8 MB over 37
- * recorded todo runs). The stamp guards the size-equal in-place rewrite (a
+ * reaches farther from EOF, the measured tradeoff (max gap from EOF to a
+ * snapshot's line start 2.67 MiB (~2.7 MB), over 80 recorded todo snapshots,
+ * measured 2026-10-30). The stamp guards the size-equal in-place rewrite (a
  * Nextcloud sync restore): an append always changes the size, so a stamp
  * that moves while the size does not is a replaced file, not a grown one.
  * A size that goes DOWN is likewise a replaced file: the marker is a lie,
@@ -111,7 +132,7 @@ const todoFileOf = new Map<string, string>();
  * a snapshot DEEPER than the ladder's 4 MiB tail then lives for one poll
  * per stamp change (an idle transcript keeps serving it from the
  * cache): the ladder cannot re-reach it and the memo re-arms at the
- * tail boundary. Recorded max gap 2.8 MB < 4 MiB, so this off-board flip is
+ * tail boundary. Measured max gap from EOF 2.67 MiB (~2.7 MB, 2026-10-30) <
  * unreachable in recorded data; it is the reach cost of a capped tail.
  */
 const scannedTo = new Map<string, { off: number; stamp: string }>();
@@ -148,8 +169,8 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 				scannedTo.delete(file);
 			} else {
 				// Scan the appended region from the proven offset — chunked, so peak
-				// memory is the ladder's cap while each line is <= the chunk (measured
-				// max recorded line ~1 MB); never floored, so a snapshot in a big
+				// memory is `REGION_CHUNK_BYTES` while each line is <= the chunk (measured
+				// max recorded line 985 KiB); never floored, so a snapshot in a big
 				// append stays visible.
 				const scan = scanRegion(file, memo.off, st.size);
 				if (scan.todos) scannedTo.delete(file); // a found list is not "no list"
@@ -219,13 +240,28 @@ function eofBoundary(text: string, size: number): number {
 	return size - Buffer.byteLength(text.slice(cut + 1));
 }
 
-/** The appended-region scan chunks at the ladder's cap. Peak memory tracks
- * the ladder's while lines fit ONE chunk (largest recorded line ~1 MB); a
- * line between one and three chunks raises the live set to carry + chunk +
- * concat, up to 6 chunks (~24 MiB) plus the decoded region, at the carry
- * cap. Past three chunks the scan stops (see scanRegion). A line is the
- * atomic unit of the scan between the cap and the stop — it is never split. */
-const REGION_CHUNK_BYTES = TODO_TAIL_STEPS[TODO_TAIL_STEPS.length - 1];
+/**
+ * The appended-region scan's chunk size, in bytes — the scan's own measured
+ * bound, named here with its own rationale rather than derived from the
+ * ladder's top rung: the two justifications are different, and a
+ * wake-path-motivated change to the cap must not silently retune the board
+ * scan's reach and memory.
+ *
+ * The chunk sets the scan's reach and peak, independently of the ladder: a
+ * pass reads 3 chunks (the carry caps at 2, so a line between one and three
+ * chunks is carried whole — carry + chunk + concat, up to 6 chunks, ~24 MiB
+ * at the carry cap), so 4 MB chunks give the 12 MiB reach the edge tests
+ * pin, and the measured max line (~1.0 MB, 1,008,398 B, 2026-10-30) sits
+ * well inside one chunk. A line past three chunks stops the scan at its
+ * start (see scanRegion); a line is the atomic unit of the scan between the
+ * chunk and the stop — it is never split.
+ *
+ * It equals the shared `EVIDENCE_TAIL_BYTES` today, so the board scan and
+ * the wake path's evidence read stay at the same 4 MB; `lib.test.ts` pins
+ * the equality, so the coupling is an explicit tested fact, not an
+ * incidental one.
+ */
+export const REGION_CHUNK_BYTES = 4 * 1024 * 1024;
 
 /**
  * Scan `[from, size)` front to back for the newest `todo` snapshot, in
@@ -241,7 +277,7 @@ const REGION_CHUNK_BYTES = TODO_TAIL_STEPS[TODO_TAIL_STEPS.length - 1];
  * moves it FORWARD past a line start, which would skip a snapshot line
  * forever. The cuts are byte-aligned, which forecloses both there (the
  * tail's <=1-byte under-count is bounded and safe — see eofBoundary).
- * Peak memory: ~2x the ladder's peak while lines fit one chunk; at the
+ * Peak memory: ~2x `REGION_CHUNK_BYTES` while lines fit one chunk; at the
  * carry cap, carry + chunk + concat reach 6 chunks (~24 MiB) plus the
  * decoded region (~12 MiB for a 12 MiB ASCII concat — Latin1 strings are
  * one byte per char — ~24 MiB more with split() copies; ~60 MiB
@@ -320,7 +356,7 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
  * scan, so the offset must not be raised to the ladder's 4 MB tail — that
  * floor is what made a snapshot inside the skipped band permanently invisible.
  * The delta is bounded only by the poll cadence; `scanRegion` reads it in
- * byte-aligned chunks so peak memory stays at the ladder's cap.
+ * byte-aligned chunks so peak memory stays at `REGION_CHUNK_BYTES`.
  */
 function readRangeBytes(file: string, offset: number, len: number): Buffer {
 	try {

@@ -46,7 +46,8 @@ import {
 	type RunInfos,
 	type SessionEntryLike,
 } from "./lib.js";
-import { readRunInfo, readRunInfos } from "./runs.js";
+import { EVIDENCE_TAIL_BYTES } from "../subagent-herdr/rundir.js";
+import { readRunInfo, readRunInfos, REGION_CHUNK_BYTES } from "./runs.js";
 
 const run = (...ops: KanbanOp[]): KanbanState => ops.reduce(applyOp, emptyState());
 
@@ -606,6 +607,18 @@ describe("runs.ts (meta.json reader)", () => {
 		"2026-10-08T00-00-00-000Z_sub-0005.jsonl.exit": "{}",
 	});
 
+	test("the region-scan chunk equals the shared evidence cap", () => {
+		// `REGION_CHUNK_BYTES` used to be derived from the ladder's top rung;
+		// it is now a named constant with its own rationale (measured max line
+		// ~1.0 MB; 3 chunks per pass => 12 MiB reach, ~24 MiB peak). The
+		// equality with `EVIDENCE_TAIL_BYTES` is deliberate — the board scan
+		// and the wake path's evidence read bound at the same 4 MB — so the
+		// coupling is pinned here as an explicit tested fact: a
+		// wake-path-motivated cap change is a deliberate re-tune of the board
+		// scan, not a silent one.
+		expect(REGION_CHUNK_BYTES).toBe(EVIDENCE_TAIL_BYTES);
+	});
+
 	test("reads status and agent", () => {
 		expect(readRunInfo(agent, "sub-0001")).toEqual({ status: "running", agent: "worker" });
 		expect(readRunInfo(agent, "sub-0002")).toEqual({ status: "done", agent: "reviewer" });
@@ -623,7 +636,7 @@ describe("runs.ts (meta.json reader)", () => {
 	});
 
 	test("the tail ladder finds a todo snapshot >32 KB from EOF, and a torn final line is dropped", () => {
-		// The measured p90 EOF gap is ~1.0 MB — the 32 KB and 512 KB windows
+		// The measured p90 EOF gap is ~0.4 MB (2026-10-30) — the 32 KB and 512 KB windows
 		// both miss, a wider step must find it.
 		const todo = JSON.stringify({
 			type: "message",

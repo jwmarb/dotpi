@@ -55,6 +55,42 @@
  *    That code is the only structured signal that the submitting Enter was
  *    lost to the TUI (task text sitting in the editor), so `index.ts`
  *    recovers with bounded repeated Enters (`PROMPT_RECOVERY_ATTEMPTS`).
+ * 8. `agent prompt <pane> <text>` to a closed or absent pane (measured,
+ *    herdr 0.9.3, 2026-10-30): exits 1 and prints on stderr
+ *    `{"error":{"code":"agent_not_found","message":"agent target <pane> not found"},"id":"cli:agent:prompt"}` —
+ *    the same code `agent get` reports (behaviour 6), for both an absent id
+ *    and a once-open-now-closed pane — and for an open pane whose agent
+ *    process has exited (measured, herdr 0.9.0, 2026-10-30, observed ~3 s
+ *    after the kill): the source read (herdr 0.9.5, `.firecrawl/src/herdr`)
+ *    has `is_agent_terminal()` = `agent_name.is_some() ||
+ *    effective_agent_label().is_some()`, and our panes are named — the name
+ *    clears only once detection sees no agent and a recorded exit
+ *    (`state.rs` ~639-641) — so there is a detection lag. `child-done.ts`'s
+ *    detached notice
+ *    walker uses the prompt itself as the liveness probe: only this code
+ *    advances the walk to the next hop; every other refusal stops it, and a
+ *    probe that lands inside that lag delivers to the dead hop and stops the
+ *    walk (the notice is lost, as for a one-level delivery to a dead parent).
+ * 9. `agent prompt <pane> <text> --timeout <MS>` without `--wait` (measured,
+ *    herdr 0.9.0, 2026-10-30): exits 2 and prints "--timeout requires --wait"
+ *    on stderr — herdr's own timeout only exists on the `--wait` form, so the
+ *    non-wait probe `child-done.ts`'s delivery walk uses cannot be bounded
+ *    with it; the walk bounds each probe with `timeout(1)` instead (30 s per
+ *    hop, falling back to an unbounded probe when `timeout(1)` is absent).
+ * 10. A CLI round-trip killed by our own exec timeout (measured, herdr
+ *     0.9.3, 2026-10-30, on a hung `agent prompt --wait` call): the process
+ *     dies on SIGTERM having printed no reply document — and
+ *     `agent_not_found` rides that document (behaviours 6 and 8), so a
+ *     killed CLI can never report it. The measurement was on
+ *     `agent prompt --wait`, not on `agent get`, the wake path's call:
+ *     the kill is ours, not herdr's — any execFile timeout SIGTERMs the
+ *     process the same way, reply document or none — so it applies to
+ *     every command we probe. `classifyExecFailure` sees a non-zero exit
+ *     with no structured code, and `probeFromCall` answers `unreachable`,
+ *     never `gone`. That is what makes the wake path's bounded parent
+ *     probe (`WAKE_PROBE_TIMEOUT_MS` in `index.ts`) safe to cut short: its
+ *     short bound can only strip a reroute note (the conservative
+ *     direction), never prove a pane gone.
  *
  * (`agent wait --until done` was used until the parent stopped blocking on
  * children; `waitAgentWorking` keeps the `--until working` form, which is still
@@ -424,9 +460,17 @@ export function probeFromCall(call: HerdrCall): AgentProbe {
   return { kind: "state", status, name: typeof a.name === "string" ? a.name : undefined };
 }
 
-/** One-shot three-way state probe (see {@link AgentProbe}). Never throws. */
-export async function probeAgent(paneId: string): Promise<AgentProbe> {
-  return probeFromCall(await herdr(["agent", "get", paneId]));
+/**
+ * One-shot three-way state probe (see {@link AgentProbe}). Never throws.
+ *
+ * @param timeoutMs - Patience for the round-trip (default: the module-wide
+ *        {@link HERDR_TIMEOUT_MS}). The wake path's reroute predicate passes
+ *        a short bound, so a hung herdr cannot stall the serialized flush —
+ *        a timeout answers `unreachable` (behaviour 10), which its caller
+ *        reads as "not gone", the conservative direction.
+ */
+export async function probeAgent(paneId: string, timeoutMs = HERDR_TIMEOUT_MS): Promise<AgentProbe> {
+  return probeFromCall(await herdr(["agent", "get", paneId], timeoutMs));
 }
 
 /**

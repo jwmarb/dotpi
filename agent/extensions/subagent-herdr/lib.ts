@@ -9,11 +9,16 @@
  *
  * @module subagent-herdr/lib
  */
-import { readdir, readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { open, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { type AgentInfo, frontmatterOf } from "../lib/agents.js";
 import { ENV_AGENT_DIR } from "../lib/layout.js";
+import { personaOverride } from "../lib/persona.js";
+// The lease dir's env name is owned by the extension that reads it, so the
+// crossing child and the router cannot drift apart.
+import { LEASE_DIR_ENV, leaseDir } from "../model-fallback/concurrency.js";
 import { findSkills } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
@@ -32,17 +37,25 @@ import {
   type TodoCounts,
 } from "../lib/todo.js";
 import {
+  ANCESTRY_ENV,
   CARD_ID_PATTERN,
   type ChildReport,
   type RunRecord,
   exitPath,
+  formatAncestry,
+  isRunRecord,
   isSessionFileFor,
+  metaPath,
+  RUN_ID_PATTERN,
   parseReportLine,
   qualifiesAsAnswer,
   qualifiesAsSalvage,
   reportsPath,
   systemPromptPath,
   visibleTextOf,
+  type AncestorEntry,
+  MAX_ANCESTRY,
+  parseAncestry,
 } from "./rundir.js";
 
 export type { ChildReport };
@@ -104,12 +117,14 @@ export interface ChildLaunchOptions {
  * process's `HERDR_PANE_ID`), and the child's report tool prompts it. The
  * other vars let the child's extensions identify the run without guessing.
  *
- * `PI_CODING_AGENT_DIR` crosses only when the parent has it set: the child must
- * resolve the same profile as its parent, or it silently runs a different
- * persona, agent fleet, and skill catalogue — a child spawned from a
- * non-default profile would load the default profile's extensions, agents, and
- * skills. An unset var stays unset, so the default profile's resolution is
- * untouched.
+ * `PI_CODING_AGENT_DIR` crosses only when the parent has it set, or an
+ * in-session profile switch is active: the child must resolve the same
+ * profile as its parent, or it silently runs a different persona, agent
+ * fleet, and skill catalogue — a child spawned from a non-default profile
+ * would load the default profile's extensions, agents, and skills. The
+ * switch wins over the env var, because it retargets the fleet without
+ * moving the process's own dir. An unset var with no switch stays unset, so
+ * the default profile's resolution is untouched.
  *
  * `runDir` is passed alongside the record rather than read off it: the path is
  * derived from the run id (see `rundir.ts`), so the record does not carry it,
@@ -132,6 +147,15 @@ export interface ChildLaunchOptions {
  * gate and the board both trust it without re-checking, and a malformed one is
  * a parent-side refusal (the `subagent` tool refuses it at spawn), not a
  * child-side mystery.
+ *
+ * `PI_SUBAGENT_ANCESTRY` is the structured ancestry chain
+ * (`rundir.ts` {@link ANCESTRY_ENV}): each ancestor process's pane, run id,
+ * and agent, nearest first. Like the lineage it is stamped by processes —
+ * the parent writes it, the child reads it one process later — and the child
+ * uses it as the delivery route for a notice whose parent pane is gone
+ * (`child-done.ts`'s `noticeRoute`). An empty chain crosses nothing: a
+ * child with no ancestry above its parent gets today's exact one-hop
+ * delivery.
  */
 export function buildChildEnv(
   rec: { runId: string; agent: string },
@@ -140,6 +164,7 @@ export function buildChildEnv(
   childLineage: string[] = [rec.agent],
   fallbackChain?: readonly string[],
   card?: string,
+  ancestry: readonly AncestorEntry[] = [],
 ): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_RUN_ID: rec.runId,
@@ -152,8 +177,16 @@ export function buildChildEnv(
   // and skill catalogue). An unset var stays unset — forwarding an empty value
   // would make the child resolve an empty agent dir, and the default profile's
   // resolution must be untouched when the parent has no override.
-  const dir = process.env[ENV_AGENT_DIR];
+  // The in-session switch retargets the fleet without moving the process's
+  // dir, so when it is active the child's profile dir comes from the switch,
+  // not the env var — the env var is the process's profile and would send the
+  // child back home.
+  const dir = personaOverride()?.dir ?? process.env[ENV_AGENT_DIR];
   if (dir) env[ENV_AGENT_DIR] = dir;
+  // The router's machine-wide concurrency cap leases in the process's own
+  // agent-dir cache; a child on the target profile would lease under its own
+  // dir and the cap would split, so the lease dir crosses with the switch.
+  if (personaOverride()) env[LEASE_DIR_ENV] = leaseDir();
   // The child always launches on `fallback/auto`, so the chain must cross
   // whenever it is non-empty — a single unpinned entry included: without the
   // var the child's router registers nothing and `fallback/auto` is
@@ -165,7 +198,62 @@ export function buildChildEnv(
   if (card !== undefined && CARD_ID_PATTERN.test(card)) {
     env.PI_KANBAN_CARD = card;
   }
+  if (ancestry.length > 0) env[ANCESTRY_ENV] = formatAncestry(ancestry);
   return env;
+}
+
+/**
+ * The ancestry chain to stamp into a child: this process's own entry — its
+ * pane, run id, and agent, with an empty run id and agent for the human's
+ * orchestrator, which is pane-only — followed by the chain its parent
+ * stamped, truncated to `MAX_ANCESTRY`.
+ *
+ * Process-stamped, like `PI_SUBAGENT_LINEAGE`: the parent writes it, the
+ * child reads it one process later. With no `HERDR_PANE_ID` (a process with
+ * no pane of its own) there is no entry to prepend, so the chain passes
+ * through unchanged.
+ */
+export function childAncestry(env: NodeJS.ProcessEnv): AncestorEntry[] {
+  const chain = parseAncestry(env[ANCESTRY_ENV]);
+  const pane = env.HERDR_PANE_ID;
+  if (!pane) return chain;
+  const self: AncestorEntry = {
+    pane,
+    runId: env.PI_SUBAGENT_RUN_ID ?? "",
+    agent: env.PI_SUBAGENT_AGENT ?? "",
+  };
+  return [self, ...chain].slice(0, MAX_ANCESTRY);
+}
+
+/**
+ * Reads and validates a run's meta record from its run dir — the rescue
+ * path for a run lost to a parent restart: the in-memory registry no
+ * longer has it, but the run dir (and its session transcript) is on
+ * disk.
+ *
+ * Takes the runs dir and the run id, and derives the run dir from the id by
+ * joining the id onto the runs dir: the id is checked against `RUN_ID_PATTERN`
+ * before any path is built, so a model-supplied `../x` can never reach the
+ * filesystem through this API, no matter where it is called from — the guard
+ * lives in the reader, not at the call sites, so it cannot be forgotten there.
+ *
+ * The record's runId must match the caller's: the run dir layout assumes
+ * that identity, and a mismatch is a partial dir (crashed mid-spawn),
+ * not a run. Synchronous on purpose — the input hook that calls it is
+ * synchronous, and the read is one small file.
+ *
+ * @param runsDir - The runs directory (the `subagent-runs` dir).
+ * @param runId - The run id; must match `RUN_ID_PATTERN`.
+ */
+export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord | undefined {
+  if (!RUN_ID_PATTERN.test(runId)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(metaPath(join(runsDir, runId)), "utf-8"));
+  } catch {
+    return undefined;
+  }
+  return isRunRecord(parsed) && parsed.runId === runId ? parsed : undefined;
 }
 
 /**
@@ -607,13 +695,19 @@ export interface RunResult {
  *
  * Salvage (2 and 3) sets `salvagedFrom`; the normal path leaves it unset.
  */
-export async function extractRunResult(runDir: string, runId: string): Promise<RunResult> {
+export async function extractRunResult(runDir: string, runId: string, tailBytes?: number): Promise<RunResult> {
   let entries: string[];
   let sessionFile: string | undefined;
   try {
     sessionFile = await findSessionFile(runDir, runId);
     if (!sessionFile) return { found: false, answered: false, text: "" };
-    const content = await readFile(sessionFile, "utf-8");
+    // `tailBytes` bounds the read to the file's tail (the wake-path evidence
+    // read, where the completion boundary sits at the end of a finished
+    // transcript); absent, the whole file is read, as everywhere else.
+    const content =
+      tailBytes !== undefined
+        ? await readSessionTail(sessionFile, tailBytes)
+        : await readFile(sessionFile, "utf-8");
     entries = content.split("\n");
   } catch {
     return { found: false, answered: false, text: "" };
@@ -832,6 +926,33 @@ async function findSessionFile(runDir: string, runId: string): Promise<string | 
   // the progress line are read from the same transcript while the run runs.
   const name = pickSessionName(dirEntries, runId);
   return name === undefined ? undefined : join(runDir, name);
+}
+
+/**
+ * At most `bytes` from the end of `file`, without loading the whole file.
+ *
+ * The wake-path evidence read (`parentRunIsFinished`) bounds its transcript
+ * read this way, the same cap the kanban board's progress reader walks to:
+ * the completion boundary sits at the end of a finished run's transcript, so
+ * a tail is enough to find a clean answer, and a multi-megabyte transcript is
+ * not read whole on the serialized wake path. A torn first line (the tail
+ * cutting mid-line) is skipped by the JSON.parse loop, like a torn final line.
+ */
+async function readSessionTail(file: string, bytes: number): Promise<string> {
+  const handle = await open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const len = Math.min(bytes, size);
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await handle.read(buf, 0, len, size - len);
+    // `bytesRead`, not `len`: if the file shrinks between the stat and the
+    // read (the equal-size Nextcloud sync restore the board's reader
+    // documents), the zero-fill beyond what was read would decode as
+    // trailing NULs — the same rule the kanban board's bounded reader applies.
+    return buf.toString("utf-8", 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
 }
 
 /**

@@ -38,11 +38,50 @@
  * - **Bounded re-drive.** A degraded release (the target's block could not be
  *   read) is re-driven exactly {@link MAX_DEGRADED_RELEASE_ATTEMPTS} times.
  *
+ * - **Reroute validation.** A reroute marker is provenance the receiver can
+ *   check, and four findings strip it to ordinary body text before the note
+ *   prints it: a record this pane owns was addressed to this pane directly
+ *   (no walk ran); a `deliveredTo` that names another ancestor is not this
+ *   delivery; a `parentRunId` that does not resolve to a real *terminal* run
+ *   (`done`, `failed`, `cancelled`) is model text; a `parentRunId` that names
+ *   the notice's own run is model text. Stripping keeps a model-typed marker
+ *   from claiming a lineage and a delivery that never happened.
+ *
  * @module subagent-herdr/release-ledger
  */
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
-import type { Notice, RunRecord } from "./rundir.js";
+import { rerouteMarker, type Notice, type RunRecord } from "./rundir.js";
 import type { RunLifecycle, RunObservation } from "./run-lifecycle.js";
+
+/**
+ * The reroute note a briefing carries for a notice that was delivered to
+ * this pane because its original parent pane was gone.
+ *
+ * Names the parent the notice was addressed to, says that parent has
+ * finished, and tells the orchestrator the run is not one of its own — and
+ * how to reach it. The run id is the notice's own, never the parent's.
+ *
+ * Requires `notice.reroute` (the marker is parsed by `parseNotice` from the
+ * body of a notice that already matched): a notice without it is a direct
+ * delivery and gets no note. It is only called with a *validated* marker —
+ * {@link createReleaseLedger} strips the marker to ordinary text when the
+ * record is owned by this pane (a direct delivery), when `deliveredTo` names
+ * another ancestor, when the claimed parent is not a real *terminal* run
+ * (`done`, `failed`, `cancelled`), or when the marker names the notice's own
+ * run as its parent — so "delivered to
+ * you" below is a claim that passed the receiver's plausibility check; the
+ * marker text itself is still the sender's word.
+ */
+export function rerouteNote(notice: Notice): string {
+  const r = notice.reroute;
+  if (!r) throw new Error(`rerouteNote requires a rerouted notice, got ${notice.runId}`);
+  return (
+    `--- ${notice.runId} (${notice.agent}) rerouted ---\n` +
+    `Addressed to its parent ${r.parentAgent} ${r.parentRunId}, which has finished, so it was delivered to you (${r.deliveredTo}) as the nearest surviving ancestor. ` +
+    `Lineage: ${r.parentAgent} ${r.parentRunId} → ${notice.agent} ${notice.runId}. ` +
+    `It is not one of your own delegations; reply with subagent_tasks (action "message", ids ["${notice.runId}"]) if it needs an answer.`
+  );
+}
 
 /**
  * How long to let notices accumulate before waking the orchestrator.
@@ -227,6 +266,52 @@ export interface ReleaseLedgerDeps {
   extractRunResult(rec: RunRecord): Promise<RunResult>;
   /** This process's herdr pane; `undefined` owns nothing. */
   ownerPane: string | undefined;
+  /**
+   * The label the delivery walker stamps on the notice it delivers to this
+   * process — `orchestrator` for the root, `agent runId` for a nested child —
+   * or `undefined` when the process has no pane to be named. Compared against
+   * a reroute marker's `deliveredTo` before the note prints it: a marker that
+   * claims delivery to a *different* ancestor is not this delivery's.
+   */
+  selfLabel: string | undefined;
+  /**
+   * The parent-side half of a reroute marker's provenance: whether the
+   * marker's `parentRunId` resolves (registry or disk) to a *terminal* record.
+   * The `direct` and `wrongHop` checks prove the delivery; this one proves the
+   * lineage — a marker survives only when its claimed parent is a real
+   * *terminal* run (`done`, `failed`, `cancelled`). Ownership is deliberately not part of the test: in the canonical
+   * single-hop case (R spawns A, A finishes, A's child's notice walks to R) the
+   * receiver IS the parent's owner, so a foreign-ownership clause would strip
+   * the feature's own target. A model-typed `parentRunId` that resolves to
+   * nothing (or to a live run) strips the marker to ordinary text; the ledger
+   * separately refuses a marker that names the notice's own run as its parent.
+   * I/O lives here (the factory), not in the ledger, which stays free of
+   * filesystem reads. The factory answers a `running` record from its pane
+   * first — a pure read, so it touches none of the ownership rules — and any
+   * state that is not `gone` is `false`: a live pane, in any state, is the
+   * parent's own process still running, and `unreachable` says nothing about
+   * the child. Only a `gone` pane (or a paneless record) is answered from
+   * non-mutating completion evidence (the sidecar, or a clean transcript
+   * answer). It never settles the record in either case — a foreign parent
+   * the receiver never writes or closes (the scrollback is the failure
+   * evidence), and an owned one whose own notice settles it through the
+   * ordinary path, not this proof. The predicate is total: an evidence read
+   * that throws is answered `{ finished: false, status }` from the record in
+   * hand, so it can never reject the flush. The answer carries the status it
+   * was read from — the record's status, or `"absent"` when nothing
+   * resolves — for the ledger's log line, NOT as a memo key. The predicate's
+   * own cross-flush memo (index.ts `parentProofMemo`) is keyed on the run id
+   * ALONE, caches positives only, and is reached only on the `running`
+   * branch: a terminal status short-circuits before the lookup. A proven
+   * `true` stands (sidecar) or is re-proven past `PARENT_PROOF_TTL_MS`
+   * (answer); a `false` is never stored, so a parent that finishes between
+   * a pair's two notices (one 1.2 s coalesce window) is re-proven for the
+   * second and keeps the note — `wake.test.ts` pins that. The ledger itself
+   * memoizes nothing (see `verifiedReroute`).
+   */
+  parentRunIsFinished: (
+    runId: string,
+  ) => Promise<{ finished: boolean; status: RunRecord["status"] | "absent" }>;
 }
 
 export interface ReleaseLedger {
@@ -381,6 +466,70 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
   };
 
   /**
+   * The reroute marker, validated against what the receiver can know.
+   *
+   * The marker is model-readable text: a `report` body is model-authored and
+   * crosses `parseNotice` verbatim, so a child delivering to its *live* parent
+   * can type a marker of its own. Before the note prints the marker as
+   * measured provenance, four findings strip it — the same four the module
+   * header names:
+   *
+   * - the record is owned by this pane ⇒ the child addressed this pane
+   *   directly (its parent is this process), so no walk ran and the marker is
+   *   ordinary body text;
+   * - `deliveredTo` names another ancestor ⇒ the walk delivered to that hop,
+   *   not to this pane, so the marker is not this delivery's;
+   * - the claimed `parentRunId` does not resolve to a real *terminal* run
+   *   (`done`, `failed`, `cancelled`) ⇒ the lineage is model text, not
+   *   measured provenance;
+   * - the claimed `parentRunId` names the notice's own run ⇒ the lineage is
+   *   model text, not measured provenance.
+   *
+   * Any hit strips `reroute` and reconstitutes the marker into the text
+   * (`rerouteMarker`, byte-for-byte the child's own wording — the marker itself, not the whole notice) so the body keeps
+   * it as ordinary text. `selfLabel` undefined (no pane) cannot be checked —
+   * and such a process receives no herdr prompt in the first place.
+   */
+  const verifiedReroute = async (notice: Notice): Promise<Notice> => {
+    if (!notice.reroute) return notice;
+    const rec = lookup(notice.runId);
+    const direct = rec !== undefined && isOwned(rec);
+    const wrongHop =
+      deps.selfLabel !== undefined && notice.reroute.deliveredTo !== deps.selfLabel;
+    const parentRunId = notice.reroute.parentRunId;
+    // Each notice that reaches the lineage test pays its own predicate call
+    // (the ledger keeps no memo of its own, and the caller skips validation
+    // for an already-noted run, and the self-parent strip short-circuits
+    // before the call). A per-batch map here would add nothing: the
+    // expensive half — the pane probe and the evidence read — is bounded by
+    // the predicate's own cross-flush memo (index.ts `parentProofMemo`),
+    // keyed on the run id alone, reached only on the `running` branch, and
+    // caching positives only: a proven `true` stands (sidecar) or is
+    // re-proven past `PARENT_PROOF_TTL_MS` (answer), and a `false` is never
+    // stored, so a parent that finishes between the pair's two notices (one
+    // 1.2 s coalesce window) is re-proven for the second and keeps the note.
+    // What the transition tests pin is the ledger's own no-memo, against a
+    // memo-free stub.
+    // The one parent lookup the ledger performs, run only for a marker the
+    // delivery checks did not already strip: a marker about to be stripped
+    // must not pay a parent read. The predicate is total (it answers from
+    // the record in hand when its evidence read throws), so it can never
+    // reject the flush.
+    const noLineage =
+      direct || wrongHop
+        ? false
+        : parentRunId === notice.runId ||
+          !(await deps.parentRunIsFinished(parentRunId)).finished;
+    if (!direct && !wrongHop && !noLineage) return notice;
+    const r = notice.reroute;
+    return {
+      ...notice,
+      text: notice.text ? `${rerouteMarker(r)} ${notice.text}` : rerouteMarker(r),
+      reroute: undefined,
+    };
+  };
+
+  /**
    * The briefing a batch of notices plus a sweep becomes.
    *
    * A `done` notice inlines the child's answer. A `report` is reconciled
@@ -469,9 +618,50 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
       composedBriefed.add(rec.runId);
     };
 
-    for (const notice of batch) {
+    // One reroute note per run per flush: a pair of notices for the same
+    // re-routed run (report + done) briefs the situation once.
+
+    const noted = new Set<string>();
+    const noteReroute = (notice: Notice, before: number): void => {
+      if (notice.reroute && blocks.length > before && !noted.has(notice.runId)) {
+        noted.add(notice.runId);
+        blocks.splice(before, 0, rerouteNote(notice));
+      }
+    };
+
+    for (const raw of batch) {
+      // An already-noted run skips validation for its second notice: its note
+      // is suppressed for the block below (one per run per flush), so the
+      // marker a strip would have served never prints, and the parent read it
+      // would cost is discarded with the note.
+      const notice = noted.has(raw.runId) ? raw : await verifiedReroute(raw);
+      const before = blocks.length;
       const rec = lookup(notice.runId);
       if (!rec) {
+        if (notice.reroute) {
+          // A re-routed notice for a run this process never spawned: the note
+          // is the whole briefing for it — it says where the run lives and how
+          // to reach it, which the restart text cannot. The body rides with it
+          // when there is one: a rerouted report whose meta is unreadable and
+          // run dir gone is the only information available, and a note that
+          // swallows it loses it. One note per run per flush, like the
+          // registered path.
+          if (noted.has(notice.runId)) {
+            // Second notice for the same re-routed run in one flush: the note
+            // is suppressed (one per run per flush, like the registered path),
+            // but the notice itself is not — a report + done pair must not lose
+            // the completion.
+            blocks.push(
+              `--- ${notice.runId} (${notice.agent}) ${notice.kind} ---\n${
+                notice.text || "(no message)"
+              }`,
+            );
+            continue;
+          }
+          noted.add(notice.runId);
+          blocks.push(rerouteNote(notice) + (notice.text ? `\n\n${notice.text}` : ""));
+          continue;
+        }
         // A notice for a run this process never registered (the parent
         // restarted and the meta file was lost). Still worth surfacing.
         blocks.push(
@@ -486,6 +676,11 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
       const observation = await deps.lifecycle.read(rec);
       if (rec.status === "running") {
         if (notice.kind === "stalled") {
+          // A marker stripped above rides back into `notice.text` as ordinary
+          // body text, and this detail is what the health check's task quotes:
+          // deliberate. The strip only downgrades the *note's* provenance
+          // claim; it does not delete the child's own wording, and the
+          // diagnosis should see what the child actually sent.
           const hc = await requestHealthCheck(rec, { kind: "stalled", detail: notice.text });
           if (!hc.ok) {
             blocks.push(
@@ -494,15 +689,20 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
                 `Look at it with subagent_tasks (action "result", ids ["${rec.runId}"]), or interrupt/cancel it.`,
             );
           }
+          // A rerouted stall that launches its health check adds no block at
+          // all — and no note, no wake: nothing is pending for it here.
+          noteReroute(notice, before);
           continue;
         }
         blocks.push(
           `--- ${rec.runId} (${notice.agent}) ${notice.kind === "report" ? "sent a mid-run report" : "sent a notice"} ---\n${notice.text || "(no message)"}\n` +
             `It is still working. Reply with subagent_tasks (action "message", ids ["${rec.runId}"]) if it needs an answer or a correction.`,
         );
+        noteReroute(notice, before);
         continue;
       }
       await renderFinished(observation);
+      noteReroute(notice, before);
     }
     for (const observation of swept) await renderFinished(observation);
 

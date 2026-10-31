@@ -89,10 +89,14 @@ import { execFile, spawn } from "node:child_process";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 
 import {
+  ANCESTRY_ENV,
+  ancestorLabel,
   exitPath,
   formatExitSidecar,
   formatNotice,
   formatReportLine,
+  type NoticeKind,
+  parseAncestry,
   qualifiesAsAnswer,
   reportsPath,
   requiresResultBlock,
@@ -155,8 +159,10 @@ export interface ChildDoneEffects {
   /**
    * Send a notice to the parent's pane. Must preserve detached + ignored-stdio
    * + unref behavior so the delivery survives the child's own process-group kill.
+   * `fallbacks` — the ancestor hops, nearest first — is passed only when it is
+   * non-empty, so the one-level case keeps its exact two-argument call.
    */
-  sendNotice(parentPane: string, notice: string): void;
+  sendNotice(parentPane: string, notice: string, fallbacks?: readonly NoticeHop[]): void;
 
   /** Fire-and-forget pane close. Never throws. */
   closePane(paneId: string): void;
@@ -187,6 +193,123 @@ export type ChildReportOutcome =
   | { kind: "recorded-no-parent" }
   | { kind: "delivered" };
 
+// ---------------------------------------------------------------------------
+// The delivery route: the parent first, then the surviving ancestors
+// ---------------------------------------------------------------------------
+
+/** One hop of a notice's delivery route. */
+export interface NoticeHop {
+  /** The pane the hop is delivered to. */
+  pane: string;
+  /** The notice text the hop receives (the parent's hop is the bare notice). */
+  notice: string;
+}
+
+/** The full delivery route for one notice. */
+export interface NoticeRoute {
+  /** The parent's pane — hop 0, always first. */
+  pane: string;
+  /** The parent's notice: today's exact text. */
+  notice: string;
+  /** The ancestor hops, nearest first; empty when the parent is alive. */
+  fallbacks: NoticeHop[];
+}
+
+/**
+ * The delivery route for one notice: the parent's pane with today's exact
+ * notice text, plus one annotated hop per ancestor above the parent.
+ *
+ * `undefined` when `PI_SUBAGENT_PARENT_PANE` is unset — the notice has
+ * nowhere to go at all, which callers keep as today's behaviour (a report is
+ * recorded undelivered; the other kinds simply skip).
+ *
+ * The fallbacks are non-empty only when the stamped chain's HEAD is the
+ * parent pane with a real run id: a chain that disagrees with the parent pane
+ * is ignored, so it cannot redirect delivery (Assumption 1). Each later entry
+ * becomes a hop carrying the same notice annotated with the original parent —
+ * `ancestry[0]`, even when an intermediate ancestor is also dead — and the
+ * ancestor it lands on (`ancestorLabel`).
+ */
+export function noticeRoute(
+  env: NodeJS.ProcessEnv,
+  kind: NoticeKind,
+  message: string,
+): NoticeRoute | undefined {
+  const parentPane = env.PI_SUBAGENT_PARENT_PANE;
+  if (!parentPane) return undefined;
+  const runId = env.PI_SUBAGENT_RUN_ID ?? "unknown";
+  const agent = env.PI_SUBAGENT_AGENT ?? "subagent";
+  const notice = formatNotice(runId, agent, kind, message);
+  const chain = parseAncestry(env[ANCESTRY_ENV]);
+  const head = chain[0];
+  const fallbacks: NoticeHop[] =
+    head && head.pane === parentPane && head.runId !== ""
+      ? chain.slice(1).map((entry) => ({
+          pane: entry.pane,
+          notice: formatNotice(runId, agent, kind, message, {
+            parentAgent: head.agent,
+            parentRunId: head.runId,
+            deliveredTo: ancestorLabel(entry),
+          }),
+        }))
+      : [];
+  return { pane: parentPane, notice, fallbacks };
+}
+
+/**
+ * The detached POSIX-sh walk that delivers a notice down its route.
+ *
+ * Positional args are `pane, notice` pairs, parent first. Each hop asks
+ * herdr for the prompt; the prompt's own refusal is the liveness probe —
+ * no separate `paneExists` call, because a probe-then-send pair is two round
+ * trips with a race between them, and the walk must finish inside the
+ * child's synchronous close/shutdown window (Assumption 2). A hop that is
+ * gone (herdr's measured not-found code, `agent_not_found` — see `herdr.ts`
+ * behaviour 8) is skipped; the first accepting hop ends the walk; any other
+ * refusal (timeout, crash, any other code) stops it — an uncertain probe
+ * says nothing about the parent, and a notice is worth losing to a live pane
+ * that merely hiccuped (Assumption 3).
+ *
+ * Every probe in the walk is bounded, because the walk was the repo's only
+ * unbounded *multi-hop* herdr call: a hung herdr CLI at hop 0 means the reroute
+ * never happens — dead in its own target scenario — and the detached, unref'd
+ * `sh` leaks with no parent left to reap it. (The one-level delivery — a child
+ * with no ancestry — is a separate single unbounded call, pre-existing and out
+ * of scope here.) The bound is `timeout(1)` at 30 s, the same patience
+ * the repo gives any single herdr CLI round trip (`HERDR_TIMEOUT_MS` in
+ * `herdr.ts`). herdr's own `--timeout` cannot carry it: measured on 0.9.0,
+ * `agent prompt --timeout <MS>` refuses without `--wait` ("--timeout requires
+ * --wait", exit 2 — herdr.ts behaviour 9), and the walk's probe is the
+ * non-wait form. When `timeout(1)` is absent the probe runs unbounded (the
+ * pre-bound behaviour); the refusal semantics are unchanged either way, a
+ * killed probe yields no `agent_not_found`, so it stops the walk like any
+ * other reachability failure.
+ */
+export const NOTICE_WALK_SCRIPT = `if command -v timeout >/dev/null 2>&1; then BOUND="timeout 30"; else BOUND=""; fi
+while [ "$#" -ge 2 ]; do
+  err=$( { $BOUND herdr agent prompt "$1" "$2"; } 2>&1 ) && exit 0
+  case "$err" in *'"code":"agent_not_found"'*) shift 2 ;; *) exit 1 ;; esac
+done
+exit 1
+`;
+
+/**
+ * The argv that runs {@link NOTICE_WALK_SCRIPT} for one route.
+ *
+ * `sh -c` with the script as a positional string and the hops as positional
+ * args: the notice text (quotes, `$`, newlines — the report body) is never
+ * interpolated into the script, so it rides the argv byte-for-byte.
+ */
+export function noticeWalkArgv(route: NoticeRoute): string[] {
+  return [
+    "-c",
+    NOTICE_WALK_SCRIPT,
+    "subagent-notice",
+    route.pane,
+    route.notice,
+    ...route.fallbacks.flatMap((h) => [h.pane, h.notice]),
+  ];
+}
 
 // ---------------------------------------------------------------------------
 // The card gate: a child that was delegated a kanban card owes the board a list
@@ -510,7 +633,7 @@ export function continuationMessage(requiresResult: boolean): string {
  * bad `subagent_done` consumes one refusal, whatever it got wrong.
  *
  * @param effects The side effects to perform.
- * @param env The process environment (for `HERDR_PANE_ID`, `HERDR_ENV`,
+ * @param env The process environment (for `HERDR_PANE_ID`, `HERDR_ENV`, `PI_SUBAGENT_ANCESTRY`,
  *   `PI_SUBAGENT_PARENT_PANE`, `PI_SUBAGENT_RUN_ID`, `PI_SUBAGENT_AGENT`,
  *   `PI_KANBAN_CARD`).
  */
@@ -601,17 +724,10 @@ export function createChildDoneHandshake(
 
     if (!written) return { kind: "write-failed", sessionFile };
 
-    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
-    if (parentPane) {
-      effects.sendNotice(
-        parentPane,
-        formatNotice(
-          env.PI_SUBAGENT_RUN_ID ?? "unknown",
-          env.PI_SUBAGENT_AGENT ?? "subagent",
-          "done",
-          "",
-        ),
-      );
+    const route = noticeRoute(env, "done", "");
+    if (route) {
+      if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
+      else effects.sendNotice(route.pane, route.notice, route.fallbacks);
     }
     closePane();
     shutdown();
@@ -630,18 +746,10 @@ export function createChildDoneHandshake(
       // fall through: delivery still happens
     }
 
-    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
-    if (!parentPane) return { kind: "recorded-no-parent" };
-
-    effects.sendNotice(
-      parentPane,
-      formatNotice(
-        env.PI_SUBAGENT_RUN_ID ?? "unknown",
-        env.PI_SUBAGENT_AGENT ?? "subagent",
-        "report",
-        message,
-      ),
-    );
+    const route = noticeRoute(env, "report", message);
+    if (!route) return { kind: "recorded-no-parent" };
+    if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
+    else effects.sendNotice(route.pane, route.notice, route.fallbacks);
     return { kind: "delivered" };
   }
 
@@ -746,17 +854,10 @@ export function createChildDoneHandshake(
       formatExitSidecar(),
     );
     if (signalled) {
-      const parentPane = env.PI_SUBAGENT_PARENT_PANE;
-      if (parentPane) {
-        effects.sendNotice(
-          parentPane,
-          formatNotice(
-            env.PI_SUBAGENT_RUN_ID ?? "unknown",
-            env.PI_SUBAGENT_AGENT ?? "subagent",
-            "done",
-            "",
-          ),
-        );
+      const route = noticeRoute(env, "done", "");
+      if (route) {
+        if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
+        else effects.sendNotice(route.pane, route.notice, route.fallbacks);
       }
       closePane();
       shutdown();
@@ -875,8 +976,10 @@ export interface ChildWatchdogEffects {
   /**
    * Deliver a notice to the parent pane. Must preserve detached + ignored-stdio
    * + unref behavior so the delivery survives the child's own process-group kill.
+   * `fallbacks` — the ancestor hops, nearest first — is passed only when it is
+   * non-empty, so the one-level case keeps its exact two-argument call.
    */
-  sendNotice(parentPane: string, notice: string): void;
+  sendNotice(parentPane: string, notice: string, fallbacks?: readonly NoticeHop[]): void;
 }
 
 /**
@@ -898,7 +1001,7 @@ export interface ChildWatchdogEffects {
  * per token delta.
  *
  * @param effects The side effects to perform (clock + detached notice).
- * @param env The process environment (for `PI_SUBAGENT_RUN_ID`,
+ * @param env The process environment (for `PI_SUBAGENT_ANCESTRY`, `PI_SUBAGENT_RUN_ID`,
  *   `PI_SUBAGENT_AGENT`, `PI_SUBAGENT_PARENT_PANE`).
  */
 export function createChildWatchdog(
@@ -1048,19 +1151,13 @@ export function createChildWatchdog(
   }
 
   function sendStalled(text: string): void {
-    const parentPane = env.PI_SUBAGENT_PARENT_PANE;
-    // No parent pane: the notice has nowhere to go. A stall signal that cannot
-    // be delivered is a no-op, not a reason to throw from the watchdog tick.
-    if (!parentPane) return;
-    effects.sendNotice(
-      parentPane,
-      formatNotice(
-        env.PI_SUBAGENT_RUN_ID ?? "unknown",
-        env.PI_SUBAGENT_AGENT ?? "subagent",
-        "stalled",
-        text,
-      ),
-    );
+    const route = noticeRoute(env, "stalled", text);
+    // No route (no parent pane): the notice has nowhere to go. A stall signal
+    // that cannot be delivered is a no-op, not a reason to throw from the
+    // watchdog tick.
+    if (!route) return;
+    if (route.fallbacks.length === 0) effects.sendNotice(route.pane, route.notice);
+    else effects.sendNotice(route.pane, route.notice, route.fallbacks);
   }
 
   return {
@@ -1094,7 +1191,7 @@ function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffec
       appendFileSync(path, line);
     },
 
-    sendNotice(parentPane, notice) {
+    sendNotice(parentPane, notice, fallbacks) {
       // `spawn` rather than `execFile`, detached and unref'd, because the `done`
       // notice races its own sender's death: `closePane()` kills this child's
       // *process group*, and a delivery still in flight would go with it — the
@@ -1103,6 +1200,20 @@ function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffec
       // process group so it survives that kill; `unref` plus ignored stdio
       // means it holds neither the event loop nor a pipe to a process that is
       // about to exit.
+      //
+      // A fallback-aware delivery rides the same detached process: one `sh`
+      // that walks the hops in order, so the detach property holds for every
+      // hop, and the walk's prompt is its own liveness probe.
+      if (fallbacks && fallbacks.length > 0) {
+        const child = spawn(
+          "sh",
+          noticeWalkArgv({ pane: parentPane, notice, fallbacks: [...fallbacks] }),
+          { detached: true, stdio: "ignore" },
+        );
+        child.on("error", () => {});
+        child.unref();
+        return;
+      }
       const child = spawn(
         "herdr",
         ["agent", "prompt", parentPane, notice],

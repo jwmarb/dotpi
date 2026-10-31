@@ -66,8 +66,9 @@ export interface RunLifecycleEffects {
   /** Is the run's `.exit` sidecar on disk? */
   hasSidecar(runDir: string, runId: string): boolean;
   /**
-   * A cheap fingerprint of the run's completion evidence (`undefined` when
-   * there is none to fingerprint). Revival extracts only when it changed.
+   * A cheap fingerprint of the run's completion evidence — the session
+   * file's and the prompt file's size/mtime (`undefined` when there is none
+   * to fingerprint). Revival extracts only when it changed.
    */
   evidenceStamp(runDir: string, runId: string): string | undefined;
   /** Persist the record; best-effort (today's contract). */
@@ -97,6 +98,20 @@ export type LifecycleCause =
   | "no-pane"
   | "cancelled"
   | "late-completion";
+
+/**
+ * THE completion predicate, as a pure rule over what the caller already has:
+ * whether the `.exit` sidecar is on disk, and the transcript extraction.
+ * Dir-free on purpose — the lifecycle applies it through its own effects
+ * (whose `runDirOf` knows this process's bases), while the factory's reroute
+ * evidence read (`parentRunIsFinished`) consumes the same rule with a dir it
+ * resolved from {@link runDirBases}-style bases the lifecycle does not know.
+ * A salvage (`answered` with a `salvagedFrom`) is deliberately not a signal:
+ * it proves the child produced text, not that it stopped.
+ */
+export function completionSignal(hasSidecar: boolean, result: RunResult): boolean {
+  return hasSidecar || (result.answered && result.salvagedFrom === undefined);
+}
 
 export interface LifecycleTransition {
   run: RunRecord;
@@ -169,10 +184,9 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
     return result;
   };
 
-  /** THE completion predicate. */
+  /** THE completion predicate: {@link completionSignal} through this lifecycle's effects. */
   const completed = (rec: RunRecord, result: RunResult): boolean =>
-    effects.hasSidecar(effects.runDirOf(rec.runId), rec.runId) ||
-    (result.answered && result.salvagedFrom === undefined);
+    completionSignal(effects.hasSidecar(effects.runDirOf(rec.runId), rec.runId), result);
 
   const extract = (rec: RunRecord): Promise<RunResult> =>
     effects.extract(effects.runDirOf(rec.runId), rec.runId);
