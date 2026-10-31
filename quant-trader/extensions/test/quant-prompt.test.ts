@@ -22,7 +22,7 @@ import { join } from "node:path";
 
 import quantExtension, { buildQuantPrompt } from "../quant-prompt.js";
 import { LINEAGE_ENV, type AgentInfo } from "../lib/agents.js";
-
+import { setPersonaOverride } from "../lib/persona.js";
 const LIB = "/home/u/.pi/quant-trader/skills";
 
 /** The profile's own fleet, as a builder input — never read from disk. */
@@ -375,5 +375,72 @@ describe("the before_agent_start handler", () => {
     const { systemPrompt } = await start({ selectedTools: ["read", "bash"] });
     expect(systemPrompt).not.toContain("## Available Agents");
     expect(systemPrompt).toContain("# Quant-Research Agent");
+  });
+});
+
+describe("the persona yield", () => {
+  // An in-session `/agent <profile>` switch makes the persona extension the
+  // single prompt builder for the run: this handler stands down on the same
+  // `personaOverride()` check the orchestrator's uses. The yield is what keeps
+  // the prompt from depending on load order — exactly one handler returns a
+  // systemPrompt in each state.
+  let agentRoot: string;
+  let originalAgentDir: string | undefined;
+
+  beforeAll(() => {
+    agentRoot = mkdtempSync(join(tmpdir(), "quant-prompt-yield-"));
+    mkdirSync(join(agentRoot, "agents"));
+    mkdirSync(join(agentRoot, "skills"));
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentRoot;
+  });
+
+  afterAll(() => {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  });
+
+  /** Runs the `before_agent_start` handler without assuming a prompt comes back. */
+  async function startYield() {
+    const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
+    quantExtension({
+      on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+        handlers.set(name, handler);
+      },
+    } as never);
+    const startHandler = handlers.get("before_agent_start");
+    expect(startHandler).toBeDefined();
+    const event = {
+      messageType: "user",
+      prompt: "",
+      systemPromptOptions: {
+        cwd: "/work/desk",
+        selectedTools: ["read", "bash", "write"],
+        skills: [],
+        contextFiles: [],
+        promptGuidelines: [],
+      },
+    };
+    const result = await startHandler!(event as never, undefined as never);
+    return { result, selectedTools: event.systemPromptOptions.selectedTools as string[] };
+  }
+
+  test("yields to an active persona switch: undefined, and the run's tool list untouched", async () => {
+    setPersonaOverride({ name: "agent", dir: "/home/u/.pi/agent", deniedTools: new Set() });
+    try {
+      const { result, selectedTools } = await startYield();
+      expect(result).toBeUndefined();
+      expect(selectedTools).toEqual(["read", "bash", "write"]);
+    } finally {
+      setPersonaOverride(undefined);
+    }
+  });
+
+  test("with no switch, returns the quant prompt and applies the filter", async () => {
+    setPersonaOverride(undefined);
+    const { result, selectedTools } = await startYield();
+    expect(result).toBeDefined();
+    expect((result as { systemPrompt: string }).systemPrompt).toContain("# Quant-Research Agent");
+    expect(selectedTools).toEqual(["read", "bash"]);
   });
 });

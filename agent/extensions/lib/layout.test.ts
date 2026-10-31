@@ -22,6 +22,7 @@ import {
 	settingsFile,
 	skillsDir,
 } from "./layout.js";
+import { setPersonaOverride } from "./persona.js";
 
 const original = process.env[ENV_AGENT_DIR];
 
@@ -107,5 +108,39 @@ describe("the files and directories inside it", () => {
 			expect(p).not.toBe(before[i]);
 			expect(p.startsWith("/b/two")).toBe(true);
 		}
+	});
+});
+
+describe("the profile switch", () => {
+	// The switch retargets the fleet and the skills library without moving the
+	// process: `agentsDir()` and `skillsDir()` follow it, `agentDir()` and
+	// everything that hangs off it (env, settings, repo root) do not. Each test
+	// clears the switch so it cannot leak into the other suites.
+	afterEach(() => {
+		setPersonaOverride(undefined);
+	});
+
+	test("agentsDir and skillsDir follow the switch; agentDir and envFile do not", () => {
+		process.env[ENV_AGENT_DIR] = "/srv/agent";
+		setPersonaOverride({ name: "quant-trader", dir: "/srv/quant-trader", deniedTools: new Set() });
+		expect(agentsDir()).toBe("/srv/quant-trader/agents");
+		expect(skillsDir()).toBe("/srv/quant-trader/skills");
+		expect(agentDir()).toBe("/srv/agent");
+		expect(envFile()).toBe("/srv/agent/.env");
+		expect(envExampleFile()).toBe("/srv/agent/.env.example");
+		expect(settingsFile()).toBe("/srv/agent/settings.json");
+		expect(repoRoot()).toBe("/srv");
+	});
+
+	test("with the switch cleared, everything matches the unswitched expectations", () => {
+		process.env[ENV_AGENT_DIR] = "/srv/agent";
+		setPersonaOverride({ name: "quant-trader", dir: "/srv/quant-trader", deniedTools: new Set() });
+		setPersonaOverride(undefined);
+		expect(agentsDir()).toBe("/srv/agent/agents");
+		expect(skillsDir()).toBe("/srv/agent/skills");
+		expect(agentDir()).toBe("/srv/agent");
+		expect(envFile()).toBe("/srv/agent/.env");
+		expect(settingsFile()).toBe("/srv/agent/settings.json");
+		expect(repoRoot()).toBe("/srv");
 	});
 });

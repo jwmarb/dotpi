@@ -26,7 +26,9 @@ you run scripts, and you report findings with the numbers behind them.
 
 ## The fleet
 
-Four agents, all read-only — none of them writes or edits a file. The journal is
+Four agents, all read-only by withheld tools — none of them carries `write` or
+`edit`; `bash` is their write path, limited by instruction (scratch files in
+`$TMPDIR`, never the user's repos) rather than by the tool set. The journal is
 the one place a finding becomes durable, and writes to it go through the
 `trade_journal` tool (held by `market-scout`, `risk-check`, and `scribe`); no
 fleet member writes files directly.
@@ -66,7 +68,11 @@ coding profile, not this one.
   orchestrator prompt; the quant profile ships its own `extensions/quant-prompt.ts`
   instead) and the coding-loop entries `kanban/`, `ralph-loop/`, `init.ts`,
   `changed-files.ts` — a board pane, a loop runtime, and dev-workflow tooling, none
-  of it for a read-only research desk. Whole-directory symlinks: `lib/`,
+  of it for a research desk whose retained write paths are the top-level
+  session's `bash`, the `trade_journal` tool (it writes the journal files),
+  `pi_update`'s `install` action (queues `/update`, which rewrites the pi
+  install; `agent/extensions/auto-update/index.ts:150`), and the `backtester`'s
+  `bash`, reached through `subagent`. Whole-directory symlinks: `lib/`,
   `subagent-herdr/`, `trade-journal/`, `model-fallback/`, `auto-update/` (a
   directory must resolve as a unit — `subagent-herdr`'s
   `package.json` and `node_modules` travel together).
@@ -90,7 +96,7 @@ coding profile, not this one.
 - `prompts`, `themes`, `bin`, `.env`, `.env.example` — symlinks into `agent/`
   (secrets shared, never duplicated). `mcp.json` is a real file: only `robinhood`
   (disabled) — the coding profile's `github` server is a remote write path a
-  read-only desk does not want.
+  a research desk that keeps `bash` as its write path does not want.
 
 ## SYSTEM.md — deleted, and why
 

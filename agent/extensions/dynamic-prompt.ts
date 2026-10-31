@@ -17,6 +17,7 @@ import {
   type DelegationRoster,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
+import { personaOverride } from './lib/persona.js';
 import { groupByCategory } from './lib/skill-categories.js';
 import { categoryFromPath } from './lib/skill-tree.js';
 import {
@@ -120,7 +121,11 @@ export default function (pi: ExtensionAPI) {
   // telling it to call a tool that stays invisible for the whole rest of the run.
   pi.on('tool_call', async (event) => {
     const activated = activation.noteToolCall(event.toolName, event.input);
-    if (activated.length > 0) await refreshActiveTools();
+    // A persona switch owns the active set: the persona extension declares it and
+    // hard-blocks everything outside it, so the additive refresh below is skipped
+    // — running it would widen pi's set beyond the switch's declaration, and the
+    // switch's own `tool_call` block would then refuse every widened tool.
+    if (activated.length > 0 && !personaOverride()) await refreshActiveTools();
     return undefined;
   });
 
@@ -131,7 +136,10 @@ export default function (pi: ExtensionAPI) {
    * it can never withdraw a tool another extension is relying on. Guarded because
    * `getActiveTools`/`setActiveTools` live on the `pi` API object, not on an
    * event's `ctx` — older hosts may not have them, and a missing one must not
-   * throw inside an event handler.
+   * throw inside an event handler. It is also skipped under a persona switch —
+   * the persona extension owns the active set there, and an additive refresh would
+   * widen it beyond the switch's declaration (which the switch's block then
+   * refuses); the call site guards on `personaOverride()`.
    */
   async function refreshActiveTools(): Promise<void> {
     if (typeof pi.getActiveTools !== 'function' || typeof pi.setActiveTools !== 'function') return;
@@ -160,6 +168,12 @@ export default function (pi: ExtensionAPI) {
     // `prompt` exists only on user-triggered runs (1.2.0's `BeforeAgentStartEvent`
     // is a user/custom discriminated union); a custom-triggered turn has none to scan.
     activation.notePrompt(event.messageType === 'user' ? event.prompt : '');
+
+    // A persona switch takes over the prompt: the switched profile's own
+    // prompt extension builds it, so this one yields, leaving the run to the
+    // switched builder. With no override `personaOverride()` is undefined and
+    // the path below is byte-identical to the pre-switch code.
+    if (personaOverride()) return undefined;
 
     // Everything that touches disk or env is loaded here; promptInputs is pure.
     // The roster carries agents shipped by ACTIVE skills only, so an unrelated

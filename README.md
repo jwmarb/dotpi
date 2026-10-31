@@ -211,6 +211,33 @@ A *profile* is an agent directory under the repo root, and pi runs it as its who
 
 A profile **symlinks into** `agent/` — curated skills, per-item extension symlinks, shared prompts/themes — and owns only its differences: its own fleet, its own prompt extension (`quant-prompt.ts`; the orchestrator's `dynamic-prompt.ts` never loads in a non-orchestrator profile), and a `settings.json` copy.
 
+### In-session switching (`/agent`)
+
+The table above is what a *launch* picks. A running session can switch its own profile in place — no relaunch — with the `/agent` command, owned by `agent/extensions/persona/`.
+
+| Form | Effect |
+| --- | --- |
+| `/agent` | List the profiles. `●` marks the active one, `(home)` marks this process's own profile. |
+| `/agent <name>` | Switch to that profile. |
+| `/agent -` | Switch back to this process's own profile. |
+
+A *narrowing* switch (fewer tools) applies silently. A *widening* switch — one that re-enables tools such as `edit`/`write` — asks for a UI confirm, and is refused outright in a session with no UI (a subagent child, or `--print`) — with one exception: resuming a session restores a recorded widening without asking when the entry has `widened && confirmed` and its `homeTools` match the current active tools; the trust boundary is that session files are local, user-owned and gitignored, and a subagent child cannot write a persona entry, so a recorded confirmation is the user's own. Restoring the process's own home profile is never treated as widening.
+
+A switch retargets the session's **system prompt**, its **subagent fleet**, the **skills** it scans, its **active tool set**, and the **MCP servers** in `persona-mcp.json` — a switch that *adds* servers makes their tools usable through a server rule (the hard block and the declaration filter pass them by server name), including a server that connects after the switch; a switch *away* drops them, because pi 1.4.0 reports MCP tools with sourceInfo `builtin:mcp` and the switch's server check runs before its builtin keep. It does not move the process: `PI_CODING_AGENT_DIR`, sessions, `.env`, and `subagent-runs/` stay in the home profile.
+
+**`github` MCP now lives in `agent/persona-mcp.json`, not `agent/mcp.json`.** The persona extension registers and unregisters it at runtime, so `pi mcp list` no longer shows it, `/mcp` enable/disable for it is session-only, and re-adding it to `mcp.json` silently overrides the runtime registration. Its credential is still a `${GITHUB_TOKEN}` reference, resolved from `agent/.env`.
+
+**What an in-place switch cannot do** — it retargets, it does not re-load:
+- Load the target profile's extensions, or unload this profile's. Extensions load at startup; a dropped tool is hidden from the model *and* blocked at `tool_call`, but its extension's handlers and slash commands (e.g. `/kanban`) stay live.
+- Remove the home profile's `AGENTS.md` text already in the transcript.
+- Swap the model fallback chain (read at load).
+- Disconnect servers declared in `mcp.json` — only `persona-mcp.json` ones.
+- Affect subagent children already running.
+- Make the target profile's skills first-class for `/skill:` completion — load one by `read`-ing its `SKILL.md` path.
+- Run `ralph-loop`'s verify gate under a `quant` switch: the gate resolves its grader agents via `agentsDir()`, and `quant-trader/agents/` has no `reviewer`/`verifier`.
+
+Verified 2026-10-30 — `/agent` in `agent/extensions/persona/index.ts` (`:806`), active/home markers `:826-827`, no-UI widening refusal `:394`, home-not-widening `:391`, recorded-widening restore `:568-569`; shared state in `agent/extensions/lib/persona.ts`; fleet/skills follow the switch in `agent/extensions/lib/layout.ts`; `github` in `agent/persona-mcp.json`; the ralph-loop gate in `agent/extensions/ralph-loop/gate-agent.ts:73`.
+
 ## Skills 🃏
 
 Every skill lives under a category directory — `agent/skills/<category>/<skill>/SKILL.md` — and the skill directory's *name* is its identity, so refiling one is a pure `git mv`. A test walks the live tree and fails if a skill is left loose at the top level. Each skill is a `SKILL.md` entry point with sibling docs (`tests.md`, `REPORT.md`, `PATTERNS.md`, …) loaded on demand — progressive disclosure. Some set `disable-model-invocation: true`: interview and workflow skills that need a human in the loop fire only from a slash command. Personal-identity skills are kept on disk and gitignored rather than placeholdered, under a category like everything else.

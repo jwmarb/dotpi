@@ -61,6 +61,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { agentDir } from "../lib/layout.js";
+import { personaDenies } from "../lib/persona.js";
 import { BE_BUN_ENV, runningCompiled } from "../lib/runtime.js";
 import { cachedByWidth } from "../lib/widget.js";
 import { closePane, paneExists, paneLabel, paneRect, renamePane, runInPane, splitPaneOf } from "../subagent-herdr/herdr.js";
@@ -753,10 +754,13 @@ export default function kanban(pi: ExtensionAPI) {
 	 * for. Same contract as the todo guard it replaces — `custom_message` draft +
 	 * `continue: true`, once per board state, only on a completed run, and never
 	 * gated on `context.canContinue` (it reads false at handler time; see
-	 * agent/extensions/AGENTS.md).
+	 * agent/extensions/AGENTS.md). Stands down while the active persona denies the
+	 * `kanban` tool: a profile that withholds the board withholds its enforcement
+	 * with it, so an unaccounted board no longer holds the turn open.
 	 */
 	pi.on("agent_before_settle", async (event) => {
 		if (event.outcome !== "completed") return;
+		if (personaDenies(TOOL_NAME)) return;
 		const nudge = nudgeFor(state, runInfos());
 		if (!nudge || nudged.has(nudge.signature)) return;
 		nudged.add(nudge.signature);

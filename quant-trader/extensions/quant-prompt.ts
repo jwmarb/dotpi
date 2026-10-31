@@ -25,6 +25,7 @@ import {
   type AgentInfo,
 } from './lib/agents.js';
 import { agentsDir, skillsDir } from './lib/layout.js';
+import { personaOverride } from './lib/persona.js';
 import { SkillActivation } from './lib/skill-activation.js';
 import { groupByCategory } from './lib/skill-categories.js';
 import { categoryFromPath } from './lib/skill-tree.js';
@@ -43,7 +44,7 @@ import { categoryFromPath } from './lib/skill-tree.js';
  */
 // Every tool that mutates a file, not just the two named ones: code_rewrite
 // writes when dry_run=false, and undo_last_edit rewrites the file it reverts.
-const REMOVED_TOOLS = new Set(['write', 'edit', 'code_rewrite', 'undo_last_edit']);
+export const QUANT_REMOVED_TOOLS = new Set(['write', 'edit', 'code_rewrite', 'undo_last_edit']);
 
 /**
  * The spawn tool registered by `subagent-herdr`. The roster is gated on it: a
@@ -354,6 +355,13 @@ export default function (pi: ExtensionAPI) {
     // to scan.
     activation.notePrompt(event.messageType === 'user' ? event.prompt : '');
 
+    // An in-session `/agent <profile>` switch owns the prompt for the run: the
+    // persona extension is the single builder in that state, so this handler
+    // stands down. There is no load-order dependency — exactly one handler
+    // returns a systemPrompt in each state. With no switch active, this line is
+    // inert and today's behaviour is unchanged.
+    if (personaOverride()) return undefined;
+
     // --- Drop the file-mutating tools from this run's tool set ---
     // selectedTools is mutable here and is what the model is offered for this run.
     // There is no top-level `tools:` config and no unregisterTool, so this is the
@@ -361,7 +369,7 @@ export default function (pi: ExtensionAPI) {
     // `--tools`, and this strips the mutators from that allowlist as well — a
     // stronger guarantee than the child's body, which constrains by instruction.
     if (Array.isArray(opts.selectedTools)) {
-      opts.selectedTools = opts.selectedTools.filter((t) => !REMOVED_TOOLS.has(t));
+      opts.selectedTools = opts.selectedTools.filter((t) => !QUANT_REMOVED_TOOLS.has(t));
     }
 
     // Everything that touches disk or env is loaded here; buildQuantPrompt is pure.

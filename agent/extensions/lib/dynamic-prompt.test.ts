@@ -24,10 +24,14 @@
  * Run: `bun test agent/extensions/lib/dynamic-prompt.test.ts`
  */
 import { describe, expect, test, afterAll, beforeAll } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { buildOrchestratorPrompt, promptInputs, type PromptInputsOptions } from "../dynamic-prompt.js";
+import dynamicExtension, { buildOrchestratorPrompt, promptInputs, type PromptInputsOptions } from "../dynamic-prompt.js";
 import { agentsDir } from "./layout.js";
 import { discoverAgents, type AgentInfo } from "./agents.js";
+import { setPersonaOverride } from "./persona.js";
 import { fileURLToPath } from "node:url";
 /** A minimal valid call; each test overrides only what it is about. */
 function build(overrides: Partial<Parameters<typeof buildOrchestratorPrompt>[0]> = {}) {
@@ -1472,5 +1476,160 @@ describe("promptInputs", () => {
     expect(out.buildOptions.appendSystemPrompt).toBe("appended");
     expect(out.buildOptions.cwd).toBe("/work/repo");
     expect(out.buildOptions.skillsLibrary).toBe(LIB);
+  });
+});
+
+describe("the before_agent_start handler", () => {
+  // The persona yield lives in the handler, not in `buildOrchestratorPrompt`,
+  // so this is the only layer that can pin it. The env is pointed at a temp
+  // profile tree, so the inventories come from the (empty) stub dirs — not
+  // from `agent/agents/` and `agent/skills/`, which other work is reshaping
+  // in parallel.
+  let agentRoot: string;
+  let originalAgentDir: string | undefined;
+
+  beforeAll(() => {
+    agentRoot = mkdtempSync(join(tmpdir(), "dynamic-prompt-test-"));
+    mkdirSync(join(agentRoot, "agents"));
+    mkdirSync(join(agentRoot, "skills"));
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentRoot;
+  });
+
+  afterAll(() => {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  });
+
+  /** Runs the extension's `before_agent_start` handler against a fake event. */
+  async function start(selectedTools: string[]) {
+    const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
+    dynamicExtension({
+      on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+        handlers.set(name, handler);
+      },
+    } as never);
+    const startHandler = handlers.get("before_agent_start");
+    expect(startHandler).toBeDefined();
+    const event = {
+      messageType: "user",
+      prompt: "",
+      systemPromptOptions: {
+        cwd: "/work/repo",
+        selectedTools,
+        skills: [],
+        contextFiles: [],
+        promptGuidelines: [],
+      },
+    };
+    const result = await startHandler!(event as never, undefined as never);
+    return {
+      result,
+      selectedTools: event.systemPromptOptions.selectedTools as string[],
+    };
+  }
+
+  test("yields to a persona switch: undefined, and the run's tool list untouched", async () => {
+    setPersonaOverride({
+      name: "quant-trader",
+      dir: join(agentRoot, "quant-trader"),
+      deniedTools: new Set(["write", "edit"]),
+    });
+    try {
+      const { result, selectedTools } = await start(["read", "bash", "write"]);
+      expect(result).toBeUndefined();
+      // The handler returned before the gate, so the run's tool list is exactly
+      // what pi offered it.
+      expect(selectedTools).toEqual(["read", "bash", "write"]);
+    } finally {
+      setPersonaOverride(undefined);
+    }
+  });
+
+  test("with no switch, returns the orchestrator prompt the builder tests expect", async () => {
+    setPersonaOverride(undefined);
+    const { result, selectedTools } = await start(["read", "bash"]);
+    expect(result).toBeDefined();
+    const prompt = (result as { systemPrompt: string }).systemPrompt;
+    expect(prompt).toContain("# Orchestrator Agent");
+    expect(prompt).toContain("## Core Responsibilities");
+    // No skill-owned tools in the stub tree, so the gate leaves the list alone.
+    expect(selectedTools).toEqual(["read", "bash"]);
+  });
+});
+describe("the tool_call handler", () => {
+  // W3: under a persona switch the persona extension owns the active set, so the
+  // skill-gating refresh must not widen it. The refresh is additive — it unions
+  // skill-owned tools into pi's active set — so running it under a switch would add
+  // tools the switch never declared, which the switch's own `tool_call` block then
+  // refuses. The call site skips it on `personaOverride()`.
+  let agentRoot: string;
+  let originalAgentDir: string | undefined;
+
+  beforeAll(() => {
+    agentRoot = mkdtempSync(join(tmpdir(), "dynamic-prompt-toolcall-"));
+    // A skill that owns a tool, so the refresh has something to add when it runs.
+    const skillDir = join(agentRoot, "skills", "research", "trade-journal");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      "---\nname: trade-journal\ndescription: d\ntools: trade_journal\n---\nbody\n",
+    );
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentRoot;
+  });
+
+  afterAll(() => {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  });
+
+  /** Fires the extension's `tool_call` handler with a skill load; returns the setActiveTools calls. */
+  async function fireSkillLoad(override: boolean): Promise<string[][]> {
+    const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
+    let active = ["read", "bash"];
+    const setActiveCalls: string[][] = [];
+    dynamicExtension({
+      on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+        handlers.set(name, handler);
+      },
+      getActiveTools: () => active,
+      setActiveTools: (tools: string[]) => {
+        active = [...tools];
+        setActiveCalls.push([...tools]);
+      },
+    } as never);
+    if (override) {
+      setPersonaOverride({
+        name: "quant-trader",
+        dir: join(agentRoot, "quant-trader"),
+        deniedTools: new Set(["write", "edit"]),
+      });
+    }
+    try {
+      const handler = handlers.get("tool_call");
+      expect(handler).toBeDefined();
+      await handler!(
+        {
+          toolName: "read",
+          input: { path: join(agentRoot, "skills", "research", "trade-journal", "SKILL.md") },
+        } as never,
+        undefined as never,
+      );
+    } finally {
+      if (override) setPersonaOverride(undefined);
+    }
+    return setActiveCalls;
+  }
+
+  test("override set → a skill activation does NOT call setActiveTools", async () => {
+    const calls = await fireSkillLoad(true);
+    expect(calls).toEqual([]);
+  });
+
+  test("cleared → a skill activation calls setActiveTools with the owned tool", async () => {
+    const calls = await fireSkillLoad(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("trade_journal");
   });
 });
