@@ -16,7 +16,7 @@ const baseUrl = () => requireEnv('LITELLM_BASE_URL', 'the LiteLLM provider');
 
 const TOKENS_PER_MILLION = 1_000_000;
 
-interface LiteLLMModelGroupInfo {
+export interface LiteLLMModelGroupInfo {
   model_group: string;
   providers: string[];
   max_input_tokens: number | null;
@@ -41,11 +41,11 @@ interface LiteLLMModelGroupInfo {
   health_checked_at: string | null;
 }
 
-interface LiteLLMModelGroupInfoResponse {
+export interface LiteLLMModelGroupInfoResponse {
   data: LiteLLMModelGroupInfo[];
 }
 
-interface LiteLLMModelInfoEntry {
+export interface LiteLLMModelInfoEntry {
   model_name: string;
   litellm_params: {
     input_cost_per_token?: number;
@@ -79,7 +79,7 @@ interface LiteLLMModelInfoEntry {
   };
 }
 
-interface LiteLLMModelInfoResponse {
+export interface LiteLLMModelInfoResponse {
   data: LiteLLMModelInfoEntry[];
 }
 
@@ -147,25 +147,27 @@ const QWEN_THINKING_LEVEL_MAP = {
  */
 const CLAUDE_THINKING_LEVEL_MAP = { off: 'none', xhigh: 'xhigh' } as const;
 /**
- * LiteLLM proxy extension. Fetches model metadata from a LiteLLM proxy and
- * registers it as a provider, including per-token costs and cache read/write rates.
- *
- * Preconditions:
- * - LITELLM_BASE_URL and LITELLM_API_KEY must be set (in the environment or
- *   agent/.env); throws naming the missing variable if not.
- * - The LiteLLM proxy at LITELLM_BASE_URL must be reachable.
- *
- * @param pi - The Pi extension API handle.
+ * The thinking-level map a model group accepts, chosen by its prefix. Pure
+ * extraction of the registration map's nested ternary, so the choice is
+ * testable without a proxy.
  */
-export default async function (pi: ExtensionAPI) {
-  const baseOrigin = baseUrl().replace(/\/v1$/, '');
-  const [groupInfo, modelInfo] = await Promise.all([
-    fetchJson<LiteLLMModelGroupInfoResponse>(`${baseOrigin}/model_group/info`),
-    fetchJson<LiteLLMModelInfoResponse>(`${baseOrigin}/model/info`),
-  ]);
+export function thinkingLevelMapFor(modelGroup: string) {
+  if (modelGroup.startsWith('qwen/')) return QWEN_THINKING_LEVEL_MAP;
+  if (modelGroup.startsWith('anthropic/')) return CLAUDE_THINKING_LEVEL_MAP;
+  return { xhigh: 'xhigh' } as const;
+}
 
-  if (!groupInfo) return;
-
+/**
+ * The provider's model list from the two proxy responses: chat-capable groups
+ * only, with per-million costs, cache rates taken from `/model/info` (the
+ * first deployment of a name that defines any wins, `litellm_params` ahead of
+ * `model_info`), and the bounded token defaults. Pure — the fetches stay in
+ * the default export.
+ */
+export function buildModels(
+  groupInfo: LiteLLMModelGroupInfoResponse,
+  modelInfo: LiteLLMModelInfoResponse | null,
+): NonNullable<ProviderConfig['models']> {
   // Build a lookup of cache costs from /model/info keyed by model_name.
   // A model_name can appear multiple times (multiple deployments); take the
   // first entry that has cache costs defined.
@@ -188,48 +190,65 @@ export default async function (pi: ExtensionAPI) {
 
   const chatModels = groupInfo.data.filter((m) => m.mode == null || m.mode === 'chat' || m.mode === 'completion');
 
+  return chatModels.map((m) => {
+    const cache = cacheCosts.get(m.model_group);
+    return {
+      id: m.model_group,
+      name: m.model_group,
+      reasoning: m.supports_reasoning,
+      thinkingLevelMap: m.supports_reasoning ? thinkingLevelMapFor(m.model_group) : undefined,
+      input: m.supports_vision ? (['text', 'image'] as const) : (['text'] as const),
+      cost: {
+        input: perMillionTokens(m.input_cost_per_token),
+        output: perMillionTokens(m.output_cost_per_token),
+        cacheRead: cache?.cacheRead ?? 0,
+        cacheWrite: cache?.cacheWrite ?? 0,
+      },
+      contextWindow: m.max_input_tokens ?? 262_144,
+      // This gateway reports max_output_tokens: null for most model groups, and
+      // the old `?? 256_000` fallback made maxTokens ~= contextWindow. pi's
+      // clampMaxTokensToContext (pi-ai/api/simple-options.js) then computes
+      //   available = contextWindow - estimate(context) - 4096
+      // and sends min(maxTokens, available) as max_tokens -- so the completion
+      // reservation absorbed the entire remaining window. Because `estimate`
+      // is a char/4 heuristic (utils/estimate.js) it undercounts dense scraped
+      // markdown by ~16%, which is more than the fixed 4096 safety margin, so
+      // input + max_tokens overshot the 262144 limit and litellm returned a
+      // hard 400 (observed: run sub-72cc, over by 1581 then 106 tokens, at
+      // only ~10-14% real context use). Compaction cannot fix this: freeing
+      // input just hands the same space back to the reservation.
+      //
+      // A bounded default keeps max_tokens well clear of the window while
+      // staying larger than any reply we actually want.
+      maxTokens: m.max_output_tokens ?? 32_768,
+    };
+  });
+}
+
+/**
+ * LiteLLM proxy extension. Fetches model metadata from a LiteLLM proxy and
+ * registers it as a provider, including per-token costs and cache read/write rates.
+ *
+ * Preconditions:
+ * - LITELLM_BASE_URL and LITELLM_API_KEY must be set (in the environment or
+ *   agent/.env); throws naming the missing variable if not.
+ * - The LiteLLM proxy at LITELLM_BASE_URL must be reachable.
+ *
+ * @param pi - The Pi extension API handle.
+ */
+export default async function (pi: ExtensionAPI) {
+  const baseOrigin = baseUrl().replace(/\/v1$/, '');
+  const [groupInfo, modelInfo] = await Promise.all([
+    fetchJson<LiteLLMModelGroupInfoResponse>(`${baseOrigin}/model_group/info`),
+    fetchJson<LiteLLMModelInfoResponse>(`${baseOrigin}/model/info`),
+  ]);
+
+  if (!groupInfo) return;
+
   pi.registerProvider('litellm', {
     baseUrl: baseUrl(),
     apiKey: apiKey(),
     api: 'openai-completions',
-    models: chatModels.map((m) => {
-      const cache = cacheCosts.get(m.model_group);
-      return {
-        id: m.model_group,
-        name: m.model_group,
-        reasoning: m.supports_reasoning,
-        thinkingLevelMap: m.supports_reasoning
-          ? m.model_group.startsWith('qwen/')
-            ? QWEN_THINKING_LEVEL_MAP
-            : m.model_group.startsWith('anthropic/')
-              ? CLAUDE_THINKING_LEVEL_MAP
-              : { xhigh: 'xhigh' }
-          : undefined,
-        input: m.supports_vision ? (['text', 'image'] as const) : (['text'] as const),
-        cost: {
-          input: perMillionTokens(m.input_cost_per_token),
-          output: perMillionTokens(m.output_cost_per_token),
-          cacheRead: cache?.cacheRead ?? 0,
-          cacheWrite: cache?.cacheWrite ?? 0,
-        },
-        contextWindow: m.max_input_tokens ?? 262_144,
-        // This gateway reports max_output_tokens: null for most model groups, and
-        // the old `?? 256_000` fallback made maxTokens ~= contextWindow. pi's
-        // clampMaxTokensToContext (pi-ai/api/simple-options.js) then computes
-        //   available = contextWindow - estimate(context) - 4096
-        // and sends min(maxTokens, available) as max_tokens -- so the completion
-        // reservation absorbed the entire remaining window. Because `estimate`
-        // is a char/4 heuristic (utils/estimate.js) it undercounts dense scraped
-        // markdown by ~16%, which is more than the fixed 4096 safety margin, so
-        // input + max_tokens overshot the 262144 limit and litellm returned a
-        // hard 400 (observed: run sub-72cc, over by 1581 then 106 tokens, at
-        // only ~10-14% real context use). Compaction cannot fix this: freeing
-        // input just hands the same space back to the reservation.
-        //
-        // A bounded default keeps max_tokens well clear of the window while
-        // staying larger than any reply we actually want.
-        maxTokens: m.max_output_tokens ?? 32_768,
-      };
-    }),
+    models: buildModels(groupInfo, modelInfo),
   } satisfies ProviderConfig);
 }
