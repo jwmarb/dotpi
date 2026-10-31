@@ -14,7 +14,7 @@
  * reported `done`, because the sidecar is what the parent itself classifies by.
  */
 
-import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -137,6 +137,42 @@ const todoFileOf = new Map<string, string>();
  */
 const scannedTo = new Map<string, { off: number; stamp: string }>();
 
+
+/**
+ * One chunked or laddered read's outcome: the newest snapshot found (if any),
+ * the byte offset the read PROVED free of snapshots (a newline boundary), and
+ * whether the read itself failed — a failed read proves nothing and arms
+ * nothing.
+ */
+export interface TodoRead {
+	todos?: RunTodoCounts;
+	boundary: number;
+	failed: boolean;
+}
+
+/** What the scan memo permits next: trust the cache, read the growth, or re-prove. */
+export type MemoDecision = { kind: "hit" } | { kind: "scan"; from: number } | { kind: "ladder" };
+
+/**
+ * What the scan memo proves about a transcript of `size` bytes stamped `stamp`,
+ * given the offset the ladder proved (`memo`) under an earlier stamp. The
+ * transcript is append-only, so a memo below EOF still holds; every other
+ * mismatch is a file the memo was never proven against:
+ * - no memo: nothing is proven — walk the ladder.
+ * - `off > size`: the file SHRANK (a sync rewrite) — append-only is broken,
+ *   the marker proves nothing; the ladder re-proves from scratch.
+ * - `off === size`, same stamp: nothing new above EOF — a hit, read nothing.
+ * - `off === size`, new stamp: a same-size IN-PLACE REWRITE (a sync restore).
+ *   The memo was proven against bytes that are gone; the ladder re-proves.
+ * - `off < size`: scan the appended region from the proven offset — the only
+ *   arm that reads, and it reads just the growth.
+ */
+export function memoDecision(memo: { off: number; stamp: string } | undefined, size: number, stamp: string): MemoDecision {
+	if (!memo) return { kind: "ladder" };
+	if (memo.off > size) return { kind: "ladder" };
+	if (memo.off === size) return memo.stamp === stamp ? { kind: "hit" } : { kind: "ladder" };
+	return { kind: "scan", from: memo.off };
+}
 function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 	try {
 		const names = readdirSync(dir).filter((n) => isSessionFileFor(n, runId));
@@ -153,64 +189,39 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
 			scannedTo.delete(prev);
 		}
 		todoFileOf.set(runId, file);
-		const st = statSync(file);
-		const stamp = `${st.size}:${st.mtimeMs}`;
-		const hit = todoCache.get(file);
-		if (hit && hit.stamp === stamp) return hit.todos;
-		const memo = scannedTo.get(file);
-		if (memo) {
-			if (memo.off > st.size) {
-				// The file shrank: append-only is broken, the marker proves nothing.
-				scannedTo.delete(file);
-			} else if (memo.off === st.size) {
-				if (memo.stamp === stamp) return undefined; // nothing new above EOF
-				// Same size, new stamp: an in-place rewrite (sync restore). The memo
-				// was proven against bytes that are gone; the ladder re-proves.
-				scannedTo.delete(file);
-			} else {
-				// Scan the appended region from the proven offset — chunked, so peak
-				// memory is `REGION_CHUNK_BYTES` while each line is <= the chunk (measured
-				// max recorded line 985 KiB); never floored, so a snapshot in a big
-				// append stays visible.
-				const scan = scanRegion(file, memo.off, st.size);
-				if (scan.todos) scannedTo.delete(file); // a found list is not "no list"
-				else scannedTo.set(file, { off: scan.boundary, stamp });
-				todoCache.set(file, { stamp, todos: scan.todos }); // cache BOTH arms
-				return scan.todos;
-			}
-		}
-		// The ladder: a miss in the small window expands before "no list" is
-		// concluded (the measured bound is on TODO_TAIL_STEPS).
-		let todos: RunTodoCounts | undefined;
-		let lastText = "";
-		let tailSize = st.size;
-		for (const bytes of TODO_TAIL_STEPS) {
-			const tail = readTail(file, bytes);
-			// Transient read failure: prove NOTHING — a memo armed at 0
+		// ONE `open` and ONE `fstat` for the whole read: every ladder, region,
+		// and tail read below runs against this fd, so the size the stamp
+		// reports and the bytes the scan reads are the same file. A failed
+		// `open` (an unreadable mode) exits through the outer catch and caches
+		// nothing — the next poll re-proves.
+		const fd = openSync(file, "r");
+		try {
+			const st = fstatSync(fd);
+			const stamp = `${st.size}:${st.mtimeMs}`;
+			const hit = todoCache.get(file);
+			if (hit && hit.stamp === stamp) return hit.todos;
+			const memo = scannedTo.get(file);
+			const d = memoDecision(memo, st.size, stamp);
+			if (d.kind === "hit") return undefined; // nothing new above EOF
+			// A memo the decision rejected (`ladder`) proved nothing about the
+			// file this stamp describes; drop it, the ladder re-proves.
+			if (memo && d.kind === "ladder") scannedTo.delete(file);
+			// The ladder expands its window on a miss before "no list" is
+			// concluded (the measured bound is on TODO_TAIL_STEPS); the scan
+			// reads only the appended region above the proven offset.
+			const r = d.kind === "scan" ? scanRegion(fd, d.from, st.size) : readLadder(fd, st.size);
+			// A failed ladder proves NOTHING — arm nothing. A memo armed at 0
 			// from "" would rescan the whole file on every future append.
-			if (tail.size < 0) return undefined;
-			lastText = tail.text;
-			tailSize = tail.size; // the size the text was read at, not the earlier stat
-			const lines = tail.text.split("\n");
-			// A torn final line (a write in progress) is not evidence: drop it, the
-			// same rule `extractRunResult` applies.
-			lines.pop();
-			todos = parseRunTodos(lines);
-			if (todos) break;
-			// A window that already covered the whole file read everything there is:
-			// every larger step would re-read and re-parse byte-identical bytes, and
-			// a run with no list walks this ladder on **every** append (the board
-			// polls at 1 s, the widget refreshes inside pi's main loop). Stop covered.
-			if (bytes >= st.size) break;
+			if (r.failed) return undefined;
+			if (r.todos) scannedTo.delete(file); // a found list is not "no list"
+			// Arm on every miss, at the newline boundary of the last window
+			// read (see the scannedTo and readLadder docstrings).
+			else scannedTo.set(file, { off: r.boundary, stamp });
+			todoCache.set(file, { stamp, todos: r.todos }); // cache BOTH arms
+			return r.todos;
+		} finally {
+			closeSync(fd);
 		}
-		if (todos) scannedTo.delete(file);
-		// Arm the memo on every miss, at the newline boundary of the last window
-		// read: covered files prove everything below it; a past-cap file proves the
-		// cap tail, and bytes farther from EOF than that tail are never reached
-		// (see the scannedTo docstring).
-		else scannedTo.set(file, { off: eofBoundary(lastText, tailSize), stamp });
-		todoCache.set(file, { stamp, todos });
-		return todos;
 	} catch {
 		return undefined;
 	}
@@ -234,7 +245,7 @@ function readRunTodos(dir: string, runId: string): RunTodoCounts | undefined {
  * subpart (F0 80 80 80 -> one replacement char); JSON.stringify never
  * emits one.)
  */
-function eofBoundary(text: string, size: number): number {
+export function eofBoundary(text: string, size: number): number {
 	const cut = text.lastIndexOf("\n");
 	if (cut < 0) return Math.max(0, size - Buffer.byteLength(text));
 	return size - Buffer.byteLength(text.slice(cut + 1));
@@ -284,6 +295,8 @@ export const REGION_CHUNK_BYTES = 4 * 1024 * 1024;
  * transient at the split). The CARRY is capped at 2 chunks: the
  * transcript is untrusted input written by a child, and a
  * longer line stops the scan at its start (bounded re-reads per poll).
+ * (The `12 MiB` figures are 3 × `chunkBytes` at the default chunk: the reach
+ * and the carry bound are multiples of the parameter, not literals.)
  * Reach splits at 12 MiB - 1 (the 12 MiB window, one byte shy of its own
  * terminating newline): a line of AT MOST 12 MiB - 1 is invisible while
  * torn and FOUND once it closes (sub-0021, 2.25 chunks; sub-0022's
@@ -293,7 +306,7 @@ export const REGION_CHUNK_BYTES = 4 * 1024 * 1024;
  * invisible FOREVER (sub-0020, sub-0022's thick edge). A zero-length read
  * stops the scan at `pos` — the loop cannot spin in a reader's loop.
  */
-function scanRegion(file: string, from: number, size: number): { todos?: RunTodoCounts; boundary: number } {
+export function scanRegion(fd: number, from: number, size: number, chunkBytes: number = REGION_CHUNK_BYTES): TodoRead {
 	let found: RunTodoCounts | undefined;
 	// Invariants (see the docstring for why): `pos` is the file offset of
 	// carry[0]; chunks are cut ONLY at newlines, so `pos` is always a line
@@ -302,8 +315,8 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
 	let carry: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 	let pos = from; // file offset of carry[0]
 	while (pos < size) {
-		const want = Math.min(REGION_CHUNK_BYTES, size - pos - carry.length);
-		const chunk = readRangeBytes(file, pos + carry.length, want);
+		const want = Math.min(chunkBytes, size - pos - carry.length);
+		const chunk = readRangeBytes(fd, pos + carry.length, want);
 		if (chunk.length === 0) {
 			// A read delivered NOTHING (EMFILE, the file shrank under the scan,
 			// want <= 0): the loop's only advance is `pos += nl + 1` below, which
@@ -312,7 +325,7 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
 			// pi on flush/liveness events). Stop at `pos`, the start of the
 			// line in flight: the backward, safe bias
 			// (same as eofBoundary); the next poll re-proves from here.
-			return { todos: found, boundary: pos };
+			return { todos: found, boundary: pos, failed: false };
 		}
 		const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
 		const end = pos + data.length; // file offset just past data
@@ -327,8 +340,9 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
 			// the safe direction (see eofBoundary).
 			// nl < 0: the whole region is ONE partial line — the boundary stays at
 			// its start (`pos`), so the completed line is re-read whole next pass.
-			const tailBytes = nl < 0 ? 0 : data.length - Buffer.byteLength(text.slice(nl + 1));
-			return { todos: todos ?? found, boundary: pos + tailBytes };
+			// `eofBoundary(text, end)` IS the `end - byteLength(text after nl)`
+			// arithmetic the boundary needs.
+			return { todos: todos ?? found, boundary: nl < 0 ? pos : eofBoundary(text, end), failed: false };
 		}
 		const nl = data.lastIndexOf(0x0a);
 		if (nl >= 0) {
@@ -338,15 +352,15 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
 			carry = data.subarray(nl + 1);
 		} else {
 			carry = data; // one line longer than a chunk: keep buffering
-			if (carry.length > 2 * REGION_CHUNK_BYTES) {
+			if (carry.length > 2 * chunkBytes) {
 				// Untrusted input (the child writes this file) must not make
 				// pi's main loop buffer a 200 MB line. Stop at the line's
 				// start; the per-poll re-read stays bounded at 3 chunks.
-				return { todos: found, boundary: pos };
+				return { todos: found, boundary: pos, failed: false };
 			}
 		}
 	}
-	return { todos: found, boundary: pos }; // defensive: the caller only enters with from < size
+	return { todos: found, boundary: pos, failed: false }; // defensive: the caller only enters with from < size
 }
 
 /**
@@ -358,36 +372,54 @@ function scanRegion(file: string, from: number, size: number): { todos?: RunTodo
  * The delta is bounded only by the poll cadence; `scanRegion` reads it in
  * byte-aligned chunks so peak memory stays at `REGION_CHUNK_BYTES`.
  */
-function readRangeBytes(file: string, offset: number, len: number): Buffer {
+function readRangeBytes(fd: number, offset: number, len: number): Buffer {
 	try {
-		const fd = openSync(file, "r");
-		try {
-			const buf = Buffer.alloc(len);
-			const n = readSync(fd, buf, 0, len, offset);
-			return buf.subarray(0, n);
-		} finally {
-			closeSync(fd);
-		}
+		const buf = Buffer.alloc(len);
+		const n = readSync(fd, buf, 0, len, offset);
+		return buf.subarray(0, n);
 	} catch {
 		return Buffer.alloc(0);
 	}
 }
 
-/** At most `bytes` from the end of `file`, without loading the whole file. */
-function readTail(file: string, bytes: number): { text: string; size: number } {
+/** At most `bytes` from the end of an OPEN file, decoded. Throws with the read. */
+function readTailAt(fd: number, size: number, bytes: number): string {
+	const len = Math.min(bytes, size);
+	const buf = Buffer.alloc(len);
+	const bytesRead = readSync(fd, buf, 0, len, size - len);
+	return buf.toString("utf-8", 0, bytesRead);
+}
+
+/**
+ * The ladder of tail windows, walked on an OPEN file (see TODO_TAIL_STEPS for
+ * why a miss expands before "no list" is concluded). Each rung reads the tail,
+ * pops the torn final line (a write in progress is not evidence — the same
+ * rule `extractRunResult` applies), and parses; it stops covered when a window
+ * already spanned the whole file (a larger step would re-read byte-identical
+ * bytes, and a no-list run walks this on **every** append — the board polls at
+ * 1 s, the widget inside pi's main loop).
+ *
+ * `boundary` is the newline boundary of the last window read: covered files
+ * prove everything below it; a past-cap file proves the cap tail, and bytes
+ * farther from EOF than that tail are never reached (see the scannedTo
+ * docstring). A failed rung throws out of the loop: `failed: true` proves
+ * NOTHING — the caller must not arm anything from it.
+ */
+export function readLadder(fd: number, size: number, steps: readonly number[] = TODO_TAIL_STEPS): TodoRead {
 	try {
-		const fd = openSync(file, "r");
-		try {
-			const size = fstatSync(fd).size;
-			const len = Math.min(bytes, size);
-			const buf = Buffer.alloc(len);
-			const bytesRead = readSync(fd, buf, 0, len, size - len);
-			return { text: buf.toString("utf-8", 0, bytesRead), size };
-		} finally {
-			closeSync(fd);
+		let todos: RunTodoCounts | undefined;
+		let lastText = "";
+		for (const bytes of steps) {
+			lastText = readTailAt(fd, size, bytes);
+			const lines = lastText.split("\n");
+			lines.pop();
+			todos = parseRunTodos(lines);
+			if (todos) break;
+			if (bytes >= size) break; // covered: stop, the memo arms at EOF
 		}
+		return { todos, boundary: eofBoundary(lastText, size), failed: false };
 	} catch {
-		return { text: "", size: -1 }; // failure: callers must not arm anything from this
+		return { boundary: 0, failed: true };
 	}
 }
 /** One run's status, `unknown` when its record is absent or unreadable. Never throws. */

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,7 +47,7 @@ import {
 	type SessionEntryLike,
 } from "./lib.js";
 import { EVIDENCE_TAIL_BYTES } from "../subagent-herdr/rundir.js";
-import { readRunInfo, readRunInfos, REGION_CHUNK_BYTES } from "./runs.js";
+import { eofBoundary, memoDecision, readLadder, readRunInfo, readRunInfos, REGION_CHUNK_BYTES, scanRegion } from "./runs.js";
 
 const run = (...ops: KanbanOp[]): KanbanState => ops.reduce(applyOp, emptyState());
 
@@ -774,18 +774,16 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "sub-0015").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
 	});
 
-	// The byte fixtures below write ~67 MiB of temp files (5 + 29 + 9 +
-	// 12 + 12) and the cap tests re-read up to 12 MiB per poll — unavoidable
-	// for byte-level pins.
-
-	test("an unreadable transcript mid-scan stops at a safe offset, never spins, and recovers", () => {
-		// The scanRegion zero-read guard. A chunk read that delivers NOTHING
-		// (EACCES here; EMFILE / a mid-scan shrink in the field) must stop the
-		// scan at `pos` — the loop's only advance needs bytes, and an empty
-		// read repeating byte-identical state would hang pi's main loop at 100%
-		// CPU on the board's 1 s poll. Write-only chmod: the child keeps
-		// appending, the reader cannot read. On b03bdea (no guard) this test
-		// HANGS (verified by swap + timeout).
+	// The byte fixtures below (sub-0013, sub-0015) write ~15 MiB of temp files
+	// (10 + 5) and their appended regions re-read ~5 MB per pass — the past-cap
+	// geometries are integration pins for `readRunInfo`; the boundary edges of
+	// `scanRegion`/`readLadder` are pinned at C = 256 bytes below instead.
+	test("an unreadable transcript fails the open, caches nothing, and recovers", () => {
+		// One `open` happens before any scanning, so a write-only chmod (the
+		// child keeps appending, the reader cannot read) fails the open: the
+		// read returns undefined and caches NOTHING — the next poll re-proves.
+		// The scanRegion zero-read guard this test used to pin mid-scan is now
+		// pinned directly by the C = 256 read-past-EOF case below.
 		const name = "2026-10-09T00-00-00-000Z_sub-0017.jsonl";
 		// chmod blocks the OWNER's reads; uid 0 ignores permissions, and
 		// Windows chmod maps only the write bit (0o200 stays readable) —
@@ -807,81 +805,17 @@ describe("runs.ts (meta.json reader)", () => {
 		const file = join(agent, "subagent-runs", "sub-0017", name);
 		chmodSync(file, 0o200); // write-only: stat works, reads fail
 		appendFileSync(file, snapshot + "\n");
-		expect(readRunInfo(agent, "sub-0017").todos).toBeUndefined(); // empty read -> stop at pos, no spin
+		expect(readRunInfo(agent, "sub-0017").todos).toBeUndefined(); // the open fails: nothing proven, nothing cached
 		chmodSync(file, 0o644);
-		appendFileSync(file, "\n"); // bump the stamp: the failed read cached {stamp, undefined} and chmod alone does not move mtime
+		appendFileSync(file, "\n"); // bump the stamp (the failed open cached nothing; the bump keeps the assertion strict)
 		expect(readRunInfo(agent, "sub-0017").todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 }); // recovery
 	});
 
-	test("one line longer than the chunk buffers whole, and its snapshot is found once it closes", () => {
-		const name = "2026-10-09T00-00-00-000Z_sub-0019.jsonl";
-		const head = Array.from({ length: 60 }, () => JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n").join("");
-		write("sub-0019", { runId: "sub-0019", agent: "worker", status: "running" }, { [name]: head });
-		const file = join(agent, "subagent-runs", "sub-0019", name);
-		expect(readRunInfo(agent, "sub-0019").todos).toBeUndefined(); // memo armed at the EOF boundary
-		const big = "x".repeat(5 * 1024 * 1024); // one line, no newline, bigger than the 4 MB chunk
-		appendFileSync(file, big);
-		expect(readRunInfo(agent, "sub-0019").todos).toBeUndefined(); // carried across chunks; nothing to parse yet
-		appendFileSync(file, "\n" + JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "grew", status: "in_progress" }], nextId: 2 } } } }) + "\n");
-		// The multi-chunk line keeps the memo at its START; once it closes,
-		// the next scan re-reads it whole and finds the snapshot after it.
-		expect(readRunInfo(agent, "sub-0019").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
-	});
-
-	test("a carried line past the 2-chunk cap stops at its start; snapshots behind it stay invisible", () => {
-		const name = "2026-10-09T00-00-00-000Z_sub-0020.jsonl";
-		write("sub-0020", { runId: "sub-0020", agent: "worker", status: "running" }, { [name]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
-		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined(); // memo armed at the EOF boundary
-		const snap = JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "wide", status: "in_progress" }], nextId: 2 } } } }) + "\n";
-		appendFileSync(join(agent, "subagent-runs", "sub-0020", name), "x".repeat(20 * 1024 * 1024) + "\n" + snap);
-		// 20 MB line: the carry caps at 2 chunks and the scan STOPS at the
-		// line's start — memory bounded on untrusted input; a snapshot after
-		// a line longer than 3 chunks is invisible (documented reach cost).
-		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined();
-		appendFileSync(join(agent, "subagent-runs", "sub-0020", name), "y".repeat(9 * 1024 * 1024) + "\n" + snap);
-		// The scan re-proves from the same offset each poll (bounded), and
-		// the snapshot behind the 20 MB line stays invisible — the scan can
-		// never advance past it, the 9 MB filler behind it never helps.
-		expect(readRunInfo(agent, "sub-0020").todos).toBeUndefined();
-	});
-
-	test("a 2.25-chunk line is found once it closes (the cap's reach edge is 12 MiB - 1)", () => {
-		const name = "2026-10-09T00-00-00-000Z_sub-0021.jsonl";
-		const file = join(agent, "subagent-runs", "sub-0021", name);
-		write("sub-0021", { runId: "sub-0021", agent: "worker", status: "running" }, { [name]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
-		expect(readRunInfo(agent, "sub-0021").todos).toBeUndefined(); // memo armed at the EOF boundary
-		appendFileSync(file, "z".repeat(9 * 1024 * 1024)); // 2.25 chunks: at the cap, the scan reaches EOF with no newline
-		expect(readRunInfo(agent, "sub-0021").todos).toBeUndefined(); // boundary stays at the line's start
-		appendFileSync(file, "\n" + JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "edge", status: "in_progress" }], nextId: 2 } } } }) + "\n");
-		// Within cap reach — this fixture's concat is ~9 MiB; the cap's
-		// worst case is carry 8 + chunk 4 = 12 MiB: the closed line parses
-		// and the snapshot after it is FOUND, not just bounded.
-		expect(readRunInfo(agent, "sub-0021").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
-	});
-
-	test("the reach edge: a closed 12 MiB - 1 line is found, a closed 12 MiB line is invisible forever", () => {
-		const thin = "2026-10-09T00-00-00-000Z_sub-0022.jsonl";
-		write("sub-0022", { runId: "sub-0022", agent: "worker", status: "running" }, { [thin]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
-		expect(readRunInfo(agent, "sub-0022").todos).toBeUndefined();
-		const snap = JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: [{ id: "t1", text: "edge", status: "in_progress" }], nextId: 2 } } } }) + "\n";
-		appendFileSync(join(agent, "subagent-runs", "sub-0022", thin), "x".repeat(12 * 1024 * 1024 - 1) + "\n" + snap);
-		// 12 MiB - 1: its terminating newline is the LAST byte of the 12 MiB
-		// window — the scan advances past the closed line and finds the snapshot.
-		expect(readRunInfo(agent, "sub-0022").todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
-		const thick = "2026-10-09T00-00-00-000Z_sub-0023.jsonl";
-		write("sub-0023", { runId: "sub-0023", agent: "worker", status: "running" }, { [thick]: JSON.stringify({ type: "message", message: { role: "user", content: "head" } }) + "\n" });
-		expect(readRunInfo(agent, "sub-0023").todos).toBeUndefined();
-		appendFileSync(join(agent, "subagent-runs", "sub-0023", thick), "y".repeat(12 * 1024 * 1024) + "\n" + snap);
-		// 12 MiB exactly: the newline sits ONE byte outside the window, the
-		// cap fires, the scan stops at the line's start forever — closed line,
-		// invisible snapshot. The edge the docstring's split claims.
-		expect(readRunInfo(agent, "sub-0023").todos).toBeUndefined();
-	});
-
 	test("a failed ladder read recovers on the next good read (the no-arm contract is not observable here)", () => {
-		// readTail's catch returns size -1; the ladder must return undefined
-		// WITHOUT arming the memo — a memo armed at 0 from an empty text would
-		// make every future append a full-transcript rescan on every poll.
+		// chmod 0o000 fails the ONE open now (before any ladder), so through
+		// `readRunInfo` the ladder's no-arm contract is not observable here —
+		// `readLadder`'s closed-fd case pins it directly. Through the reader,
+		// this pins the open-failure path: undefined, nothing cached, recovery.
 		const name = "2026-10-09T00-00-00-000Z_sub-0018.jsonl";
 		// 0o000 is inert on Windows (chmod maps only the write bit) and
 		// under uid 0 (root ignores permissions): the read would succeed,
@@ -1071,6 +1005,143 @@ describe("runs.ts (meta.json reader)", () => {
 		const compact = compactLines(state, infos, 100, PLAIN_STYLE).join("\n");
 		expect(compact).toContain("1/2");
 		expect(compact).not.toContain("1/3");
+	});
+});
+
+describe("runs.ts pure decisions", () => {
+	const C = 256; // small chunks make every reach/carry edge a few hundred bytes
+	const dir = mkdtempSync(join(tmpdir(), "kanban-scan-"));
+	let seq = 0;
+
+	const snapLine = (items: Array<{ id: string; text: string; status: string }>, nextId: number) =>
+		JSON.stringify({
+			type: "message",
+			message: { role: "toolResult", toolName: "todo", details: { state: { items, nextId } } },
+		}) + "\n";
+	const snapA = snapLine([{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "pending" }], 3);
+	const snapB = snapLine([{ id: "t1", text: "b", status: "in_progress" }], 2);
+
+	const mk = (body: string) => {
+		const file = join(dir, `${seq++}.jsonl`);
+		writeFileSync(file, body);
+		return file;
+	};
+	const scan = (file: string, from = 0, size?: number, chunk = C) => {
+		const fd = openSync(file, "r");
+		try {
+			return scanRegion(fd, from, size ?? fstatSync(fd).size, chunk);
+		} finally {
+			closeSync(fd);
+		}
+	};
+
+	test("memoDecision: the five memo states pick hit, scan, or ladder", () => {
+		expect(memoDecision(undefined, 100, "100:1")).toEqual({ kind: "ladder" });
+		// the file shrank: the marker proves nothing
+		expect(memoDecision({ off: 101, stamp: "101:1" }, 100, "100:9")).toEqual({ kind: "ladder" });
+		// proven at EOF under the same stamp: nothing new above it
+		expect(memoDecision({ off: 100, stamp: "100:1" }, 100, "100:1")).toEqual({ kind: "hit" });
+		// proven at EOF, new stamp: a size-equal in-place rewrite
+		expect(memoDecision({ off: 100, stamp: "100:1" }, 100, "100:2")).toEqual({ kind: "ladder" });
+		// grown past the proven offset: read only the appended region
+		expect(memoDecision({ off: 40, stamp: "40:1" }, 100, "100:2")).toEqual({ kind: "scan", from: 40 });
+	});
+
+	test("eofBoundary: end of the last COMPLETE line, counted in bytes", () => {
+		expect(eofBoundary("a\nb", 10)).toBe(9);
+		expect(eofBoundary("abc", 10)).toBe(7); // no newline: the region's start
+		expect(eofBoundary("a\n", 10)).toBe(10); // complete to EOF
+		expect(eofBoundary("\u00e9\nx", Buffer.byteLength("\u00e9\nx"))).toBe(Buffer.byteLength("\u00e9\n"));
+	});
+
+	test("scanRegion reach edge at 3C - 1: the closed line's snapshot is FOUND", () => {
+		// its terminating newline is the last byte the 3-chunk window touches
+		// (replaces the 12 MiB sub-0022-thin fixture at scale).
+		const body = "x".repeat(3 * C - 1) + "\n" + snapA;
+		const r = scan(mk(body));
+		expect(r.todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
+		expect(r.boundary).toBe(Buffer.byteLength(body));
+	});
+
+	test("scanRegion reach edge at 3C: the newline is outside the window, invisible", () => {
+		// closed or not, the scan can never advance past the line (replaces
+		// the 12 MiB sub-0023 and the 20 MB sub-0020 fixtures at scale).
+		const r = scan(mk("y".repeat(3 * C) + "\n" + snapA));
+		expect(r.todos).toBeUndefined();
+		expect(r.boundary).toBe(0);
+	});
+
+	test("scanRegion: a 2.25-chunk torn line proves nothing; once closed, found", () => {
+		// replaces the 9 MB sub-0021 fixture at scale.
+		const file = mk("z".repeat(Math.round(2.25 * C)));
+		expect(scan(file).todos).toBeUndefined();
+		appendFileSync(file, "\n" + snapA);
+		expect(scan(file).todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
+	});
+
+	test("scanRegion: a 1.25-chunk line torn, then closed, re-read whole and found", () => {
+		// replaces the 5 MB sub-0019 fixture at scale: the multi-chunk line
+		// keeps the boundary at its START; the closed line parses next scan.
+		const file = mk("w".repeat(Math.round(1.25 * C)));
+		expect(scan(file).boundary).toBe(0); // the whole region is ONE partial line
+		appendFileSync(file, "\n" + snapB);
+		expect(scan(file).todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+	test("scanRegion: a zero-length read stops at `pos` — the loop cannot spin", () => {
+		// The size lies past EOF (the mid-scan shrink arm): the read delivers
+		// NOTHING, and the scan stops at the start of the line in flight — a
+		// real boundary, re-proven next poll, never a byte-identical spin.
+		const body = "a\nb\n";
+		const r = scan(mk(body), 0, Buffer.byteLength(body) + 100);
+		expect(r.todos).toBeUndefined();
+		expect(r.boundary).toBe(Buffer.byteLength(body));
+		expect(r.failed).toBe(false);
+	});
+
+	test("scanRegion: two snapshots in different chunks — the later one wins", () => {
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "u".repeat(2 * C) } }) + "\n";
+		const r = scan(mk(snapA + filler + snapB));
+		expect(r.todos).toEqual({ done: 0, total: 1, inProgress: 1, blocked: 0 });
+	});
+
+	test("scanRegion: a region ending mid-line puts the boundary at its START", () => {
+		const r = scan(mk("a\n" + "b".repeat(4)));
+		expect(r.boundary).toBe(2);
+	});
+
+	test("readLadder: a rung-1 miss is found at rung 2; a covered miss arms at EOF", () => {
+		const filler = JSON.stringify({ type: "message", message: { role: "user", content: "f".repeat(400) } });
+		const body = filler + "\n" + snapA + "z".repeat(40) + "\n"; // snapshot 40 B of content from EOF
+		const fdOf = (b: string) => {
+			const file = mk(b);
+			const fd = openSync(file, "r");
+			return { fd, size: fstatSync(fd).size };
+		};
+		const a = fdOf(body);
+		try {
+			const r = readLadder(a.fd, a.size, [64, 256, 1024]); // 64 B rips the tail; 256 B spans the line
+			expect(r.todos).toEqual({ done: 1, total: 2, inProgress: 0, blocked: 0 });
+			expect(r.boundary).toBe(Buffer.byteLength(body));
+		} finally {
+			closeSync(a.fd);
+		}
+		const b = fdOf("abcdefghi\n"); // 10 B, no list: rung 1 covers the file
+		try {
+			const dry = readLadder(b.fd, b.size, [16, 64, 256]);
+			expect(dry.todos).toBeUndefined();
+			expect(dry.boundary).toBe(10);
+			expect(dry.failed).toBe(false);
+		} finally {
+			closeSync(b.fd);
+		}
+	});
+
+	test("readLadder: a failed read proves nothing and arms nothing", () => {
+		const file = mk("anything\n");
+		const fd = openSync(file, "r");
+		closeSync(fd);
+		expect(readLadder(fd, 9, [16, 64])).toEqual({ boundary: 0, failed: true });
 	});
 });
 
