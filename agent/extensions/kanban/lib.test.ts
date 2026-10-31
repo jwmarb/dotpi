@@ -18,10 +18,12 @@ import {
 	findOnPath,
 	paneCommand,
 	formatCardList,
+	KANBAN_COLUMNS,
 	KanbanError,
 	linkedRunIds,
 	MAX_CARDS,
 	MAX_TERMINAL_DIM,
+	NUDGE_MOVE_TARGETS,
 	nudgeFor,
 	opFromParams,
 	parseBoardArgs,
@@ -33,6 +35,9 @@ import {
 	reconstructFromEntries,
 	renderBody,
 	renderFrame,
+	SETTLE_DISPOSITION,
+	SETTLE_EXEMPT_COLUMNS,
+	SETTLE_GUIDELINE,
 	settleSignature,
 	shellJoin,
 	shellQuote,
@@ -347,11 +352,60 @@ describe("settle guard", () => {
 		expect(text).toContain("k1");
 		expect(text).toContain("collect their results");
 		expect(text).toContain("Never move a card just to clear this message");
-		// The offered dispositions must match `actionableCards`: a `review` card is counted
-		// while nothing is waiting, so the guard may not offer `review` flat — that wording
+		// The offered dispositions must match `actionableCards`: a column the guard
+		// counts while nothing is waiting may not be offered flat — that wording
 		// told the model to perform the shuffle this same sentence forbids.
-		expect(text).toContain("to review only while another card is waiting");
-		expect(text).toContain("a review card is counted otherwise");
+		for (const col of NUDGE_MOVE_TARGETS) {
+			if (SETTLE_DISPOSITION[col] === "owes-unless-board-waiting") {
+				expect(text).toContain(`to ${col} only while another card is waiting`);
+				expect(text).toContain(`a ${col} card is counted otherwise`);
+			} else {
+				expect(SETTLE_DISPOSITION[col]).toBe("exempt");
+				expect(text).toContain(`to ${col}`);
+				expect(text).not.toContain(`to ${col} only while`);
+			}
+		}
+	});
+
+	test("the settle guideline names exactly the exempt columns", () => {
+		const named = KANBAN_COLUMNS.filter((c) => SETTLE_GUIDELINE.includes(c));
+		expect([...named].sort()).toEqual([...SETTLE_EXEMPT_COLUMNS].sort());
+	});
+
+	test("actionableCards over column × own run status × another card waiting", () => {
+		// The expectation is a hand-written predicate, NOT the table: it is the
+		// behaviour the table must reproduce, so a table edit that changes it fails here.
+		const ownStatuses = ["none", "running", "done", "failed", "cancelled", "unknown"] as const;
+		const others = ["none", "in_progress-running", "done-running"] as const;
+		for (const col of KANBAN_COLUMNS) {
+			for (const own of ownStatuses) {
+				for (const other of others) {
+					const ops: KanbanOp[] = [{ op: "add", titles: other === "none" ? ["a"] : ["a", "b"] }];
+					if (col !== "backlog") ops.push({ op: "move", id: "k1", column: col, ...(col === "blocked" ? { note: "waits" } : {}) });
+					const runs: Record<string, RunInfos[string]> = {};
+					if (own !== "none") {
+						ops.push({ op: "link", id: "k1", runId: "sub-0001" });
+						if (own !== "unknown") runs["sub-0001"] = { status: own };
+					}
+					if (other !== "none") {
+						ops.push({ op: "move", id: "k2", column: other === "done-running" ? "done" : "in_progress" });
+						ops.push({ op: "link", id: "k2", runId: "sub-0002" });
+						runs["sub-0002"] = { status: "running" };
+					}
+					const otherWaitingNotDone = other === "in_progress-running";
+					const expected =
+						col === "done" || col === "blocked"
+							? false
+							: own === "running"
+								? false
+								: col === "in_progress"
+									? true
+									: !otherWaitingNotDone;
+					const got = actionableCards(run(...ops), runs).some((c) => c.id === "k1");
+					expect({ col, own, other, actionable: got }).toEqual({ col, own, other, actionable: expected });
+				}
+			}
+		}
 	});
 
 	test("linkedRunIds skips done cards", () => {

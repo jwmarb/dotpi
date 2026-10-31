@@ -32,6 +32,7 @@ import dynamicExtension, { buildOrchestratorPrompt, promptInputs, type PromptInp
 import { agentsDir } from "./layout.js";
 import { discoverAgents, type AgentInfo } from "./agents.js";
 import { setPersonaOverride } from "./persona.js";
+import { KANBAN_COLUMNS, SETTLE_DISPOSITION, SETTLE_EXEMPT_COLUMNS } from "../kanban/lib.js";
 import { fileURLToPath } from "node:url";
 /** A minimal valid call; each test overrides only what it is about. */
 function build(overrides: Partial<Parameters<typeof buildOrchestratorPrompt>[0]> = {}) {
@@ -555,10 +556,10 @@ describe("the kanban board section is gated on the tool existing", () => {
   test("does not count `review` as an accounted card", () => {
     // `actionableCards` in kanban/lib.ts keeps a `review` card actionable while nothing
     // else is waiting, so `review` may not join the accounted list: a prompt that offered
-    // it as a disposition would teach the shuffle its own last sentence forbids. The
-    // guard's end-of-turn text does list it, which is why this is pinned to the source.
+    // it as a disposition would teach the shuffle its own last sentence forbids. Which
+    // columns the prose names is checked against the settle table itself in
+    // "kanban prose matches the settle table" below, not pinned to a literal here.
     const s = board({ hasKanban: true });
-    expect(s).toContain("`review` is not one of them");
     expect(s).toContain("Never move a card to silence the guard");
   });
 
@@ -714,6 +715,43 @@ describe("the kanban board section is gated on the tool existing", () => {
       expect(p).not.toContain("${");
     }
   });
+});
+
+describe("kanban prose matches the settle table", () => {
+  // The board section's accounting sentence is hand-written prose; the settle guard's
+  // `SETTLE_DISPOSITION` table is what enforces it. The prose names the always-exempt
+  // columns, then the column(s) that are NOT accounted for — both derived here from
+  // the table, so editing one without the other fails.
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+  const board = (ovs: Partial<Parameters<typeof buildOrchestratorPrompt>[0]> = {}) =>
+    section(build(ovs), "## Kanban Board");
+  const COLUMN_TOKEN = new RegExp(`\`(${KANBAN_COLUMNS.join("|")})\``, "g");
+  const columnsIn = (text: string) => [...text.matchAll(COLUMN_TOKEN)].map((m) => m[1]);
+
+  for (const [label, ovs] of [
+    ["with the spawn tool", { hasKanban: true, agentInventory: [agent("worker")] }],
+    ["without the spawn tool", { hasKanban: true, hasSubagent: false }],
+  ] as const) {
+    test(`the accounted list is exactly the exempt columns, ${label}`, () => {
+      const s = board(ovs);
+      const from = s.indexOf("**Account for every card before you end the turn:**");
+      const notOne = s.indexOf(" is not one of them", from);
+      expect(from).toBeGreaterThanOrEqual(0);
+      expect(notOne).toBeGreaterThan(from);
+      const rule = s.slice(from, notOne);
+      const firstStop = rule.indexOf(". ");
+      expect(firstStop).toBeGreaterThan(0);
+      const accounted = columnsIn(rule.slice(0, firstStop));
+      expect([...accounted].sort()).toEqual([...SETTLE_EXEMPT_COLUMNS].sort());
+      // Each column the prose says is "not one of them" really is counted by the guard.
+      const excluded = columnsIn(rule.slice(firstStop));
+      expect(excluded.length).toBeGreaterThan(0);
+      for (const col of excluded) {
+        expect(SETTLE_DISPOSITION[col as keyof typeof SETTLE_DISPOSITION]).not.toBe("exempt");
+      }
+    });
+  }
 });
 
 describe("the delegation-first section is gated on a delegation-capable roster", () => {

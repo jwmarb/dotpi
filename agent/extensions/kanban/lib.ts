@@ -562,23 +562,63 @@ export const needsAttention = (card: KanbanCard, runs: RunInfos): boolean =>
 	});
 
 /**
- * Cards that still owe the orchestrator an action when it is about to stop.
- *
- * Exempt: done, blocked (accounted for, with a note), and any card waiting on a
- * running linked run — ending the turn *is* how the orchestrator waits for a
- * subagent. Backlog and review are also exempt while anything on the board is
- * waiting: they are plausibly queued behind that work, and nagging about them
- * on every delegation trains the model to shuffle cards to silence the guard.
- * An in-progress card with no running run is never exempt — that is the
- * abandoned card this guard exists for.
+ * How the settle guard treats a card in each column, before any run is looked
+ * at. The ONE table `actionableCards`, `nudgeFor`'s offered moves, and the
+ * prose tests read:
+ * - `exempt`: accounted for, always (done; blocked, with a note).
+ * - `owes`: owes an action unless the card itself waits on a running linked
+ *   run — the in-progress card with no running run is the abandoned card this
+ *   guard exists for.
+ * - `owes-unless-board-waiting`: plausibly queued behind delegated work, so
+ *   accounted for only while some card not in `done` is waiting on a running
+ *   run; nagging about it on every delegation trains the model to shuffle
+ *   cards to silence the guard.
+ * A card waiting on its own running linked run is exempt whatever its column
+ * (see {@link settleDisposition}): ending the turn *is* how the orchestrator
+ * waits for a subagent.
+ */
+export type SettleDisposition = "exempt" | "owes" | "owes-unless-board-waiting";
+
+export const SETTLE_DISPOSITION: Readonly<Record<KanbanColumn, SettleDisposition>> = {
+	backlog: "owes-unless-board-waiting",
+	in_progress: "owes",
+	blocked: "exempt",
+	review: "owes-unless-board-waiting",
+	done: "exempt",
+};
+
+/** The columns the guard always treats as accounted for, in board order. */
+export const SETTLE_EXEMPT_COLUMNS: readonly KanbanColumn[] = KANBAN_COLUMNS.filter((c) => SETTLE_DISPOSITION[c] === "exempt");
+
+/**
+ * One card's disposition under the guard: the column's table entry, except
+ * that a non-exempt card waiting on its own running linked run is `waiting`.
+ */
+export function settleDisposition(card: KanbanCard, runs: RunInfos): SettleDisposition | "waiting" {
+	const d = SETTLE_DISPOSITION[card.column];
+	if (d === "exempt") return d;
+	return isWaiting(card, runs) ? "waiting" : d;
+}
+
+/**
+ * The settle rule as the tool's prompt guideline states it. Hand-written prose;
+ * it lives here (not inline in `index.ts`) so a test can check it names exactly
+ * {@link SETTLE_EXEMPT_COLUMNS} without loading the extension.
+ */
+export const SETTLE_GUIDELINE =
+	"Before you end your turn, every card must be done, blocked with a note, dropped, or waiting on a linked running subagent; otherwise the turn is held open with a reminder.";
+
+/**
+ * Cards that still owe the orchestrator an action when it is about to stop,
+ * per {@link SETTLE_DISPOSITION}: `owes` cards always, and
+ * `owes-unless-board-waiting` cards only while nothing on the board (outside
+ * `done`) is waiting on a running linked run.
  */
 export function actionableCards(state: KanbanState, runs: RunInfos): KanbanCard[] {
 	const anyWaiting = state.cards.some((c) => c.column !== "done" && isWaiting(c, runs));
 	return state.cards.filter((c) => {
-		if (c.column === "done" || c.column === "blocked") return false;
-		if (isWaiting(c, runs)) return false;
-		if (c.column === "in_progress") return true;
-		return !anyWaiting;
+		const d = settleDisposition(c, runs);
+		return d === "owes" || (d === "owes-unless-board-waiting" && !anyWaiting);
 	});
 }
 
@@ -601,6 +641,34 @@ export function settleSignature(state: KanbanState, runs: RunInfos): string {
 
 const NUDGE_MAX_LISTED = 8;
 
+/** The moves the nudge offers, in the order it offers them. */
+export const NUDGE_MOVE_TARGETS = ["done", "review", "blocked"] as const satisfies readonly KanbanColumn[];
+type NudgeMoveTarget = (typeof NUDGE_MOVE_TARGETS)[number];
+
+const MOVE_HINT: Record<NudgeMoveTarget, string> = {
+	done: " once it is genuinely verified (put the evidence in the note)",
+	review: "",
+	blocked: " with a note saying what it waits on (including the user)",
+};
+
+/**
+ * One offered move, worded from the target's disposition: an exempt column is
+ * offered flat; a column the guard keeps counting while nothing waits is offered
+ * only with that condition, or the nudge would teach the shuffle it forbids.
+ */
+function moveClause(col: NudgeMoveTarget): string {
+	const d = SETTLE_DISPOSITION[col];
+	if (d === "exempt") return `op 'move' to ${col}${MOVE_HINT[col]}`;
+	if (d === "owes-unless-board-waiting") {
+		return (
+			`op 'move' to ${col}${MOVE_HINT[col]} only while another card is waiting on a running subagent — ` +
+			`a ${col} card is counted otherwise, so it does not settle this (a card linked to its own running run is the exempt case)`
+		);
+	}
+	// An `owes` column settles nothing — offering it would be a lie.
+	throw new Error(`nudge offers a move to ${col}, which the settle guard always counts`);
+}
+
 export interface KanbanNudge {
 	text: string;
 	signature: string;
@@ -620,11 +688,8 @@ export function nudgeFor(state: KanbanState, runs: RunInfos): KanbanNudge | unde
 		signature: settleSignature(state, runs),
 		text:
 			`Not done yet: ${subject} you — ${shown.join("; ")}${more}. ` +
-			"For each one do exactly one of: keep working on it; kanban op 'move' to done once it " +
-			"is genuinely verified (put the evidence in the note); op 'move' to review only while another " +
-			"card is waiting on a running subagent — a review card is counted otherwise, so it does not " +
-			"settle this (a card linked to its own running run is the exempt case); op 'move' to blocked with a note " +
-			"saying what it waits on (including the user); op 'link' with the run id if a running subagent " +
+			`For each one do exactly one of: keep working on it; kanban ${NUDGE_MOVE_TARGETS.map(moveClause).join("; ")}; ` +
+			"op 'link' with the run id if a running subagent " +
 			"is doing it; or op 'drop' if it is not needed. Never move a card just to clear this message.",
 	};
 }
