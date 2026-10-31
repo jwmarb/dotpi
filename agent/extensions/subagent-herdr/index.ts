@@ -446,9 +446,11 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
  * documents): a transcript (or prompt file) restored with identical size and mtime serves
  * the cached verdict, which is the right one when the bytes are in fact
  * identical. The map is never pruned: its entries are bounded by the
- * distinct (dir, run id) pairs ever read for evidence (hundreds, not a
- * growth path). It contrasts with the parent-proof memo (positives only,
- * TTL-bounded): see `createParentProof` in parent-proof.ts.
+ * distinct (dir, run id) pairs read for evidence while still sidecarless —
+ * `hasExitSidecar` decides before the memo is touched, so a terminal run never
+ * adds a key (hundreds of still-running pairs, not a growth path). It
+ * contrasts with the parent-proof memo (positives only, TTL-bounded): see
+ * `createParentProof` in parent-proof.ts.
  *
  * The dir is in the key, not left to `dirFor`: `agentDir()` reads
  * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a profile

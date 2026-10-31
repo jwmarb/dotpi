@@ -689,6 +689,8 @@ export function planRegistration(input: {
 				dropped.map((d) => `${JSON.stringify(d.input) ?? String(d.input)} (${d.reason})`).join("; ")
 			: undefined;
 	const shapeWarning = !settingsSilenced && shapeError ? `model-fallback: settings.json ${shapeError}` : undefined;
+	// Today at most one of the two is set — `readChain` reports a `shapeError`
+	// instead of any drops, never both — so the join is future-proofing.
 	const settingsWarning = [shapeWarning, dropWarning].filter(Boolean).join("\n") || undefined;
 	const warning = [envWarning, settingsWarning].filter(Boolean).join("\n") || undefined;
 	const withWarning = (plan: RegistrationPlan): RegistrationPlan => (warning ? { ...plan, warning } : plan);
@@ -1186,7 +1188,11 @@ export interface ReserveEffects<L> {
  * `start` is normalised into `[0, chain.length)` once, and that normalised
  * index is what both no-lease returns (all-at-cap, every acquire refused)
  * route to. An empty chain (`chain.length === 0`) has nothing to reserve:
- * it returns `start` unchanged with no lease and never calls `effects`.
+ * it returns `start` unchanged with no lease and never calls `effects`. That
+ * guard only keeps the pure function total: a caller cannot use an index into
+ * an empty chain at all (index.ts reads `resolved[index]!` and
+ * `chain[index]!.ref`), and never gets one — `planRegistration` registers only
+ * a non-empty chain, so the caller's reachability walk always has an entry.
  */
 export function reserveRoute<L>(input: {
 	chain: readonly ChainEntry[];

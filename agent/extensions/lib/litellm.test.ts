@@ -8,7 +8,7 @@
  * the default export only, so this file exercises the real module.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 
 import {
   buildModels,
@@ -108,9 +108,39 @@ describe("buildModels", () => {
     expect(buildModels({}, null)).toEqual([]);
     expect(buildModels({}, {})).toEqual([]);
     // A missing /model/info list leaves cache rates at zero, not a crash.
+    // The warning each missing `data` emits is pinned by the next test.
     const models = buildModels(groups(group({ model_group: "m/1" })), {});
     expect(models.map((m) => m.id)).toEqual(["m/1"]);
     expect(models[0]!.cost.cacheRead).toBe(0);
+  });
+
+  test("a body without `data` warns, naming the endpoint that produced it", () => {
+    // The `?? []` guards are what keep extension load alive; the warnings are
+    // what stop a proxy that answers 200 with an unexpected body from quietly
+    // registering zero models. `mock.calls` is read before `mockRestore`,
+    // which clears them.
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    let noGroups: ReturnType<typeof buildModels> = [];
+    let noDeployments: ReturnType<typeof buildModels> = [];
+    let messages: string[] = [];
+    try {
+      noGroups = buildModels({}, null);
+      noDeployments = buildModels(groups(group({ model_group: "m/1" })), {});
+      messages = warn.mock.calls.map((call) => call.join(" "));
+    } finally {
+      warn.mockRestore();
+    }
+    // The guard is a warning, not an exception: the empty result still holds,
+    // and the surviving group keeps registering with zero cache costs. A null
+    // `/model/info` adds no warning of its own — a non-ok fetch already
+    // console.errors in `fetchJson`.
+    expect(noGroups).toEqual([]);
+    expect(noDeployments.map((m) => m.id)).toEqual(["m/1"]);
+    expect(noDeployments[0]!.cost.cacheRead).toBe(0);
+    expect(messages).toEqual([
+      expect.stringContaining("/model_group/info"),
+      expect.stringContaining("/model/info"),
+    ]);
   });
 
   test("a non-reasoning group carries no thinkingLevelMap", () => {

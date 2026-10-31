@@ -168,8 +168,8 @@ export function thinkingLevelMapFor(modelGroup: string): ThinkingLevelMap {
  * The provider's model list from the two proxy responses: chat-capable groups
  * only, with per-million costs, cache rates taken from `/model/info` (the
  * first deployment of a name that defines any wins, `litellm_params` ahead of
- * `model_info`), and the bounded token defaults. Pure — the fetches stay in
- * the default export.
+ * `model_info`), and the bounded token defaults. Pure apart from the two
+ * `no data` warnings below — the fetches stay in the default export.
  */
 export function buildModels(
   groupInfo: LiteLLMModelGroupInfoResponse,
@@ -181,7 +181,12 @@ export function buildModels(
   const cacheCosts = new Map<string, { cacheWrite: number; cacheRead: number }>();
   if (modelInfo) {
     // `?? []`: `fetchJson`'s cast is unchecked, so a body without `data`
-    // must read as "no models", not crash extension load.
+    // must read as "no models", not crash extension load. The warning is the
+    // only signal here — the `!ok` path in `fetchJson` already console.errors,
+    // so a 200 that carries no list is a misconfigured endpoint, and silence
+    // would mean zero cache costs with nothing printed to say why.
+    if (modelInfo.data === undefined)
+      console.warn('LiteLLM /model/info returned no "data" list; every cache cost stays zero');
     for (const entry of modelInfo.data ?? []) {
       if (cacheCosts.has(entry.model_name)) continue;
       const cacheWrite =
@@ -197,6 +202,11 @@ export function buildModels(
     }
   }
 
+  // The same unchecked cast on the primary response: an absent `data` is a
+  // misconfigured proxy, not an empty gateway, so name the endpoint instead of
+  // registering zero models in silence.
+  if (groupInfo.data === undefined)
+    console.warn('LiteLLM /model_group/info returned no "data" list; registering zero models');
   const chatModels = (groupInfo.data ?? []).filter((m) => m.mode == null || m.mode === 'chat' || m.mode === 'completion');
 
   return chatModels.map((m) => {
