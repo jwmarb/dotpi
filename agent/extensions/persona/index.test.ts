@@ -9,7 +9,7 @@
  * Run: `bun test agent/extensions/persona/index.test.ts`
  */
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -75,6 +75,13 @@ beforeAll(async () => {
   writeFileSync(
     join(researchDir, "skills", "demo-cat", "demo", "SKILL.md"),
     "---\nname: demo\ndescription: demo skill\n---\nBody.\n",
+  );
+  // A skill that owns a tool (`tools:` frontmatter), so the takeover's skill-gate
+  // is exercised: `write` is offered only while `gated` is active.
+  mkdirSync(join(researchDir, "skills", "demo-cat", "gated"), { recursive: true });
+  writeFileSync(
+    join(researchDir, "skills", "demo-cat", "gated", "SKILL.md"),
+    "---\nname: gated\ndescription: owns write\ntools: write\n---\nBody.\n",
   );
   researchReal = await realpath(researchDir);
   writeFileSync(join(agentDirPath, "AGENTS.md"), "# Home profile context\n");
@@ -374,21 +381,62 @@ describe("the takeover feeds the target's inputs to the builder", () => {
     ext: StubPi,
     entryOver: Record<string, unknown>,
     contextFiles: Array<{ path: string }>,
+    run: { selectedTools?: string[]; prompt?: string } = {},
   ) {
     const ctx = makeCtx([switchEntry(entryOver)]);
     await ext.handlers.get("session_start")!({ reason: "resume" }, ctx);
+    const systemPromptOptions = {
+      cwd: "/w",
+      selectedTools: run.selectedTools ?? ["read"],
+      skills: [],
+      promptGuidelines: [],
+      contextFiles,
+    };
     await ext.handlers.get("before_agent_start")!({
       messageType: "user",
-      prompt: "hi",
-      systemPromptOptions: {
-        cwd: "/w",
-        selectedTools: ["read"],
-        skills: [],
-        promptGuidelines: [],
-        contextFiles,
-      },
-    });
+      prompt: run.prompt ?? "hi",
+      systemPromptOptions,
+    } as never);
+    return systemPromptOptions;
   }
+
+  /** The probe's view of the run, written at `agent_start` (A8). */
+  async function probe(ext: StubPi): Promise<{ selectedTools: string[] }> {
+    const file = join(repoRoot, `probe-${importCounter}.json`);
+    const original = process.env.PI_PERSONA_PROBE_FILE;
+    process.env.PI_PERSONA_PROBE_FILE = file;
+    try {
+      await ext.handlers.get("agent_start")!({} as never, { getSystemPrompt: () => "" } as never);
+    } finally {
+      if (original === undefined) delete process.env.PI_PERSONA_PROBE_FILE;
+      else process.env.PI_PERSONA_PROBE_FILE = original;
+    }
+    return JSON.parse(readFileSync(file, "utf-8"));
+  }
+
+  // A function, not a const: `researchReal` is only set once `beforeAll` runs.
+  const research = () => ({ profile: "research", dir: researchReal, widened: false, confirmed: false, dropped: [] });
+
+  test("an orchestrator target gates a skill-owned tool until its skill is active", async () => {
+    const ext = await freshExtension();
+    const opts = await runTakeover(ext, research(), [], { selectedTools: ["read", "write"] });
+    expect(personaOverride()?.name).toBe("research");
+    // `write` is owned by the inactive `gated` skill: withheld from the run and
+    // from what the probe reports.
+    expect(opts.selectedTools).toEqual(["read"]);
+    expect((await probe(ext)).selectedTools).toEqual(["read"]);
+  });
+
+  test("an orchestrator target offers a skill-owned tool once its skill is active", async () => {
+    const ext = await freshExtension();
+    const location = join(researchReal, "skills", "demo-cat", "gated", "SKILL.md");
+    const opts = await runTakeover(ext, research(), [], {
+      selectedTools: ["read", "write"],
+      prompt: `<skill name="gated" location="${location}">`,
+    });
+    expect(opts.selectedTools).toEqual(["read", "write"]);
+    expect((await probe(ext)).selectedTools).toEqual(["read", "write"]);
+  });
 
   test("an orchestrator target gets its own skill catalogue and AGENTS.md", async () => {
     const ext = await freshExtension();

@@ -560,7 +560,7 @@ export default function (pi: ExtensionAPI) {
     // `opts` — is the whole point of routing the takeover through the shared
     // derivation.
     const owners = quantModule
-      ? new Map<string, string>() // quant owns no skill-gated tools, same as its own handler
+      ? new Map<string, string>() // quant does not gate skill-owned tools; trade_journal is offered ungated by design
       : await loadSkillToolOwners(library);
     const d = derivePromptInputs({
       selectedTools: opts.selectedTools ?? [],

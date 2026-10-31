@@ -375,10 +375,10 @@ export default function (pi: ExtensionAPI) {
       activeSkills: activation.list(),
     });
 
-    // No skill-owned tool gating here, same as before this shared derivation:
-    // the quant profile owns no `tools:` frontmatter, so `owners` is empty and
-    // `isActive` is never consulted — the gate is present only so the derivation
-    // is one function for every builder.
+    // Quant does not gate skill-owned tools; trade_journal is offered ungated by
+    // design (its skill declares `tools: trade_journal`, but the desk always has
+    // it). `owners` is therefore empty and `isActive` is never consulted — the
+    // gate is present only so the derivation is one function for every builder.
     const d = derivePromptInputs({
       selectedTools: opts.selectedTools ?? [],
       toolSnippets: opts.toolSnippets,

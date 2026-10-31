@@ -6,13 +6,15 @@
  * fixture would only prove the fixture. Each rule is one the top-level
  * `AGENTS.md` "Profiles" section states and nothing else enforced:
  *
- *   - A non-home profile never carries `dynamic-prompt.ts`. That extension
- *     replaces the whole prompt with the orchestrator's, so a quant desk that
- *     loaded it would silently become a code orchestrator.
+ *   - A non-home profile never carries `dynamic-prompt.ts`, by name or by
+ *     symlink under another name. That extension replaces the whole prompt
+ *     with the orchestrator's, so a quant desk that loaded it would silently
+ *     become a code orchestrator.
  *   - Every entry in a non-home profile's `extensions/` is a per-item symlink
  *     into `agent/`, the profile's own `.ts`, or one of a short pinned list of
  *     non-extension files. A real copy of a shared extension drifts from the
- *     original the first time either is edited.
+ *     original the first time either is edited, so an own `.ts` whose name
+ *     also exists in `agent/extensions/` is a copy, not the profile's own.
  *   - A profile's `.env` and `sessions/` are gitignored. A new profile must not
  *     be one `git add` away from committing its credentials or transcripts.
  *
@@ -24,7 +26,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { discoverProfiles } from "../persona/lib.js";
@@ -34,6 +36,10 @@ import { gitEnv } from "./git-env.js";
 const ROOT = realpathSync(dirname(dirname(dirname(import.meta.dir))));
 /** The home profile: the one every other profile symlinks into. */
 const HOME = realpathSync(join(ROOT, "agent"));
+/** The home profile's extensions dir, where every shared extension lives. */
+const HOME_EXT = join(HOME, "extensions");
+/** The one extension no non-home profile may load, under any name. */
+const DYNAMIC_PROMPT = realpathSync(join(HOME_EXT, "dynamic-prompt.ts"));
 
 /**
  * The non-extension entries a profile's `extensions/` may hold as real files
@@ -57,7 +63,18 @@ describe("the profiles on disk", () => {
     const extDir = join(p.dir, "extensions");
 
     test(`${p.name} never loads dynamic-prompt.ts`, () => {
-      expect(readdirSync(extDir)).not.toContain("dynamic-prompt.ts");
+      const entries = readdirSync(extDir);
+      expect(entries).not.toContain("dynamic-prompt.ts");
+      // By identity too: a symlink under another name still loads it. A broken
+      // symlink is the next test's failure, not this one's.
+      const aliases = entries.filter((e) => {
+        try {
+          return realpathSync(join(extDir, e)) === DYNAMIC_PROMPT;
+        } catch {
+          return false;
+        }
+      });
+      expect(aliases).toEqual([]);
     });
 
     test(`${p.name}/extensions holds only symlinks into agent/, its own .ts, or pinned files`, () => {
@@ -76,7 +93,12 @@ describe("the profiles on disk", () => {
           if (!real.startsWith(HOME + "/")) bad.push(`${p.name}/extensions/${e} -> ${real} (outside agent/)`);
           continue;
         }
-        if (e.endsWith(".ts") && statSync(path).isFile()) continue; // the profile's own
+        if (e.endsWith(".ts") && statSync(path).isFile()) {
+          // The profile's own, unless agent/extensions has a file of the same
+          // name: then this is a real copy of a shared extension, and it drifts.
+          if (existsSync(join(HOME_EXT, e))) bad.push(`${p.name}/extensions/${e} (real copy of agent/extensions/${e})`);
+          continue;
+        }
         if (!ALLOWED_OWN.has(e)) bad.push(`${p.name}/extensions/${e} (real entry, not allowlisted)`);
       }
       expect(bad).toEqual([]);
