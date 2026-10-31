@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "eagle": {
+      "baseUrl": "http://eagle.lan:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [{ "id": "qwen3.8-27b", "contextWindow": 262144, "maxTokens": 65536 }]
+    }
+  }
+}
