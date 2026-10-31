@@ -5,6 +5,7 @@ import {
 	applyOp,
 	counts,
 	demotedBy,
+	latestTodoCounts,
 	emptyState,
 	openItems,
 	parseTodoState,
@@ -275,5 +276,76 @@ describe("openItems", () => {
 
 	test("an empty list has no open items", () => {
 		expect(openItems(emptyState())).toEqual([]);
+	});
+});
+
+describe("latestTodoCounts", () => {
+	const todo = (state: unknown, extra: Record<string, unknown> = {}) =>
+		JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state }, ...extra } });
+	const items = (...statuses: string[]) => ({
+		items: statuses.map((status, i) => ({ id: `t${i + 1}`, text: `item ${i + 1}`, status })),
+		nextId: statuses.length + 1,
+	});
+
+	test("the newest valid snapshot wins over an older one", () => {
+		expect(latestTodoCounts([todo(items("pending")), todo(items("done", "blocked"))])).toEqual({
+			total: 2,
+			done: 1,
+			inProgress: 0,
+			blocked: 1,
+			pending: 0,
+		});
+	});
+
+	test("a bash result with todo-shaped details and a user row are skipped", () => {
+		const bash = JSON.stringify({
+			type: "message",
+			message: { role: "toolResult", toolName: "bash", details: { state: items("done") } },
+		});
+		const user = JSON.stringify({ type: "message", message: { role: "user", content: "todo chatter" } });
+		expect(latestTodoCounts([todo(items("in_progress")), bash, user])).toEqual({
+			total: 1,
+			done: 0,
+			inProgress: 1,
+			blocked: 0,
+			pending: 0,
+		});
+	});
+
+	test("malformed states are skipped and the walk falls back to an older valid one", () => {
+		const older = todo(items("done", "pending"));
+		const malformed = [todo({ items: "not-an-array", nextId: 2 }), todo(undefined)];
+		expect(latestTodoCounts([older, ...malformed])).toEqual({ total: 2, done: 1, inProgress: 0, blocked: 0, pending: 1 });
+		expect(latestTodoCounts([todo({ items: "nope" })])).toBeUndefined();
+	});
+
+	test("unparseable and blank lines are skipped; a torn line is safe raw", () => {
+		const good = todo(items("done"));
+		expect(latestTodoCounts([good, "", "   ", "{not json", good.slice(0, 20)])).toEqual({
+			total: 1,
+			done: 1,
+			inProgress: 0,
+			blocked: 0,
+			pending: 0,
+		});
+	});
+
+	test("an entry whose type is not \"message\" is skipped", () => {
+		const custom = JSON.stringify({ type: "custom", message: { role: "toolResult", toolName: "todo", details: { state: items("done") } } });
+		expect(latestTodoCounts([custom])).toBeUndefined();
+	});
+
+	test("an isError todo result counts: its details carry the unchanged state", () => {
+		expect(latestTodoCounts([todo(items("in_progress", "pending"), { isError: true })])).toEqual({
+			total: 2,
+			done: 0,
+			inProgress: 1,
+			blocked: 0,
+			pending: 1,
+		});
+	});
+
+	test("no lines, no snapshot", () => {
+		expect(latestTodoCounts([])).toBeUndefined();
 	});
 });

@@ -257,10 +257,9 @@ describe("extractRunResult", () => {
     expect(r.sessionFile).toBe(join(dir, settledName));
   });
 
-  test("the todo walk: non-todo results, non-toolResult rows, and malformed states are all skipped", async () => {
-    // The backward walk's whole contract: newest VALID todo snapshot wins;
-    // a bash result carrying todo-shaped details is a decoy; a malformed
-    // todo state (the newest) must fall through to the older valid one.
+  test("the todo walk is wired: a malformed newest snapshot falls back to the older valid one", async () => {
+    // The walk's full contract is `latestTodoCounts`' (lib/todo.test.ts); this
+    // pins only that extractRunResult reads it off the same transcript.
     const dir = mkdtempSync(join(tmpdir(), "sub-herdr-test-"));
     const todo = (items: unknown) =>
       JSON.stringify({
@@ -268,15 +267,8 @@ describe("extractRunResult", () => {
         message: { role: "toolResult", toolName: "todo", details: { state: { items, nextId: 9 } } },
       });
     const lines = [
-      todo([{ id: "t1", text: "a", status: "done" }]),
-      JSON.stringify({
-        type: "message",
-        message: { role: "toolResult", toolName: "bash", details: { state: { items: [{ id: "x", text: "y", status: "done" }], nextId: 1 } } },
-      }),
-      JSON.stringify({ type: "message", message: { role: "user", content: "todo chatter, not a result" } }),
-      todo("not-an-array"), // newest todo: malformed, must be skipped
       todo([{ id: "t1", text: "a", status: "done" }, { id: "t2", text: "b", status: "blocked" }]),
-      todo(undefined), // newer still: no state at all — also skipped
+      todo("not-an-array"), // newest todo: malformed, must be skipped
       JSON.stringify({
         type: "message",
         message: { role: "assistant", content: [{ type: "text", text: "<result>done</result>" }], stopReason: "stop" },

@@ -25,7 +25,7 @@ import {
 	runDir,
 	EVIDENCE_TAIL_BYTES,
 } from "../subagent-herdr/rundir.js";
-import { counts, parseTodoState } from "../lib/todo.js";
+import { latestTodoCounts } from "../lib/todo.js";
 import { RUN_ID_PATTERN, type RunInfo, type RunInfos, type RunTodoCounts } from "./lib.js";
 
 /**
@@ -57,42 +57,13 @@ import { RUN_ID_PATTERN, type RunInfo, type RunInfos, type RunTodoCounts } from 
 const TODO_TAIL_STEPS = [32 * 1024, 512 * 1024, EVIDENCE_TAIL_BYTES];
 
 /**
- * One run's todo progress, read off its session file: the newest `todo` tool
- * result's snapshot, walked backwards.
- *
- * The session is untrusted, append-only JSONL written by a process that may
- * die mid-line, so:
- * - a line that does not parse is skipped — the torn final line is dropped
- *   by the caller before this runs;
- * - a `todo` result whose `details.state` `parseTodoState` refuses does not
- *   win the scan: the scan keeps looking for an older, well-formed one;
- * - an `isError` result is just as good as a successful one: a refused op's
- *   `details` carries the unchanged previous state, which is the state.
- *
- * @param lines - The session's lines, oldest first.
+ * One run's todo progress, as the board renders it: the shared
+ * `latestTodoCounts` walk (newest valid `todo` snapshot), projected to the
+ * board's four fields.
  */
-export function parseRunTodos(lines: readonly string[]): RunTodoCounts | undefined {
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const line = lines[i];
-		if (!line || !line.trim()) continue;
-		let entry: unknown;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (typeof entry !== "object" || entry === null) continue;
-		const e = entry as {
-			type?: unknown;
-			message?: { role?: unknown; toolName?: unknown; details?: unknown };
-		};
-		if (e.type !== "message" || e.message?.role !== "toolResult" || e.message?.toolName !== "todo") continue;
-		const state = parseTodoState((e.message?.details as { state?: unknown } | undefined)?.state);
-		if (!state) continue;
-		const c = counts(state);
-		return { done: c.done, total: c.total, inProgress: c.inProgress, blocked: c.blocked };
-	}
-	return undefined;
+function runTodoCounts(lines: readonly string[]): RunTodoCounts | undefined {
+	const c = latestTodoCounts(lines);
+	return c && { done: c.done, total: c.total, inProgress: c.inProgress, blocked: c.blocked };
 }
 
 /**
@@ -332,7 +303,7 @@ export function scanRegion(fd: number, from: number, size: number, chunkBytes: n
 			const nl = text.lastIndexOf("\n");
 			const lines = text.split("\n");
 			lines.pop();
-			const todos = parseRunTodos(lines);
+			const todos = runTodoCounts(lines);
 			// Byte-exact when the tail decodes cleanly (ASCII transcripts); a lone
 			// surrogate in a torn tail over-counts, moving the boundary backward —
 			// the safe direction (see eofBoundary).
@@ -345,7 +316,7 @@ export function scanRegion(fd: number, from: number, size: number, chunkBytes: n
 		const nl = data.lastIndexOf(0x0a);
 		if (nl >= 0) {
 			const head = data.subarray(0, nl + 1).toString("utf-8"); // complete lines, byte-aligned
-			found = parseRunTodos(head.split("\n")) ?? found;
+			found = runTodoCounts(head.split("\n")) ?? found;
 			pos += nl + 1;
 			carry = data.subarray(nl + 1);
 		} else {
@@ -411,7 +382,7 @@ export function readLadder(fd: number, size: number, steps: readonly number[] = 
 			lastText = readTailAt(fd, size, bytes);
 			const lines = lastText.split("\n");
 			lines.pop();
-			todos = parseRunTodos(lines);
+			todos = runTodoCounts(lines);
 			if (todos) break;
 			if (bytes >= size) break; // covered: stop, the memo arms at EOF
 		}

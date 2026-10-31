@@ -951,33 +951,6 @@ describe("runs.ts (meta.json reader)", () => {
 		expect(readRunInfo(agent, "sub-0014").todos).toEqual({ done: 1, total: 1, inProgress: 0, blocked: 0 });
 	});
 
-	test("a non-todo newest result is skipped; the newest todo snapshot wins; malformed states are skipped", () => {
-		const todo = (items: Array<{ id: string; text: string; status: string }>) =>
-			JSON.stringify({
-				type: "message",
-				message: { role: "toolResult", toolName: "todo", details: { state: { items, nextId: 9 } } },
-			});
-		const bash = JSON.stringify({
-			type: "message",
-			message: { role: "toolResult", toolName: "bash", details: { state: { items: [] , nextId: 1} } },
-		});
-		write("sub-0009", { runId: "sub-0009", agent: "worker", status: "running" }, {
-			"2026-10-09T00-00-00-000Z_sub-0009.jsonl": [
-				todo([{ id: "t1", text: "old", status: "pending" }]),
-				bash,
-				todo([{ id: "t1", text: "old", status: "done" }, { id: "t2", text: "new", status: "in_progress" }]),
-				bash, // newest is a bash result — the walk must keep going back
-			].join("\n") + "\n",
-		});
-		expect(readRunInfo(agent, "sub-0009").todos).toEqual({ done: 1, total: 2, inProgress: 1, blocked: 0 });
-		write("sub-000b", { runId: "sub-000b", agent: "worker", status: "running" }, {
-			"2026-10-09T00-00-00-000Z_sub-000b.jsonl":
-				JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "todo", details: { state: { items: "nope" } } } }) +
-				"\n",
-		});
-		expect(readRunInfo(agent, "sub-000b").todos).toBeUndefined();
-	});
-
 	test("a resumed run dir reads the newest session file; a sidecar-terminal run drops its cache entry", () => {
 		const todo = (text: string) =>
 			JSON.stringify({

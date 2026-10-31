@@ -32,8 +32,7 @@ import {
   parseChainItem,
 } from "../model-fallback/lib.js";
 import {
-  counts,
-  parseTodoState,
+  latestTodoCounts,
   type TodoCounts,
 } from "../lib/todo.js";
 import {
@@ -736,17 +735,11 @@ export async function extractRunResult(runDir: string, runId: string, tailBytes?
     }
   }
 
-  // The child's final todo state, walked back from the end of the SAME parsed
-  // entries (no second read): the newest VALID todo tool result wins,
-  // malformed ones skipped — the shared `parseTodoState` rule the board and
-  // the child's own gate apply.
-  let todos: TodoCounts | undefined;
-  for (let i = parsed.length - 1; i >= 0 && !todos; i--) {
-    const m = (parsed[i] as { message?: { role?: string; toolName?: string; details?: unknown } }).message;
-    if (m?.role !== "toolResult" || m.toolName !== "todo") continue;
-    const state = parseTodoState((m.details as { state?: unknown } | undefined)?.state);
-    if (state) todos = counts(state);
-  }
+  // The child's final todo state, from the SAME lines (no second read, though
+  // it is a second parse): the shared `latestTodoCounts` walk — the newest
+  // VALID todo tool result wins, malformed ones skipped, the `parseTodoState`
+  // rule the board and the child's own gate apply.
+  const todos: TodoCounts | undefined = latestTodoCounts(entries);
 
   // The contract the child was launched under. Unreadable (a historical run, a
   // corrupt dir) degrades to the weaker rule rather than declaring every such

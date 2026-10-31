@@ -196,6 +196,46 @@ export function counts(state: TodoState): TodoCounts {
 	return c;
 }
 
+/**
+ * The counts of the newest valid `todo` snapshot in a session transcript's
+ * lines, walked backwards — the one walk the kanban board (live progress) and
+ * subagent-herdr (a finished run's result) share.
+ *
+ * The transcript is untrusted, append-only JSONL written by a process that may
+ * die mid-line, so:
+ * - a blank line, or one that does not parse, is skipped. Callers drop the
+ *   torn final line themselves, but raw lines are safe: a torn one is skipped;
+ * - only a `type: "message"` entry whose message is a `toolResult` of the
+ *   `todo` tool counts — a bash result carrying todo-shaped details is a decoy;
+ * - a `todo` result whose `details.state` {@link parseTodoState} refuses does
+ *   not win: the walk keeps looking for an older, well-formed one;
+ * - an `isError` result counts just like a successful one: a refused op's
+ *   `details` carries the unchanged previous state, which is the state.
+ *
+ * @param lines - The transcript's lines, oldest first.
+ */
+export function latestTodoCounts(lines: readonly string[]): TodoCounts | undefined {
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i];
+		if (!line || !line.trim()) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof entry !== "object" || entry === null) continue;
+		const e = entry as {
+			type?: unknown;
+			message?: { role?: unknown; toolName?: unknown; details?: unknown };
+		};
+		if (e.type !== "message" || e.message?.role !== "toolResult" || e.message?.toolName !== "todo") continue;
+		const state = parseTodoState((e.message?.details as { state?: unknown } | undefined)?.state);
+		if (state) return counts(state);
+	}
+	return undefined;
+}
+
 /** The item the widget highlights: whatever is in flight. */
 export const activeItem = (state: TodoState): TodoItem | undefined =>
 	state.items.find((i) => i.status === "in_progress");
