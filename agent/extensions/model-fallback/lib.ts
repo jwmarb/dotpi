@@ -264,6 +264,10 @@ export function parseChainItem(item: string): ChainEntry | undefined {
  * forms cannot name the same model in two different ways, and a ref with a
  * `:level` suffix is rejected in both.
  *
+ * A `|` inside a string stays part of the literal reference **here** — this
+ * parser is shared. The `settings.json` load path rejects such strings
+ * before calling it ({@link parseChainReport}); `ref|level` pins only in the
+ * {@link parseChainItem} grammar.
  *
  * A `thinking` value is kept only when it is one of {@link THINKING_LEVELS}
  * exactly (case-sensitive, no trimming). Anything else — `"ultra"`, `"HIGH"`,
@@ -478,19 +482,60 @@ function walkToReachable(
  * `fallback_models` (`subagent-herdr/lib.ts` `childFallbackChain`), first
  * occurrence winning.
  *
+ * A **string containing `|`** is malformed here, not a `|level` pin —
+ * {@link parseChainReport} drops it with the reason, which is where the
+ * `settings.json` rejection of the pin form lives. The env and agent-file
+ * grammar ({@link parseChainItem}) is where `ref|level` pins.
  *
  * @param entries - Entries in priority order; the first is the primary.
  * @returns The chain, possibly empty when nothing parsed.
  */
 export function parseChain(entries: readonly unknown[]): ChainEntry[] {
-	const out: ChainEntry[] = [];
+	return parseChainReport(entries).chain;
+}
+
+/** One rejected `settings.json` chain entry, as {@link parseChainReport} saw it. */
+export interface DroppedEntry {
+	/** The raw entry, exactly as configured. */
+	input: unknown;
+	/** Why it is not a chain entry, for the load-time warning. */
+	reason: string;
+}
+
+/**
+ * {@link parseChain}'s loop, reporting every entry it dropped.
+ *
+ * A **string containing `|`** is dropped, not parsed: this grammar's pin is
+ * the object form `{ "model": "<ref>", "thinking": "<level>" }`, and the
+ * `ref|level` suffix belongs to {@link parseChainItem} — the env/agent-file
+ * grammar. Accepting the string form here would let one chain string mean
+ * two things depending on which surface wrote it. Every other malformed
+ * entry is reported too (non-strings, `:level` refs, leading or trailing
+ * `/`); duplicates are not, because dedup is documented behaviour, not a
+ * drop.
+ */
+export function parseChainReport(entries: readonly unknown[]): { chain: ChainEntry[]; dropped: DroppedEntry[] } {
+	const chain: ChainEntry[] = [];
+	const dropped: DroppedEntry[] = [];
 	const seen = new Set<string>();
 	for (const value of entries) {
+		if (typeof value === "string" && value.includes("|")) {
+			dropped.push({
+				input: value,
+				reason:
+					`"|level" pins only in ${CHAIN_ENV}/agent-file items; in settings.json write ` +
+					`{ "model": "<ref>", "thinking": "<level>" }`,
+			});
+			continue;
+		}
 		const entry = parseModelEntry(value);
-		if (!entry) continue;
-		pushUnique(out, seen, entry);
+		if (!entry) {
+			dropped.push({ input: value, reason: "not a model reference" });
+			continue;
+		}
+		pushUnique(chain, seen, entry);
 	}
-	return out;
+	return { chain, dropped };
 }
 
 /**
@@ -581,7 +626,7 @@ export interface RegistrationPlan {
 	 * `"settings"` with `register: false`.
 	 */
 	source: "environment" | "settings" | "none";
-	/** A one-line load-time warning for the caller to print, when there is one. */
+	/** Load-time warnings for the caller to print, when there are any; one per line, joined by `\n`. */
 	warning?: string;
 }
 
@@ -625,13 +670,24 @@ export function planRegistration(input: {
 }): RegistrationPlan {
 	const { settings, envValue, envName = CHAIN_ENV } = input;
 	const envChain = parseChainEnv(envValue);
-	const settingsChain = readChain(settings);
-	let warning: string | undefined;
+	const { chain: settingsChain, dropped } = readChain(settings);
+	let envWarning: string | undefined;
 	if (envValue !== undefined && envChain.length === 0) {
-		warning =
+		envWarning =
 			`model-fallback: ${envName} is set to "${envValue}" but no entry parses; ` +
 			(settingsChain.length > 0 ? "falling back to the settings.json chain" : "the router registers nothing");
 	}
+	// The settings chain only reaches the user when the env gave nothing: an
+	// env-launched child runs on a parent's chain, and warning about the same
+	// stale settings entries in every child would print the complaint once
+	// per process. A switched-off feature's entries never load, so they stay
+	// silent too.
+	const settingsWarning =
+		envChain.length === 0 && !isDisabled(settings) && dropped.length > 0
+			? `model-fallback: settings.json modelFallback.chain dropped ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"}: ` +
+				dropped.map((d) => `${JSON.stringify(d.input) ?? String(d.input)} (${d.reason})`).join("; ")
+			: undefined;
+	const warning = [envWarning, settingsWarning].filter(Boolean).join("\n") || undefined;
 	const withWarning = (plan: RegistrationPlan): RegistrationPlan => (warning ? { ...plan, warning } : plan);
 
 	if (envChain.length > 0) {
@@ -1728,17 +1784,22 @@ export function concurrencyLimitFor(config: ConcurrencyConfig, ref: string): num
  * Accepts `chain: ["provider/id", { "model": "...", "thinking": "high" }, ...]`
  * — a mix of bare references and level-pinning objects — and also a bare array
  * at the key so `modelFallback: ["a/b", "c/d"]` means what it looks like. Each
- * entry is parsed leniently ({@link parseModelEntry}): malformed entries and
- * malformed `thinking` values are dropped without discarding their neighbours.
- * Anything that is not an array yields an empty chain, which the caller reads
- * as "not configured".
+ * entry is parsed leniently ({@link parseChainReport}): malformed entries,
+ * malformed `thinking` values, and *strings containing `|`* are dropped
+ * without discarding their neighbours — a pin in this file is the object
+ * form. Anything that is not an array yields an empty chain, which the
+ * caller reads as "not configured".
+ *
+ * Returns `{ chain, dropped }`: every entry that did not become a chain
+ * entry (a duplicate ref excepted — dedup is not a drop) is reported for
+ * {@link planRegistration}'s load-time warning.
  */
-export function readChain(raw: unknown): ChainEntry[] {
-	if (Array.isArray(raw)) return parseChain(raw);
+export function readChain(raw: unknown): { chain: ChainEntry[]; dropped: DroppedEntry[] } {
+	if (Array.isArray(raw)) return parseChainReport(raw);
 	const obj = (raw ?? {}) as Record<string, unknown>;
 	const chain = obj.chain;
-	if (Array.isArray(chain)) return parseChain(chain);
-	return [];
+	if (Array.isArray(chain)) return parseChainReport(chain);
+	return { chain: [], dropped: [] };
 }
 
 /** Whether the feature is switched off explicitly in settings. */

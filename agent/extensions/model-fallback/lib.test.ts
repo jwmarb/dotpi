@@ -988,29 +988,59 @@ describe("readConfig", () => {
 
 describe("readChain", () => {
 	test("reads the chain key", () => {
-		expect(readChain({ chain: ["a/1", "b/2"] }).map(formatModelRef)).toEqual(["a/1", "b/2"]);
+		expect(readChain({ chain: ["a/1", "b/2"] }).chain.map(formatModelRef)).toEqual(["a/1", "b/2"]);
 	});
 
 	test("reads mixed string and object entries in both forms", () => {
-		const nested = readChain({ chain: ["a/1", { model: "b/2", thinking: "max" }] });
+		const nested = readChain({ chain: ["a/1", { model: "b/2", thinking: "max" }] }).chain;
 		expect(nested.map((e) => e.ref)).toEqual(["a/1", "b/2"]);
 		expect(nested[1]!.thinking).toBe("max");
 		expect("thinking" in nested[0]!).toBe(false);
-		expect(readChain(["a/1", { model: "b/2" }]).map(formatModelRef)).toEqual(["a/1", "b/2"]);
+		expect(readChain(["a/1", { model: "b/2" }]).chain.map(formatModelRef)).toEqual(["a/1", "b/2"]);
 	});
 
 	test("reads a bare array at the key", () => {
-		expect(readChain(["a/1", "b/2"]).map(formatModelRef)).toEqual(["a/1", "b/2"]);
+		expect(readChain(["a/1", "b/2"]).chain.map(formatModelRef)).toEqual(["a/1", "b/2"]);
 	});
 
 	test("ignores entries that are neither strings nor objects", () => {
-		expect(readChain({ chain: ["a/1", 7, null] }).map(formatModelRef)).toEqual(["a/1"]);
+		const r = readChain({ chain: ["a/1", 7, null] });
+		expect(r.chain.map(formatModelRef)).toEqual(["a/1"]);
+		// Nothing parses silently any more: every drop is reported.
+		expect(r.dropped.map((d) => d.input)).toEqual([7, null]);
 	});
 
 	test("an absent or wrong-shaped blob is an empty chain", () => {
-		expect(readChain(undefined)).toEqual([]);
-		expect(readChain({ chain: "a/1" })).toEqual([]);
-		expect(readChain(42)).toEqual([]);
+		expect(readChain(undefined)).toEqual({ chain: [], dropped: [] });
+		expect(readChain({ chain: "a/1" })).toEqual({ chain: [], dropped: [] });
+		expect(readChain(42)).toEqual({ chain: [], dropped: [] });
+	});
+
+	test("a settings string containing | is rejected with the pin-form reason", () => {
+		// The `ceb3112` string form: a pin written as `ref|level` is the env
+		// grammar; here it names no model, and the reason teaches the fix.
+		const r = readChain({ chain: ["qwen/qwen3.8-flash-next|xhigh"] });
+		expect(r.chain).toEqual([]);
+		expect(r.dropped).toHaveLength(1);
+		expect(r.dropped[0]!.input).toBe("qwen/qwen3.8-flash-next|xhigh");
+		expect(r.dropped[0]!.reason).toContain("thinking");
+	});
+
+	test("a | string drops alone; its valid neighbours are kept", () => {
+		const r = readChain({
+			chain: ["a/1", "qwen/qwen3.8-flash-next|xhigh", { model: "b/2", thinking: "high" }, 7],
+		});
+		expect(r.chain).toEqual([
+			{ ref: "a/1" },
+			{ ref: "b/2", thinking: "high" },
+		]);
+		expect(r.dropped.map((d) => d.input)).toEqual(["qwen/qwen3.8-flash-next|xhigh", 7]);
+	});
+
+	test("a repeated ref is dedup, not a drop: it never reaches `dropped`", () => {
+		const r = readChain({ chain: ["a/1", "A/1"] });
+		expect(r.chain.map(formatModelRef)).toEqual(["a/1"]);
+		expect(r.dropped).toEqual([]);
 	});
 });
 
@@ -2529,6 +2559,25 @@ describe("planRegistration", () => {
 		expect(planRegistration({ settings: undefined, envValue: "x:y", envName: "OTHER" }).warning).toContain(
 			'OTHER is set to "x:y"',
 		);
+	});
+	test("a settings chain with a | string warns about the dropped entry", () => {
+		const result = planRegistration({ settings: { chain: ["a/1", "x/y|high", "b/2"] }, envValue: undefined });
+		expect(result.register).toBe(true);
+		expect(result.chain).toEqual([{ ref: "a/1" }, { ref: "b/2" }]);
+		expect(result.warning).toContain("x/y|high");
+		expect(result.warning).toContain("dropped 1 entry");
+	});
+
+	test("the env pin form still works and warns nothing", () => {
+		expect(planRegistration({ settings: undefined, envValue: "qwen/qwen3.8-flash-next|xhigh" })).toEqual({
+			register: true,
+			chain: [{ ref: "qwen/qwen3.8-flash-next", thinking: "xhigh" }],
+			source: "environment",
+		});
+	});
+
+	test("when the env chain wins, settings drops stay silent", () => {
+		expect(planRegistration({ settings: { chain: ["x|high"] }, envValue: "a/1" }).warning).toBeUndefined();
 	});
 });
 
