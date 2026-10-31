@@ -1,63 +1,59 @@
 # kanban — the orchestrator's board: single-writer state, settle guard, read-only side-pane viewer
 
-Inventory row and the "not the old `plan` extension" rule live in `../AGENTS.md`; this file
-covers what you need to know to change the module itself. Every `:NNN` below is a line number
-measured 2026-10-28 in a file that is edited constantly: treat it as a hint, and grep for the
-exported name when it misses.
+The inventory row is in `../AGENTS.md`. This file covers what you need to change the module itself.
+Line refs were checked on 2026-10-31. The files change often, so grep for the exported name if a ref misses.
 
 ## WHERE TO LOOK
 
 | Question | Answer |
 |---|---|
-| Op semantics, id minting, note rules, caps | `lib.ts` `applyOp` (`:206`; pure reducer; `KanbanError` on refusal). Caps (`lib.ts:94-105`): `MAX_CARDS` 200, `MAX_TITLE` 200, `MAX_NOTE` 500, `MAX_RUNS_PER_CARD` 8, `MAX_ADD_PER_CALL` 20 — the last is restated **by hand** in `dynamic-prompt.ts`'s prose ("up to 20 titles per call") with nothing tying them at test time, so change both. (A test *does* pin the prose string — `lib/dynamic-prompt.test.ts:544` asserts the literal sentence, with the numeral hardcoded — so raising the cap fails nothing: it just makes that assertion's string stale-looking, which is exactly why prose and code drift here.) |
-| How state survives reload/rewind | `lib.ts` `reconstructFromEntries` — replays the session branch (`kanban-state` custom entries + tool-result `details`) |
-| Settle guard (holds the turn while cards are unaccounted for) | `lib.ts` `nudgeFor`/`settleSignature`/`actionableCards`; wired at `index.ts` `agent_before_settle` (`:761`), which stands down when `personaDenies("kanban")` is true (`:763`) — a profile that withholds the board withholds its enforcement with it, so an unaccounted board no longer holds the turn open |
-| Pane open/adopt/close, projection publish | `index.ts` (`publish`, `replaceSync`, `findBun`) |
-| The viewer process | `board.ts` (shebang, plain bun; args via `lib.ts` `parseBoardArgs`) |
-| Linked-run badges | `runs.ts` — the only reader of `subagent-runs/<id>/meta.json`, via `../subagent-herdr/rundir.ts`, plus a bounded tail read of the run's session JSONL (32 KB → 512 KB → 4 MB ladder on a miss — the 4 MB top rung is the shared `EVIDENCE_TAIL_BYTES` from `../subagent-herdr/rundir.js`, the same cap the wake path's evidence read passes — a step that covers the file stops it — `size:mtimeMs`-stamped cache, dropped on both terminal paths incl. the `.exit` sidecar; every ladder miss arms a per-transcript `scannedTo` memo (offset + `size:mtimeMs` stamp) at a newline boundary: append-only growth re-scans only the appended region — a chunked read at `REGION_CHUNK_BYTES` (4 MB, equal to the cap by test), cut ONLY at newlines with a raw-byte carry so the boundary offset stays byte-exact (a lossy string carry drifts: replacement-char over-count moves the boundary backward, the safe bias, an under-count of invalid bytes forward — which would skip a snapshot line), peak memory bounded while lines fit ~3 chunks — the carry caps at 2 chunks and a longer line stops the scan at its start, so a line of at most 12 MiB - 1 is found once it closes while a line AT 12 MiB or beyond puts the newline outside the 12 MiB window and a snapshot behind it is invisible forever (measured max line 985 KiB (1,008,398 B), 2026-10-30); a snapshot deeper than the 4 MiB tail is visible for one poll per stamp change before the re-armed memo puts it off-board (recorded max gap from EOF ~2.7 MB, measured 2026-10-30, keeps that unreachable), and a zero-length read STOPS the scan at the line in flight — the loop cannot spin in a reader's loop (the board viewer at 1 s; pi on flush/liveness events) — and torn tails — including one line spanning several 4 MB chunks, whose start the offset keeps through the span — re-read whole from their line start; a SHRUNK file or a stamp that moves without the size moving (an equal-size sync restore) invalidates it; a restore that lands LONGER is indistinguishable from an append, so bytes below the offset are not re-scanned; bytes farther from EOF than the first read's 4 MB tail are never reached (recorded max gap from EOF ~2.7 MB, measured 2026-10-30)) for the child's live `todo` counts (`RunInfo.todos`), rendered under a live run's line by `lib.ts` `cardLines`/`compactLines` — advisory progress, never moves a card |
-| Pane geometry (which side, how wide) | `lib.ts` `decideSplit` (`:977`) from the pane rect |
-| `/kanban` argument parsing | `lib.ts` `parseCommand` (`:1095`) → `opFromParams` (`:1144`); board-process args `parseBoardArgs` (`:1206`, returns a `string` usage error) |
-| What the pane draws (TUI + widget fallback) | `lib.ts` `renderFrame` (`:888`), `compactLines` (`:921`, capped at 8 cards), `fit`; the viewer contract is `board.ts`: watches the **directory** + polls at 1 s, alternate screen/raw mode/autowrap off, exits on `q`/Ctrl-C, on the owner pid dying, or when the runtime dir is removed (`board.ts:15-16`) — every exit path runs `restore()` (`board.ts:148`) |
+| Op semantics, id minting, note rules | `lib.ts` `applyOp` (`:212`, pure: never mutates `prev`, throws `KanbanError` to refuse). Ops: add/move/note/rename/link/unlink/drop/clear_done/show. Column aliases (`todo`, `wip`, `doing`, …) are accepted for humans |
+| Caps | `lib.ts:100-111`: `MAX_CARDS` 200, `MAX_TITLE` 200, `MAX_NOTE` 500, `MAX_RUNS_PER_CARD` 8, `MAX_ADD_PER_CALL` 20. The last is also written out by hand in `dynamic-prompt.ts:576` ("up to 20 titles per call"). The only link between them is a literal-string assertion in `lib/dynamic-prompt.test.ts:549`, so raising the cap fails nothing. Change all three together |
+| How state survives reload/rewind | `lib.ts` `reconstructFromEntries` (`:392`) replays the session branch: tool-result `details.state` plus `kanban-state` custom entries from `/kanban`. A malformed newest snapshot is skipped in favour of the previous one. `index.ts` `repair()` re-appends when the digest differs |
+| Settle guard | `lib.ts` `SETTLE_DISPOSITION` (`:587`, the one rule table) → `settleDisposition`/`actionableCards`/`settleSignature`/`nudgeFor` (`:686`). The nudge's move clauses come from `NUDGE_MOVE_TARGETS` (`:650`; a non-exempt target is a compile error), and the prompt sentence is `SETTLE_GUIDELINE` (`:613`), hand-written but tested against the table. Wired at `index.ts:762` (`agent_before_settle`). It acts only when `outcome === "completed"`, dedupes by signature (columns **and** run statuses), and stands down when `personaDenies("kanban")` (`:764`) |
+| Who owes an action | Read `SETTLE_DISPOSITION`; in prose: done/blocked are exempt. A card whose linked run is positively `running` is exempt. in_progress is always actionable. backlog/review are exempt only while something else is waiting |
+| Pane open/adopt/close, projection publish | `index.ts` (`publish`, `replaceSync`, `findBun`). The pane registry is process-global (`Symbol.for("pi.kanban.boards")`), so it survives `/reload` |
+| No-pane fallback | `index.ts` uses a compact widget (no herdr, tiny pane, no bun, failed launch). `deactivateTool()` (`:403`) handles print/json sessions |
+| The viewer process | `board.ts`: shebang, plain bun, args from `lib.ts` `parseBoardArgs` (`:1317`, returns a usage `string`, exit 2) |
+| Linked-run badges + child `todo` counts | `runs.ts` is the only reader of `subagent-runs/<id>/meta.json` (through `../subagent-herdr/rundir.js`). `readRunTodos` opens the transcript once and `fstat`s it once; every decision uses that one fd and size. The pure steps are exported and tested directly: `memoDecision` (`:139`), `eofBoundary` (`:217`), `scanRegion` (`:278`), `readLadder` (`:377`, 32 KB → 512 KB → `EVIDENCE_TAIL_BYTES` 4 MB). It keeps a `size:mtimeMs` cache and an append-only `scannedTo` memo, and the counts come from `lib/todo.ts` `latestTodoCounts`. A `meta.json` whose status is not in `RUN_STATUSES` reads as `unknown`. The counts are advisory and never move a card |
+| Pane geometry | `lib.ts` `decideSplit` (`:1088`) |
+| `/kanban` parsing | `lib.ts` `parseCommand` (`:1206`) → `opFromParams` (`:1255`). Pane verbs: show/open/close/restart/help |
+| What the pane draws | `lib.ts` `renderFrame` (`:994`), `compactLines` (`:1027`, max 8 cards). `board.ts` restores the terminal in `restore()` (`:148`) on every exit |
+| Cross-extension events | `changed-files.ts` ↔ `CHANGED_FILES_EVENT`, `kanban:pane` (live flag), `lib/todo.ts` `RUN_TODOS_EVENT` |
 
 ## CONVENTIONS
 
-- **One writer.** `index.ts` (the orchestrator's pi) is the only thing that mutates state. `board.ts`
-  only reads a disposable `projection.json` in `$XDG_RUNTIME_DIR/pi-kanban/<pid>-*` (tmpdir
-  fallback). Never under `agent/`, because that is Nextcloud-synced. User edits go through `/kanban`, never through the pane.
-- **Orchestrator only.** The factory returns immediately when `PI_SUBAGENT_RUN_ID` is set (children
-  get `todo`); `gate.test.ts` pins it.
-  `dynamic-prompt.ts`'s `## Kanban Board` section is gated on the tool being *offered* — this
-  registration gate is what keeps the section out of a child's prompt, which is why the prompt
-  adds no `isSubagent` check of its own.
-- **No WIP limit.** Several cards may be `in_progress` (the opposite of `lib/todo.ts`).
-- **Refuse, don't repair.** A blank note on `move` keeps the existing note (only the `note` op clears it);
-  leaving `blocked` drops the stale blocker note. Run links are advisory badges. A card is never
-  auto-moved.
-- **`cleanText` strips C0/C1 (incl. ESC)** from titles/notes/agent names: they are model- or
-  disk-originated and drawn into a raw terminal.
-- `lib.ts` imports no pi runtime, only `@earendil-works/pi-tui` width helpers (via this dir's
-  `tsconfig.json` `paths`; `typeRoots` borrows `../subagent-herdr/node_modules/@types`).
+- **One writer.** Only `index.ts` (the orchestrator's pi) mutates state. `board.ts` only reads a disposable
+  `projection.json` in `$XDG_RUNTIME_DIR/pi-kanban/<pid>-*` (tmpdir fallback). It never lives under `agent/`,
+  because that directory is synced by Nextcloud. User edits go through `/kanban`, never through the pane.
+- **Parallel calls compose in call order.** Ops apply to the in-memory state synchronously, before any `await`.
+  `/kanban` edits made while a response is streaming are deferred to the `turn_end` repair.
+- **Orchestrator only.** The factory returns immediately when `PI_SUBAGENT_RUN_ID` is set, and `gate.test.ts`
+  pins this. That gate is also what keeps `dynamic-prompt.ts`'s board section out of a child's prompt.
+- **No WIP limit.** Several cards may be `in_progress` (unlike `lib/todo.ts`).
+- **Refuse, don't repair.** `add` cannot target `blocked`. `move` to blocked requires a note. A blank note on
+  `move` keeps the existing note, and leaving `blocked` drops the blocker note. Cards are never auto-moved.
+  `nextId` only increases, so ids are never reused.
+- **`cleanText` strips C0/C1 control characters (including ESC and `U+009B`)** from titles, notes and agent
+  names, because they are drawn into a raw terminal.
+- The run-id pattern `/^sub-[0-9a-f]{4}$/` (`lib.ts:91`) duplicates `subagent-herdr`'s and must stay strict,
+  because it is joined into a path.
+- `lib.ts` imports only `@earendil-works/pi-tui` width helpers plus a *type* from `../subagent-herdr/rundir.js`.
 
 ## COMMANDS
 
 ```sh
 bun test agent/extensions/kanban/lib.test.ts agent/extensions/kanban/gate.test.ts
 bun test agent/extensions/kanban/publish.test.ts   # alone: mock.module("node:fs") is process-wide
-cd agent/extensions/kanban && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/kanban && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json   # tests not in include
 ```
 
 ## ANTI-PATTERNS
 
-- Giving `board.ts` any write path (inbox, marker file, lock). That is the second writer the deleted
-  `plan` extension needed, and it is the reason that extension is gone.
-- File-watching `projection.json`. An atomic rename replaces the inode, so `board.ts` watches the
-  **directory** and also polls every 1 s.
-- Replacing `replaceSync` with a bare `rename`. Windows `fs.rename` throws EPERM while the target
-  exists. `publish.test.ts` emulates that.
-- Gating the settle guard on `event.context.canContinue` (it reads `false` at handler time).
-- Treating a lower `revision` as stale in the viewer. A rewind lowers it legitimately. Only a lower
-  projection `seq` is stale.
-- Launching the pane with `execPath` under Pi-Bolt without `BUN_BE_BUN=1` (`findBun()`): the
-  compiled pi parses the board's flags as its own and dies.
-- Exiting `board.ts` without restoring the terminal (alt screen, cursor, raw mode, autowrap). A
-  stranded alt screen looks like a dead pane.
+- Giving `board.ts` any write path (inbox, marker, lock). That second writer is why the old `plan` extension was deleted.
+- File-watching `projection.json`. An atomic rename replaces the inode, so the viewer watches the **directory** and also polls every 1 s.
+- Replacing `replaceSync` with a bare `rename`. On Windows, `rename` throws EPERM while the target exists.
+- Gating the settle guard on `event.context.canContinue`. It reads `false` at handler time.
+- Treating a lower `revision` as stale in the viewer. A rewind lowers it legitimately, so only a lower projection `seq` is stale.
+- Launching the pane with `execPath` under Pi-Bolt without `BUN_BE_BUN=1`. Pi-Bolt then parses the board's flags as its own and dies.
+- Exiting `board.ts` without restoring the terminal (alt screen, cursor, raw mode, autowrap).

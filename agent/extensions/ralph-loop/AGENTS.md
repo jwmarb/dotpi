@@ -1,217 +1,80 @@
-# ralph-loop — completion-loop commands with optional verification gates
+# ralph-loop — settle-driven completion loop, plus the oracle/verifier `--verify` gates and their Docker images
 
-Owns `/ralph-loop`, `/ulw-loop`, and `/loop-stop`. Re-prompts the agent every time it
-stops, until it declares completion by emitting `<promise>DONE</promise>`, the iteration
-cap is reached, it stalls, or the user stops it. A port of oh-my-openagent's
-`/ralph-loop` + `/ulw-loop` (itself a take on Geoffrey Huntley's "Ralph Wiggum"
-`while :; do cat PROMPT.md | agent; done`); upstream has since retired both for `/goal`.
+The command surface, the completion tag and the `--verify` modes are in the root `AGENTS.md`. This file covers
+the internals. Line refs were checked on 2026-10-31.
 
 ## WHERE TO LOOK
 
 | File | Owns |
 |---|---|
-| `lib.ts` | All pure logic: arg parsing, completion + stall detection, prompt rendering. The knobs live here, in code, not in prose: `DEFAULT_PROMISE` `DONE`, `DEFAULT_MAX_ITERATIONS` 25, `DEFAULT_MAX_VERIFICATIONS` 3, `STALL_LIMIT` 4 (`--max-iterations=` / `--promise=` override them) |
-| `index.ts` | Session wiring: the `agent_settled` state machine, observation hooks, the three commands |
-| `gate.ts` | The **static** gate — resolves the oracle definition, captures the git baseline, runs the headless audit child |
-| `runtime-gate.ts` | The **runtime** gate — runs the `verifier` agent, which executes the project's checks in Docker. `RUNTIME_TIMEOUT_MS` 600 000 (10 min; a timeout is `inconclusive`, which stops the loop), `RUNTIME_FALLBACK_MODEL` `anthropic/claude-opus-5` and `DEFAULT_RUNTIME_TOOLS` (`read grep find ls bash`) are only used when `agents/verifier.md` cannot be read — the file is the authority |
-| `image.ts` | Container image provisioning: prefers the project's Dockerfile, else synthesises one extending the reference base; keyed by manifest hash |
-| `lib.test.ts` | The pure parts, both gate protocols, image + web detection (the one suite here; count it rather than trusting a number) |
+| `index.ts` (754) | Session wiring only: loop state, footer, the three `registerCommand`s (`:728-744`), and the `agent_settled` handler (`:334`), which is the whole contract |
+| `lib.ts` (849) | Pure logic with **zero imports**: `parseArgs` (`:180`, the one place verify mode is decided), `detectCompletion` (`:264`), fingerprinting, prompt rendering, verdict parsing, and `decideVerificationTransition` (`:628`) |
+| `gate-agent.ts` (99) | `resolveGateAgent` (`:68`) reads `agents/<name>.md` via `agentsDir()` and returns `{chain, tools, promptBody}`. It is the one seam both gates use |
+| `gate.ts` (251) | Static gate (`oracle`): `captureBaseline` (`:108`), `withChainEnv` (`:70`), `runGate` |
+| `runtime-gate.ts` (320) | Runtime gate (`verifier`, `RUNTIME_TIMEOUT_MS` 600 s `:61`, `parseRuntimeVerdict` `:74`). The docker-run recipe is *prompt text* for the verifier. This code never runs the tests itself |
+| `image.ts` (612) | `ensureImage` (`:513`): project profile and digest, web detection, Dockerfile synthesis, base-image build. Docker is used only for `image inspect`/`version`/`build` |
+| `lib.test.ts` | The only suite (it also imports `index.js` for `GATE_FALLBACK_MODEL`) |
 
-The loop edge is `agent_settled` — the only event that fires *after* auto-retry and
-auto-compaction, so it means "the agent genuinely stopped", not "the agent paused". Per
-settle: abort/error stops; **progress accounting runs before the completion branch**, so a
-turn that only re-emits the tag without fixing anything still counts as a stall; a
-completion tag in the message tail runs the active gates; `stallCount >= 4` stops and the
-first stall nudges once; hitting `maxIterations` asks the user to extend.
+## THE SETTLE HANDLER (`index.ts:334-405`), in order
 
-## THE `--verify` GATES
+1. Bail while `stopping`/`awaitingDecision`/`verifying`. Yield if `ctx.hasPendingMessages()`.
+2. If `lastStop` is `aborted`, stop as cancelled. If it is `error`, stop as error.
+3. Progress accounting (`fingerprint`/`isProgress`) runs **before** the completion check.
+4. Completion: `detectCompletion` looks only at the last `COMPLETION_TAIL_CHARS` = 600 (`lib.ts:54`).
+   It requires the tag (or a documented near-miss) as the sign-off. Prose such as "Done." never matches.
+5. Stall: `stallCount >= STALL_LIMIT` (4). Before that, one *nudge*, which is only reworded continuation text
+   (`renderContinuation(state, stalled)`), not a handler. **No `agent_before_settle` guard exists here.**
+   That guard is kanban's alone.
+6. Cap: `iteration >= maxIterations` (default 25) calls `askToContinue`. Otherwise `dispatchContinuation`.
 
-Off by default. `--verify` runs **both** (bare `--no-verify` and `=off`/`=none` disable it; an unknown `=X` falls back to both, never off); `=static`, `=runtime` narrow it. A
-completion claim is accepted only if every active gate agrees. They run in sequence,
-static first, and a static rejection short-circuits — no point spending a container run to
-prove a defect already found. `maxVerifications` (default 3) bounds gate rounds per loop.
+Continuations go through `setTimeout(…, 0)` inside a `try/catch` (a throw in a timer exits pi) with
+`expandPromptTemplates: false`. They are guarded by a state-snapshot check and the 30 s `DISPATCH_TIMEOUT_MS` watchdog.
 
-**Static** (`gate.ts`, `oracle`, chain = `agents/oracle.md` `model` + `fallback_models`, resolved by `gate-agent.ts` — read the file, do not copy the list here) *reads* the repo: goal, starting `HEAD` + `git status`,
-touched paths, and the agent's claim. Catches "runs green but does the wrong thing". ~20s.
+## THE GATES
 
-**Runtime** (`runtime-gate.ts`, `verifier`, chain = `agents/verifier.md`'s, same resolver) *executes* the project's own tests in Docker.
-
-Catches "reads fine but does not run". Minutes cold, ~20s once the image is cached:
-
-```
-docker run --rm --network none --memory=2g --pids-limit=512 \
-  -v <project>:/project:ro -v <artifacts>:/artifacts -w /project \
-  --user "$(id -u):$(id -g)" -e HOME=/tmp <image> <test command>
-```
-
-All four safety properties are measured, not assumed: network blocked, writes to the mount
-refused, the **live working tree** visible (so edits need no rebuild), real exit codes
-propagated. Both mounts are in the real invocation (`runtime-gate.ts:146-149`), and the
-`/artifacts` one is not decoration: `/project` is read-only **by design**, so a verifier with
-no writable path cannot produce evidence at all — drop the mount and the run yields
-`inconclusive`, not a pass. (Copy-pasting a stripped version of the block above is how this
-mistake is made.)
-
-Images are at most three layers: the tracked reference base
-(`../../docker/verify-base.Dockerfile`, tag `ralph-verify/base:latest` — Node 24 + Chrome +
-the pinned `agent-browser` CLI, ~30s warm, 1.5 GB), which a project image `FROM`s **only when it is a web project without its own Dockerfile** — a project-supplied Dockerfile never pulls it; the project image itself, preferring the
-project's own `Dockerfile` and otherwise synthesised (web projects `FROM` the base, non-web
-use a plain language image); and the live tree, bind-mounted `:ro` at run time. The tag is
-`ralph-verify/<slug>:<digest>` where the digest hashes manifests, lockfiles **and** the web
-(measured: 15s cold, 0.0s warm). Web detection reads `package.json` dependency *names* — a
-declaration of intent, unlike the presence of an `index.html`; malformed JSON falls back to
-a quoted-name scan rather than to `false`, since over-detecting costs a bigger image while
-under-detecting silently skips every UI check. **If no image can be produced the verdict is
-`inconclusive` and the loop stops** — "I could not run it" must never read as "it works".
-
-For web projects the verifier drives the real app cheapest-signal-first (`agent-browser
-snapshot -i` → `get text` → `click` → `a11y` → `screenshot --annotate`) and then `read`s
-the PNG to judge it visually. Measured end to end: a discount note styled `#0d8` on `#0b7`
-passed `npm test` and `is visible`, and was still caught — axe reported `[serious]
-color-contrast`, the screenshot read as "a faint smudge rather than text", and the verifier
-computed **1.40:1 against the required 4.5:1** before returning `<verdict>FAIL</verdict>`.
+- Static runs first and short-circuits on any non-approve. Runtime runs only for `runtime|both`.
+  `DEFAULT_MAX_VERIFICATIONS` = 3 (`lib.ts:348`). The static timeout is 180 s (`lib.ts:351`).
+- `inconclusive` is a first-class verdict. It **stops the loop** and never approves. The causes include no Docker
+  daemon, no manifest and an unbuildable image (`image.ts:518-554`).
+- The gate children are headless `piExecutable() -p --no-session --model fallback/auto --tools …`, with the chain
+  set as `PI_FALLBACK_CHAIN` by `withChainEnv`. Never pass `--provider` or `--no-extensions`, because the serving
+  provider is `litellm.ts`, which is an extension. If an agent file has no `model`, the fallbacks are `oracle` →
+  `openai/gpt-5.6-sol` and `verifier` → `anthropic/claude-opus-5`.
+- Images: the base is `ralph-verify/base:latest` (`image.ts:89`), built on demand from
+  `agentDir()/docker/verify-base.Dockerfile`. The project image is `ralph-verify/<slug>:<16-hex sha256>` over
+  manifests, lockfiles, the shipped Dockerfile and the web flag. Synthesized Dockerfiles go to
+  `agentDir()/verify-images/<slug>/` and never into the verified tree. A project that ships its own Dockerfile
+  never pulls the browser base.
 
 ## CONVENTIONS (local)
 
-- **Both gates run on a fallback chain, not one model.** `resolveGateAgent` in
-  `gate-agent.ts` — the single resolution seam shared by the static gate and the
-  runtime gate — reads the agent's `model` and `fallback_models` through
-  `childFallbackChain` and returns a required non-empty `chain` (a missing or
-  malformed declaration yields `[fallbackModel]` as a singleton). The gate always
-  launches the headless child on `--model fallback/auto` with the chain in
-  `PI_FALLBACK_CHAIN`. Before the chain existed they read `info.model` alone, so the oracle's and
-  verifier's declared fallbacks were inert here: a gate audit against an erroring provider
-  burned pi's retry budget on one dead model and returned `inconclusive`, which **stops the
-  loop**. A gate is an agent like any other, so "any agent that errors moves to its next
-  fallback" has to include it. Each gate passes its own `defaultTools` so the seam does not
-  couple the two gates' tool policy.
-- **Chain items may pin a thinking level (`ref|level`), and the chain is always non-empty.**
-  `withChainEnv` (`gate.ts:70`) sets `PI_FALLBACK_CHAIN` around the spawn and restores the
-  previous value in `finally`. There is no `useChain` boolean and no `isRoutable` check at the
-  gate, and the child always launches on `fallback/auto`, so even a single unpinned entry must
-  cross. **Non-emptiness is a type-level guarantee, not a runtime check here:**
-  `resolveGateAgent` returns a required non-empty chain, but `withChainEnv` itself opens with
-  `if (chain.length === 0) return spawn();` (`gate.ts:74`) — an empty chain spawns with the env
-  **untouched**, inheriting whatever the parent had. Do not read that early return as a
-  supported "no chain" mode: the only way to reach it is a caller bypassing
-  `resolveGateAgent`, and the inherited-env behaviour is a silent fallback, not a feature.
-- **The chain crosses as env because `pi.exec()` has no `env` option.** pi's `execCommand`
-  calls `spawn` without one (`core/exec.js`), so the child inherits `process.env`.
-  `withChainEnv` in `gate.ts` sets the variable around the spawn and restores the
-  *previous* value — not `delete` — because the loop may itself be a delegated child with
-  its own chain. It lives in `gate.ts` rather than `lib.ts` on purpose: `lib.ts` is
-  documented side-effect free, and a function that mutates `process.env` has no business
-  there. It is **not reentrant**, which is sound only while the loop awaits its gates one
-  at a time; two gates in flight would need an explicit `env` on a direct `spawn`.
-- **`--provider` is always omitted.** The gate always launches on `fallback/auto`,
-  and the router's provider is `fallback`, not the provider that serves the
-  chain's models, so passing `--provider` made the model unresolvable.
-
-- **Continuations dispatch from `setTimeout(0)`, never inline.** Not for the obvious
-  reason: `agent_settled` is emitted inside `_runAgentPrompt`'s `finally` *after*
-  `_isAgentRunActive` is already false, so `prompt()` would **not** refuse the call — it
-  would re-enter `_runAgentPrompt` inside the outer run's own `finally`, nesting agent runs
-  and emitting a nested `agent_settled` per level. Do not "simplify" the timeout away.
-- **The dispatched send is wrapped in `try`/`catch`.** `pi.sendUserMessage` calls
-  `assertActive()` synchronously, which throws once the runtime is invalidated (`/reload`,
-  new session, switch). An uncaught throw from a timer callback hits pi's
-  `uncaughtException` handler, which calls `process.exit(1)` — a loop must never be able to
-  kill the session.
-- **Timer callbacks check `state !== snapshot`, not just `state`.** `startLoop` replaces
-  `state` wholesale, so a null check alone lets a superseded loop fire into its successor.
-- **Assistant text comes from `message_end`; file paths come from
-  `tool_execution_start`.** `ctx.sessionManager` is a `ReadonlySessionManager` without
-  `getLastAssistantText()`, and `tool_execution_end` carries `result`, not `args`.
-- **Observation buffers reset on `agent_start`**, the real turn boundary — not only when
-  the loop dispatches, or turns the loop skipped leave stale tools/files behind and a stale
-  `lastStop` reads as completion a settle late.
-- **Continuations are sent with `expandPromptTemplates: false`**, so a goal beginning with
-  `/` is never re-dispatched as a slash command.
-- **The cap always holds.** Reaching it asks; it never silently becomes unbounded
-  (upstream's `N/unbounded` drift is the failure this avoids).
-- **`WRITE_TOOLS` lists only tools this install really registers** (`write`, `edit`,
-  `undo_last_edit`). `bash` counts as a write only when the command *looks* like one
-  (`WRITING_SHELL`), because heredocs and `sed -i` are how a lot of work reaches disk.
-- **The gate fail-STOPS, never fail-opens.** A timeout, non-zero exit, unavailable model or
-  unparseable reply all become `inconclusive`, halting the loop without declaring success.
-  Fail-open makes an outage indistinguishable from approval; fail-closed-by-continuing
-  feeds infrastructure errors to the agent as if they were code defects.
-- **`gate.ts` never throws**, and `verifyCompletion` clears the `verifying` latch in a
-  `finally` — a stuck latch would wedge the loop permanently. That latch is deliberately
-  distinct from `awaitingDecision`; conflating them makes cancellation and status ambiguous.
-- **The audit request crosses as a file, not argv**, and goal + claim are fenced and
-  labelled as data, so a goal cannot instruct the auditor to approve itself.
-- **`--no-extensions` must never be passed to the gate child.** The provider serving the
-  gate model is itself a local extension (`litellm.ts`), so disabling discovery makes the
-  model unresolvable (`Model "…" is ambiguous across providers` — measured).
-- **The pi binary comes from `piExecutable()` (`lib/runtime.ts`), not `PATH`** — `process.argv[1]` under
-  node/bun pi (the install owning the alias map and the litellm provider), the pi-bolt executable under Pi-Bolt.
-- **The two gates use different verdict vocabularies** (`APPROVE/REJECT` vs `PASS/FAIL`), so
-  one gate's reply can never be silently read by the other's parser.
-- **Exit codes must not be piped.** `docker run ... | tail` reports `tail`'s status, always
-  `0`; the verifier prompt spells out `out=$(...); code=$?` because this mistake silently
-  turns every failing suite into a pass.
-- **Nothing is ever written into the user's project.** A generated Dockerfile goes to
-  `agent/verify-images/<slug>/` (gitignored), never into the tree being verified.
-- **Every COPY source in a generated Dockerfile must be glob-shaped.** Docker fails the
-  whole build on a missing non-glob source and most projects have exactly one lockfile —
-  measured: `COPY ... yarn.lock ...` dies with `"/yarn.lock": not found`. See
-  `lockfilePatterns`.
+- This is the only extension that spawns pi children **directly** (`pi.exec`), not through `subagent-herdr`.
+  It imports only `childFallbackChain` from that extension (`gate-agent.ts:32`). The chain grammar,
+  `CHAIN_ENV` and `FALLBACK_MODEL_REF` come from `../model-fallback/lib.js`.
+- `withChainEnv` mutates `process.env` and **restores the previous value** rather than deleting it, because a
+  loop running inside a delegated child inherits that child's chain. It is not reentrant, so gates must run one at a time.
+- The `verifying` latch is cleared in `finally` (`index.ts:432-434`). If it is not, the loop wedges.
+- Gate agents come from `agentsDir()`, so under a `/agent quant` switch the gate has no reviewer or verifier to use.
 
 ## COMMANDS
 
 ```sh
-bun test agent/extensions/ralph-loop/lib.test.ts   # the whole suite (no local config declares this; it is a repo-root command)
+bun test agent/extensions/ralph-loop/lib.test.ts
+cd agent/extensions/ralph-loop && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
 ```
-
-```
-/ralph-loop <goal> [--verify[=static|runtime|both]] [--no-verify] [--max-iterations=N] [--promise=WORD]
-/ulw-loop   <goal>      # same loop, plus the ultrawork intensity directive
-/loop-stop              # stop the running loop
-```
-
-(The reference base image's build command is in the root COMMANDS section.)
 
 ## ANTI-PATTERNS
 
-- **Un-anchoring the completion match.** This is the bug that made the first version
-  useless: the opening prompt *names* the tag, so the likeliest first reply quotes it
-  ("I'll emit `<promise>DONE</promise>` when finished") — an unanchored `includes` match
-  then reported "complete" on iteration 1, before any work. The tag must be the
-  **sign-off**: at the end of the message, modulo decoration. Guard tests that pad with
-  600+ filler chars give false confidence; test the short acknowledgement directly.
-- **Matching the tag too strictly, either.** Upstream's exact-string match is why agents
-  that wrote "Task complete" looped forever (upstream #2489, #1233). Documented near-misses
-  of the *tag* are accepted — the anchoring above is what keeps that safe.
-- **Accepting prose as completion.** "I'm done" / "Done." must not stop the loop, or the
-  sentinel means nothing: `DONE` is a signal, `Done.` is English.
-- **Re-prompting after an abort**, or letting a loop outlive its session. `stopReason:
-  "aborted"` is the user pressing escape; `session_start` cancels, because a loop from the
-  previous transcript would be prompting into a context it never saw.
-- **Calling the gate "verification" without qualification.** oracle is read-only and
-  forbidden from running tests, so the static gate audits *code and evidence*, not runtime
-  behaviour. That is exactly why `inconclusive` exists. If you need behavioural proof, use
-  the runtime gate — do not quietly widen oracle's tool list.
-- **Gating only the first claim, or only "substantive" turns.** The state most in need of
-  audit is the *repair*. Conditioning on `wrote` would be worse than useless: it is
-  heuristic, and a goal can legitimately be satisfied by analysis or by proving no change
-  is needed.
-- **Resetting `stallCount` because the audit supplied new information**, or putting
-  oracle's prose into the stall fingerprint. The turn either made observable progress or it
-  did not; the fingerprint measures *agent* activity, and letting reviewer wording vary it
-  would manufacture fake progress.
-- **Letting the verifier write a test to create evidence.** Authoring the test makes it the
-  author, destroying the independence that makes its verdict worth anything. No executable
-  evidence is INCONCLUSIVE, not an invitation.
-- **Dropping `:ro` because a tool wants to write.** Redirect the write instead
-  (`-p no:cacheprovider`, `COVERAGE_FILE=/tmp/...`, `TMPDIR=/tmp`). A gate that can mutate
-  what it is verifying is not a gate.
-- **Treating a broken harness as a failing goal.** A missing interpreter or uninstalled dev
-  dependency means the *evidence* is invalid — INCONCLUSIVE, not FAIL. Feeding it back as a
-  code defect sends the agent chasing a phantom.
-- **Generating a Dockerfile when the project ships one**, or pulling the browser base for a
-  project with no UI (1.5 GB and a Chrome download to test a library — `detectsWebProject`
-  exists to avoid this).
-- **Believing a green suite about a UI goal.** The measured case: unit tests exit 0, `is
-  visible` says `true`, and the feature is invisible to users. If the goal is user-facing,
-  the UI must be driven — a passing suite is a regression guard, not evidence.
+- Un-anchoring the completion match. The opening prompt *names* the tag, so an `includes` match fires on iteration 1.
+  Test the short acknowledgement directly, because padded tests give false confidence.
+- Accepting prose ("Done.") as completion. On the other side, rejecting documented near-misses of the tag is what
+  made agents loop forever upstream.
+- Re-prompting after `aborted`, or letting a loop survive `session_start`.
+- Widening oracle's tools to get behavioural proof. Use the runtime gate.
+- Gating only the first claim. The repair after a rejection needs auditing most.
+- Letting gate wording affect the stall fingerprint, or resetting `stallCount` on new audit info.
+- Letting the verifier write a test to create evidence, or dropping `:ro` mounts. Redirect writes to `/tmp`.
+- Reporting a broken harness (missing interpreter or dev dependency) as FAIL. It is INCONCLUSIVE.
+- Trusting a green unit suite for a user-facing UI goal. The UI must be driven.
+- `captureBaseline` (`gate.ts:114`) calls `pi.exec("git", …)` **without `gitEnv()`**, which is a known gap.
+  Do not copy it.
