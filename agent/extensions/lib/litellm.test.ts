@@ -126,6 +126,8 @@ describe("buildModels", () => {
     try {
       noGroups = buildModels({}, null);
       noDeployments = buildModels(groups(group({ model_group: "m/1" })), {});
+      // A real but empty gateway (`data: []`) is not misconfigured: no warning.
+      expect(buildModels({ data: [] }, { data: [] })).toEqual([]);
       messages = warn.mock.calls.map((call) => call.join(" "));
     } finally {
       warn.mockRestore();
