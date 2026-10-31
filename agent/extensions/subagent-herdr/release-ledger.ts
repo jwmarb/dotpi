@@ -300,14 +300,9 @@ export interface ReleaseLedgerDeps {
    * hand, so it can never reject the flush. The answer carries the status it
    * was read from — the record's status, or `"absent"` when nothing
    * resolves — for the ledger's log line, NOT as a memo key. The predicate's
-   * own cross-flush memo (index.ts `parentProofMemo`) is keyed on the run id
-   * ALONE, caches positives only, and is reached only on the `running`
-   * branch: a terminal status short-circuits before the lookup. A proven
-   * `true` stands (sidecar) or is re-proven past `PARENT_PROOF_TTL_MS`
-   * (answer); a `false` is never stored, so a parent that finishes between
-   * a pair's two notices (one 1.2 s coalesce window) is re-proven for the
-   * second and keeps the note — `wake.test.ts` pins that. The ledger itself
-   * memoizes nothing (see `verifiedReroute`).
+   * cross-flush memo policy is documented once at `createParentProof`
+   * (parent-proof.ts). The ledger itself memoizes nothing (see
+   * `verifiedReroute`).
    */
   parentRunIsFinished: (
     runId: string,
@@ -500,16 +495,10 @@ export function createReleaseLedger(deps: ReleaseLedgerDeps): ReleaseLedger {
     // Each notice that reaches the lineage test pays its own predicate call
     // (the ledger keeps no memo of its own, and the caller skips validation
     // for an already-noted run, and the self-parent strip short-circuits
-    // before the call). A per-batch map here would add nothing: the
-    // expensive half — the pane probe and the evidence read — is bounded by
-    // the predicate's own cross-flush memo (index.ts `parentProofMemo`),
-    // keyed on the run id alone, reached only on the `running` branch, and
-    // caching positives only: a proven `true` stands (sidecar) or is
-    // re-proven past `PARENT_PROOF_TTL_MS` (answer), and a `false` is never
-    // stored, so a parent that finishes between the pair's two notices (one
-    // 1.2 s coalesce window) is re-proven for the second and keeps the note.
-    // What the transition tests pin is the ledger's own no-memo, against a
-    // memo-free stub.
+    // before the call). The expensive half — the pane probe and the evidence
+    // read — is bounded by the predicate's own memo (see `createParentProof`,
+    // parent-proof.ts). The transition tests pin the ledger's no-memo, against
+    // a memo-free stub.
     // The one parent lookup the ledger performs, run only for a marker the
     // delivery checks did not already strip: a marker about to be stripped
     // must not pay a parent read. The predicate is total (it answers from

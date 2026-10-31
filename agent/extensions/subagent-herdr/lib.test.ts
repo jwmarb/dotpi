@@ -914,12 +914,16 @@ describe("extractRunResult", () => {
     // negative would silently delete a reroute note, so the only
     // `parentProofMemo.set` must sit under the `proof.finished` guard — a
     // refactor that caches every verdict (or moves the set) fails this pin.
-    const factory = readFileSync(new URL("./index.ts", import.meta.url), "utf-8");
+    const proof = readFileSync(new URL("./parent-proof.ts", import.meta.url), "utf-8");
     // A block body is allowed: the pin guards the GUARD, not the formatting.
-    expect(/if\s*\(proof\.finished\)\s*\{?\s*parentProofMemo\.set\(/.test(factory)).toBe(true);
+    expect(/if\s*\(proof\.finished\)\s*\{?\s*parentProofMemo\.set\(/.test(proof)).toBe(true);
     // "Only" is part of the pin: a second `.set(` caching every verdict
     // would pass the guard's regex, so the call count is pinned too.
-    expect((factory.match(/parentProofMemo\.set\(/g) ?? []).length).toBe(1);
+    expect((proof.match(/parentProofMemo\.set\(/g) ?? []).length).toBe(1);
+    // The move is real: the wake-path module no longer owns the memo, so the
+    // pin above cannot drift back to a second copy there.
+    const wakePath = readFileSync(new URL("./index.ts", import.meta.url), "utf-8");
+    expect(wakePath).not.toContain("parentProofMemo");
   });
 
   test("an agent with no <result> contract is still answered by plain prose", async () => {

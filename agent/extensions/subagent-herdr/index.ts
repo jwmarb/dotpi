@@ -207,10 +207,15 @@ import {
   ownerPaneOf,
   type ReleasedTarget,
 } from "./release-ledger.js";
+import { createParentProof } from "./parent-proof.js";
 
 // The terminal result cache moved to the release ledger; re-exported so its
 // importers keep their path.
 export { createTerminalResultCache, type TerminalResultCache } from "./release-ledger.js";
+
+// The running-parent proof moved to parent-proof.ts with the constants the
+// wake path pins; they are re-exported so their importers keep this path.
+export { PARENT_PROOF_TTL_MS, WAKE_PROBE_TIMEOUT_MS } from "./parent-proof.js";
 
 // ---------------------------------------------------------------------------
 // Run registry
@@ -440,11 +445,8 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
  * documents): a transcript (or prompt file) restored with identical size and mtime serves
  * the cached verdict, which is the right one when the bytes are in fact
  * identical. The map is never pruned: its entries are bounded by the
- * distinct (dir, run id) pairs ever read for evidence (hundreds, not a
- * growth path) — the same bound as `parentProofMemo`, which it contrasts:
- * `parentProofMemo` caches positives only, because a `false` rests on pane
- * liveness the stamp cannot see, so it is never stored, and a cached
- * positive is TTL-bounded — and it stays keyed on the run id alone.
+ * growth path). It contrasts with the parent-proof memo (positives only,
+ * TTL-bounded): see `createParentProof` in parent-proof.ts.
  *
  * The dir is in the key, not left to `dirFor`: `agentDir()` reads
  * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a profile
@@ -1213,40 +1215,6 @@ function fallbackBriefing(
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-/**
-/**
- * Patience for the wake path's parent probe. `probeAgent` shares the
- * module-wide 30 s herdr timeout, but this probe runs on the serialized
- * wake path — one probe per marker-carrying notice whose parent is not
- * proven finished, each bounded at `WAKE_PROBE_TIMEOUT_MS` (5 s) — so a
- * hung herdr would stall every briefing behind it. 5 s is far longer than
- * a healthy local round-trip (measured sub-millisecond) and far shorter
- * than the stall it bounds; a timeout kills the CLI with no reply document,
- * so `probeFromCall` answers `unreachable` (herdr.ts behaviour 10) — "not
- * gone", the conservative direction: the note is stripped, never a pane
- * proven gone.
- */
-export const WAKE_PROBE_TIMEOUT_MS = 5_000;
-
-/**
- * How long a cached POSITIVE inference from the running-parent proof
- * stands. A foreign `running` parent no process ever ticks (the documented
- * nested-owner case) would otherwise re-probe on every flush. The memo is
- * reached only after the terminal-status return, so every cached value is a
- * `true`: a `true` proven by the `.exit` sidecar is a completion record and
- * stands without the expiry (terminal is terminal); a `true` inferred from
- * the transcript tail is an inference, not a record, and it expires here —
- * a hit past the TTL re-proves. `false` answers are never cached: a
- * negative is a liveness inference that goes stale the moment the parent
- * exits, and serving it silently deletes a reroute note, so a notice from a
- * live parent pays one probe — `probeAgent` at `WAKE_PROBE_TIMEOUT_MS` (5 s
- * cap) — and that runs only for notices that carry a reroute marker, which
- * is rare. One liveness tick: the wake path's own clocks are the 1.2 s
- * coalesce window and this 60 s tick, so a stale entry dies within a tick
- * of whatever re-proves it.
- */
-export const PARENT_PROOF_TTL_MS = LIVENESS_BACKSTOP_MS;
-
 export default function (pi: ExtensionAPI): void {
   // This process's herdr pane, captured once at factory time: ownership is
   // stamped at spawn and compared at sweep time, and the env is the one fact
@@ -1409,25 +1377,6 @@ export default function (pi: ExtensionAPI): void {
   // The wake path: a child's notice arrives here as ordinary input
   // ---------------------------------------------------------------------------
 
-  // Cross-flush memo for the running-parent proof, keyed on the id alone:
-  // the memo is reached only on the `running` branch (a terminal answer
-  // skips it entirely — the status check precedes it), so a status in the
-  // key would be a constant. It caches ONLY `finished: true` proofs: a
-  // `false` is a liveness inference that goes stale the moment the parent
-  // exits, and serving it silently deletes a reroute note — a pair's done
-  // lands inside the 1.2 s coalesce window, so a parent that finishes
-  // between the pair's report and its done would lose the note for the
-  // whole TTL — while a positive is terminal. The entry records the proof's
-  // source, because that decides the expiry: a sidecar-proven `true` is a
-  // completion record and stands; an answer-inferred `true` expires with
-  // `PARENT_PROOF_TTL_MS`. The map is never pruned, so a sidecar-proven
-  // entry lives for the process lifetime — fine: it is bounded by the
-  // distinct run ids ever proven (hundreds, not a growth path), and keying
-  // on `runId` alone already shrank it versus the old `${id}:${status}` key.
-  const parentProofMemo = new Map<
-    string,
-    { at: number; from: "sidecar" | "answer" }
-  >();
   // The policy — coalescing, dedup, health-check pairing, ownership, the
   // liveness tick — is the ledger's (release-ledger.ts). The factory keeps
   // only what the ledger must not touch: the timers, the clock, and pi.
@@ -1436,118 +1385,19 @@ export default function (pi: ExtensionAPI): void {
     lifecycle,
     ownerPane,
     selfLabel,
-    // Parent-side half of the reroute marker's provenance: the claimed parent
-    // must resolve to a real *terminal* run — `done`, `failed` and `cancelled`
-    // all count; the parent has stopped, which is all the note claims. The
-    // registry copy is trusted only when it is this pane's own and already
-    // terminal: `loadRegistry` runs once at module load and never refreshes a
-    // record this pane does not sweep, so after a restart a foreign `running`
-    // copy — and an owned one the same one-shot load left behind — sits stale
-    // in exactly the `running` → terminal direction, and a stale `running`
-    // strips every genuine reroute from a finished parent's child. Anything
-    // else falls through to the disk read (this pane's own dir and the
-    // in-session switch target) — read *without registering*: the id comes
-    // from a model-authored marker, not a notice addressed to this pane, so
-    // the parent must not enter `runs` (where `subagent_tasks list` would
-    // surface it) or become addressable by `cancel`/`interrupt`; registration
-    // is what the notices this pane was addressed to get. A record that
-    // resolves but is still `running` is answered from the pane first — a
-    // probe is a pure read, so it touches none of the ownership rules — and
-    // any state that is not `gone` answers `false`: a live pane (any state,
-    // including `done`, which is readiness) is the parent's own process still
-    // running, and `unreachable` says nothing about the child, mirroring
-    // `readNow`. Only a `gone` pane (or a paneless record) leaves the
-    // completion evidence the one completion predicate (`completionSignal`,
-    // the rule the lifecycle's `completed()` applies) consumes — the `.exit`
-    // sidecar, or a clean transcript answer read as a bounded tail — as the
-    // answer, read *without settling* in either case: a foreign parent the
-    // receiver never writes or closes (the scrollback is the failure
-    // evidence), and an owned one whose own notice settles it through the
-    // ordinary path, not this proof. A `running` record whose pane is alive,
-    // or whose evidence is absent, is answered `false` — conservative, and
-    // exactly what an unreachable herdr already means. The pane probe runs
-    // at `WAKE_PROBE_TIMEOUT_MS`, not the module-wide 30 s, because it sits
-    // on the serialized wake path: a hung herdr would stall every briefing
-    // behind it, and a timeout answers `unreachable` — the same
-    // conservative `false` (herdr.ts behaviour 10). The running-parent
-    // proof (probe + evidence) is memoized cross-flush in `parentProofMemo`
-    // under the id, positives only: a sidecar-proven `true` stands (terminal
-    // is terminal), an answer-inferred `true` never outlives
-    // `PARENT_PROOF_TTL_MS`, and a `false` is computed, returned and not
-    // stored — a liveness inference that goes stale the moment the parent
-    // exits, and serving it would silently delete a reroute note (a pair's
-    // done lands inside the 1.2 s coalesce window).
-    // The lookup is total — an evidence read that throws answers `false`
-    // from the record in hand (its observed status) — so the flush can
-    // never reject on it. Ownership is deliberately not part
-    // of the *test* (a foreign parent is valid lineage; in the canonical
-    // single-hop case the receiver IS the parent's owner, and the live-parent
-    // forge is the `direct` check's job, not this one's) — it is part of the
-    // cache *trust* only. I/O lives here, keeping the ledger free of
-    // filesystem reads. The answer carries the status it was read from
-    // (the record's, or `"absent"` when nothing resolves) for the caller's
-    // log line. The memo below is keyed on the run id ALONE — a status in the
-    // key would be a constant, since the terminal early return runs before the
-    // lookup, so the memo is reached only on the `running` branch. That order
-    // is what keeps a status out of the key (a status component would be the
-    // constant `running`).
-    // The memo caches positives only, so a re-probe of a running parent is
-    // suppressed for at most `PARENT_PROOF_TTL_MS` while a proven `true`
-    // stands: a `false` is never stored, so a parent that finishes between
-    // a pair's two notices (one 1.2 s coalesce window) is re-proven for the
-    // second, and the note is not served away — `wake.test.ts` pins exactly
-    // that (both notices keep the note; a live parent pays one probe per
-    // notice). What the ledger guarantees is narrower: it memoizes nothing,
-    // so each notice pays its own call.
-    parentRunIsFinished: async (runId) => {
-      let status: RunRecord["status"] | "absent" = "absent";
-      try {
-        const cached = runs.get(runId);
-        const found =
-          cached !== undefined && cached.status !== "running" && isOwnedBy(cached, ownerPane)
-            ? { rec: cached, dir: dirFor(runId) }
-            : findRunRecordInAnyBase(runId);
-        if (found === undefined) return { finished: false, status };
-        const { rec, dir } = found;
-        status = rec.status;
-        if (rec.status !== "running") return { finished: true, status };
-        const at = Date.now();
-        const hit = parentProofMemo.get(runId);
-        if (
-          hit !== undefined &&
-          (hit.from === "sidecar" || at - hit.at < PARENT_PROOF_TTL_MS)
-        ) {
-          return { finished: true, status };
-        }
-        const proof = await (async (): Promise<
-          | { finished: true; from: "sidecar" | "answer" }
-          | { finished: false }
-        > => {
-          if (rec.paneId !== undefined) {
-            const pane = await probeAgent(rec.paneId, WAKE_PROBE_TIMEOUT_MS);
-            if (pane.kind !== "gone") return { finished: false };
-          }
-          const evidence = await completionEvidence(dir, runId);
-          return evidence.finished
-            ? { finished: true, from: evidence.from }
-            : { finished: false };
-        })();
-        // Positives only: a `false` is a liveness inference that goes stale
-        // the moment the parent exits, and serving it silently deletes a
-        // reroute note (a pair's done lands inside the 1.2 s coalesce
-        // window), so it is computed, returned and not stored.
-        if (proof.finished) parentProofMemo.set(runId, { at, from: proof.from });
-        return { finished: proof.finished, status };
-      } catch {
-        // Last resort, not a failure path: `findRunRecordInAnyBase`,
-        // `probeAgent`, `hasExitSidecar` and `extractRunResult` each
-        // swallow their own failures (a missing record, an unreachable
-        // herdr, an unreadable sidecar, an unreadable transcript are all
-        // answers, not throws), so a throw reaching here means a real bug.
-        // The flush contract still gets its conservative `false`.
-        return { finished: false, status };
-      }
-    },
+    // The reroute-lineage proof and its memo policy live in `createParentProof`
+    // (parent-proof.ts). The effects bind it to this process: the registry copy,
+    // its ownership, the run dirs, the bounded pane probe, the evidence read and
+    // the clock the TTL is measured on.
+    parentRunIsFinished: createParentProof({
+      registryRecord: (id) => runs.get(id),
+      isOwned: (rec) => isOwnedBy(rec, ownerPane),
+      dirFor,
+      findOnDisk: findRunRecordInAnyBase,
+      probe: probeAgent,
+      completionEvidence,
+      now: () => Date.now(),
+    }),
     spawnHealthCheck: spawnHealthCheckRun,
     extractRunResult: (rec) => extractRunResult(dirFor(rec.runId), rec.runId),
     renderer: { done: doneBlock, degraded: degradedBlock, fallback: fallbackBriefing },

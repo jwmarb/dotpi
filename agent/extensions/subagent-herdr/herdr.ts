@@ -88,7 +88,7 @@
  *     every command we probe. `classifyExecFailure` sees a non-zero exit
  *     with no structured code, and `probeFromCall` answers `unreachable`,
  *     never `gone`. That is what makes the wake path's bounded parent
- *     probe (`WAKE_PROBE_TIMEOUT_MS` in `index.ts`) safe to cut short: its
+ *     probe (`WAKE_PROBE_TIMEOUT_MS` in `parent-proof.ts`) safe to cut short: its
  *     short bound can only strip a reroute note (the conservative
  *     direction), never prove a pane gone.
  *
