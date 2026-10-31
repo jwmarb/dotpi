@@ -18,11 +18,13 @@ import {
 	type AdvanceResult,
 	type ChainEntry,
 	type ConcurrencyBlock,
+	type ConcurrencyConfig,
 	type ConcurrencyGroup,
 	type DisplayEntry,
 	type FallbackConfig,
 	type FallbackState,
 	type ModelDisplay,
+	type ReserveEffects,
 	type RouteReason,
 	CHAIN_ENV,
 	GATEWAY_UPSTREAM_FAILURE_PATTERN,
@@ -70,6 +72,7 @@ import {
 	VIRTUAL_MODEL_API,
 	VIRTUAL_MODEL_STATE_CUSTOM_TYPE,
 	requiredPhysicalRetries,
+	reserveRoute,
 	sanitizeModelRef,
 	sanitizeProviderError,
 	shouldRegisterRouter,
@@ -1452,6 +1455,124 @@ describe("concurrency rotation", () => {
 			kind: "all-at-cap",
 			index: 0,
 		});
+	});
+});
+describe("reserveRoute", () => {
+	const chain: ChainEntry[] = [{ ref: "a/1" }, { ref: "b/2" }, { ref: "c/3" }];
+	const CAP1: ConcurrencyConfig = { limits: { "a/1": 1, "b/2": 1, "c/3": 1 } };
+
+	type FakeLease = { id: number; ref: string };
+	type FakeEffects = ReserveEffects<FakeLease> & {
+		counts: Record<string, number>;
+		granted: FakeLease[];
+		acquireCalls: string[];
+	};
+
+	/** A lease store over a plain counts record, mirroring the real re-count rule. */
+	function fakeEffects(opts: {
+		counts?: Record<string, number>;
+		/** Refs (keyed) whose acquires always fail, whatever the counts. */
+		alwaysRefuse?: string[];
+		/** Override the counts the next `snapshot` reports, once. */
+		snapshotOverride?: Readonly<Record<string, number>>;
+	} = {}): FakeEffects {
+		const counts = { ...(opts.counts ?? {}) };
+		let seq = 0;
+		let snapshots = 0;
+		const effects: FakeEffects = {
+			counts,
+			granted: [],
+			acquireCalls: [],
+			snapshot: () =>
+				snapshots++ === 0 && opts.snapshotOverride ? { ...opts.snapshotOverride } : { ...counts },
+			acquire: (ref, limit) => {
+				const key = concurrencyKeyFor(ref);
+				effects.acquireCalls.push(ref);
+				if (opts.alwaysRefuse?.includes(key)) return { ok: false };
+				if ((counts[key] ?? 0) >= limit) return { ok: false };
+				counts[key] = (counts[key] ?? 0) + 1;
+				const lease = { id: seq++, ref };
+				effects.granted.push(lease);
+				return { ok: true, lease };
+			},
+		};
+		return effects;
+	}
+
+	const reserve = (input: {
+		start?: number;
+		concurrency?: ConcurrencyConfig;
+		inUse?: Record<string, number>;
+		isUsable?: (index: number) => boolean;
+		effects: ReserveEffects<FakeLease>;
+	}) =>
+		reserveRoute({
+			chain,
+			start: input.start ?? 0,
+			concurrency: input.concurrency ?? CAP1,
+			inUse: input.inUse ?? {},
+			isUsable: input.isUsable ?? (() => true),
+			effects: input.effects,
+		});
+
+	test("three callers contending on a stale snapshot take distinct entries; the fourth goes over cap leaseless", () => {
+		const effects = fakeEffects();
+		// Each call reads the store only after a refusal, so every caller picks
+		// from the same stale `{}` and the walk absorbs the contention.
+		expect(reserve({ effects })).toEqual({ index: 0, lease: { id: 0, ref: "a/1" } });
+		expect(reserve({ effects })).toEqual({ index: 1, lease: { id: 1, ref: "b/2" } });
+		expect(reserve({ effects })).toEqual({ index: 2, lease: { id: 2, ref: "c/3" } });
+		// Everything full: the soft cap routes over it to the walk's start, no lease.
+		expect(reserve({ effects })).toEqual({ index: 0 });
+		expect(effects.granted).toHaveLength(3);
+	});
+
+	test("a refused acquire excludes the entry and re-walks from the fresh snapshot", () => {
+		const effects = fakeEffects({ alwaysRefuse: ["a/1"] });
+		const r = reserve({ effects });
+		expect(r.index).toBe(1);
+		expect(r.lease).toEqual({ id: 0, ref: "b/2" });
+		// a/1 probed (refused), b/2 taken — exactly two acquires, no thrash.
+		expect(effects.acquireCalls).toEqual(["a/1", "b/2"]);
+	});
+
+	test("an unreachable entry is skipped: no acquire is ever spent on it", () => {
+		const effects = fakeEffects({ counts: { "a/1": 1 } });
+		const r = reserve({ effects, isUsable: (i) => i !== 1 });
+		expect(r.index).toBe(2);
+		expect(r.lease).toEqual({ id: 0, ref: "c/3" });
+		expect(effects.acquireCalls).not.toContain("b/2");
+	});
+
+	test("all at cap returns the normalised start with no lease and no acquire attempt", () => {
+		// The `inUse` snapshot already shows every cap reached — unlike the old
+		// index.ts walk, which probed acquires and ended on the last reachable
+		// entry, this short-circuits on pickFreeIndex's own `all-at-cap` rule.
+		const effects = fakeEffects({ counts: { "a/1": 1, "b/2": 1, "c/3": 1 } });
+		expect(reserve({ start: 4, effects, inUse: { "a/1": 1, "b/2": 1, "c/3": 1 } })).toEqual({ index: 1 });
+		expect(effects.acquireCalls).toEqual([]);
+	});
+
+	test("the returned lease is the exact object the successful acquire granted", () => {
+		const effects = fakeEffects();
+		const r = reserve({ effects });
+		expect(effects.granted).toHaveLength(1);
+		expect(r.lease).toBe(effects.granted[0]);
+	});
+
+	test("a group that filled since the snapshot steers the re-walk, on the contended path only", () => {
+		// The initial pick uses the passed-in `{}`: no group member is counted,
+		// so a/1 looks free even though b/2 already holds the group's one slot.
+		// That acquire is refused, and the re-snapshot shows the group full —
+		// b/2 is then capped by the group and skipped.
+		const effects = fakeEffects({ alwaysRefuse: ["a/1"], snapshotOverride: { "b/2": 1 } });
+		const r = reserve({
+			effects,
+			concurrency: { ...CAP1, groups: [{ name: "g1", models: ["a/1", "b/2"], max: 1 }] },
+		});
+		expect(r.index).toBe(2);
+		expect(r.lease).toEqual({ id: 0, ref: "c/3" });
+		expect(effects.acquireCalls).toEqual(["a/1", "c/3"]);
 	});
 });
 describe("concurrency groups", () => {

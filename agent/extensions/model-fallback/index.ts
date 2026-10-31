@@ -92,7 +92,8 @@ import {
 	groupInUse,
 	groupsForModel,
 	levelFor,
-	planRegistration,
+planRegistration,
+	reserveRoute,
 	readConfig,
 	readConcurrency,
 	readLimits,
@@ -619,13 +620,17 @@ export default function (pi: ExtensionAPI) {
 			// the budget `advance` just spent. `isUsable` is load-bearing: a
 			// rotation must not land on an entry this machine cannot reach, so the
 			// walk skips one exactly as the reachability walk below does.
+			// Read the lease counts once; `applyConcurrency` consults them and the
+			// reservation below re-reads them only after a refused acquire.
+			const inUse = snapshotLeases(leaseDirPath, leaseRefs);
+
 			const decision = applyConcurrency({
 				reason: request.reason,
 				chain,
 				result,
 				state: request.state,
 				concurrency,
-				inUse: snapshotLeases(leaseDirPath, leaseRefs),
+				inUse,
 				isUsable: (i) => resolved[i] !== undefined,
 			});
 
@@ -660,36 +665,26 @@ export default function (pi: ExtensionAPI) {
 			if (request.reason !== "direct") {
 				// Per-model reservation only: a group cap is snapshot-only and soft —
 				// read from `inUse` above, never reserved here.
-				let lease = acquireLease(leaseDirPath, chain[index]!.ref, concurrencyLimitFor(concurrency, chain[index]!.ref));
-				if (!lease.ok) {
-					// The slot filled between the snapshot and now — another pi process
-					// took it. Walk forward, reserving as we go, until one takes, skipping
-					// entries this machine cannot reach.
-					let lastReachable = index;
-					for (let i = 1; i < chain.length; i++) {
-						const candidate = (index + i) % chain.length;
-						const candidateModel = resolved[candidate];
-						if (candidateModel === undefined) continue;
-						const tried = acquireLease(leaseDirPath, chain[candidate]!.ref, concurrencyLimitFor(concurrency, chain[candidate]!.ref));
-						if (tried.ok) {
-							lease = tried;
-							index = candidate;
-							model = candidateModel;
-							break;
-						}
-						lastReachable = candidate;
-					}
-					if (!lease.ok) {
-						// Every candidate at its cap: the limit is soft, so route over the
-						// cap to the last reachable candidate — never wait, never throw.
-						index = lastReachable;
-						model = resolved[index]!;
-					}
-				}
+				// Per-model reservation only: a group cap is snapshot-only and soft —
+				// never reserved here; the walk re-snapshots after a refusal, so a
+				// group that filled since `inUse` still steers the next pick.
+				const reserved = reserveRoute({
+					chain,
+					start: index,
+					concurrency,
+					inUse,
+					isUsable: (i) => resolved[i] !== undefined,
+					effects: {
+						snapshot: () => snapshotLeases(leaseDirPath, leaseRefs),
+						acquire: (ref, limit) => acquireLease(leaseDirPath, ref, limit),
+					},
+				});
+				index = reserved.index;
+				model = resolved[index]!;
 				// One entry per in-flight request keeps `outstanding` aligned with the
 				// `message_end` releases, over-cap requests included (their lease has
 				// no file, so its release is a no-op).
-				outstanding.push(lease.ok ? lease.lease : { key: concurrencyKeyFor(chain[index]!.ref), ref: chain[index]!.ref });
+				outstanding.push(reserved.lease ?? { key: concurrencyKeyFor(chain[index]!.ref), ref: chain[index]!.ref });
 			}
 
 			if (result.hop) showStatus(ctx, describeHop(chain[result.hop.from], chain[index]!, result.hop.cycles));

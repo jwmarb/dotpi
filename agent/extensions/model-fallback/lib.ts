@@ -264,6 +264,7 @@ export function parseChainItem(item: string): ChainEntry | undefined {
  * forms cannot name the same model in two different ways, and a ref with a
  * `:level` suffix is rejected in both.
  *
+ *
  * A `thinking` value is kept only when it is one of {@link THINKING_LEVELS}
  * exactly (case-sensitive, no trimming). Anything else — `"ultra"`, `"HIGH"`,
  * `7`, `null` — is dropped while the model is kept: the reference is clearly
@@ -476,6 +477,7 @@ function walkToReachable(
  * level the later copy pins. The same rule the subagent launcher applies to
  * `fallback_models` (`subagent-herdr/lib.ts` `childFallbackChain`), first
  * occurrence winning.
+ *
  *
  * @param entries - Entries in priority order; the first is the primary.
  * @returns The chain, possibly empty when nothing parsed.
@@ -1089,6 +1091,70 @@ export function applyConcurrency(input: {
 	if (free.kind === "all-at-cap") return { index: free.index, state: cleared() };
 	if (!free.rotated) return { index: free.index, state: cleared() };
 		return { index: free.index, state: { ...base(), sticky: free.index }, rotate: { from: result.index, to: free.index, blockedBy: free.blockedBy } };
+}
+
+/** The effects {@link reserveRoute} performs against the lease store. */
+export interface ReserveEffects<L> {
+	/** The current in-flight counts, keyed by {@link concurrencyKeyFor}. */
+	snapshot: () => Readonly<Record<string, number>>;
+	/** Try to hold one slot on `ref` under `limit`; `ok: false` when refused. */
+	acquire: (ref: string, limit: number) => { ok: true; lease: L } | { ok: false };
+}
+
+/**
+ * Turn a {@link pickFreeIndex} start index into a routed entry, reserving a
+ * lease as we go: try the free entry the caps point at, and if the lease store
+ * refuses it — another process took the slot between snapshot and acquire —
+ * exclude it, re-read the counts, and walk again.
+ *
+ * Generic over the lease type so this module stays free of `concurrency.ts`;
+ * the caller's {@link ReserveEffects} closes over the real lease store.
+ *
+ * The caps are **soft** (leases are soft): when every candidate is at its cap
+ * on the current snapshot, nothing is acquired and the request goes to the
+ * walk's start — `pickFreeIndex`'s own `all-at-cap` rule, the normalised
+ * `start` — never the last reachable entry, and never a wait.
+ *
+ * Refused entries are excluded from later walks, so the loop ends after at
+ * most `chain.length` acquires. **Re-snapshotting makes groups stricter, but
+ * only on the contended path:** after a refusal the next walk sees the fresh
+ * counts, so a member whose group has just filled is skipped. The acquire
+ * walk this replaced ignored groups entirely. Group caps are still never
+ * reserved — only per-model leases are.
+ *
+ * Assumes `start` names a reachable entry (the caller's reachability walk
+ * guarantees it); refusals only exclude entries this loop already probed.
+ */
+export function reserveRoute<L>(input: {
+	chain: readonly ChainEntry[];
+	start: number;
+	concurrency: ConcurrencyConfig;
+	inUse: Readonly<Record<string, number>>;
+	isUsable: (index: number) => boolean;
+	effects: ReserveEffects<L>;
+}): { index: number; lease?: L } {
+	const { chain, start, concurrency, isUsable, effects } = input;
+	const n = chain.length;
+	let inUse = input.inUse;
+	const refused = new Set<number>();
+	for (let attempt = 0; attempt < n; attempt++) {
+		const pick = pickFreeIndex({
+			chain,
+			start,
+			concurrency,
+			inUse,
+			isUsable: (i) => isUsable(i) && !refused.has(i),
+		});
+		if (pick.kind === "all-at-cap") return { index: ((start % n) + n) % n };
+		const entry = chain[pick.index]!;
+		const acquired = effects.acquire(entry.ref, concurrencyLimitFor(concurrency, entry.ref));
+		if (acquired.ok) return { index: pick.index, lease: acquired.lease };
+		refused.add(pick.index);
+		inUse = effects.snapshot();
+	}
+	// Every entry refused its acquire: the caps are soft, so route over them
+	// to the start with no lease — the same shape as the `all-at-cap` return.
+	return { index: start };
 }
 
 /**
