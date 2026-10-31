@@ -11,9 +11,11 @@
  *
  * The pure decision logic — profile discovery, name resolution, MCP config
  * parsing, tool-set computation, widening, entry validation, the prompt
- * block — is in `lib.ts`. This module is the session wiring: the load-time
- * MCP registration, the command, the restore, the hard tool block, and the
- * prompt takeover.
+ * block — is in `lib.ts`, together with the pi-free readers this module used
+ * to keep privately (`readSettings`, `extRealpaths`, `mcpNamesOf`, `sameTools`,
+ * the `home*` helpers, and `promptKindOf`, the single prompt-kind reader). This
+ * module is the session wiring: the load-time MCP registration, the command,
+ * the restore, the hard tool block, and the prompt takeover.
  *
  * ## Why the prompt takeover is a yield, not a load order
  *
@@ -32,9 +34,9 @@ import type {
   ExtensionContext,
   McpServerConfig,
 } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { readFile, realpath } from "node:fs/promises";
+import { join } from "node:path";
 
 type OrchestratorModule = typeof import("../dynamic-prompt.js");
 type QuantModule = typeof import("../../../quant-trader/extensions/quant-prompt.js");
@@ -45,18 +47,27 @@ import { derivePromptInputs } from "../lib/prompt-inputs.js";
 import { SkillActivation, loadSkillToolOwners } from "../lib/skill-activation.js";
 import { categoryFromPath, findSkills } from "../lib/skill-tree.js";
 import {
+  appliedMcpApplies,
   computeTargetTools,
   deniedToolsFor,
   discoverProfiles,
+  extRealpaths,
+  homeDirReal,
+  homeName,
   installedPackageNames,
+  isHome,
   isWidening,
   latestPersonaEntry,
+  mcpNamesOf,
   mcpServerOf,
   missingInProcess,
   personaBlock,
+  promptKindOf,
   readPersonaMcp,
   readPersonaMcpSync,
+  readSettings,
   resolveProfileArg,
+  sameTools,
   type PersonaEntry,
   type ProfileInfo,
 } from "./lib.js";
@@ -98,184 +109,6 @@ let probeSelectedTools: string[] = [];
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** The process's own profile directory, resolved: the home target. */
-function homeDirReal(): string {
-  try {
-    return realpathSync(agentDir());
-  } catch {
-    return agentDir();
-  }
-}
-
-function homeName(): string {
-  return basename(homeDirReal());
-}
-
-function isHome(profile: ProfileInfo): boolean {
-  return profile.dir === homeDirReal();
-}
-/**
- * Whether a recorded home snapshot matches the session's live home active set —
- * the binding a confirmed widening was made under. Order-insensitive (a Set
- * equality); `undefined` (no snapshot recorded) never matches, so a pre-binding
- * or hand-edited entry falls back to the live gate, which re-asks.
- */
-function sameTools(recorded: string[] | undefined, live: string[]): boolean {
-  if (!recorded) return false;
-  if (recorded.length !== live.length) return false;
-  const s = new Set(recorded);
-  return live.every((t) => s.has(t));
-}
-/**
- * Whether `name` is an MCP tool of one of the active persona's declared servers.
- * A target's MCP servers are a rule, not a snapshot: this lets a freshly
- * registered server's tools through the hard block and the declaration filter
- * even when they are not in `active` (e.g. the server connected after the switch).
- */
-function appliedMcpApplies(state: { mcpServers: Set<string> }, name: string): boolean {
-  const server = mcpServerOf(name);
-  return server !== undefined && state.mcpServers.has(server);
-}
-
-/**
- * The prompt kind this process's own profile declares, by its marker file —
- * the same rule `lib.ts` applies at discovery. Without an active override, the
- * tools the session currently withholds are this profile's own, and the
- * widening check needs them.
- */
-function homePromptKind(): ProfileInfo["promptKind"] {
-  const ext = join(agentDir(), "extensions");
-  if (existsSync(join(ext, "dynamic-prompt.ts"))) return "orchestrator";
-  if (existsSync(join(ext, "quant-prompt.ts"))) return "quant";
-  return undefined;
-}
-
-/** `<dir>/settings.json` fields this extension needs; never throws. */
-function readSettings(dir: string): {
-  packages: string[];
-  declaredPackages: string[];
-  defaultProvider?: string;
-  defaultModel?: string;
-  defaultThinkingLevel?: string;
-} {
-  try {
-    const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf-8")) as {
-      packages?: unknown;
-      piBolt?: { packages?: unknown; packagesOverlay?: boolean };
-      defaultProvider?: unknown;
-      defaultModel?: unknown;
-      defaultThinkingLevel?: unknown;
-    };
-    const base = Array.isArray(raw.packages)
-      ? raw.packages
-          .map((p) => (typeof p === "string" ? p : (p as { source?: unknown })?.source))
-          .filter((s): s is string => typeof s === "string")
-      : [];
-    let packages = base;
-    let declaredPackages = base;
-    // piBolt swaps the installed name a declared specifier names (the profile
-    // declares `npm:@ff-labs/pi-fff` while the tree carries `opensec-pi-fff`).
-    // The tool-set rule matches installed names against declared bases, so the
-    // matching set must accept BOTH names: `packages` is the union of the raw
-    // declared bases and the overlay additions. `declaredPackages` keeps the
-    // replacement semantics (the replaced base gone, the overlay name in its
-    // place) for `missingInProcess` reporting, where a name is "missing" iff the
-    // process never declared it.
-    if (raw.piBolt?.packagesOverlay === true && Array.isArray(raw.piBolt.packages)) {
-      const overlay = (raw.piBolt.packages as unknown[]).filter((p): p is string => typeof p === "string");
-      const remove = new Set(overlay.filter((p) => p.startsWith("-")).map((p) => p.slice(1)));
-      const additions = overlay.filter((p) => !p.startsWith("-"));
-      packages = [...new Set([...base, ...additions])];
-      declaredPackages = [...new Set([...base.filter((p) => !remove.has(p)), ...additions])];
-    }
-    return {
-      packages,
-      declaredPackages,
-      defaultProvider: typeof raw.defaultProvider === "string" ? raw.defaultProvider : undefined,
-      defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : undefined,
-      defaultThinkingLevel: typeof raw.defaultThinkingLevel === "string" ? raw.defaultThinkingLevel : undefined,
-    };
-  } catch {
-    return { packages: [], declaredPackages: [] };
-  }
-}
-
-/**
- * The realpaths of the entries in a profile's `extensions/` that pi would
- * actually load — the tool-set rule's "inside" targets and the missing-report
- * inputs.
- *
- * Follows pi's discovery (one level deep): top-level `*.ts`/`*.js` files,
- * subdirectories with an `index.ts`/`index.js`, and subdirectories with a
- * `package.json` declaring a `pi.extensions` manifest. Symlinks are followed,
- * so a profile's per-item symlinks resolve to the shared realpaths. Anything
- * else (`test/`, `tsconfig.json`, …) is not an extension and must not appear
- * in a switch report.
- */
-async function extRealpaths(dir: string): Promise<string[]> {
-  const extDir = join(dir, "extensions");
-  let entries: string[];
-  try {
-    entries = await readdir(extDir);
-  } catch {
-    return [];
-  }
-  const out: string[] = [];
-  for (const name of entries) {
-    if (name.startsWith(".")) continue;
-    const p = join(extDir, name);
-    let st;
-    try {
-      st = await stat(p);
-    } catch {
-      // a broken entry is not an extension this target offers
-      continue;
-    }
-    if (st.isFile()) {
-      if (name.endsWith(".ts") || name.endsWith(".js")) out.push(await realpath(p));
-      continue;
-    }
-    if (st.isDirectory()) {
-      if (
-        (await fileExists(join(p, "index.ts"))) ||
-        (await fileExists(join(p, "index.js"))) ||
-        (await hasPiManifest(join(p, "package.json")))
-      ) {
-        out.push(await realpath(p));
-      }
-    }
-  }
-  return out;
-}
-
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    return (await stat(p)).isFile();
-  } catch {
-    return false;
-  }
-}
-
-async function hasPiManifest(p: string): Promise<boolean> {
-  try {
-    const raw = JSON.parse(await readFile(p, "utf-8")) as { pi?: { extensions?: unknown } };
-    return Array.isArray(raw.pi?.extensions) && raw.pi.extensions.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-/** The server names in `<dir>/mcp.json` — the shared set a target keeps. */
-function mcpNamesOf(dir: string): string[] {
-  try {
-    const raw = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf-8")) as { mcpServers?: unknown };
-    if (!raw.mcpServers || typeof raw.mcpServers !== "object" || Array.isArray(raw.mcpServers)) return [];
-    return Object.keys(raw.mcpServers);
-  } catch {
-    return [];
-  }
-}
 
 /**
  * Re-diff `registered` against the target's servers: unregister what the target
@@ -385,7 +218,7 @@ async function applyPersona(
   // 2. Widening: the target re-enables tools the session currently refuses.
   // "Current effective" is the active set minus what is withheld right now —
   // the live override's deny list, or, with no switch, this profile's own.
-  const currentDenied = currentOverride?.deniedTools ?? deniedToolsFor(homePromptKind());
+  const currentDenied = currentOverride?.deniedTools ?? deniedToolsFor(await promptKindOf(agentDir()));
   const currentEffective = pi.getActiveTools().filter((t) => !currentDenied.has(t));
   // A home restore re-enables whatever the process's own profile declares —
   // that is restoration, not widening, and it never asks.

@@ -18,15 +18,19 @@ import {
   computeTargetTools,
   deniedToolsFor,
   discoverProfiles,
+  extRealpaths,
   installedPackageNames,
   isWidening,
   latestPersonaEntry,
   missingInProcess,
   packageBaseName,
   personaBlock,
+  promptKindOf,
   readPersonaMcp,
   readPersonaMcpSync,
+  readSettings,
   resolveProfileArg,
+  sameTools,
   type PersonaEntry,
   type ProfileInfo,
   type ProcessToolInfo,
@@ -552,6 +556,197 @@ describe("readPersonaMcp", () => {
       expect(() => readPersonaMcpSync(dir)).toThrow(/persona-mcp\.json/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The profile-directory readers (moved from index.ts)
+// ---------------------------------------------------------------------------
+
+describe("sameTools", () => {
+  test("no recorded snapshot never matches", () => {
+    expect(sameTools(undefined, [])).toBe(false);
+    expect(sameTools(undefined, ["read"])).toBe(false);
+  });
+
+  test("order does not matter", () => {
+    expect(sameTools(["a", "b"], ["b", "a"])).toBe(true);
+  });
+
+  test("a different length does not match", () => {
+    expect(sameTools(["a", "b"], ["a"])).toBe(false);
+    expect(sameTools(["a"], ["a", "b"])).toBe(false);
+  });
+
+  test("the same length with a different member does not match", () => {
+    expect(sameTools(["a", "b"], ["a", "c"])).toBe(false);
+  });
+});
+
+describe("extRealpaths", () => {
+  test("lists exactly what pi would load, following symlinks and skipping broken ones", async () => {
+    const root = tempRoot();
+    const dir = makeProfile(root, "p");
+    const ext = join(dir, "extensions");
+    const outside = join(root, "outside.ts");
+    writeFileSync(outside, "export default function(){}");
+    writeFileSync(join(ext, "a.ts"), "");
+    writeFileSync(join(ext, "b.js"), "");
+    writeFileSync(join(ext, "c.txt"), "");
+    writeFileSync(join(ext, ".hidden.ts"), "");
+    mkdirSync(join(ext, "idx"));
+    writeFileSync(join(ext, "idx", "index.ts"), "");
+    mkdirSync(join(ext, "idxjs"));
+    writeFileSync(join(ext, "idxjs", "index.js"), "");
+    mkdirSync(join(ext, "man"));
+    writeFileSync(join(ext, "man", "package.json"), JSON.stringify({ pi: { extensions: ["./x.ts"] } }));
+    mkdirSync(join(ext, "emptyman"));
+    writeFileSync(join(ext, "emptyman", "package.json"), JSON.stringify({ pi: { extensions: [] } }));
+    mkdirSync(join(ext, "test"));
+    symlinkSync(outside, join(ext, "link.ts"));
+    symlinkSync(join(root, "missing.ts"), join(ext, "broken.ts"));
+    try {
+      const got = (await extRealpaths(dir)).sort();
+      const want = (
+        await Promise.all(
+          ["a.ts", "b.js", "idx", "idxjs", "man"].map((n) => realpath(join(ext, n))),
+        )
+      ).concat(await realpath(outside));
+      expect(got).toEqual(want.sort());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a profile with no extensions/ yields nothing", async () => {
+    const root = tempRoot();
+    mkdirSync(join(root, "bare"));
+    try {
+      expect(await extRealpaths(join(root, "bare"))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readSettings", () => {
+  function withSettings(settings: unknown, fn: (dir: string) => void) {
+    const root = tempRoot();
+    const dir = join(root, "p");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
+    try {
+      fn(dir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const base = ["npm:@ff-labs/pi-fff", { source: "npm:x" }];
+  const overlay = ["-npm:@ff-labs/pi-fff", "opensec-pi-fff"];
+
+  test("the piBolt overlay unions for matching and replaces for reporting", () => {
+    withSettings({ packages: base, piBolt: { packagesOverlay: true, packages: overlay } }, (dir) => {
+      const s = readSettings(dir);
+      expect(s.packages).toEqual(["npm:@ff-labs/pi-fff", "npm:x", "opensec-pi-fff"]);
+      expect(s.declaredPackages).toEqual(["npm:x", "opensec-pi-fff"]);
+    });
+  });
+
+  test("the overlay is ignored unless packagesOverlay is true", () => {
+    withSettings({ packages: base, piBolt: { packages: overlay } }, (dir) => {
+      const s = readSettings(dir);
+      expect(s.packages).toEqual(["npm:@ff-labs/pi-fff", "npm:x"]);
+      expect(s.declaredPackages).toEqual(s.packages);
+    });
+  });
+
+  test("a missing file is empty, not a throw", () => {
+    const root = tempRoot();
+    try {
+      expect(readSettings(root)).toEqual({ packages: [], declaredPackages: [] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("string defaults are read; a non-string default is undefined", () => {
+    withSettings(
+      { defaultProvider: "local", defaultModel: "m", defaultThinkingLevel: "high" },
+      (dir) => {
+        const s = readSettings(dir);
+        expect(s.defaultProvider).toBe("local");
+        expect(s.defaultModel).toBe("m");
+        expect(s.defaultThinkingLevel).toBe("high");
+      },
+    );
+    withSettings({ defaultProvider: 1, defaultModel: null, defaultThinkingLevel: ["x"] }, (dir) => {
+      const s = readSettings(dir);
+      expect(s.defaultProvider).toBeUndefined();
+      expect(s.defaultModel).toBeUndefined();
+      expect(s.defaultThinkingLevel).toBeUndefined();
+    });
+  });
+});
+
+describe("promptKindOf", () => {
+  test("a real dynamic-prompt.ts is an orchestrator", async () => {
+    const root = tempRoot();
+    const dir = makeProfile(root, "o");
+    writeFileSync(join(dir, "extensions", "dynamic-prompt.ts"), "");
+    try {
+      expect(await promptKindOf(dir)).toBe("orchestrator");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a quant-prompt.ts symlink to a real file is quant", async () => {
+    const root = tempRoot();
+    const dir = makeProfile(root, "q");
+    const real = join(root, "quant-prompt.ts");
+    writeFileSync(real, "");
+    symlinkSync(real, join(dir, "extensions", "quant-prompt.ts"));
+    try {
+      expect(await promptKindOf(dir)).toBe("quant");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a broken marker symlink selects nothing", async () => {
+    // pi cannot load a broken marker, so the profile has no builder to run; the
+    // widening check and discovery read this same answer.
+    const root = tempRoot();
+    const dir = makeProfile(root, "b");
+    symlinkSync(join(root, "missing.ts"), join(dir, "extensions", "dynamic-prompt.ts"));
+    try {
+      expect(await promptKindOf(dir)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a profile reached through a directory symlink has the same kind", async () => {
+    const root = tempRoot();
+    const dir = makeProfile(root, "o");
+    writeFileSync(join(dir, "extensions", "dynamic-prompt.ts"), "");
+    symlinkSync(dir, join(root, "alias"));
+    try {
+      expect(await promptKindOf(join(root, "alias"))).toBe("orchestrator");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("no extensions/ selects nothing", async () => {
+    const root = tempRoot();
+    mkdirSync(join(root, "bare"));
+    try {
+      expect(await promptKindOf(join(root, "bare"))).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

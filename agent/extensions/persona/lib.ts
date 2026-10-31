@@ -6,8 +6,10 @@
  * No pi import, no session state: every function takes its inputs as
  * parameters, so the whole switch decision is testable against temp dirs,
  * and the file loads identically in an orchestrator process and (through the
- * `quant-trader/extensions/persona` symlink) in a quant process. The
- * session wiring that calls these lives in `index.ts`.
+ * `quant-trader/extensions/persona` symlink) in a quant process. The one
+ * exception is the `home*` helpers, which read `agentDir()` — the process's own
+ * profile, an env lookup that no switch moves — so they still need no session
+ * state. The session wiring that calls these lives in `index.ts`.
  *
  * @module persona/lib
  */
@@ -16,6 +18,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import { QUANT_REMOVED_TOOLS } from "../../../quant-trader/extensions/quant-prompt.js";
+import { agentDir } from "../lib/layout.js";
 
 // ---------------------------------------------------------------------------
 // Profile discovery
@@ -48,16 +51,29 @@ const EXCLUDED_ENTRIES = new Set(["node_modules", "docs", "scripts"]);
  * The prompt kind a profile's `extensions/` directory declares, by its marker
  * file. A profile with neither marker is `undefined` — the switch refuses it,
  * because it cannot say which prompt builder to run.
+ *
+ * This is the ONE reader of that rule: discovery classifies every profile with
+ * it, and the session wiring asks it about the process's own profile for the
+ * widening check, so the two can never disagree. A marker counts only if it is
+ * listed AND resolves to a file (`stat` follows symlinks): a profile's marker
+ * is normally a per-item symlink, and a broken one is a file pi cannot load, so
+ * it selects nothing.
  */
-async function promptKindOf(entryPath: string): Promise<ProfileInfo["promptKind"]> {
+export async function promptKindOf(entryPath: string): Promise<ProfileInfo["promptKind"]> {
+  const ext = join(entryPath, "extensions");
+  let files: string[];
   try {
-    const files = await readdir(join(entryPath, "extensions"));
-    if (files.includes("dynamic-prompt.ts")) return "orchestrator";
-    if (files.includes("quant-prompt.ts")) return "quant";
-    return undefined;
+    files = await readdir(ext);
   } catch {
     return undefined; // no extensions dir: nothing to select
   }
+  if (files.includes("dynamic-prompt.ts") && (await fileExists(join(ext, "dynamic-prompt.ts")))) {
+    return "orchestrator";
+  }
+  if (files.includes("quant-prompt.ts") && (await fileExists(join(ext, "quant-prompt.ts")))) {
+    return "quant";
+  }
+  return undefined;
 }
 
 /**
@@ -598,4 +614,179 @@ export function personaBlock(opts: {
   }
   lines.push("To load a skill not in pi's own list, `read` its absolute `SKILL.md` path.");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Profile-directory readers (moved from index.ts: pi-free, so testable here)
+// ---------------------------------------------------------------------------
+
+/** The process's own profile directory, resolved: the home target. */
+export function homeDirReal(): string {
+  try {
+    return realpathSync(agentDir());
+  } catch {
+    return agentDir();
+  }
+}
+
+/** The process's own profile's name: its directory's basename. */
+export function homeName(): string {
+  return basename(homeDirReal());
+}
+
+/** Whether `profile` is the process's own profile. */
+export function isHome(profile: ProfileInfo): boolean {
+  return profile.dir === homeDirReal();
+}
+
+/**
+ * Whether a recorded home snapshot matches the session's live home active set —
+ * the binding a confirmed widening was made under. Order-insensitive (a Set
+ * equality); `undefined` (no snapshot recorded) never matches, so a pre-binding
+ * or hand-edited entry falls back to the live gate, which re-asks.
+ */
+export function sameTools(recorded: string[] | undefined, live: string[]): boolean {
+  if (!recorded) return false;
+  if (recorded.length !== live.length) return false;
+  const s = new Set(recorded);
+  return live.every((t) => s.has(t));
+}
+
+/**
+ * Whether `name` is an MCP tool of one of the active persona's declared servers.
+ * A target's MCP servers are a rule, not a snapshot: this lets a freshly
+ * registered server's tools through the hard block and the declaration filter
+ * even when they are not in `active` (e.g. the server connected after the switch).
+ */
+export function appliedMcpApplies(state: { mcpServers: Set<string> }, name: string): boolean {
+  const server = mcpServerOf(name);
+  return server !== undefined && state.mcpServers.has(server);
+}
+
+/** `<dir>/settings.json` fields the switch needs; never throws. */
+export function readSettings(dir: string): {
+  packages: string[];
+  declaredPackages: string[];
+  defaultProvider?: string;
+  defaultModel?: string;
+  defaultThinkingLevel?: string;
+} {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf-8")) as {
+      packages?: unknown;
+      piBolt?: { packages?: unknown; packagesOverlay?: boolean };
+      defaultProvider?: unknown;
+      defaultModel?: unknown;
+      defaultThinkingLevel?: unknown;
+    };
+    const base = Array.isArray(raw.packages)
+      ? raw.packages
+          .map((p) => (typeof p === "string" ? p : (p as { source?: unknown })?.source))
+          .filter((s): s is string => typeof s === "string")
+      : [];
+    let packages = base;
+    let declaredPackages = base;
+    // piBolt swaps the installed name a declared specifier names (the profile
+    // declares `npm:@ff-labs/pi-fff` while the tree carries `opensec-pi-fff`).
+    // The tool-set rule matches installed names against declared bases, so the
+    // matching set must accept BOTH names: `packages` is the union of the raw
+    // declared bases and the overlay additions. `declaredPackages` keeps the
+    // replacement semantics (the replaced base gone, the overlay name in its
+    // place) for `missingInProcess` reporting, where a name is "missing" iff the
+    // process never declared it.
+    if (raw.piBolt?.packagesOverlay === true && Array.isArray(raw.piBolt.packages)) {
+      const overlay = (raw.piBolt.packages as unknown[]).filter((p): p is string => typeof p === "string");
+      const remove = new Set(overlay.filter((p) => p.startsWith("-")).map((p) => p.slice(1)));
+      const additions = overlay.filter((p) => !p.startsWith("-"));
+      packages = [...new Set([...base, ...additions])];
+      declaredPackages = [...new Set([...base.filter((p) => !remove.has(p)), ...additions])];
+    }
+    return {
+      packages,
+      declaredPackages,
+      defaultProvider: typeof raw.defaultProvider === "string" ? raw.defaultProvider : undefined,
+      defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : undefined,
+      defaultThinkingLevel: typeof raw.defaultThinkingLevel === "string" ? raw.defaultThinkingLevel : undefined,
+    };
+  } catch {
+    return { packages: [], declaredPackages: [] };
+  }
+}
+
+/**
+ * The realpaths of the entries in a profile's `extensions/` that pi would
+ * actually load — the tool-set rule's "inside" targets and the missing-report
+ * inputs.
+ *
+ * Follows pi's discovery (one level deep): top-level `*.ts`/`*.js` files,
+ * subdirectories with an `index.ts`/`index.js`, and subdirectories with a
+ * `package.json` declaring a `pi.extensions` manifest. Symlinks are followed,
+ * so a profile's per-item symlinks resolve to the shared realpaths. Anything
+ * else (`test/`, `tsconfig.json`, …) is not an extension and must not appear
+ * in a switch report.
+ */
+export async function extRealpaths(dir: string): Promise<string[]> {
+  const extDir = join(dir, "extensions");
+  let entries: string[];
+  try {
+    entries = await readdir(extDir);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    const p = join(extDir, name);
+    let st;
+    try {
+      st = await stat(p);
+    } catch {
+      // a broken entry is not an extension this target offers
+      continue;
+    }
+    if (st.isFile()) {
+      if (name.endsWith(".ts") || name.endsWith(".js")) out.push(await realpath(p));
+      continue;
+    }
+    if (st.isDirectory()) {
+      if (
+        (await fileExists(join(p, "index.ts"))) ||
+        (await fileExists(join(p, "index.js"))) ||
+        (await hasPiManifest(join(p, "package.json")))
+      ) {
+        out.push(await realpath(p));
+      }
+    }
+  }
+  return out;
+}
+
+/** Whether `p` resolves (following symlinks) to a regular file. */
+export async function fileExists(p: string): Promise<boolean> {
+  try {
+    return (await stat(p)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `p` is a `package.json` declaring a non-empty `pi.extensions` list. */
+export async function hasPiManifest(p: string): Promise<boolean> {
+  try {
+    const raw = JSON.parse(await readFile(p, "utf-8")) as { pi?: { extensions?: unknown } };
+    return Array.isArray(raw.pi?.extensions) && raw.pi.extensions.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** The server names in `<dir>/mcp.json` — the shared set a target keeps. */
+export function mcpNamesOf(dir: string): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf-8")) as { mcpServers?: unknown };
+    if (!raw.mcpServers || typeof raw.mcpServers !== "object" || Array.isArray(raw.mcpServers)) return [];
+    return Object.keys(raw.mcpServers);
+  } catch {
+    return [];
+  }
 }
