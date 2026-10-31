@@ -1012,8 +1012,16 @@ describe("readChain", () => {
 
 	test("an absent or wrong-shaped blob is an empty chain", () => {
 		expect(readChain(undefined)).toEqual({ chain: [], dropped: [] });
-		expect(readChain({ chain: "a/1" })).toEqual({ chain: [], dropped: [] });
 		expect(readChain(42)).toEqual({ chain: [], dropped: [] });
+		expect(readChain({})).toEqual({ chain: [], dropped: [] });
+	});
+
+	test("a present but non-array chain key reports a shape error", () => {
+		expect(readChain({ chain: "a/1" })).toEqual({
+			chain: [],
+			dropped: [],
+			shapeError: "modelFallback.chain must be an array",
+		});
 	});
 
 	test("a settings string containing | is rejected with the pin-form reason", () => {
@@ -1580,6 +1588,19 @@ describe("reserveRoute", () => {
 		// entry, this short-circuits on pickFreeIndex's own `all-at-cap` rule.
 		const effects = fakeEffects({ counts: { "a/1": 1, "b/2": 1, "c/3": 1 } });
 		expect(reserve({ start: 4, effects, inUse: { "a/1": 1, "b/2": 1, "c/3": 1 } })).toEqual({ index: 1 });
+		expect(effects.acquireCalls).toEqual([]);
+	});
+
+	test("every acquire refused returns the normalised start too, with no lease", () => {
+		const effects = fakeEffects({ alwaysRefuse: ["a/1", "b/2", "c/3"] });
+		expect(reserve({ start: 4, effects })).toEqual({ index: 1 });
+		expect(effects.acquireCalls).toHaveLength(3);
+	});
+
+	test("an empty chain reserves nothing and never touches the lease store", () => {
+		const effects = fakeEffects();
+		const r = reserveRoute({ chain: [], start: 0, concurrency: CAP1, inUse: {}, isUsable: () => true, effects });
+		expect(r).toEqual({ index: 0 });
 		expect(effects.acquireCalls).toEqual([]);
 	});
 
@@ -2578,6 +2599,18 @@ describe("planRegistration", () => {
 
 	test("when the env chain wins, settings drops stay silent", () => {
 		expect(planRegistration({ settings: { chain: ["x|high"] }, envValue: "a/1" }).warning).toBeUndefined();
+	});
+
+	test("a non-array chain key warns that it must be an array", () => {
+		const result = planRegistration({ settings: { chain: "a/1" }, envValue: undefined });
+		expect(result.register).toBe(false);
+		expect(result.warning).toBe("model-fallback: settings.json modelFallback.chain must be an array");
+	});
+
+	test("an absent chain key stays silent; a non-array chain is silent when env wins or disabled", () => {
+		expect(planRegistration({ settings: {}, envValue: undefined }).warning).toBeUndefined();
+		expect(planRegistration({ settings: { chain: "a/1" }, envValue: "b/2" }).warning).toBeUndefined();
+		expect(planRegistration({ settings: { chain: "a/1", enabled: false }, envValue: undefined }).warning).toBeUndefined();
 	});
 });
 

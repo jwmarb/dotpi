@@ -104,6 +104,15 @@ describe("thinkingLevelMapFor", () => {
 });
 
 describe("buildModels", () => {
+  test("a response without `data` yields no models instead of throwing", () => {
+    expect(buildModels({}, null)).toEqual([]);
+    expect(buildModels({}, {})).toEqual([]);
+    // A missing /model/info list leaves cache rates at zero, not a crash.
+    const models = buildModels(groups(group({ model_group: "m/1" })), {});
+    expect(models.map((m) => m.id)).toEqual(["m/1"]);
+    expect(models[0]!.cost.cacheRead).toBe(0);
+  });
+
   test("a non-reasoning group carries no thinkingLevelMap", () => {
     const models = buildModels(groups(group({ model_group: "m/1", supports_reasoning: false })), null);
     expect(models[0]!.thinkingLevelMap).toBeUndefined();

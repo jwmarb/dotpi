@@ -1,3 +1,4 @@
+import type { ThinkingLevelMap } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { requireEnv } from './lib/dotenv.js';
 
@@ -42,7 +43,8 @@ export interface LiteLLMModelGroupInfo {
 }
 
 export interface LiteLLMModelGroupInfoResponse {
-  data: LiteLLMModelGroupInfo[];
+  /** Optional: the cast in `fetchJson` is unchecked, and a body without it must not crash load. */
+  data?: LiteLLMModelGroupInfo[];
 }
 
 export interface LiteLLMModelInfoEntry {
@@ -80,7 +82,8 @@ export interface LiteLLMModelInfoEntry {
 }
 
 export interface LiteLLMModelInfoResponse {
-  data: LiteLLMModelInfoEntry[];
+  /** Optional for the same reason as {@link LiteLLMModelGroupInfoResponse.data}. */
+  data?: LiteLLMModelInfoEntry[];
 }
 
 /**
@@ -150,8 +153,12 @@ const CLAUDE_THINKING_LEVEL_MAP = { off: 'none', xhigh: 'xhigh' } as const;
  * The thinking-level map a model group accepts, chosen by its prefix. Pure
  * extraction of the registration map's nested ternary, so the choice is
  * testable without a proxy.
+ *
+ * Typed as pi-ai's {@link ThinkingLevelMap} rather than the union of
+ * the three `as const` literals, so a caller can read any level (`.max`)
+ * without narrowing first; an absent level is `undefined`.
  */
-export function thinkingLevelMapFor(modelGroup: string) {
+export function thinkingLevelMapFor(modelGroup: string): ThinkingLevelMap {
   if (modelGroup.startsWith('qwen/')) return QWEN_THINKING_LEVEL_MAP;
   if (modelGroup.startsWith('anthropic/')) return CLAUDE_THINKING_LEVEL_MAP;
   return { xhigh: 'xhigh' } as const;
@@ -173,7 +180,9 @@ export function buildModels(
   // first entry that has cache costs defined.
   const cacheCosts = new Map<string, { cacheWrite: number; cacheRead: number }>();
   if (modelInfo) {
-    for (const entry of modelInfo.data) {
+    // `?? []`: `fetchJson`'s cast is unchecked, so a body without `data`
+    // must read as "no models", not crash extension load.
+    for (const entry of modelInfo.data ?? []) {
       if (cacheCosts.has(entry.model_name)) continue;
       const cacheWrite =
         entry.litellm_params.cache_creation_input_token_cost ?? entry.model_info.cache_creation_input_token_cost;
@@ -188,7 +197,7 @@ export function buildModels(
     }
   }
 
-  const chatModels = groupInfo.data.filter((m) => m.mode == null || m.mode === 'chat' || m.mode === 'completion');
+  const chatModels = (groupInfo.data ?? []).filter((m) => m.mode == null || m.mode === 'chat' || m.mode === 'completion');
 
   return chatModels.map((m) => {
     const cache = cacheCosts.get(m.model_group);

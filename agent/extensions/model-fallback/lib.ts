@@ -670,7 +670,7 @@ export function planRegistration(input: {
 }): RegistrationPlan {
 	const { settings, envValue, envName = CHAIN_ENV } = input;
 	const envChain = parseChainEnv(envValue);
-	const { chain: settingsChain, dropped } = readChain(settings);
+	const { chain: settingsChain, dropped, shapeError } = readChain(settings);
 	let envWarning: string | undefined;
 	if (envValue !== undefined && envChain.length === 0) {
 		envWarning =
@@ -682,11 +682,14 @@ export function planRegistration(input: {
 	// stale settings entries in every child would print the complaint once
 	// per process. A switched-off feature's entries never load, so they stay
 	// silent too.
-	const settingsWarning =
-		envChain.length === 0 && !isDisabled(settings) && dropped.length > 0
+	const settingsSilenced = envChain.length > 0 || isDisabled(settings);
+	const dropWarning =
+		!settingsSilenced && dropped.length > 0
 			? `model-fallback: settings.json modelFallback.chain dropped ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"}: ` +
 				dropped.map((d) => `${JSON.stringify(d.input) ?? String(d.input)} (${d.reason})`).join("; ")
 			: undefined;
+	const shapeWarning = !settingsSilenced && shapeError ? `model-fallback: settings.json ${shapeError}` : undefined;
+	const settingsWarning = [shapeWarning, dropWarning].filter(Boolean).join("\n") || undefined;
 	const warning = [envWarning, settingsWarning].filter(Boolean).join("\n") || undefined;
 	const withWarning = (plan: RegistrationPlan): RegistrationPlan => (warning ? { ...plan, warning } : plan);
 
@@ -1180,6 +1183,10 @@ export interface ReserveEffects<L> {
  *
  * Assumes `start` names a reachable entry (the caller's reachability walk
  * guarantees it); refusals only exclude entries this loop already probed.
+ * `start` is normalised into `[0, chain.length)` once, and that normalised
+ * index is what both no-lease returns (all-at-cap, every acquire refused)
+ * route to. An empty chain (`chain.length === 0`) has nothing to reserve:
+ * it returns `start` unchanged with no lease and never calls `effects`.
  */
 export function reserveRoute<L>(input: {
 	chain: readonly ChainEntry[];
@@ -1189,8 +1196,10 @@ export function reserveRoute<L>(input: {
 	isUsable: (index: number) => boolean;
 	effects: ReserveEffects<L>;
 }): { index: number; lease?: L } {
-	const { chain, start, concurrency, isUsable, effects } = input;
+	const { chain, concurrency, isUsable, effects } = input;
 	const n = chain.length;
+	if (n === 0) return { index: input.start };
+	const start = ((input.start % n) + n) % n;
 	let inUse = input.inUse;
 	const refused = new Set<number>();
 	for (let attempt = 0; attempt < n; attempt++) {
@@ -1201,7 +1210,7 @@ export function reserveRoute<L>(input: {
 			inUse,
 			isUsable: (i) => isUsable(i) && !refused.has(i),
 		});
-		if (pick.kind === "all-at-cap") return { index: ((start % n) + n) % n };
+		if (pick.kind === "all-at-cap") return { index: start };
 		const entry = chain[pick.index]!;
 		const acquired = effects.acquire(entry.ref, concurrencyLimitFor(concurrency, entry.ref));
 		if (acquired.ok) return { index: pick.index, lease: acquired.lease };
@@ -1792,13 +1801,17 @@ export function concurrencyLimitFor(config: ConcurrencyConfig, ref: string): num
  *
  * Returns `{ chain, dropped }`: every entry that did not become a chain
  * entry (a duplicate ref excepted — dedup is not a drop) is reported for
- * {@link planRegistration}'s load-time warning.
+ * {@link planRegistration}'s load-time warning. A `chain` key that is
+ * *present* but not an array (`{ chain: "a/1" }`) adds `shapeError`, so the
+ * warning names the mistake instead of the chain vanishing silently; an
+ * absent key is simply "not configured" and stays silent.
  */
-export function readChain(raw: unknown): { chain: ChainEntry[]; dropped: DroppedEntry[] } {
+export function readChain(raw: unknown): { chain: ChainEntry[]; dropped: DroppedEntry[]; shapeError?: string } {
 	if (Array.isArray(raw)) return parseChainReport(raw);
 	const obj = (raw ?? {}) as Record<string, unknown>;
 	const chain = obj.chain;
 	if (Array.isArray(chain)) return parseChainReport(chain);
+	if (chain !== undefined) return { chain: [], dropped: [], shapeError: "modelFallback.chain must be an array" };
 	return { chain: [], dropped: [] };
 }
 

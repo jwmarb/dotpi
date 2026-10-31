@@ -92,12 +92,12 @@ import {
 	groupInUse,
 	groupsForModel,
 	levelFor,
-planRegistration,
-	reserveRoute,
+	planRegistration,
 	readConfig,
 	readConcurrency,
 	readLimits,
 	readVirtualModelState,
+	reserveRoute,
 	upstreamDelayMs,
 	upstreamRecovery,
 	VIRTUAL_MODEL_API,
@@ -664,10 +664,9 @@ export default function (pi: ExtensionAPI) {
 			// the release nets stay as-is.
 			if (request.reason !== "direct") {
 				// Per-model reservation only: a group cap is snapshot-only and soft —
-				// read from `inUse` above, never reserved here.
-				// Per-model reservation only: a group cap is snapshot-only and soft —
-				// never reserved here; the walk re-snapshots after a refusal, so a
-				// group that filled since `inUse` still steers the next pick.
+				// read from `inUse` above, never reserved here; the walk re-snapshots
+				// after a refusal, so a group that filled since `inUse` still steers
+				// the next pick.
 				const reserved = reserveRoute({
 					chain,
 					start: index,
