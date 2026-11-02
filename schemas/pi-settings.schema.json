@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pi settings — pi's core schema plus this machine's extension keys",
+  "description": "IntelliSense for a pi `settings.json`. Core keys come from pi's own published schema; the extension branch documents the three top-level keys pi knows nothing about: `modelFallback`, `startupFetch`, `piBolt`. Neither branch constrains unknown keys, so a key owned by an extension pi has never heard of stays valid.",
+  "$comment": "The core half is upstream-owned: pi generates it from its TypeScript source and ships a copy at `node_modules/@earendil-works/pi-coding-agent/schemas/settings.schema.json`. After a pi upgrade, diff that local copy against the `$ref`'d URL to see what changed — and nothing here. This wrapper redeclares no core key on purpose: core keys are pi's to document, and only the three below can drift from the local code that reads them.",
+  "allOf": [
+    {
+      "$ref": "https://pi.dev/schemas/settings.schema.json"
+    },
+    {
+      "$comment": "Extension-owned keys, each described from the reader named in it. `additionalProperties` is deliberately unset here: pi never validates settings, and its own write path preserves keys it does not know, so closing this object would paint a working extension's config red.",
+      "type": "object",
+      "properties": {
+        "modelFallback": {
+          "description": "The model router in `agent/extensions/model-fallback/`: it registers the virtual model `fallback/auto` and hands a failed request to the next entry in `chain`. pi ignores this key. The extension reads it at load time — before pi's settings API exists — from this file, or from a project's `.pi/settings.json`, whose whole object replaces this one rather than merging key by key.",
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Set false to stop a process registering `fallback/auto` at all, leaving failover to pi's own retry. It does not switch off a chain a parent already launched this child on (`PI_FALLBACK_CHAIN`): such a process cannot resolve its own model without the router.",
+                  "default": true
+                },
+                "chain": {
+                  "type": "array",
+                  "description": "Models in priority order — the first is the primary, each later entry takes over while the one before it keeps failing. Malformed entries are dropped at startup with a warning naming each one and why; a `chain` that is present but not an array warns too, and contributes nothing.",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "description": "`provider/modelId`, or a bare id pi resolves unambiguously. The provider may be a virtual one an extension registered, so it is not checked against any list. A `|` level suffix is the env and agent-file grammar and is dropped here: the object form owns pins in this file."
+                      },
+                      {
+                        "type": "object",
+                        "description": "The same reference, plus the thinking level to pin while the router holds it. Unknown properties are ignored by the router, so a typo in one is otherwise invisible.",
+                        "additionalProperties": false,
+                        "required": [
+                          "model"
+                        ],
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "description": "`provider/modelId`, matched by pi's own rules: canonical `provider/id`, then provider plus id, then bare id. A `:level` suffix, a leading or trailing `/`, commas and internal whitespace are rejected — and a rejected reference drops the whole entry, because it names no model to route to."
+                          },
+                          "thinking": {
+                            "enum": [
+                              "off",
+                              "minimal",
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ],
+                            "description": "Thinking level pinned for requests to this model. Case-sensitive and untrimmed: a value outside the list is dropped while the model is kept, so the session's own level governs."
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "maxCycles": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "default": 10,
+                  "description": "Laps of the whole chain allowed in one failure burst — a cap on laps, not per model — so it is the router's analogue of `retry.maxRetries`. Keep `retry.maxRetries` at least `chain length × maxCycles` or the physical budget gives up before the router has used the chain. Anything that is not a positive integer is replaced by 10."
+                },
+                "maxProbes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "default": 2,
+                  "description": "Consecutive failed hand-backs to the primary before the fallback that is actually answering becomes the new home. Anything that is not a positive integer is replaced by 2."
+                },
+                "concurrency": {
+                  "type": "object",
+                  "description": "In-flight caps per model, held as leases in one shared directory (`PI_MODEL_FALLBACK_LEASE_DIR`), so two sessions against the same gateway obey one cap instead of two. `\"*\"` sets the default for every model the map does not name; a model with neither entry nor default is uncapped. A key that is not a usable model reference, or a value that is not a positive integer, is ignored at startup — the model is silently left uncapped, so this squiggle is the only notice you get.",
+                  "patternProperties": {
+                    ".*": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "The cap for the model this key names (`provider/modelId`, any casing); `\"*\"` is the default for all the others."
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "groups": {
+                  "type": "array",
+                  "description": "Named sets of models sharing one global cap — several replicas of one deployment, where per-model caps would let each run its own. Read independently of `concurrency`, so a config with only `groups` is valid. An invalid entry is dropped silently at startup, with no warning to say a cap went missing: a `name` blank after trimming, a `max` that is not a positive integer, or a `models` list that is empty or holds anything that is not a plain `provider/modelId`.",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "models",
+                      "max"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The group's label. Control characters are stripped and it is trimmed, so a blank string is not a name; two groups with the same name (compared case-insensitively) keep the first."
+                      },
+                      "models": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "string",
+                          "description": "A member as `provider/modelId`, any casing, deduped. `\"*\"` and a `|` level pin are both rejected, and either one drops the whole group: `\"*\"` would make the concurrency default key a phantom member, and a pin is the chain grammar, which can never match a lease key — so the shared cap would silently run looser than configured."
+                        }
+                      },
+                      "max": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many members of this group may be in flight at once, across every process sharing the lease directory."
+                      }
+                    }
+                  }
+                },
+                "contextWindow": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Context window advertised for `fallback/auto` before the first response arrives, for the context-usage readout only. It cannot be derived from the chain: the model catalogue is not readable when the virtual model is registered, which is load time. Once a model has answered, that model's own limits govern — compaction included. Absent means no claim is made."
+                },
+                "maxTokens": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Maximum output tokens advertised for `fallback/auto` before the first response, for the same readout and the same reason as `contextWindow`."
+                }
+              },
+              "examples": [
+                {
+                  "chain": [
+                    {
+                      "model": "qwen/qwen3.8-flash-next",
+                      "thinking": "xhigh"
+                    },
+                    {
+                      "model": "anthropic/claude-opus-5.5",
+                      "thinking": "low"
+                    },
+                    "openai/gpt-5.6-sol"
+                  ],
+                  "maxCycles": 10,
+                  "concurrency": {
+                    "qwen/qwen3.8-flash-next": 4,
+                    "anthropic/claude-opus-5.5": 10
+                  },
+                  "maxProbes": 2,
+                  "contextWindow": 1048576,
+                  "maxTokens": 262144
+                }
+              ]
+            },
+            {
+              "type": "array",
+              "description": "Shorthand: a bare array is read as the chain itself (`modelFallback: [\"a/b\", \"c/d\"]`), with every other option at its default.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "`provider/modelId`, or a bare id pi resolves unambiguously. The provider may be a virtual one an extension registered, so it is not checked against any list. A `|` level suffix is the env and agent-file grammar and is dropped here: the object form owns pins in this file."
+                  },
+                  {
+                    "type": "object",
+                    "description": "The same reference, plus the thinking level to pin while the router holds it. Unknown properties are ignored by the router, so a typo in one is otherwise invisible.",
+                    "additionalProperties": false,
+                    "required": [
+                      "model"
+                    ],
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "`provider/modelId`, matched by pi's own rules: canonical `provider/id`, then provider plus id, then bare id. A `:level` suffix, a leading or trailing `/`, commas and internal whitespace are rejected — and a rejected reference drops the whole entry, because it names no model to route to."
+                      },
+                      "thinking": {
+                        "enum": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ],
+                        "description": "Thinking level pinned for requests to this model. Case-sensitive and untrimmed: a value outside the list is dropped while the model is kept, so the session's own level governs."
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "startupFetch": {
+          "type": "object",
+          "description": "The picture drawn in the startup header by `agent/extensions/startup-fetch.ts`. Read on every header build, so an edit applies on `/reload` without a restart; a file this key cannot parse is read as an empty object.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "fixed",
+                "cycle",
+                "random",
+                "off"
+              ],
+              "default": "fixed",
+              "description": "How the picture is chosen from `<agentDir>/images/`: `fixed` always shows `image`, `cycle` takes the next file by name on each start and wraps, `random` picks one avoiding an immediate repeat, `off` prints the ASCII distro logo instead. Any other value is treated as `fixed`."
+            },
+            "image": {
+              "type": "string",
+              "description": "A file name inside `images/`, or an absolute or `~`-prefixed path to a file anywhere. Only consulted in `fixed` mode."
+            },
+            "style": {
+              "enum": [
+                "block",
+                "half",
+                "quad",
+                "sextant",
+                "octant",
+                "braille",
+                "ascii",
+                "pixels"
+              ],
+              "default": "half",
+              "description": "How the image is drawn in terminal cells, coarse to fine. `block` and `half` go through catimg; `quad`, `sextant`, `octant`, `braille` and `ascii` go through chafa and fall back to `half` when it is missing; `pixels` sends real pixels over the Kitty graphics protocol and falls back to `half` on a terminal that has no Kitty (or iTerm2) support. Any other value is treated as `half`."
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 4,
+              "maximum": 40,
+              "default": 13,
+              "description": "Rows of terminal cells the drawing gets. A value outside 4–40, or a non-integer, is replaced by 13 rather than clamped to the nearest bound."
+            }
+          }
+        },
+        "piBolt": {
+          "type": "object",
+          "description": "The Pi-Bolt-only half of the package list (https://github.com/opensec-git/Pi-Bolt, pi compiled ahead of time). Plain pi ignores this key entirely, which is the point: both binaries share one `settings.json`, and a swap that lives only here cannot make plain pi load the build meant for the other one.",
+          "additionalProperties": false,
+          "properties": {
+            "packages": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "One package source, in pi's own grammar (`npm:name[@version]`, `git:github.com/owner/repo`), where a leading `-` removes that source and a bare entry adds one."
+              },
+              "description": "Package sources this overlay contributes — on top of `packages`, or instead of it when `packagesOverlay` is set. Typically `-npm:@ff-labs/pi-fff` plus the JIT-free build's name, since the upstream package needs bun's FFI. Only entries that are strings are read; the rest are skipped."
+            },
+            "packagesOverlay": {
+              "type": "boolean",
+              "description": "When true, `piBolt.packages` replaces the effective `packages` list — additions minus removals — instead of merging into it, which is what keeps the replaced name out of the declared set. It takes effect only together with an array `packages`, and the persona extension applies the same rule when it works out which sources a profile declares."
+            }
+          }
+        }
+      }
+    }
+  ]
+}

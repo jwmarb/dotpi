@@ -71,7 +71,7 @@ Verified 2026-10-30 — line refs read against the tree on that date; a touched 
 | Add a skill | `agent/skills/<category>/<name>/SKILL.md` (frontmatter keys: `agent/AGENTS.md`) |
 | Find a skill wherever it sits in the tree | `agent/extensions/lib/skill-tree.ts` (single walker — the three readers that used to each do their own one-level `readdir`) |
 | Change a skill's category / categorize a package skill | move the directory; for a package skill, `agent/extensions/lib/skill-categories.ts` |
-| Change default model / provider / thinking / retry | `agent/settings.json` |
+| Change default model / provider / thinking / retry | `agent/settings.json` (`$schema` → `schemas/pi-settings.schema.json`: pi's shipped core schema + the extension-owned `modelFallback`/`startupFetch`/`piBolt`; `quant-trader/settings.json` points at the same wrapper) |
 | Provider key, model catalog, pricing, thinking-level mapping | `agent/extensions/litellm.ts` + `agent/.env` |
 | Fall back to another model when one errors | `agent/extensions/model-fallback/` (`fallback/auto` virtual model, `/fallback-chain`; chain in `settings.json` `modelFallback`, own AGENTS.md) |
 | Add/repair an MCP server | `agent/mcp.json` (schema: pi's built-in MCP extension; runtime: `/mcp`). A server needing a secret *URL* cannot use a `${VAR}` placeholder in `url` — register it from an extension with `pi.registerMcpServer()` instead |

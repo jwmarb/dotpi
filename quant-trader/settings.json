@@ -1,4 +1,5 @@
 {
+  "$schema": "../schemas/pi-settings.schema.json",
   "lastChangelogVersion": "1.4.0",
   "defaultProvider": "fallback",
   "defaultModel": "auto",
