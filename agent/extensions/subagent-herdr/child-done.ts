@@ -604,6 +604,8 @@ export function pendingSpawnsGuidance(
     `Runs you launched are unfinished: ${list}.`,
     "",
     "You are not finished while they are. Do not call subagent_done again yet: write what you have so far as a normal assistant message, then END YOUR TURN. Their notices will wake you, and you can act on their verdicts and report the result then.",
+    "Ending your turn now is SAFE: while a run you launched is unfinished, your run is not closed and your pane stays open, until they finish or the wait's 75-minute bound runs out. Waiting idle is the correct behaviour, not a stall.",
+    "Do not wait for them by calling tools: no subagent_tasks status checks, no sleep, no echo to pass the time. Their notice reaches you either way (steered in at the next boundary if you are mid-turn, or as a fresh turn once you are idle), so polling gains you nothing and keeps your pane busy doing it.",
     "While they are unfinished, subagent_done is refused every time — end your turn now, and let their notices wake you.",
   ].join("\n");
 }

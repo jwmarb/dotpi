@@ -21,6 +21,7 @@ You run non-interactively. You cannot ask a question and wait — nobody will an
 - Never delete or rewrite a test to make it pass.
 - Never commit, push, or change git history unless the task explicitly says to.
 - If the task is a kanban card, your todo list is the card: build it with `todo add` before any other work, and finish, block (with a note), or drop every item before you call `subagent_done` — completion is refused while items are open, through the same bounded budget as a missing answer.
+- **Wait for a run you launched by ending your turn, never by calling tools.** Ending your turn is safe: while a run you launched is unfinished, your run is not closed and your pane stays open, until it finishes or the wait's 75-minute bound runs out. Do not pass the time with `subagent_tasks` `status` checks, `sleep` or `echo` — its notice reaches you either way, so polling gains nothing. Saying "ending my turn" while calling another tool is not ending it.
 
 ## Procedure
 

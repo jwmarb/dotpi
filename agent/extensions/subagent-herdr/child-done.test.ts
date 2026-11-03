@@ -2273,6 +2273,22 @@ describe("createChildDoneHandshake: a child waiting on its own spawns", () => {
     expect(text).toContain("sub-2222 (?)");
     expect(text.match(/unfinished: [^\n]*/)?.[0]).not.toContain("<");
   });
+
+  test("the guidance says ending the turn is safe, bounds it, and forbids polling without lying about wakes", () => {
+    // A delegating worker busy-polled for ~30 turns (sub-871a): anxiety about being
+    // closed, since until this change ending its turn DID close it. Delivery was
+    // never the problem — its briefings landed after idle turns.
+    const text = pendingSpawnsGuidance([{ runId: "sub-1111", agent: "reviewer" }]);
+    expect(text).toContain("Ending your turn now is SAFE");
+    expect(text).toContain("your run is not closed");
+    // The guarantee is bounded (DEFER_MAX_MS), so the guidance must not promise it forever.
+    expect(text).toContain("75-minute bound");
+    expect(text).toContain("no subagent_tasks status checks");
+    // A steered notice IS drained between tool calls, so the guidance must never claim
+    // a polling child cannot be woken — that would contradict the delivery mechanism.
+    expect(text).not.toMatch(/nothing can wake you/i);
+    expect(text).toContain("reaches you either way");
+  });
 });
 
 describe("pendingSpawnsOfEnv: what a child believes about its own spawns", () => {
