@@ -32,24 +32,15 @@
 
   "model": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
-    "thinking": "low",
-    "contextWindow": 262144
+    "id": "deepseek/deepseek-v4-flash",
+    "contextWindow": 1048576
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
-    "thinking": "low",
-    "contextWindow": 262144
+    "id": "deepseek/deepseek-v4-flash",
+    "contextWindow": 1048576
   },
   "observerFallbackModels": [
-    {
-      "_comment": "Observer fallback 1: DeepSeek V4 Flash via litellm — cheap, 1M window, first choice after qwen3.8-flash-next.",
-      "provider": "litellm",
-      "id": "deepseek/deepseek-v4-flash",
-      "thinking": "low",
-      "cooldownHours": 2
-    },
     {
       "_comment": "Observer fallback 2: Claude Sonnet latest — paid ($2/$10 per M); second by chosen ordering, not a last resort.",
       "provider": "litellm",
@@ -67,18 +58,10 @@
   ],
   "reflectorModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
-    "thinking": "low",
-    "contextWindow": 262144
+    "id": "deepseek/deepseek-v4-flash",
+    "contextWindow": 1048576
   },
   "reflectorFallbackModels": [
-    {
-      "_comment": "Reflector fallback 1: DeepSeek V4 Flash — synthesis-grade at worker prices.",
-      "provider": "litellm",
-      "id": "deepseek/deepseek-v4-flash",
-      "thinking": "low",
-      "cooldownHours": 2
-    },
     {
       "_comment": "Reflector fallback 2: Claude Sonnet latest — paid ($2/$10 per M); second by chosen ordering, not a last resort.",
       "provider": "litellm",
@@ -96,18 +79,10 @@
   ],
   "dropperModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
-    "thinking": "low",
-    "contextWindow": 262144
+    "id": "deepseek/deepseek-v4-flash",
+    "contextWindow": 1048576
   },
   "dropperFallbackModels": [
-    {
-      "_comment": "Dropper fallback 1: DeepSeek V4 Flash — judgment/prioritisation at worker prices.",
-      "provider": "litellm",
-      "id": "deepseek/deepseek-v4-flash",
-      "thinking": "low",
-      "cooldownHours": 2
-    },
     {
       "_comment": "Dropper fallback 2: Claude Sonnet latest — paid ($2/$10 per M); second by chosen ordering, not a last resort.",
       "provider": "litellm",
