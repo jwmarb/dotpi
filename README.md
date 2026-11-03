@@ -160,6 +160,7 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | `agent/docker/`                   | Tracked reference image for runtime verification                                       |
 | `orchestrator`                    | Symlink to `agent` — a stable alias for the default profile, which is never moved       |
 | `quant-trader/`                   | pi profile: curated skills + own 4-agent fleet + own prompt extension — run with `pi-quant` (see Profiles below) |
+| `docs/model-configuration.md`     | User guide to model configuration: `settings.json`, agent frontmatter, pi-blackhole workers          |
 | `.githooks/`                      | Tracked `pre-commit`, `post-checkout`, `post-merge` hooks                              |
 | `scripts/setup-deps.sh`           | Installs each extension's npm dependencies                                             |
 | `scripts/pi-profile.sh`           | Profile launchers `pi-p` / `pi-quant` / `pi-bolt-p` (sourced from `~/.bashrc`)          |
@@ -185,19 +186,22 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 
 ## Subagents 🤖
 
-| Agent       | Role                                                          | Model             |
-| ----------- | ------------------------------------------------------------- | ----------------- |
-| `explorer`  | Read-only codebase recon; returns a compressed map with `file:line` references | deepseek-v4-flash |
-| `librarian` | External research: docs via the `firecrawl` CLI, plus dependency source and live behavior | deepseek-v4-flash |
-| `oracle`    | High-stakes architecture consultation; last-resort debugging             | gpt-5.6-sol       |
-| `planner`   | Read-only implementation planning; ordered, file-specific steps          | gpt-5.6-sol       |
-| `reviewer`  | Read-only code review; findings reported by severity                   | claude-opus-5     |
-| `spiker`    | Proves an API's real behavior with a throwaway spike                     | qwen3.8-27b       |
-| `summarizer`| Extracts a long page down to what a question needs — the librarian's own helper | deepseek-v4-flash |
-| `verifier`  | Runs the project's tests/build in Docker; reports pass/fail              | claude-opus-5     |
-| `worker`    | Implements a single well-specified change end to end                   | qwen3.8-27b       |
+| Agent       | Role                                                          |
+| ----------- | ------------------------------------------------------------- |
+| `explorer`  | Read-only codebase recon; returns a compressed map with `file:line` references |
+| `librarian` | External research: docs via the `firecrawl` CLI, plus dependency source and live behavior |
+| `oracle`    | High-stakes architecture consultation; last-resort debugging             |
+| `planner`   | Read-only implementation planning; ordered, file-specific steps          |
+| `reviewer`  | Read-only code review; findings reported by severity                   |
+| `spiker`    | Proves an API's real behavior with a throwaway spike                     |
+| `summarizer`| Extracts a long page down to what a question needs — the librarian's own helper |
+| `verifier`  | Runs the project's tests/build in Docker; reports pass/fail              |
+| `worker`    | Implements a single well-specified change end to end                   |
+| `healthcheck` | Diagnoses a stalled or unanswered delegated run; spawned by `subagent-herdr`, not by hand           |
 
-Every agent declares `fallback_models`, tried when a child fails to *launch* (unknown model, provider down, rate-limited) — not when it fails its task. Read-only agents carry no `write`/`edit`: the `tools` list is the enforcement.
+No model column on purpose: a hand-copied one drifts from the frontmatter the moment a file is retuned (`agent/AGENTS.md`: "never copy a table here"). Read the live assignments with `grep -H -E '^(model|fallback_models):' agent/agents/*.md`, and how the chain those lines build is routed in [docs/model-configuration.md](docs/model-configuration.md).
+
+Every agent declares `model` + `fallback_models`, and together they are that agent's **runtime** model chain: the child runs on `fallback/auto` and walks that chain when its own model calls fail (provider down, rate-limited, unknown model) — not when it fails its task. A declaration with no usable reference is refused before launch. The handoff machinery (`childFallbackChain`, `PI_FALLBACK_CHAIN`) is owned by [agent/extensions/subagent-herdr/AGENTS.md](agent/extensions/subagent-herdr/AGENTS.md); the user-facing walkthrough is [docs/model-configuration.md](docs/model-configuration.md). Read-only agents carry no `write`/`edit`: the `tools` list is the enforcement.
 A child delegated a **kanban card** works by the list it keeps: it builds the card's steps into its `todo` list before other work, and `subagent_done` is refused (through the same bounded budget as a missing answer) while the list is empty or items are still open. The kanban board reads that list straight from the child's session file and renders per-card progress, so the list *is* the card's progress.
 
 ## Profiles 🛰
