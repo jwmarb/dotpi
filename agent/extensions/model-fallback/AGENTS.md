@@ -1,7 +1,7 @@
 # model-fallback — the `fallback/auto` router: chain state machine, two retry budgets, cross-process leases
 
-The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json` `modelFallback` key) is in the root
-AGENTS.md. Line refs checked 2026-10-31 against pi 1.4.0.
+The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json` `modelFallback` key) is in
+`docs/model-configuration.md` (§4–§5); the root AGENTS.md keeps the repo-level pointer. Line refs checked 2026-10-31 against pi 1.4.0.
 
 ## WHERE TO LOOK
 

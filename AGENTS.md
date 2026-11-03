@@ -27,6 +27,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `scripts/check.sh` — the load/typecheck/test guard the pre-commit hook runs (see NOTES)
 - `install.sh` / `install.ps1` — the dotpi installers: bare machine → working pi config (checks bun/git/npm, clones the repo, arms the hooks, installs deps + the firecrawl/agent-browser CLIs, offers herdr, seeds `agent/.env` from the template)
 - `README.md` — the human-facing twin (what/why, features, install, layout, commands, Pi-Bolt, OS compatibility). It restates this file's conventions for readers who never open `AGENTS.md`; keep it in sync by pointing here rather than forking the prose.
+- `docs/` — tracked human docs, including `model-configuration.md` (the user guide to model configuration)
 - `.firecrawl/` — gitignored scratch for scraped pages (the `scrape-web-as-markdown` CLI and the `librarian` agent's clones). Not repo content.
 
 ## Profiles
@@ -74,6 +75,7 @@ Verified 2026-10-30 — line refs read against the tree on that date; a touched 
 | Change default model / provider / thinking / retry | `agent/settings.json` (`$schema` → `schemas/pi-settings.schema.json`: pi's shipped core schema + the extension-owned `modelFallback`/`startupFetch`/`piBolt`; `quant-trader/settings.json` points at the same wrapper) |
 | Provider key, model catalog, pricing, thinking-level mapping | `agent/extensions/litellm.ts` + `agent/.env` |
 | Fall back to another model when one errors | `agent/extensions/model-fallback/` (`fallback/auto` virtual model, `/fallback-chain`; chain in `settings.json` `modelFallback`, own AGENTS.md) |
+| How models are configured (user guide) | `docs/model-configuration.md` (settings, agent frontmatter, blackhole workers) |
 | Add/repair an MCP server | `agent/mcp.json` (schema: pi's built-in MCP extension; runtime: `/mcp`). A server needing a secret *URL* cannot use a `${VAR}` placeholder in `url` — register it from an extension with `pi.registerMcpServer()` instead |
 | Add a credential | `agent/.env` (template: `agent/.env.example`) |
 | The orchestrator's system prompt | `agent/extensions/dynamic-prompt.ts` (replaces pi's default prompt with discovered inventories) |
