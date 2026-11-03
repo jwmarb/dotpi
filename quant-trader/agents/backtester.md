@@ -4,7 +4,7 @@ description: Run backtests and research code against data and report the exact c
 tools: read, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
 skills: technical-analysis, fundamental-analysis
 model: qwen/qwen3.8-27b|xhigh
-fallback_models: anthropic/claude-opus-5.5|off, openai/gpt-5.6-sol
+fallback_models: anthropic/claude-opus-latest|off, openai/gpt-5.6-sol
 callable_by: orchestrator
 ---
 

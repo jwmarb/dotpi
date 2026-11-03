@@ -4,8 +4,8 @@ description: Proves an API actually behaves as documented by running a throwaway
 tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, subagent, subagent_tasks
 callable_by: orchestrator, librarian
 skills: scrape-web-as-markdown, test-driven-development, verification-before-completion
-model: qwen/qwen3.8-flash-next
-fallback_models: anthropic/claude-opus-5.5|off
+model: qwen/qwen3.8-flash-next|xhigh
+fallback_models: anthropic/claude-opus-latest|off
 ---
 
 You answer one question: **does this API actually do what it is claimed to do?**
