@@ -95,14 +95,21 @@ import {
   formatExitSidecar,
   formatNotice,
   formatReportLine,
+  listRunCandidates,
   type NoticeKind,
+  pendingSpawnsOf,
+  printableAgent,
   parseAncestry,
   qualifiesAsAnswer,
   reportsPath,
   requiresResultBlock,
+  RUN_ID_PATTERN,
+  runDirBasesOf,
+  runsDir,
   systemPromptPath,
   visibleTextOf,
 } from "./rundir.js";
+import { agentDir, profileDir } from "../lib/layout.js";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -176,6 +183,19 @@ export interface ChildDoneEffects {
    * anything.
    */
   sendAnswerNudge(message: string): void;
+
+  /**
+   * This run's unfinished launches, read at the moment of the call.
+   *
+   * A child that delegated work is not finished while any of them is: it is
+   * sitting in the turn whose whole purpose is to be woken by their notices.
+   * Synchronous because both callers are — the `agent_end` handler and the tool
+   * call that would close the pane — and it scans fresh on every call, so a run
+   * starts and stops holding itself open between two calls with nothing cached in
+   * either. A run with no id of its own reports none, and so does a scan that
+   * cannot run: this must never be the reason a child cannot finish.
+   */
+  pendingSpawns(): readonly { runId: string; agent: string }[];
 }
 
 /** Outcome of the `complete` operation. */
@@ -183,7 +203,7 @@ export type ChildDoneOutcome =
   | { kind: "no-session-file" }
   | { kind: "write-failed"; sessionFile: string }
   /** Refused: no visible answer precedes this call. Carries what to tell the model. */
-  | { kind: "no-answer"; guidance: string; attemptsLeft: number }
+  | { kind: "no-answer"; guidance: string; attemptsLeft?: number }
   | { kind: "completed"; sessionFile: string };
 
 export { visibleTextOf };
@@ -562,6 +582,32 @@ export function answerGuidance(requiresResult: boolean, attemptsLeft: number): s
 }
 
 /** What the child is asked when it stops talking without an answer. */
+/**
+ * The refusal for a child whose own launches are still running.
+ *
+ * Identifiers only, and never the answer format: the run is being told to WAIT,
+ * not to re-emit, and a line instructing it to produce its result block would
+ * push it toward finishing the very turn it is supposed to end. The ids come from
+ * disk, which a model can write, so the agent names arrive already reduced to
+ * what a name is allowed to look like ({@link printableAgent}); run ids are
+ * pattern-checked by the scanner that found them.
+ *
+ * No refusal count: this refusal is a waiting state, not a misbehaviour, and it
+ * is unbounded — it never spends the answer gate's budget, so the guidance never
+ * promises that the N-th call will get through.
+ */
+export function pendingSpawnsGuidance(
+  pending: readonly { runId: string; agent: string }[],
+): string {
+  const list = pending.map((p) => `${p.runId} (${p.agent})`).join(", ");
+  return [
+    `Runs you launched are unfinished: ${list}.`,
+    "",
+    "You are not finished while they are. Do not call subagent_done again yet: write what you have so far as a normal assistant message, then END YOUR TURN. Their notices will wake you, and you can act on their verdicts and report the result then.",
+    "While they are unfinished, subagent_done is refused every time — end your turn now, and let their notices wake you.",
+  ].join("\n");
+}
+
 export function nudgeMessage(requiresResult: boolean): string {
   return [
     `You stopped without leaving an answer the orchestrator can read.`,
@@ -687,6 +733,24 @@ export function createChildDoneHandshake(
     // (the child never built it from its card) and open items are refused the
     // same way a missing answer is — through this same counter, so one bad
     // call consumes one refusal, not two.
+    // The same rule as `agent_end`, but a waiting state, not a misbehaviour: the
+    // refusal must not spend the answer gate's budget. A worker that calls
+    // `subagent_done` once per grader wake is doing exactly what it was told, and
+    // a shared budget spent here would let that final sign-off through with no
+    // qualifying answer. So the pending refusal is unbounded: while a launch of
+    // this run is unfinished, the pane simply does not close.
+    if (!signalled) {
+      // Only when the scan can change the outcome: once the sidecar is on disk
+      // a redundant call is not re-judged — it falls through to the finish path
+      // (notice, pane close, shutdown), so its pending list would be discarded.
+      const pending = effects.pendingSpawns();
+      if (pending.length > 0) {
+        // `no-answer` is the outcome the tool renders as guidance plus an error
+        // flag. This child did answer; it is the guidance text that says so.
+        return { kind: "no-answer", guidance: pendingSpawnsGuidance(pending) };
+      }
+    }
+
     const card = cardOf(env);
     const acct = card !== undefined && answer ? cardAccounting(answer.cardTodos) : undefined;
     const cardBlocking = acct !== undefined && (acct.empty || acct.open.length > 0);
@@ -721,7 +785,12 @@ export function createChildDoneHandshake(
       exitPath(sessionFile),
       formatExitSidecar(),
     );
-    signalled = true;
+    // Only a sidecar that is on disk is a durable signal. If the write fails the
+    // run is NOT signalled: `onAgentEnd` must re-attempt it on the next turn, and
+    // a later `subagent_done` must not skip both gates and close the pane with no
+    // sidecar on disk. The sidecar *is* the done classification — losing it is
+    // not the same as having written it.
+    if (written) signalled = true;
 
     if (!written) return { kind: "write-failed", sessionFile };
 
@@ -761,6 +830,25 @@ export function createChildDoneHandshake(
   ): void {
     if (signalled) return;
     if (!sessionFile) return;
+
+    // A child that ends a turn while its own launches are out is WAITING, not
+    // finished — and this is precisely the moment its own agent file tells it to
+    // reach: graders launched, a `<result>` written to say the pass is pending,
+    // turn ended so their notices can wake it. Nothing below may fire. The
+    // sidecar is the load-bearing one to skip: the sidecar *is* the done
+    // classification, so writing one here would let every reader of a `done` pane
+    // settle the run anyway and close the pane out from under verdicts that have
+    // not been written yet. So: no sidecar, no notice, no nudge, no close, no
+    // shutdown. The pane stays open and idle, and the notices its spawns deliver
+    // start a fresh turn in it the same way they do at the root.
+    //
+    // `DEFER_MAX_MS` bounds how long that can hold, and it lives inside the
+    // predicate this effect calls rather than in a timer here — this module runs
+    // no clocks. The truncation arm below is deliberately not reached either: a
+    // response cut off mid-answer while spawns are pending waits for the wake that
+    // is already coming, because a nudge stacked on top of it is noise and the
+    // continuation slot is worth more on the run's last turn.
+    if (effects.pendingSpawns().length > 0) return;
 
     // A card child owes the board a settled list: an empty list (never built
     // from the card) and open items are a first-class reason to continue the
@@ -1174,7 +1262,37 @@ export function createChildWatchdog(
 // Real Node adapter
 // ---------------------------------------------------------------------------
 
-function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffects {
+/**
+ * The scan behind {@link ChildDoneEffects.pendingSpawns}, over an arbitrary
+ * environment and clock.
+ *
+ * Exported because the rules that decide the answer — the run-id gate, which
+ * bases get scanned, what a hostile `agent` field may print as — are the child's
+ * whole contribution to the deferral, and they are worth pinning without a child
+ * process. The bases default to the ones this process would spawn into, from the
+ * function the parent enumerates with ({@link runDirBasesOf}), so one caller can
+ * never see a subtree the other cannot; the predicate is the parent's own, so
+ * "is this child waiting?" means one thing in both processes.
+ */
+export function pendingSpawnsOfEnv(
+  env: NodeJS.ProcessEnv,
+  now: number,
+  bases = runDirBasesOf(runsDir(agentDir()), runsDir(profileDir())),
+): readonly { runId: string; agent: string }[] {
+  const runId = env.PI_SUBAGENT_RUN_ID;
+  // Nothing on disk can have been stamped with an id this process does not have,
+  // and an id that is not an id is an env someone else set.
+  if (!runId || !RUN_ID_PATTERN.test(runId)) return [];
+  return pendingSpawnsOf({ runId, paneId: env.HERDR_PANE_ID }, listRunCandidates(bases), now).map((r) => ({
+    runId: r.runId,
+    agent: printableAgent(r.agent),
+  }));
+}
+
+function createNodeEffects(
+  sendNudge: (message: string) => void,
+  env: NodeJS.ProcessEnv = process.env,
+): ChildDoneEffects {
   return {
     writeExitSidecar(path, content) {
       try {
@@ -1227,6 +1345,10 @@ function createNodeEffects(sendNudge: (message: string) => void): ChildDoneEffec
     sendAnswerNudge(message) {
       sendNudge(message);
     },
+
+    pendingSpawns() {
+      return pendingSpawnsOfEnv(env, Date.now());
+    },
   };
 }
 
@@ -1261,7 +1383,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const effects = createNodeEffects(sendNudge);
+  const effects = createNodeEffects(sendNudge, process.env);
   const handshake = createChildDoneHandshake(effects, process.env);
 
   /**
@@ -1394,7 +1516,7 @@ export default function (pi: ExtensionAPI) {
             // not as a result to acknowledge and move on from.
             isError: true,
             content: [{ type: "text", text: outcome.guidance }],
-            details: { attemptsLeft: outcome.attemptsLeft },
+            details: outcome.attemptsLeft !== undefined ? { attemptsLeft: outcome.attemptsLeft } : {},
           };
         case "completed":
           return {

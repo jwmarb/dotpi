@@ -51,7 +51,12 @@
  */
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
 import {
+  DEFER_MAX_MS,
+  isRunStatus,
+  launchedBy,
+  printableAgent,
   rerouteMarker,
+  RUN_ID_PATTERN,
   type Notice,
   type NoticeReroute,
   type RunRecord,
@@ -212,6 +217,129 @@ export function ownerPaneOf(rec: RunRecord): string | undefined {
  */
 export function isOwnedBy(rec: RunRecord, paneId: string | undefined): boolean {
   return paneId !== undefined && ownerPaneOf(rec) === paneId;
+}
+
+/**
+ * Does `paneId` own at least one **running** record in `recs`?
+ *
+ * The question a liveness tick asks before it looks at anything. A process that
+ * owns no running record has nothing to reconcile, and an unguarded tick is not
+ * free: it probes panes, writes `meta.json`, and can settle a run whose pane it
+ * should never have examined. This is the gate that lets a *delegating child*
+ * keep a tick at all — its own spawns need a reconciliation driver, and no other
+ * process has them in its registry — without letting a child that has launched
+ * nothing sweep anything.
+ *
+ * Ownership itself stays the one rule in {@link isOwnedBy}; this only asks it of a
+ * whole record set, so a second definition of "mine" cannot drift from the first.
+ */
+export function ownsRunningRecord(recs: readonly RunRecord[], paneId: string | undefined): boolean {
+  return recs.some((rec) => rec.status === "running" && isOwnedBy(rec, paneId));
+}
+
+// ---------------------------------------------------------------------------
+// The spawns block: what a finished run left behind it
+// ---------------------------------------------------------------------------
+
+/** How many launched runs one block lists before it summarises the rest. */
+export const SPAWNS_BLOCK_MAX_LINES = 20;
+
+/**
+ * The runs `rec` launched, as a snapshot printed under its answer — or
+ * `undefined` when it launched none.
+ *
+ * Why it exists: a worker's answer can describe a quality pass that had not
+ * finished when the answer was written, and nothing about the answer says so. The
+ * block puts the facts the orchestrator needs next to the claim: which runs this
+ * one launched, what state each is in now, and whether its finish is provable
+ * from disk.
+ * **It prints identifiers, never content.** Every field of a candidate came out
+ * of a world-writable directory, so a planted `meta.json` is the threat model,
+ * and this text lands in another model's context. The run id prints only when it
+ * matches `RUN_ID_PATTERN`, the agent only through {@link printableAgent}, the
+ * status only when {@link isRunStatus} accepts it — and `task` is never read at
+ * all, because a task string is exactly where an injection would be written.
+ *
+ * Selection is {@link launchedBy}, the relation `pendingSpawnsOf` selects on, but
+ * with no sidecar filter: a finished child belongs in the snapshot too. One
+ * extra rule: a child must have started no earlier than `rec` itself. A run
+ * cannot launch anything before it exists, and pane ids are reused across herdr
+ * sessions, so without it the legacy `ownerPane` fallback would list every old
+ * record that happened to share this run's pane id. When the window hides
+ * *everything*, the block falls back to the unfiltered relation — it exists to
+ * say why a delegating worker is (or was) running, and `pendingSpawnsOf`
+ * selects on the unfiltered relation, so a run it is holding open must not
+ * render no block at all — but only as far as `pendingSpawnsOf` can reach:
+ * it cannot be holding a record older than `DEFER_MAX_MS`, so the fallback
+ * must not print one as this child's launch, either.
+ *
+ * "Delivery not provable from disk" is the honesty clause. A child that
+ * finished (sidecar on disk, or a `done` record) and is not in `collected` has
+ * no on-disk proof that its notice was read by the run whose answer is printed
+ * above. The label states what the disk supports — nothing proves delivery —
+ * and deliberately stops short of claiming the block above did not show it:
+ * after the pending-spawn deferral a delegating worker settles *because* its
+ * graders' verdicts reached it, so "not reflected" would assert the opposite
+ * of the truth in the one case that matters. The caller decides what counts
+ * as collected; this function never infers it from text.
+ *
+ * Pure and disk-free: `hasSidecar` is injected so the ledger module stays
+ * free of I/O, the same way its other effects are.
+ *
+ * @param rec - The run whose answer the block follows.
+ * @param candidates - Every record the caller can see, with its directory.
+ * @param collected - Run ids proven to have been delivered to `rec`.
+ * @param now - The snapshot time printed in the header.
+ * @param hasSidecar - Whether a run's `.exit` sidecar is on disk.
+ */
+export function renderSpawnsBlock(
+  rec: RunRecord,
+  candidates: readonly { rec: RunRecord; dir: string }[],
+  collected: ReadonlySet<string>,
+  now: number,
+  hasSidecar: (dir: string, runId: string) => boolean,
+): string | undefined {
+  const parent = { runId: rec.runId, ...(typeof rec.paneId === "string" ? { paneId: rec.paneId } : {}) };
+  const parentStart = typeof rec.startedAt === "number" && Number.isFinite(rec.startedAt) ? rec.startedAt : undefined;
+  const launched = candidates.filter(({ rec: c }) => c.runId !== rec.runId && launchedBy(c, parent));
+  // The lifetime window keeps a reused pane id from attributing stale records;
+  // when it hides *everything*, fall back to the unfiltered relation: this
+  // block exists to say why a delegating worker is (or was) running, and
+  // `pendingSpawnsOf` selects on the unfiltered relation, so a run it is
+  // holding open must not render no block at all.
+  const inLifetime = (c: RunRecord): boolean =>
+    parentStart === undefined
+      ? true
+      : typeof c.startedAt === "number" && Number.isFinite(c.startedAt) && c.startedAt >= parentStart;
+  const withinLifetime = launched.filter(({ rec: c }) => inLifetime(c));
+  // The fallback is bounded the same way `pendingSpawnsOf` is: it cannot be
+  // holding a record older than `DEFER_MAX_MS`, so the block must not print
+  // one as this child's launch — a reused pane id is exactly the threat the
+  // lifetime window exists for.
+  const children =
+    withinLifetime.length > 0
+      ? withinLifetime
+      : launched.filter(
+          ({ rec: c }) =>
+            typeof c.startedAt === "number" && Number.isFinite(c.startedAt) && now - c.startedAt < DEFER_MAX_MS,
+        );
+  children.sort((a, b) => (a.rec.runId < b.rec.runId ? -1 : a.rec.runId > b.rec.runId ? 1 : 0));
+  if (children.length === 0) return undefined;
+
+  const lines = children.slice(0, SPAWNS_BLOCK_MAX_LINES).map(({ rec: c, dir }) => {
+    const id = typeof c.runId === "string" && RUN_ID_PATTERN.test(c.runId) ? c.runId : "?";
+    const status = isRunStatus(c.status) ? c.status : "unknown";
+    const sidecar = id !== "?" && hasSidecar(dir, id);
+    const finished = sidecar || status === "done";
+    return (
+      `${id} (${printableAgent(c.agent)}): ${status}` +
+      (sidecar ? ", sidecar on disk" : "") +
+      (finished && !collected.has(id) ? " — delivery not provable from disk" : "")
+    );
+  });
+  const more = children.length - lines.length;
+  if (more > 0) lines.push(`… and ${more} more`);
+  return [`runs this child launched (snapshot at ${new Date(now).toISOString()}):`, ...lines].join("\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -144,9 +144,7 @@ import {
   herdrAgentName,
   makeRunId,
   parseLineage,
-  pickSessionName,
   readReports,
-  readRunRecordFromDisk,
   type HealthCheckTrigger,
   type RunResult,
   selectSkills,
@@ -168,12 +166,20 @@ import {
   EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
   hasRunId,
+  isRunStatus,
+  launchedBy,
+  listRunCandidates,
   metaPath,
+  pendingSpawnsOf,
+  readExitSidecarAt,
+  readRunRecordFromDisk,
+  pickSessionName,
   type Notice,
   parseNotice,
   RUN_ID_PATTERN,
   type RunRecord,
   runDir,
+  runDirBasesOf,
   runsDir,
   systemPromptPath,
 } from "./rundir.js";
@@ -204,11 +210,14 @@ import {
   createReleaseLedger,
   healthCheckOfId,
   isOwnedBy,
+  ownsRunningRecord,
+  renderSpawnsBlock,
   LIVENESS_BACKSTOP_MS,
   ownerPaneOf,
   type ReleasedTarget,
 } from "./release-ledger.js";
 import { createParentProof } from "./parent-proof.js";
+import { settleOrphans, settleStuckRecords, STUCK_SIDECAR_MIN_AGE_MS } from "./settle-stuck.js";
 
 // The terminal result cache moved to the release ledger; re-exported so its
 // importers keep their path.
@@ -335,6 +344,28 @@ const launchingRunIds = new Set<string>();
  */
 let piSkillCatalogue: SkillEntry[] | undefined;
 
+/**
+ * The on-disk candidate list behind {@link allRunCandidates}, or `undefined`
+ * when the next question has to re-scan. One scan is a `readdir` plus a small
+ * `JSON.parse` per run dir (measured 4-6 ms over the 650-dir corpus), which is
+ * cheap once and wasteful eight times in a sweep.
+ *
+ * The window is closed by anything that can change what a scan would find,
+ * rather than by a clock: a memo left open across a local mutation is how a
+ * *missed* pending spawn happens, and a missed pending spawn is the exact bug
+ * this predicate exists to prevent. Note what is NOT memoized — the `.exit`
+ * sidecar, which `pendingSpawnsOf` reads fresh every call, so a spawn that
+ * finishes while a memo is open still stops holding its parent open. Only the
+ * record set is cached, and the fields it caches (`parentRunId`, `ownerPane`,
+ * `startedAt`) are stamped once at spawn and never rewritten.
+ */
+let runCandidateScan: { rec: RunRecord; dir: string }[] | undefined;
+
+/** Closes {@link runCandidateScan}. Every writer of a run dir calls it. */
+const invalidateRunScan = (): void => {
+  runCandidateScan = undefined;
+};
+
 function saveMeta(rec: RunRecord): void {
   try {
     writeFileSync(metaPath(dirFor(rec.runId)), JSON.stringify(rec, null, 2));
@@ -342,6 +373,10 @@ function saveMeta(rec: RunRecord): void {
     // Losing the meta file degrades a run to "unknown after restart"; the
     // session transcript on disk is unaffected, so this never blocks work.
   }
+  // Any meta write can change what a candidate scan would return — a status the
+  // spawns block prints, a record that settles — so the memo closes on every
+  // writer rather than on a clock.
+  invalidateRunScan();
 }
 
 /**
@@ -389,12 +424,38 @@ loadRegistry();
  * rescue retry and the ledger's `parentRunIsFinished` parent lookup — both
  * read through these.
  */
-const runDirBases = (): string[] => {
-  const bases = [RUNS_DIR];
-  const switched = runsDir(profileDir());
-  if (switched !== RUNS_DIR) bases.push(switched);
-  return bases;
+const runDirBases = (): string[] => runDirBasesOf(RUNS_DIR, runsDir(profileDir()));
+
+/**
+ * Every run record on disk under {@link runDirBases}, with its directory.
+ *
+ * The candidate set of the pending-spawn question, the spawns block, and the
+ * orphan settle. Records this process never spawned are included on purpose —
+ * the dir is global — and one found outside {@link dirFor}'s answer is recorded
+ * in `adoptedRunDirs` on the way past, the same way {@link adoptRunFromDisk}
+ * records it, so a later transcript or sidecar read for that run looks in the
+ * directory it was actually enumerated from.
+ */
+const allRunCandidates = (): { rec: RunRecord; dir: string }[] => {
+  const scanned = (runCandidateScan ??= listRunCandidates(runDirBases()));
+  for (const { rec, dir } of scanned) {
+    if (dir !== dirFor(rec.runId) && !adoptedRunDirs.has(rec.runId)) adoptedRunDirs.set(rec.runId, dir);
+  }
+  return scanned;
 };
+
+/**
+ * Does this run have a launch of its own that has not finished?
+ *
+ * {@link pendingSpawnsOf} over {@link allRunCandidates}: no `.exit` sidecar and
+ * a status that is not terminal ({@link isTerminalRecord}), bounded by
+ * `DEFER_MAX_MS` inside the predicate. Both the
+ * lifecycle's completion decision and the child's own deferral ask this one
+ * question, which is the point of the shared predicate: a worker must not be
+ * settled by its parent while its own graders are still out.
+ */
+const hasPendingSpawns = (run: { runId: string; paneId?: string }): boolean =>
+  pendingSpawnsOf(run, allRunCandidates(), Date.now()).length > 0;
 
 /**
  * The claimed parent's record and the run dir it lives in, from {@link runDirBases} —
@@ -445,7 +506,11 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
  * is an equal-size restore (the Nextcloud sync restore `readSessionTail`
  * documents): a transcript (or prompt file) restored with identical size and mtime serves
  * the cached verdict, which is the right one when the bytes are in fact
- * identical. The map is never pruned: its entries are bounded by the
+ * identical. One thing the stamp cannot see is one of the run's own spawns
+ * finishing, which is also an input to the verdict now: a cached `not finished`
+ * can therefore outlive the pending spawn by one transcript write. That is the
+ * conservative direction (a run the reader would finish is held), and the sidecar
+ * the child writes when it really does finish is checked before the memo. The map is never pruned: its entries are bounded by the
  * distinct (dir, run id) pairs ever read while sidecarless —
  * `hasExitSidecar` decides before the memo is touched, so a run whose sidecar
  * is already on disk never adds a key; keys are not removed when a run later
@@ -470,6 +535,7 @@ const completionEvidenceMemo = new Map<
 const completionEvidence = async (
   dir: string,
   runId: string,
+  paneId?: string,
 ): Promise<CompletionEvidence> => {
   const sidecar = hasExitSidecar(dir, runId);
   if (sidecar) return { finished: true, from: "sidecar" };
@@ -478,7 +544,15 @@ const completionEvidence = async (
   const hit = completionEvidenceMemo.get(key);
   if (hit !== undefined && hit.stamp === stamp) return hit.value;
   const result = await extractRunResult(dir, runId, EVIDENCE_TAIL_BYTES);
-  const value: CompletionEvidence = completionSignal(sidecar, result)
+  // The same third input the lifecycle gets, so the evidence read and the
+  // lifecycle cannot disagree about a delegating run (see `completionSignal`).
+  // The record's own pane, passed by the caller: every call site holds the
+  // record in hand, and a run missing from this process's registry is not a
+  // run with no pane — the legacy `ownerPane` relation is exactly what an
+  // unregistered record speaks, and dropping it would make `finished` MORE
+  // likely, the direction a read must not lean.
+  const hasPending = hasPendingSpawns({ runId, paneId });
+  const value: CompletionEvidence = completionSignal(sidecar, result, hasPending)
     ? { finished: true, from: "answer", result }
     : { finished: false };
   completionEvidenceMemo.set(key, { stamp, value });
@@ -515,7 +589,12 @@ function adoptRunFromDisk(runId: string): RunRecord | undefined {
     if (!rec) continue;
     runs.set(runId, rec);
     const dir = join(base, runId);
-    if (dir !== dirFor(runId)) adoptedRunDirs.set(runId, dir);
+    if (dir !== dirFor(runId)) {
+      adoptedRunDirs.set(runId, dir);
+      // The memo's entry for this id carries the other dir; drop the whole scan
+      // rather than patch one entry.
+      invalidateRunScan();
+    }
     return rec;
   }
   return undefined;
@@ -567,6 +646,11 @@ const lifecycle: RunLifecycle = createRunLifecycle({
   now: Date.now,
   delay: sleep,
   isLaunching: (runId) => launchingRunIds.has(runId),
+  // The third input to the completion predicate: a run with unfinished launches
+  // of its own is not finished, however clean its last turn ended. Read off disk
+  // (every run dir under both bases), which is why it is an effect — the
+  // lifecycle must not learn to enumerate the registry itself.
+  hasPendingSpawns: (rec) => hasPendingSpawns(rec),
 });
 
 // ---------------------------------------------------------------------------
@@ -835,6 +919,14 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
     // only this pane's process may autonomously sweep the run (see
     // isOwnedBy). Absent when the process has no pane of its own.
     ...(process.env.HERDR_PANE_ID ? { ownerPane: process.env.HERDR_PANE_ID } : {}),
+    // This process's own run id, when it has one: the parent relation
+    // `pendingSpawnsOf` selects on. Process-stamped like the pane above and the
+    // ancestry chain (never model-supplied), and gated on the run-id pattern for
+    // the same reason `loadRegistry` gates on it — the value comes from this
+    // process's env, and an env a parent could not have set is not a parent.
+    ...(process.env.PI_SUBAGENT_RUN_ID && RUN_ID_PATTERN.test(process.env.PI_SUBAGENT_RUN_ID)
+      ? { parentRunId: process.env.PI_SUBAGENT_RUN_ID }
+      : {}),
     // The card this run does, when the parent passed one (see SpawnParams).
     ...(params.card !== undefined ? { card: params.card } : {}),
   };
@@ -1066,6 +1158,29 @@ function formatResultHeader(rec: RunRecord): string {
   return `=== ${rec.runId} (${rec.agent}) — ${role} [${elapsed}] ===`;
 }
 
+/**
+ * Run ids proven to have been delivered as a `done` notice to the run whose
+ * answer a spawns block follows — always empty, and deliberately so.
+ *
+ * The plan was to read them off the session transcript: a `[subagent … done]`
+ * input recorded there would be a fact, not a claim. pi does not record one.
+ * An `input` hook that answers `handled` (this module's, in every process that
+ * loads it) returns before pi creates a message, and session persistence hangs
+ * off `message_end`, so a swallowed notice is nowhere on disk — verified against
+ * the installed `agent-session.js` and an empty `grep` over a live session. The
+ * one durable trace is the briefing the notice was folded into, and a briefing
+ * header is text a model can also write, so it is not evidence either.
+ *
+ * Empty therefore means every finished child is labelled "delivery not
+ * provable from disk" — always true, and stated because nothing on disk proves
+ * the verdict reached the run whose text is printed above it. The label says
+ * what the disk supports (no proof of delivery), not that the block above
+ * omitted it: after the pending-spawn deferral a delegating worker settles
+ * *because* its graders' verdicts reached it, which the old "not reflected"
+ * claim asserted the opposite of.
+ */
+const COLLECTED_DONE_IDS: ReadonlySet<string> = new Set();
+
 function truncate(text: string): string {
   if (text.length <= RESULT_MAX_CHARS) return text;
   return `${text.slice(0, RESULT_MAX_CHARS)}\n…[truncated; full transcript: see run dir]`;
@@ -1137,6 +1252,16 @@ async function renderResultBlock(
     out.push(`todos: ${bits.join(", ")}`);
   }
   out.push(resolved.answered ? truncate(resolved.text) : "(no final answer in transcript)");
+  // What this run launched, as of now, on the line right after its answer — so
+  // it lands just past the child's closing `</result>` in what the receiver
+  // reads, and outside the element. To `out` ONLY: never the transcript, the
+  // sidecar or `system-prompt.md`, which are evidence the completion predicates
+  // read, and a line written into any of them would become a new candidate
+  // answer. A fresh scan rather than the memo: the header says "snapshot at",
+  // and a record set left over from the last tick could be a minute old.
+  invalidateRunScan();
+  const spawns = renderSpawnsBlock(rec, allRunCandidates(), COLLECTED_DONE_IDS, Date.now(), hasExitSidecar);
+  if (spawns) out.push(spawns);
   if (rec.status === "failed" && !resolved.answered) {
     const diag = await paneDiagnostic(rec);
     if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
@@ -1409,6 +1534,7 @@ export default function (pi: ExtensionAPI): void {
   });
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
   let livenessTimer: ReturnType<typeof setInterval> | undefined;
+  let livenessTickInFlight = false;
 
   /**
    * Delivers a composed briefing.
@@ -1507,13 +1633,72 @@ export default function (pi: ExtensionAPI): void {
   /** Buffers a notice through the ledger and arms the flush it calls for. */
   const enqueueNotice = (notice: Notice): void => armFlush(ledger.enqueue(notice, Date.now()));
 
+  /**
+   * The registry's copy of a scanned record when there is one, so a settlement
+   * moves the object every later `saveMeta` writes from. A scan returns fresh
+   * parses; settling only those would leave `runs` saying `running`, and the
+   * next write of that copy would put it back on disk.
+   */
+  const liveCopyOf = (rec: RunRecord): RunRecord => runs.get(rec.runId) ?? rec;
+
+  /**
+   * Records this process must leave to its own sweep: the ones it owns. Their
+   * settlement has to come from the ledger, because the ledger is what turns a
+   * settlement into a briefing — settling one here would finish it silently.
+   */
+  const ownedHere = (rec: RunRecord): boolean => isOwnedBy(rec, ownerPane);
+
   /** One liveness tick through the ledger, arming the flush its notices call for. */
   const runLivenessTick = async (): Promise<void> => {
-    armFlush(await ledger.tick(Date.now()));
-    // The tick is the board's other heartbeat: even with no notices queued, a
-    // child's todo list may have moved, so ask the kanban board to re-read the
-    // runs. No-op when no board is listening.
-    pi.events?.emit(RUN_TODOS_EVENT, undefined);
+    // The interval fires every 60 s, but a tick can legitimately run longer: the
+    // orphan settle probes herdr serially, one 30 s timeout per distinct owner
+    // pane, before `ledger.tick` runs. While the previous tick is in flight the
+    // tick is skipped — overlapping ticks would repeat the whole scan-and-probe
+    // set, compounding round-trips exactly when herdr is slow. The next
+    // interval re-drives everything this one was left behind; the settle is
+    // idempotent, so nothing is lost to the skip.
+    if (livenessTickInFlight) return;
+    livenessTickInFlight = true;
+    try {
+      // The scan memo opens for one tick's worth of reads and no longer: every
+      // sweep, query and render below shares one directory scan, and the next tick
+      // re-reads the record set whatever another process wrote to it.
+      invalidateRunScan();
+      // Orphans first, so the sweep below reads a registry they no longer pollute:
+      // finished, ownerless records nobody else will ever settle. The root only —
+      // a child's tick exists to reconcile its own launches, and the rule that made
+      // giving it one safe is that it touches nothing it does not own.
+      if (!process.env.PI_SUBAGENT_RUN_ID) {
+        try {
+          await settleOrphans(allRunCandidates(), {
+            lifecycle,
+            sidecarAt: readExitSidecarAt,
+            hasSidecar: hasExitSidecar,
+            resolve: liveCopyOf,
+            skip: ownedHere,
+            findParent: (rec) => {
+              const id = typeof rec.parentRunId === "string" ? rec.parentRunId : undefined;
+              if (id === undefined) return undefined;
+              const parent = runs.get(id) ?? findRunRecordInAnyBase(id)?.rec;
+              // A parent whose status is not one of ours is unknown, and an unknown
+              // parent does not prove anything is finished.
+              return parent && isRunStatus(parent.status) ? parent : undefined;
+            },
+            probeOwnerPane: (paneId) => probeAgent(paneId),
+          });
+        } catch {
+          // A settle that threw leaves every record where it was; the next tick
+          // looks again.
+        }
+      }
+      armFlush(await ledger.tick(Date.now()));
+      // The tick is the board's other heartbeat: even with no notices queued, a
+      // child's todo list may have moved, so ask the kanban board to re-read the
+      // runs. No-op when no board is listening.
+      pi.events?.emit(RUN_TODOS_EVENT, undefined);
+    } finally {
+      livenessTickInFlight = false;
+    }
   };
 
   /**
@@ -1553,25 +1738,79 @@ export default function (pi: ExtensionAPI): void {
     ledger.shutdown();
   });
 
-  // The parent-side liveness backstop: one bounded reconciliation tick per
-  // interval. A live child costs one status probe and nothing else; a dead
-  // child is classified from its sidecar and woken through the ordinary
-  // coalesced path. `unref` keeps a session whose only remaining activity is a
-  // quiet fleet from holding the process open.
-  // Children load this module too (they get the subagent/subagent_tasks tools)
-  // and share the on-disk registry, so a child's tick would reconcile records
-  // it does not own: closing siblings' panes (destroying scrollback evidence),
-  // overwriting siblings' meta.json, and injecting sibling briefings into the
-  // child's own session — it can even mark its own record failed (herdr's
-  // `done` means "ready for input"). Guard the interval registration, not the
-  // factory: children keep spawning and querying, they just never tick. Same
-  // guard as todo.ts and kanban/index.ts.
-  if (!process.env.PI_SUBAGENT_RUN_ID) {
-    livenessTimer = setInterval(() => {
-      void runLivenessTick().catch(() => {});
-    }, LIVENESS_BACKSTOP_MS);
-    livenessTimer.unref?.();
+  // The liveness backstop: one bounded reconciliation tick per interval. A live
+  // child costs one status probe and nothing else; a dead child is classified
+  // from its sidecar and woken through the ordinary coalesced path. `unref` keeps
+  // a session whose only remaining activity is a quiet fleet from holding the
+  // process open.
+  //
+  // A child used to be excluded outright, and for good reason: it loads this
+  // module too and shares the on-disk registry, so an unguarded child tick
+  // reconciles records it does not own — closing siblings' panes (destroying
+  // scrollback evidence), overwriting their `meta.json`, injecting their briefings
+  // into the child's own session. That is still true, and ownership is still what
+  // answers it: `ledger.tick` sweeps `records().filter(isOwned)` and `isOwned` is
+  // {@link isOwnedBy} against this process's pane, so a tick can only ever touch
+  // records whose `ownerPane` is this pane — a child's own spawns, never a
+  // sibling's and never the child's own record (its parent stamped that one).
+  //
+  // What changed is that a delegating child now *needs* a tick. Its spawns are the
+  // records it may be waiting on, they live in its registry and nowhere else, and
+  // a grader whose pane died stays `running` on disk until somebody settles it —
+  // which, since the deferral, is what holds the child's own completion open
+  // (up to `DEFER_MAX_MS`). So the interval is registered everywhere and the gate
+  // moved inside the callback: a child ticks only while it owns a running record,
+  // which for a child means "while one of my launches is unreconciled". A child
+  // that has spawned nothing never sweeps anything.
+  const childRunId = process.env.PI_SUBAGENT_RUN_ID;
+
+  // The one-time cleanup: every `running` record a sidecar proves finished, whose
+  // owner is not this process and has had `STUCK_SIDECAR_MIN_AGE_MS` to settle it,
+  // is settled `done` at the sidecar's own time.
+  // These are the records a dead owner left behind (a worker that exited before
+  // its graders, a session that went away); nothing else would ever settle them.
+  // Idempotent — a settled record is not `running` — so running it on every root
+  // start is the migration. Fire-and-forget: a slow disk must not hold up the
+  // factory, and the lifecycle's per-run queue orders it against any sweep.
+  if (!childRunId) {
+    // Scoped to THIS profile's run dir — not `allRunCandidates()`, which also
+    // scans the import-time `RUNS_DIR` constant. That constant is the real
+    // `~/.pi/agent/subagent-runs` whenever a module instance was imported with
+    // `PI_CODING_AGENT_DIR` unset (the suites import this way), and a settle is
+    // a WRITE: scanning it from a factory pointed at a temp dir would rewrite
+    // live records from a test run. In production the two bases coincide, so
+    // nothing real is missed.
+    //
+    // The pass writes through `dirFor` (and its `adoptedRunDirs`), so a scan
+    // that reads from a switched profile's dir must record the adoption, the
+    // same way `allRunCandidates` does. Without it, `saveMeta` would write to
+    // `runDir(agentDir(), id)` — the other dir — and die silently in its
+    // catch, after the in-memory copy is already `done`.
+    const stuck = listRunCandidates([runsDir(profileDir())]);
+    for (const { rec, dir } of stuck) {
+      if (dir !== dirFor(rec.runId) && !adoptedRunDirs.has(rec.runId)) adoptedRunDirs.set(rec.runId, dir);
+    }
+    void settleStuckRecords(stuck, {
+      lifecycle,
+      sidecarAt: readExitSidecarAt,
+      resolve: liveCopyOf,
+      skip: ownedHere,
+      abandonedBefore: Date.now() - STUCK_SIDECAR_MIN_AGE_MS,
+    })
+      .then((settled) => {
+        // A settled record's status changed under the cached scan; drop the
+        // cache so the next read (a `status` action, the ledger's rescan) sees
+        // `done` rather than the stale `running`.
+        if (settled.length > 0) invalidateRunScan();
+      })
+      .catch(() => {});
   }
+
+  livenessTimer = setInterval(() => {
+    if (childRunId && !ownsRunningRecord([...runs.values()], ownerPane)) return;
+    void runLivenessTick().catch(() => {});
+  }, LIVENESS_BACKSTOP_MS);
+  livenessTimer.unref?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,7 +1985,7 @@ async function dispatchTasks(
           // that), so answer from the completion evidence already on disk:
           // display-only, no transition, no meta write, no pane close; the
           // `result` arm below nests the same evidence test.
-          const evidence = await completionEvidence(dirFor(rec.runId), rec.runId);
+          const evidence = await completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
           if (evidence.finished) {
             lines.push(
               `${rec.runId} (${rec.agent}): done (${
@@ -1827,7 +2066,7 @@ async function dispatchTasks(
             // the completion evidence already on disk, display-only: the
             // record is not touched, so the owning pane's process stays the
             // one to settle it. The label says the status is inferred.
-            const evidence = await completionEvidence(dirFor(rec.runId), rec.runId);
+            const evidence = await completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
             if (evidence.finished) {
               const note =
                 evidence.from === "sidecar"

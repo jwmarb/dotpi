@@ -9,7 +9,6 @@
  *
  * @module subagent-herdr/lib
  */
-import { readFileSync } from "node:fs";
 import { open, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
@@ -42,11 +41,9 @@ import {
   type RunRecord,
   exitPath,
   formatAncestry,
-  hasRunId,
   isSessionFileFor,
-  metaPath,
-  RUN_ID_PATTERN,
   parseReportLine,
+  pickSessionName,
   qualifiesAsAnswer,
   qualifiesAsSalvage,
   reportsPath,
@@ -225,37 +222,12 @@ export function childAncestry(env: NodeJS.ProcessEnv): AncestorEntry[] {
 }
 
 /**
- * Reads and validates a run's meta record from its run dir — the rescue
- * path for a run lost to a parent restart: the in-memory registry no
- * longer has it, but the run dir (and its session transcript) is on
- * disk.
- *
- * Takes the runs dir and the run id, and derives the run dir from the id by
- * joining the id onto the runs dir: the id is checked against `RUN_ID_PATTERN`
- * before any path is built, so a model-supplied `../x` can never reach the
- * filesystem through this API, no matter where it is called from — the guard
- * lives in the reader, not at the call sites, so it cannot be forgotten there.
- *
- * The record's runId must match the caller's: the run dir layout assumes
- * that identity, and a mismatch is a partial dir (crashed mid-spawn),
- * not a run. Synchronous on purpose — the input hook that calls it is
- * synchronous, and the read is one small file.
- *
- * @param runsDir - The runs directory (the `subagent-runs` dir).
- * @param runId - The run id; must match `RUN_ID_PATTERN`.
+ * `readRunRecordFromDisk` and `pickSessionName` moved to `rundir.ts` with the
+ * pending-spawn predicate: the module that owns `meta.json`'s shape owns the
+ * one reader of it, and a name rule *is* the layout contract. The re-exports
+ * keep these paths for their importers.
  */
-export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord | undefined {
-  if (!RUN_ID_PATTERN.test(runId)) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(metaPath(join(runsDir, runId)), "utf-8"));
-  } catch {
-    return undefined;
-  }
-  // `hasRunId`, not the strict `isRunRecord`: adoption must not drop a record
-  // whose status is missing or unrecognised (a truncated or older meta.json).
-  return hasRunId(parsed) && parsed.runId === runId ? parsed : undefined;
-}
+export { pickSessionName, readRunRecordFromDisk } from "./rundir.js";
 
 /**
  * Reads the child's report log ({@link reportsPath}, appended by the child's
@@ -887,20 +859,6 @@ export async function extractRunResult(runDir: string, runId: string, tailBytes?
   return { found: true, answered: false, text: "", sessionFile, ...(todos ? { todos } : {}) };
 }
 
-/**
- * The one transcript-selection rule, as a pure function over a directory
- * listing: the `.exit`-settled transcript wins, else the newest (ISO-prefixed
- * names sort chronologically). `findSessionFile` and the lifecycle's
- * `evidenceStamp` (a sync reader) share it so a resumed dir fingerprints and
- * answers from the same file.
- */
-export function pickSessionName(names: readonly string[], runId: string): string | undefined {
-  const own = names.filter((n) => isSessionFileFor(n, runId));
-  if (own.length === 0) return undefined;
-  own.sort();
-  const settled = own.filter((n) => names.includes(exitPath(n)));
-  return settled.length > 0 ? settled[settled.length - 1] : own[own.length - 1];
-}
 
 async function findSessionFile(runDir: string, runId: string): Promise<string | undefined> {
   let dirEntries: string[];

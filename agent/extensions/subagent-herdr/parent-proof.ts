@@ -125,6 +125,7 @@ export interface ParentProofEffects {
   completionEvidence(
     dir: string,
     runId: string,
+    paneId?: string,
   ): Promise<{ finished: true; from: "sidecar" | "answer" } | { finished: false }>;
   /** The clock the memo's TTL is measured on. */
   now(): number;
@@ -170,7 +171,7 @@ export function createParentProof(
           const pane = await effects.probe(rec.paneId, WAKE_PROBE_TIMEOUT_MS);
           if (pane.kind !== "gone") return { finished: false };
         }
-        const evidence = await effects.completionEvidence(dir, runId);
+        const evidence = await effects.completionEvidence(dir, runId, rec.paneId);
         return evidence.finished
           ? { finished: true, from: evidence.from }
           : { finished: false };

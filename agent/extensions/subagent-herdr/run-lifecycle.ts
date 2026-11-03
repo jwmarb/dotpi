@@ -38,6 +38,9 @@
 import type { AgentProbe } from "./herdr.js";
 import type { RunResult } from "./lib.js";
 import type { FailedAttempt, RunRecord, RunStatus } from "./rundir.js";
+import { REVIVAL_WINDOW_MS } from "./rundir.js";
+
+export { REVIVAL_WINDOW_MS };
 
 /** Patience between settle re-reads of a gone/absent pane's evidence. */
 export const SETTLE_DELAY_MS = 750;
@@ -45,12 +48,6 @@ export const SETTLE_DELAY_MS = 750;
 /** Settle re-reads after the first extraction, when a session exists but no signal does. */
 const SETTLE_RETRIES = 2;
 
-/**
- * How long after its terminal time a `failed` run stays a revival candidate:
- * six liveness intervals. A false failure is corrected now, not hours later —
- * and after a restart, history is not re-read on every tick.
- */
-export const REVIVAL_WINDOW_MS = 6 * 60_000;
 
 /** At most this many records are reconciled at once by a sweep. */
 const SWEEP_CONCURRENCY = 8;
@@ -82,6 +79,17 @@ export interface RunLifecycleEffects {
    * a crash mid-spawn is not in flight and still settles as `no-pane`.
    */
   isLaunching(runId: string): boolean;
+  /**
+   * Does this run have launches of its own that have not finished?
+   *
+   * The third input to {@link completionSignal} — the pending-spawn predicate
+   * over the *whole* on-disk registry, which is why it is an effect and not
+   * something this module can read: the lifecycle knows one run dir at a time,
+   * and the answer needs every run dir under both of this process's bases.
+   * Absent means "no", which is every behaviour this module had before the
+   * predicate gained the input.
+   */
+  hasPendingSpawns?(rec: RunRecord): boolean;
 }
 
 /**
@@ -97,7 +105,8 @@ export type LifecycleCause =
   | "pane-gone"
   | "no-pane"
   | "cancelled"
-  | "late-completion";
+  | "late-completion"
+  | "sidecar-settle";
 
 /**
  * THE completion predicate, as a pure rule over what the caller already has:
@@ -108,9 +117,34 @@ export type LifecycleCause =
  * resolved from {@link runDirBases}-style bases the lifecycle does not know.
  * A salvage (`answered` with a `salvagedFrom`) is deliberately not a signal:
  * it proves the child produced text, not that it stopped.
+ *
+ * `hasPendingSpawns` is the third input, and it is the reason a *clean* answer is
+ * no longer enough on its own: a delegating child follows its own agent's
+ * instruction to launch its graders, write a `<result>` saying the pass is
+ * pending, and end its turn to be woken by them. That waiting turn's answer is
+ * clean by every rule above, and the old two-input predicate read it as the run
+ * being finished — settling the worker and closing its pane while the verdicts it
+ * was waiting for were still unwritten. A run with unfinished spawns of its own
+ * (`rundir.ts`'s `pendingSpawnsOf` — no sidecar, and a status that is not
+ * terminal) is therefore not finished, however well its last turn ended.
+ *
+ * The sidecar still wins outright: a child that wrote one *did* finish, whatever
+ * its spawns look like, and it is the child's own write that settles the question
+ * (the anti-pattern that the sidecar *is* the done classification).
+ *
+ * Injected by the caller rather than computed here, so this module stays pi-free
+ * and disk-free about the rest of the registry: only the factory can enumerate
+ * every run dir.
  */
-export function completionSignal(hasSidecar: boolean, result: RunResult): boolean {
-  return hasSidecar || (result.answered && result.salvagedFrom === undefined);
+export function completionSignal(
+  hasSidecar: boolean,
+  result: RunResult,
+  hasPendingSpawns = false,
+): boolean {
+  return (
+    hasSidecar ||
+    (result.answered && result.salvagedFrom === undefined && !hasPendingSpawns)
+  );
 }
 
 export interface LifecycleTransition {
@@ -157,6 +191,19 @@ export interface RunLifecycle {
   ): LifecycleTransition;
   /** Cancel a running record: persist first, then close its pane best-effort. */
   cancel(rec: RunRecord): Promise<RunObservation>;
+  /**
+   * Settle a `running` record as `done` on the strength of its `.exit` sidecar
+   * alone, stamping `finishedAt` with the sidecar's own `at`. Persists; **never
+   * closes a pane** and never writes `failed`. `undefined` when the record is not
+   * `running` or `at` is not a finite number.
+   *
+   * The settlement for records whose owner can no longer sweep them (a dead
+   * parent, a pane that went with its session). It skips the probe and the
+   * transcript read on purpose: the sidecar is the child's own write and the
+   * done classification by itself, and the pane is left alone because a pane id
+   * outlives its run — closing whatever now answers to it is not cleanup.
+   */
+  settleFromSidecar(rec: RunRecord, at: number): Promise<LifecycleTransition | undefined>;
 }
 
 export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
@@ -186,6 +233,26 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
 
   /** THE completion predicate: {@link completionSignal} through this lifecycle's effects. */
   const completed = (rec: RunRecord, result: RunResult): boolean =>
+    completionSignal(
+      effects.hasSidecar(effects.runDirOf(rec.runId), rec.runId),
+      result,
+      effects.hasPendingSpawns?.(rec) ?? false,
+    );
+
+  /**
+   * The same rule for a run whose pane is **gone** (or was never recorded): the
+   * pending input pinned off, which is the one place the third input is not
+   * consulted.
+   *
+   * A deferral is a promise that the run will be looked at again, and only a live
+   * pane can keep that promise. The process behind a gone pane cannot be woken by
+   * its children's notices, so refusing it `done` buys nothing and costs
+   * something specific: a run that produced a clean answer and whose pane has
+   * since been destroyed would be written `failed`, which is the label that tells
+   * the orchestrator to re-delegate rather than read the answer. Dead-pane
+   * settlement is deliberately unchanged.
+   */
+  const completedDead = (rec: RunRecord, result: RunResult): boolean =>
     completionSignal(effects.hasSidecar(effects.runDirOf(rec.runId), rec.runId), result);
 
   const extract = (rec: RunRecord): Promise<RunResult> =>
@@ -206,14 +273,22 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
     };
   };
 
-  /** The one mutation of status/finishedAt; undefined for an illegal transition. */
-  const transition = (rec: RunRecord, to: RunStatus, cause: LifecycleCause): LifecycleTransition | undefined => {
+  /**
+   * The one mutation of status/finishedAt; undefined for an illegal transition.
+   * `at` defaults to the injected clock; the sidecar settle passes the time the
+   * child actually finished.
+   */
+  const transition = (
+    rec: RunRecord,
+    to: RunStatus,
+    cause: LifecycleCause,
+    at: number = effects.now(),
+  ): LifecycleTransition | undefined => {
     const from = rec.status;
     const legal =
       (from === "running" && to !== "running") ||
       (from === "failed" && to === "done" && rec.failedAttempts === undefined);
     if (!legal) return undefined;
-    const at = effects.now();
     rec.status = to;
     rec.finishedAt = at;
     return { run: rec, from, to, cause, at };
@@ -261,11 +336,11 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
     fallback: "pane-gone" | "no-pane",
   ): Promise<RunObservation> => {
     let result = await extract(rec);
-    let signal = completed(rec, result);
+    let signal = completedDead(rec, result);
     for (let i = 0; i < SETTLE_RETRIES && !signal && result.found; i++) {
       await effects.delay(SETTLE_DELAY_MS);
       result = await extract(rec);
-      signal = completed(rec, result);
+      signal = completedDead(rec, result);
     }
     const t = signal ? await finishDone(rec, "completion-signal") : finishFailed(rec, fallback);
     return observe(rec, pane, t, result);
@@ -374,5 +449,16 @@ export function createRunLifecycle(effects: RunLifecycleEffects): RunLifecycle {
       return observe(rec, { kind: "none" }, t);
     });
 
-  return { read, sweep, launchFailed, cancel };
+  const settleFromSidecar = (rec: RunRecord, at: number): Promise<LifecycleTransition | undefined> =>
+    serialize(rec.runId, async () => {
+      // Narrower than `transition`'s table on purpose: only `running` qualifies.
+      // A `failed` record is revived through the sweep, which re-reads its
+      // evidence; this path reads none, so it must not overrule a verdict.
+      if (rec.status !== "running" || !Number.isFinite(at)) return undefined;
+      const t = transition(rec, "done", "sidecar-settle", at);
+      if (t) effects.saveMeta(rec);
+      return t;
+    });
+
+  return { read, sweep, launchFailed, cancel, settleFromSidecar };
 }

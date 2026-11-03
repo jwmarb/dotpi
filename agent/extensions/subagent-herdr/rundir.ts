@@ -30,16 +30,22 @@
  *
  * ## What is deliberately not here
  *
- * The reads and writes themselves. This module answers "where does it live and
- * what shape is it", not "go and fetch it": `readReports` stays in `lib.ts`
- * where the parent's async I/O lives, and `appendReport`/`writeSidecar` stay in
- * `child-done.ts` where the child's synchronous, crash-path-sensitive writes
- * live. Paths and shapes are the part both sides must agree on.
+ * The async reads and the bulky writes. This module answers "where does it live
+ * and what shape is it", and it owns the *small synchronous* reads whose trust
+ * rule is part of that shape — `hasExitSidecar`, `readExitSidecarAt`,
+ * `readRunRecordFromDisk` and the `listRunCandidates` built from them — because
+ * both halves of the handshake, and the child process that imports nothing else
+ * from the parent, have to ask the same question of disk. What stays out is the
+ * bulk I/O: `readReports` and `extractRunResult` live in `lib.ts` where the
+ * parent's async I/O is, and `appendReport`/`writeSidecar` stay in
+ * `child-done.ts` where the child's crash-path-sensitive writes are. Paths and
+ * shapes, and the one reader of each small file that decides them, are the part
+ * both sides must agree on.
  *
  * @module subagent-herdr/rundir
  */
 
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -145,6 +151,65 @@ export function hasExitSidecar(runDirPath: string, runId: string): boolean {
 }
 
 /**
+ * The one transcript-selection rule, as a pure function over a directory
+ * listing: the `.exit`-settled transcript wins, else the newest (ISO-prefixed
+ * names sort chronologically). `findSessionFile` and the lifecycle's
+ * `evidenceStamp` (a sync reader) share it so a resumed dir fingerprints and
+ * answers from the same file; {@link readExitSidecarAt} selects through it so
+ * a resumed dir with two sidecars stamps `finishedAt` from the newest settled
+ * completion, not from whichever file the directory enumeration surfaced
+ * first. The rule lives here because a name rule *is* the layout contract.
+ */
+export function pickSessionName(names: readonly string[], runId: string): string | undefined {
+	const own = names.filter((n) => isSessionFileFor(n, runId));
+	if (own.length === 0) return undefined;
+	own.sort();
+	const settled = own.filter((n) => names.includes(exitPath(n)));
+	return settled.length > 0 ? settled[settled.length - 1] : own[own.length - 1];
+}
+
+/**
+ * When did the child write its completion sidecar? `undefined` when there is
+ * none, it cannot be read, or its `at` is not a finite number.
+ *
+ * Same name rule as {@link hasExitSidecar} (one listing, the sidecar must sit
+ * beside a session file for this run id), and the same "a sidecar nobody can
+ * read proves nothing" answer for every filesystem or parse error. Where
+ * {@link hasExitSidecar} answers *whether*, this answers *when*, which is what
+ * a settlement needs to stamp `finishedAt` with the real completion time
+ * rather than the time somebody got round to noticing.
+ *
+ * The session is selected through {@link pickSessionName} — the one
+ * transcript-selection rule `findSessionFile` and `evidenceStamp` share — so
+ * a resumed dir with two settled transcripts answers from the newest
+ * completion, and a newer transcript with *no* sidecar (a post-completion
+ * resume) does not shadow the settled one. Selection is by name, before any
+ * parse: an *unparseable* sidecar on the selected transcript proves nothing
+ * and yields `undefined`, never an older sibling's `at` — a stale completion
+ * time is worse than none.
+ *
+ * @param runDirPath - The run's directory.
+ * @param runId - The run id whose session file to look for.
+ */
+export function readExitSidecarAt(runDirPath: string, runId: string): number | undefined {
+	try {
+		const names = readdirSync(runDirPath);
+		const name = pickSessionName(names, runId);
+		if (name === undefined) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(readFileSync(join(runDirPath, exitPath(name)), "utf-8"));
+		} catch {
+			return undefined;
+		}
+		const at = (parsed as { at?: unknown } | null | undefined)?.at;
+		return typeof at === "number" && Number.isFinite(at) ? at : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Every way a run can stand, as recorded in `meta.json` — the ONE list
  * `RunStatus`, {@link isRunStatus} and the kanban board's reader derive from.
  */
@@ -156,6 +221,56 @@ export type RunStatus = (typeof RUN_STATUSES)[number];
 /** Is `v` one of {@link RUN_STATUSES}? */
 export function isRunStatus(v: unknown): v is RunStatus {
 	return (RUN_STATUSES as readonly unknown[]).includes(v);
+}
+/**
+ * Can this *record* still produce a `.exit` sidecar — the ONE terminal rule the
+ * pending-spawn predicate applies by default, and the mirror of the
+ * lifecycle's own legality rule (`run-lifecycle.ts`):
+ *
+ * - `done` / `cancelled` — the run ended; no sidecar is coming.
+ * - `failed` **with** `failedAttempts` — the launch failed before the process
+ *   started (no composer, no prompt, nothing left to answer), so a sidecar
+ *   can never be coming.
+ * - `failed` **without** `failedAttempts` — terminal only **after**
+ *   `REVIVAL_WINDOW_MS` has elapsed since it settled (`finishedAt`): that is
+ *   the state the lifecycle keeps recoverable (`failed → done` legal exactly
+ *   while `failedAttempts === undefined` and the window has not run out), a
+ *   pane kept alive as evidence, a composer that may still finish the run.
+ *   Measured on the recorded corpus, 12 such records settled `failed` and went
+ *   on to write a sidecar, so a rule that released a bare `failed`
+ *   *unconditionally* was wrong. The rule now releases them only once the
+ *   window has run: while it runs the record keeps holding, and past it the
+ *   state is closed in every sense the lifecycle recognises, so it releases.
+ *
+ * A record, not a status: the question is "can a sidecar still be coming
+ * from this run", and only the record answers it — a `failed` status alone
+ * cannot.
+ *
+ * `now` is the caller's clock; the revival-window clause is the only reason a
+ * `finishedAt` is consulted. A bare `failed` with a `finishedAt` that is
+ * missing or not a finite number is treated as **still recoverable** (pending):
+ * a record too broken to say when it closed keeps holding rather than
+ * releasing on an untrusted timestamp.
+ * A missing or unrecognised `status` is NOT terminal: a broken record keeps
+ * holding its parent rather than silently releasing it.
+ */
+export function isTerminalRecord(rec: RunRecord, now: number): boolean {
+	if (rec.status === "done" || rec.status === "cancelled") return true;
+	if (rec.status === "failed") {
+		// A failed launch attempt means the process never started, so no sidecar
+		// is ever coming: terminal now, regardless of the revival window.
+		if (rec.failedAttempts !== undefined) return true;
+		// A bare `failed` is the lifecycle's recoverable state. It stays pending
+		// until REVIVAL_WINDOW_MS has passed since it settled (`finishedAt`);
+		// past that the state is closed and releases its waiting parent. A
+		// missing or non-finite `finishedAt` fails closed to pending: a record
+		// too broken to say when it closed keeps holding.
+		const finishedAt = rec.finishedAt;
+		if (typeof finishedAt !== "number" || !Number.isFinite(finishedAt))
+			return false;
+		return now - finishedAt >= REVIVAL_WINDOW_MS;
+	}
+	return false;
 }
 
 /**
@@ -235,6 +350,251 @@ export interface RunRecord {
 	 * it under the run line. Absent for ordinary runs.
 	 */
 	card?: string;
+	/**
+	 * The run id of the process that launched this run, stamped at spawn from
+	 * that process's own `PI_SUBAGENT_RUN_ID` — process-stamped, never taken
+	 * from model output, the same rule as {@link ownerPane} and the ancestry
+	 * chain. Present only for a nested delegation (a child's own child); the
+	 * orchestrator's runs have no run id to inherit and leave it absent.
+	 *
+	 * It exists because `ownerPane` names a *pane*, not a run: an orchestrator
+	 * session reuses one pane for days of successive delegations, so the pane
+	 * relation cannot say which run did the launching. Old records stay valid
+	 * without it — {@link launchedBy} falls back to `ownerPane` — and a present
+	 * non-string value is treated as absent (the same rule as `ownerPane` at
+	 * the guarded read sites), so a planted value cannot claim a parent.
+	 */
+	parentRunId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Pending spawns: is a run still waiting on runs it launched?
+// ---------------------------------------------------------------------------
+
+/**
+ * How long another run's unfinished spawn may hold this run's completion open.
+ *
+ * Measured over the recorded nested runs: p90 duration 31 min, max 67 min, so
+ * 75 min clears every case the corpus contains. The bound therefore only ever
+ * fires on something that will never finish anyway — a spawn whose pane died
+ * silently, or a record planted in the world-writable run dir.
+ *
+ * It bounds the deferral *decision*: on any re-evaluation after it expires,
+ * the spawn no longer counts as pending, so it cannot hold its parent. The
+ * bound does not itself wake anything, and nothing watches the expired spawn:
+ * the release is noticed by whoever next re-evaluates the *waiting* run — its
+ * owner's liveness tick (open while that owner holds any `running` record),
+ * or the waiting child's own next `agent_end` / `subagent_done`.
+ *
+ * Most closed states do not reach this bound: the terminal rule
+ * ({@link isTerminalRecord}) releases a `done`, `cancelled`, or
+ * `failed`-with-`failedAttempts` record immediately, and a bare `failed` once
+ * its `REVIVAL_WINDOW_MS` has run (the state is recoverable — and a spawn that
+ * keeps holding — only while the lifecycle still allows `failed → done`). The
+ * bound is the residual backstop for what neither the sidecar nor that
+ * time-bounded rule releases: a `running` record whose pane died silently, or a
+ * record broken enough to say nothing.
+ */
+export const DEFER_MAX_MS = 75 * 60 * 1000;
+/**
+ * How long after it settled a bare `failed` run stays the lifecycle's
+ * recoverable state (and therefore a pending spawn that keeps holding its
+ * parent): six liveness intervals. A false failure is corrected now, not
+ * hours later, and after a restart history is not re-read on every tick.
+ *
+ * Lives here, not in `run-lifecycle.ts`, because the pending-spawn terminal
+ * rule in this contract module needs it and `run-lifecycle.ts` imports from
+ * this one — the number is spelled once and re-exported by the lifecycle.
+ */
+export const REVIVAL_WINDOW_MS = 6 * 60_000;
+
+/**
+ * Was `rec` launched by `parent`?
+ *
+ * `parentRunId` decides whenever the record carries a usable one; the legacy
+ * `ownerPane` relation is consulted only for records that predate the field.
+ * The stamp *wins* rather than narrowing the pane match: a record stamped with
+ * a different parent belongs to that parent even when the pane also matches,
+ * which is what keeps a pane reused across sessions from adopting unrelated
+ * records.
+ *
+ * Exported because the pending-spawn predicate and the spawns block a parent
+ * renders must agree on exactly one parent relation.
+ */
+export function launchedBy(rec: RunRecord, parent: { runId: string; paneId?: string }): boolean {
+	const parentId = typeof rec.parentRunId === "string" ? rec.parentRunId : undefined;
+	if (parentId !== undefined) return parentId === parent.runId;
+	const owner = typeof rec.ownerPane === "string" ? rec.ownerPane : undefined;
+	return owner !== undefined && parent.paneId !== undefined && owner === parent.paneId;
+}
+
+/**
+ * The runs `run` launched that have not finished — the ONE pending-spawn rule,
+ * applied identically by the child that wants to stop and the parent that
+ * would otherwise settle it.
+ *
+ * **Unfinished means: no `.exit` sidecar, and a status that is not terminal**
+ * ({@link isTerminalRecord}: `done`, `cancelled`, `failed` *with*
+ * `failedAttempts`, or a bare `failed` once `REVIVAL_WINDOW_MS` has passed
+ * since it settled — while that window runs a bare `failed` is the lifecycle's
+ * recoverable state, so it keeps holding). The sidecar alone was not enough.
+ * Some spawns can never write one — a launch that failed before the process
+ * started, a run its parent cancelled — and holding the waiting worker for the
+ * whole {@link DEFER_MAX_MS} over those defeated the liveness tick that exists
+ * to end the wait. A terminal status is written by the owning process, never
+ * by the run, so it is not a child's premature claim of done.
+ *
+ * `DEFER_MAX_MS` is applied here rather than at each caller, measured from the
+ * pending spawn's own `startedAt`: one rule, so the child deferring its own
+ * completion and the parent declining to settle it cannot disagree about when
+ * the wait has run out. A `startedAt` that is not a finite number is treated as
+ * expired — a record too broken to say when it started cannot hold anything
+ * open.
+ *
+ * @param run - The run asking, identified by its run id (or, for a record with
+ *   no `parentRunId` stamp, by the pane its children were stamped with).
+ * @param candidates - Every record the caller can see, with the directory it
+ *   was read from ({@link listRunCandidates} produces this shape).
+ * @param now - The caller's clock, so the rule is testable without sleeping.
+ * @param hasSidecar - "Is this run finished?" — {@link hasExitSidecar} for every
+ *   live caller. Injectable only so a replay can ask the same rule *as of* a past
+ *   moment (a sidecar counts once its own `at` is no later than that moment)
+ *   without a second copy of the rule drifting from this one.
+ *
+ * @param isTerminal - "Can this spawn still produce a sidecar?" — {@link
+ *   isTerminalRecord} on the record for every live caller. Injectable for the
+ *   same historical reason: a replay asks about a past moment, and a record's
+ *   `status` TODAY (settled since by the migration or its owner) says nothing
+ *   about what it was then. A replay that skipped this would read every settled
+ *   child as "not pending" and report the whole late population as early.
+ *   The predicate receives the caller's `now` (the same value `pendingSpawnsOf`
+ *   is given) so the revival-window clause of {@link isTerminalRecord} is
+ *   evaluated at the same instant as the {@link DEFER_MAX_MS} bound.
+ */
+export function pendingSpawnsOf(
+	run: { runId: string; paneId?: string },
+	candidates: readonly { rec: RunRecord; dir: string }[],
+	now: number,
+	hasSidecar: (dir: string, runId: string) => boolean = hasExitSidecar,
+	isTerminal: (rec: RunRecord, now: number) => boolean = isTerminalRecord,
+): RunRecord[] {
+	const pending: RunRecord[] = [];
+	for (const { rec, dir } of candidates) {
+		// A record that *is* the asking run (legacy pane match on its own
+		// stamp) is not its own spawn.
+		if (rec.runId === run.runId) continue;
+		if (!launchedBy(rec, run)) continue;
+		if (hasSidecar(dir, rec.runId)) continue;
+		if (isTerminal(rec, now)) continue;
+		const startedAt = rec.startedAt;
+		if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) continue;
+		if (now - startedAt >= DEFER_MAX_MS) continue;
+		pending.push(rec);
+	}
+	return pending;
+}
+
+/**
+ * Reads and validates one run's `meta.json` from a runs dir.
+ *
+ * The one reader of that file, shared by the parent's registry, its adoption
+ * paths and {@link listRunCandidates}. It lives here because its trust rule *is*
+ * part of the layout contract: the id must match `RUN_ID_PATTERN` **before** any
+ * path is built (so a model-supplied `../x` cannot reach the filesystem through
+ * this API, guard in the reader rather than at the call sites), and the record's
+ * own `runId` must equal the caller's — the layout assumes that identity, and a
+ * mismatch is a partial dir (a crash mid-spawn), not a run.
+ *
+ * `hasRunId`, not the strict {@link isRunRecord}: a reader must not drop a
+ * record whose `status` is missing or unrecognised (an older or truncated
+ * `meta.json`).
+ *
+ * Synchronous on purpose: the input hook that reaches it is synchronous, and
+ * the read is one small file.
+ *
+ * @param runsDir - The runs directory (the `subagent-runs` dir).
+ * @param runId - The run id; must match `RUN_ID_PATTERN`.
+ */
+export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord | undefined {
+	if (!RUN_ID_PATTERN.test(runId)) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(metaPath(join(runsDir, runId)), "utf-8"));
+	} catch {
+		return undefined;
+	}
+	return hasRunId(parsed) && parsed.runId === runId ? parsed : undefined;
+}
+
+/**
+ * Every record readable under `bases`, each with the directory it was found in.
+ *
+ * The candidate set {@link pendingSpawnsOf} and the spawns block are evaluated
+ * over. This process's in-memory registry is *not* enough: the runs dir is
+ * global to every pi process, a nested child's record may have been written by
+ * a process that has since exited, and a profile switch moves the dir — so
+ * "does this run have unfinished spawns?" is a question about disk, asked of
+ * {@link runDirBases}-shaped bases by whoever holds them.
+ *
+ * Hostile by assumption: every field of a returned record came out of a
+ * world-writable directory, which is why the predicates guard each one
+ * (`launchedBy`'s `typeof` checks, {@link pendingSpawnsOf}'s finite
+ * `startedAt`) and why the block renderer prints only what matches a pattern.
+ *
+ * Deduped by run id with the first base winning — the same rule
+ * `findRunRecordInAnyBase` applies — so a record present in both this process's
+ * dir and a switched profile's dir is counted once.
+ */
+export function listRunCandidates(bases: readonly string[]): { rec: RunRecord; dir: string }[] {
+	const out: { rec: RunRecord; dir: string }[] = [];
+	const seen = new Set<string>();
+	for (const base of bases) {
+		let names: string[];
+		try {
+			names = readdirSync(base);
+		} catch {
+			continue; // No such runs dir: nothing to enumerate.
+		}
+		for (const name of names) {
+			if (!RUN_ID_PATTERN.test(name) || seen.has(name)) continue;
+			const rec = readRunRecordFromDisk(base, name);
+			if (!rec) continue;
+			seen.add(name);
+			out.push({ rec, dir: join(base, name) });
+		}
+	}
+	return out;
+}
+
+/**
+ * The bases a process enumerates run records from, in the one order every
+ * caller has to agree on: this process's own runs dir, then the switched
+ * profile's dir when an in-session profile switch retargeted children there.
+ *
+ * {@link listRunCandidates} dedupes with the first base winning, so an order two
+ * callers disagree about is a record one caller sees and the other does not — and
+ * that is exactly the split that would make a delegating worker look finished to
+ * its parent while looking waiting to itself. The parent calls this with its own
+ * agent dir; a child calls it with the dir it would spawn into. Same function,
+ * same answer, by construction.
+ */
+export function runDirBasesOf(ownRunsDir: string, switchedRunsDir: string): string[] {
+	return ownRunsDir === switchedRunsDir ? [ownRunsDir] : [ownRunsDir, switchedRunsDir];
+}
+
+/**
+ * An `agent` name reduced to what a name is allowed to look like.
+ *
+ * Every field of a {@link RunRecord} came out of a world-writable directory, and
+ * this one is model-supplied at spawn. It is about to be printed into another
+ * model's context (the spawns block, the child's own refusal), so anything
+ * outside the id shape prints as `"?"`: the text still says how many runs are
+ * pending and which ids they are, which is all it exists to say. A run *id* needs
+ * no such guard — {@link listRunCandidates} only returns names that already match
+ * `RUN_ID_PATTERN`.
+ */
+export function printableAgent(agent: unknown): string {
+	return typeof agent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(agent) ? agent : "?";
 }
 
 /**

@@ -8,6 +8,7 @@ import type { AgentProbe } from "./herdr.js";
 import type { RunResult } from "./lib.js";
 import type { RunRecord } from "./rundir.js";
 import {
+  completionSignal,
   createRunLifecycle,
   REVIVAL_WINDOW_MS,
   SETTLE_DELAY_MS,
@@ -50,6 +51,8 @@ function world() {
   let extractImpl: ((runId: string) => Promise<RunResult>) | undefined;
   /** Run ids this process is still launching (default: none). */
   const launching = new Set<string>();
+  /** Run ids with an unfinished launch of their own (default: none). */
+  const pending = new Set<string>();
 
   const next = <T>(m: Map<string, T[]>, key: string, fallback: T): T => {
     const q = m.get(key);
@@ -86,6 +89,7 @@ function world() {
       log.push(`delay ${ms}`);
     },
     isLaunching: (runId) => launching.has(runId),
+    hasPendingSpawns: (rec) => pending.has(rec.runId),
   };
 
   return {
@@ -95,6 +99,7 @@ function world() {
     probes,
     results,
     launching,
+    pending,
     sidecars,
     stamps,
     saved,
@@ -231,6 +236,86 @@ describe("run lifecycle: the completion predicate", () => {
       expect(await classify({ ...CLEAN, salvagedFrom: label })).toBe("failed");
     });
   }
+});
+
+describe("run lifecycle: a delegating run holds itself open", () => {
+  // The waiting-turn bug: a worker launches its graders, writes a `<result>`
+  // saying the pass is pending, and ends its turn so their notices can wake it.
+  // Its pane reports `done` (herdr's "ready for input") and its answer is clean,
+  // so the two-input predicate finished it and closed the pane out from under the
+  // verdicts it was waiting for. `hasPendingSpawns` is the third input that stops
+  // that; the gone-pane arm is the one place it is deliberately not asked.
+
+  test("a live done pane, a clean answer, and an unfinished spawn: no transition at all", async () => {
+    const w = world();
+    w.setProbe(() => live("done"));
+    w.results.set("sub-0001", [CLEAN]);
+    w.pending.add("sub-0001");
+    const r = rec();
+    const o = await w.lifecycle.read(r);
+    expect(o.transition).toBeUndefined();
+    expect(r.status).toBe("running");
+    expect(r.finishedAt).toBeUndefined();
+    expect(w.saved).toEqual([]);
+    expect(w.count("close")).toBe(0);
+  });
+
+  test("the same run finishes once its spawn is no longer pending", async () => {
+    const w = world();
+    w.setProbe(() => live("done"));
+    w.results.set("sub-0001", [CLEAN, CLEAN]);
+    w.pending.add("sub-0001");
+    const r = rec();
+    expect((await w.lifecycle.read(r)).transition).toBeUndefined();
+
+    // The spawn wrote its sidecar. The worker's turn is the same clean answer,
+    // and now it is allowed to finish.
+    w.pending.delete("sub-0001");
+    const o = await w.lifecycle.read(r);
+    expect(o.transition).toMatchObject({ from: "running", to: "done", cause: "completion-signal" });
+    expect(r.status).toBe("done");
+  });
+
+  test("the worker's own sidecar decides on its own, pending spawns and all", async () => {
+    const w = world();
+    w.setProbe(() => live("done"));
+    w.results.set("sub-0001", [CLEAN]);
+    w.sidecars.add("sub-0001");
+    w.pending.add("sub-0001");
+    const o = await w.lifecycle.read(rec());
+    expect(o.transition).toMatchObject({ to: "done", cause: "completion-signal" });
+  });
+
+  test("a gone pane is settled by the evidence alone: a dead process cannot be deferred", async () => {
+    const w = world();
+    w.probes.set("w1:p1", [GONE]);
+    w.results.set("sub-0001", [CLEAN]);
+    w.pending.add("sub-0001");
+    const r = rec();
+    const o = await w.lifecycle.read(r);
+    expect(o.transition).toMatchObject({ to: "done", cause: "completion-signal" });
+    expect(r.status).toBe("done");
+  });
+
+  test("a pending run is not revived out of `failed` while its spawns are out", async () => {
+    const w = world();
+    w.stamps.set("sub-0001", "s1");
+    w.results.set("sub-0001", [CLEAN]);
+    w.pending.add("sub-0001");
+    const r = rec({ status: "failed", finishedAt: NOW - 60_000 });
+    expect((await w.lifecycle.sweep([r])).transitions).toEqual([]);
+    expect(r.status).toBe("failed");
+  });
+
+  test("completionSignal: the third input blocks a clean answer but never a sidecar", () => {
+    expect(completionSignal(false, CLEAN, true)).toBe(false);
+    expect(completionSignal(false, CLEAN, false)).toBe(true);
+    expect(completionSignal(true, NO_SESSION, true)).toBe(true);
+    // Omitting the argument is the old two-input behaviour, which is what an
+    // effects set without `hasPendingSpawns` gets.
+    expect(completionSignal(false, CLEAN)).toBe(true);
+    expect(completionSignal(true, NO_SESSION)).toBe(true);
+  });
 });
 
 describe("run lifecycle: reading a running record", () => {
