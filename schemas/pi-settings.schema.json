@@ -107,7 +107,7 @@
                         "minItems": 1,
                         "items": {
                           "type": "string",
-                          "description": "A member as `provider/modelId`, any casing, deduped. `\"*\"` and a `|` level pin are both rejected, and either one drops the whole group: `\"*\"` would make the concurrency default key a phantom member, and a pin is the chain grammar, which can never match a lease key — so the shared cap would silently run looser than configured."
+"description": "A member as `provider/modelId`, any casing, deduped. A `|` level pin drops the whole group: it is the chain grammar, which can never match a lease key, so the shared cap would silently run looser than configured. A `\"*\"` member is only skipped, and the group survives without it — but a `models` list left empty that way drops the group, since `minItems` cannot see what parsing removed."
                         }
                       },
                       "max": {
