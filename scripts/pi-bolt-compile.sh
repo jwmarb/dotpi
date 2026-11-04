@@ -25,6 +25,7 @@
 # name to EXCLUDE when a future extension refuses to compile or to load.
 set -euo pipefail
 
+# keep in sync with scripts/pi-bolt-compile.ps1 ($EXCLUDE, $AOT_LIMIT)
 EXCLUDE=(ff-labs-pi-fff)
 AOT_LIMIT="${PIBOLT_AOT_LIMIT:-300000}"
 SETTINGS="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json"
@@ -77,6 +78,15 @@ PY
 	fi
 fi
 
+# Upstream refuses `compile` (all modes) on some builds -- win32 in 1.0.9:
+# "compiling extensions in is not available on Windows yet". --status is the
+# cheap detector: if it fails, the build cannot compile in extensions at all;
+# surface upstream's own reason (e.g. "whose folder brew owns: install it
+# with the installer") rather than guessing at it.
+if ! status_reason=$(pi-bolt compile --status 2>&1 >/dev/null | head -1); then
+	die "this pi-bolt build refuses to compile extensions in (pi-bolt compile --status: ${status_reason:-no output})"
+fi
+
 before=$(count_tools before)
 [ -n "$before" ] || die "the current pi-bolt does not start cleanly; fix that first (see: pi-bolt --no-session -p hi)"
 
@@ -98,5 +108,5 @@ if [ -z "$after" ] || [ "$after" -lt "$before" ] || grep -qiE "failed to load ex
 fi
 
 echo "pi-bolt-compile: $after tools load (before: $before)"
-pi-bolt compile --status
+pi-bolt compile --status || true
 echo "pi-bolt-compile: done. Restart pi-bolt to use it; undo with: pi-bolt update --rollback"

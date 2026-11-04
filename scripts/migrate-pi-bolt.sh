@@ -34,6 +34,7 @@
 # when it detects it is running under Pi-Bolt (agent/extensions/lib/runtime.ts).
 set -euo pipefail
 
+# keep in sync with scripts/migrate-pi-bolt.ps1 ($OPENSEC_FFF)
 OPENSEC_FFF="opensec-pi-fff@0.11.1"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
@@ -138,8 +139,15 @@ if [ "$mode" = check ]; then
 	if [ "$rc" -eq 0 ]; then ok "settings.json has the Pi-Bolt entries"; else while IFS= read -r l; do todo "$l"; done <<<"$out"; gaps=1; fi
 	if [ -d "$AGENT_DIR/npm/node_modules/${OPENSEC_FFF%@*}" ]; then ok "${OPENSEC_FFF%@*} installed"; else todo "${OPENSEC_FFF%@*} not installed"; gaps=1; fi
 	if command -v pi-bolt >/dev/null; then
-		status=$(pi-bolt compile --status 2>/dev/null | head -1)
-		case "$status" in No\ extensions*) todo "no extensions compiled in (optional: scripts/pi-bolt-compile.sh)" ;; *) ok "${status:0:90}…" ;; esac
+		status_rc=0
+		# Drain the full output before slicing: an early-closing pipe can leave
+		# the pipeline rc stale on a writer that stays open.
+		status_all=$(pi-bolt compile --status 2>/dev/null) || status_rc=$?
+		status=${status_all%%$'\n'*}
+		case "$status" in
+			No\ extensions*) todo "no extensions compiled in (optional: scripts/pi-bolt-compile.sh)" ;;
+			*) if [ "$status_rc" -eq 0 ]; then ok "${status:0:90}…"; else todo "pi-bolt compile --status failed; this build may not compile extensions in (see: pi-bolt compile --status)"; fi ;;
+		esac
 	fi
 	[ "$gaps" -eq 0 ] && ok "ready: run pi-bolt (or pi; both work)" || todo "run: bash scripts/migrate-pi-bolt.sh"
 	exit 0
