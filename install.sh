@@ -22,17 +22,21 @@
 #   5c. offers to install the herdr CLI, which the subagent tool delegates through
 #   5d. adds ~/.bun/bin and ~/.local/bin to your shell rc PATH, when missing
 #   6. copies agent/.env.example to agent/.env for you to fill in
-#   7. with --pi-bolt: sets up Pi-Bolt (the AOT-compiled pi) beside pi,
-#      via scripts/migrate-pi-bolt.sh; pi keeps working either way
+#   7. asks whether to set up Pi-Bolt (the AOT-compiled pi) beside pi —
+#      recommended; --yes or no terminal means plain pi — via
+#      scripts/migrate-pi-bolt.sh; pi keeps working either way
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
 #
 # Flags:
 #   --dir <path>   clone here and symlink ~/.pi at it (default: clone to ~/.pi)
 #   --ref <ref>    branch or tag to check out (default: master)
-#   --yes          assume yes for the backup and herdr prompts (unattended installs)
+#   --yes          assume yes for the backup and herdr prompts (unattended installs);
+#                  picks plain pi at the Pi-Bolt question
 #   --no-pi        do not install pi even if it is missing
-#   --pi-bolt      also set up Pi-Bolt (scripts/migrate-pi-bolt.sh); pi stays the fallback
+#   --pi-bolt      set up Pi-Bolt without asking (scripts/migrate-pi-bolt.sh);
+#                  pi stays the fallback
+#   --no-pi-bolt   plain pi only, without asking
 #   --help
 #
 # Exit codes: 0 ok · 1 usage/precondition · 2 refused to touch an existing ~/.pi
@@ -44,7 +48,8 @@ CLONE_DIR=""
 REF="master"
 ASSUME_YES=0
 INSTALL_PI=1
-PI_BOLT=0
+PI_BOLT=""
+PI_BOLT_WHY=""
 
 # ---------------------------------------------------------------------------
 # Output. Colour only when stdout is a terminal, so a piped log stays readable.
@@ -72,7 +77,8 @@ while [ $# -gt 0 ]; do
 		--ref)   REF="${2:-}";       [ -n "$REF" ]       || die "--ref needs a ref";  shift 2 ;;
 		--yes|-y) ASSUME_YES=1; shift ;;
 		--no-pi) INSTALL_PI=0; shift ;;
-		--pi-bolt) PI_BOLT=1; shift ;;
+		--pi-bolt) [ "$PI_BOLT" = 0 ] && die "--pi-bolt and --no-pi-bolt: pick one"; PI_BOLT=1; PI_BOLT_WHY="--pi-bolt"; shift ;;
+		--no-pi-bolt) [ "$PI_BOLT" = 1 ] && die "--pi-bolt and --no-pi-bolt: pick one"; PI_BOLT=0; PI_BOLT_WHY="--no-pi-bolt"; shift ;;
 		--help|-h) usage ;;
 		*) die "unknown argument: $1 (try --help)" ;;
 	esac
@@ -98,6 +104,70 @@ confirm() {
 	printf '%s [y/N] ' "$prompt" > /dev/tty 2>/dev/null || return 1
 	read -r reply < /dev/tty 2>/dev/null || return 1
 	case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+# Pi-Bolt is its own question, separate from the yes/no prompts above, so it
+# carries a tri-state: "" = ask if we can, 1 = set it up, 0 = plain pi. The
+# question is conservative: --yes and no terminal both pick plain pi, and a
+# read that fails is no terminal, not a consent. Reads /dev/tty, never stdin,
+# exactly like confirm() — stdin is the script's own bytes when curl-piped.
+choose_pi_bolt() {
+	# A flag already decided it; nothing to ask.
+	[ -n "$PI_BOLT" ] && return 0
+	[ "$ASSUME_YES" -eq 1 ] && { PI_BOLT=0; PI_BOLT_WHY="--yes"; return 0; }
+	# /dev/tty must open, not merely exist (the same test confirm() uses).
+	( : < /dev/tty ) 2>/dev/null || { PI_BOLT=0; PI_BOLT_WHY="no terminal"; return 0; }
+
+	step "Choosing pi or Pi-Bolt"
+	# The shared prompt block. Identical to install.ps1 apart from the command
+	# slots and option 2: that file adds the pi-shim non-port note (AGENTS.md
+	# NOTES) under 1; under 2 the rationale lines after the heading differ entirely,
+	# four in install.ps1 to our three (there: the compile upstream refuses, so
+	# extensions run interpreted, plus one runtime instead of two; here: the
+	# re-compile loop and its command). The whole block including the already-
+	# installed note is DIM-wrapped as one write, so a failed write means
+	# no terminal, which means plain pi.
+	{
+		printf '%s' "$DIM"
+		cat <<'PI_BOLT_PROMPT'
+  Run pi alone, or Pi-Bolt beside it? pi stays installed either way, and
+  both share ~/.pi/agent, so this choice is not permanent.
+
+    1) Pi-Bolt (recommended) - pi compiled ahead of time: it starts faster,
+       streams with less CPU and uses less memory.
+    2) plain pi - pick this if you are editing the harness itself
+       (agent/extensions, settings). Pi-Bolt compiles the extensions in, so
+       an edited one runs from its source with a warning until you
+       re-compile: bash scripts/pi-bolt-compile.sh
+
+  Add Pi-Bolt later:  bash scripts/migrate-pi-bolt.sh
+  Undo it later:      bash scripts/migrate-pi-bolt.sh --undo
+PI_BOLT_PROMPT
+		# Only when pi-bolt is already on PATH: option 2 never uninstalls it.
+		if command -v pi-bolt >/dev/null 2>&1; then
+			printf '  Pi-Bolt is already installed here; 2 leaves it as it is (no uninstall).\n'
+		fi
+		printf '%s' "$R"
+	} > /dev/tty 2>/dev/null || { PI_BOLT=0; PI_BOLT_WHY="no terminal"; return 0; }
+
+	local reply="" attempt=0
+	while [ "$attempt" -lt 3 ]; do
+		attempt=$((attempt + 1))
+		printf '  Choice [1/2, Enter = 1]: ' > /dev/tty 2>/dev/null || { PI_BOLT=0; PI_BOLT_WHY="no terminal"; return 0; }
+		read -r reply < /dev/tty 2>/dev/null || { PI_BOLT=0; PI_BOLT_WHY="no terminal"; return 0; }
+		# Trim, then match case-insensitively.
+		reply="${reply#"${reply%%[![:space:]]*}"}"
+		reply="${reply%"${reply##*[![:space:]]}"}"
+		reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+		case "$reply" in
+			""|1|b|bolt|pi-bolt) PI_BOLT=1; PI_BOLT_WHY="chosen"; return 0 ;;
+			2|p|pi) PI_BOLT=0; PI_BOLT_WHY="chosen"; return 0 ;;
+		esac
+		printf '  Please answer 1 or 2 (Enter = 1).\n' > /dev/tty 2>/dev/null || true
+	done
+	warn "no clear answer to the Pi-Bolt question; picking plain pi"
+	PI_BOLT=0
+	PI_BOLT_WHY="no clear answer"
+	return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -529,18 +599,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Pi-Bolt (opt-in: --pi-bolt)
+# 7. Pi-Bolt (asked; --pi-bolt / --no-pi-bolt / --yes decide unattended)
 #
 # Pi-Bolt installs beside pi and shares agent/, so this only adds: the
 # binary, two Pi-Bolt-only settings entries, opensec-pi-fff, and a compiled
-# build. Never fatal: a failure leaves pi exactly as it was.
+# build - the general case, not a guarantee: upstream refuses the compile on
+# win32, and refuses npm/brew-managed installs everywhere (see the --status
+# gate in scripts/pi-bolt-compile.sh). Never fatal: a failure leaves pi
+# working as before, and scripts/migrate-pi-bolt.sh --undo restores
+# settings.json. The .ps1 twin says why its compile is skipped.
 # ---------------------------------------------------------------------------
-if [ "$PI_BOLT" -eq 1 ]; then
-	step "Setting up Pi-Bolt"
-	if bash scripts/migrate-pi-bolt.sh; then
-		ok "Pi-Bolt ready: run pi-bolt (pi still works)"
+PI_BOLT_OK=0
+PI_BOLT_FAILED=0
+if [ ! -f scripts/migrate-pi-bolt.sh ]; then
+	[ "$PI_BOLT" = 1 ] && warn "this ref has no scripts/migrate-pi-bolt.sh; Pi-Bolt skipped"
+	PI_BOLT=0
+	PI_BOLT_WHY="no migrate script at this ref"
+else
+	choose_pi_bolt
+	if [ "$PI_BOLT" = 1 ]; then
+		step "Setting up Pi-Bolt"
+		if bash scripts/migrate-pi-bolt.sh; then
+			PI_BOLT_OK=1
+			ok "Pi-Bolt ready: run pi-bolt (pi still works)"
+		else
+			PI_BOLT_FAILED=1
+			warn "Pi-Bolt setup did not finish; pi is unaffected. Retry: bash scripts/migrate-pi-bolt.sh"
+		fi
 	else
-		warn "Pi-Bolt setup did not finish; pi is unaffected. Retry: bash scripts/migrate-pi-bolt.sh"
+		ok "plain pi ($PI_BOLT_WHY)"
 	fi
 fi
 
@@ -569,7 +656,18 @@ if [ "$PATH_LINES_ADDED" -gt 0 ]; then
 	printf '  %sor just open a new terminal.%s\n\n' "$DIM" "$R"
 fi
 
-if [ "$PI_BOLT" -eq 1 ]; then printf 'Then start it:\n\n    pi-bolt      %s# or pi; both share this config%s\n\n' "$DIM" "$R"; else printf 'Then start it:\n\n    pi\n\n'; printf '%sFaster: bash scripts/migrate-pi-bolt.sh sets up Pi-Bolt beside pi.%s\n\n' "$DIM" "$R"; fi
+if [ "$PI_BOLT_OK" = 1 ]; then
+	printf 'Then start it:\n\n    pi-bolt      %s# or pi; both share this config%s\n\n' "$DIM" "$R"
+else
+	printf 'Then start it:\n\n    pi\n\n'
+	if [ "$PI_BOLT_FAILED" = 1 ]; then
+		printf '%sPi-Bolt setup did not finish; pi is unaffected. Retry: bash scripts/migrate-pi-bolt.sh%s\n\n' "$DIM" "$R"
+	elif command -v pi-bolt >/dev/null 2>&1; then
+		printf '%sPi-Bolt was already installed and this run left it as it is (%s); run pi-bolt any time.%s\n\n' "$DIM" "$PI_BOLT_WHY" "$R"
+	else
+		printf '%sPi-Bolt not set up (%s). Add it any time: bash scripts/migrate-pi-bolt.sh%s\n\n' "$DIM" "$PI_BOLT_WHY" "$R"
+	fi
+fi
 printf '%sVerify it works:%s\n' "$B" "$R"
 printf '    pi /mcp            %s# are the MCP servers reachable with your keys?%s\n' "$DIM" "$R"
 printf '    pi /sessions       %s# extensions loaded (this one is an extension)%s\n\n' "$DIM" "$R"

@@ -62,7 +62,10 @@ extension with npm dependencies, offers to install the [herdr](https://herdr.dev
 that `subagent` delegates through, adds `~/.bun/bin` and `~/.local/bin` to your shell
 rc (`.bashrc` or `.zshrc`, autodetected from `$SHELL`, skipped when already present),
 and copies `agent/.env.example` to `agent/.env` for you to fill in. It never writes
-credentials.
+credentials. The last step asks whether to set up Pi-Bolt beside pi, and
+recommends Pi-Bolt; `--yes` or a run with no terminal to ask through takes plain pi
+unless `--pi-bolt` is also given (the Pi-Bolt section below has the reasoning both
+ways).
 
 An existing `~/.pi` is never clobbered: an existing dotpi clone is updated in place
 (and left alone if the tree is dirty), and anything else stops the install until you
@@ -74,8 +77,10 @@ backup up front, or download and run it directly.
 | --- | --- |
 | `--dir <path>` | Clone there and symlink `~/.pi` at it |
 | `--ref <ref>` | Branch or tag to check out (default `master`) |
-| `--yes` | Accept the backup prompt without a terminal |
+| `--yes` | Accept the backup and herdr prompts without a terminal; picks plain pi at the Pi-Bolt question unless `--pi-bolt` is also given |
 | `--no-pi` | Do not install pi even if it is missing |
+| `--pi-bolt` | Set up Pi-Bolt without asking; pi stays installed as the fallback (unless `--no-pi` was also given) |
+| `--no-pi-bolt` | Plain pi only, without asking |
 
 Flags go after `--` when piping: `... | bash -s -- --dir ~/src/dotpi`
 
@@ -94,7 +99,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/jwm
 .\install.ps1
 ```
 
-The same flags work: `--dir`, `--ref`, `--yes`, `--no-pi`. When piping, flags go through `-Args`:
+The same flags work: `--dir`, `--ref`, `--yes`, `--no-pi`, `--pi-bolt`, `--no-pi-bolt`. When piping, flags go through `-Args`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/jwmarb/dotpi/master/install.ps1 | iex -Args '--dir C:\src\dotpi'"
@@ -331,16 +336,29 @@ cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p
 
 ## Pi-Bolt ⚡
 
-[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably. A profile runs under both the same way — `PI_CODING_AGENT_DIR` is read by both binaries — and a profile needs the `piBolt` keys in **its own** `settings.json` for Pi-Bolt parity (`quant-trader/settings.json` carries its own copy); `bash scripts/migrate-pi-bolt.sh --check` remains the parity checker.
+[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably. A profile runs under both the same way — `PI_CODING_AGENT_DIR` is read by both binaries — and a profile needs the `piBolt` keys in **its own** `settings.json` for Pi-Bolt parity (`quant-trader/settings.json` carries its own copy); the `migrate-pi-bolt` twin's `--check` remains the parity checker.
+
+Both installers ask which of the two to set up, and the recommendation is **Pi-Bolt**: ahead-of-time compilation is what buys the faster start, the cheaper streaming and the smaller footprint. Pick **plain pi** instead while you are editing the harness itself — Pi-Bolt compiles the extensions into its executable, so an edited one runs from its source with a warning until you re-compile it, and that re-compile loop is pure overhead when you touch an extension every few minutes. That reasoning is Linux/macOS-only: as of Pi-Bolt 1.0.9 upstream refuses `pi-bolt compile` on Windows, so there an edited extension loads from source under either binary — and Pi-Bolt's default build has no JIT, so it loads interpreted where plain pi's runtime would JIT it. The further case for plain pi on Windows is that one runtime then runs everything, including the subagent children Pi-Bolt leaves on bun. The choice is not permanent either way: `pi` is installed first and stays installed (unless you pass `--no-pi`), both binaries read the same `~/.pi/agent`, and picking plain pi never uninstalls a Pi-Bolt that is already there. Unattended runs take the conservative answer — `--yes`, or a piped run with no terminal to ask through, installs plain pi unless `--pi-bolt` is also given.
+
+Setup is a pair of scripts per platform, with the same four commands on both — the Windows fourth refuses, and says why:
 
 ```sh
-bash scripts/migrate-pi-bolt.sh           # set it up (or: install.sh --pi-bolt)
+bash scripts/migrate-pi-bolt.sh           # set it up (the installers ask; or: --pi-bolt)
 bash scripts/migrate-pi-bolt.sh --check   # what is set up; changes nothing
 bash scripts/migrate-pi-bolt.sh --undo    # back to plain pi only
 bash scripts/pi-bolt-compile.sh           # re-compile after editing an extension
 ```
 
-The setup keeps the bun `pi`, which the kanban board and the tests still use. It adds two Pi-Bolt-only settings that plain pi ignores, swaps pi-fff for the JIT-free `opensec-pi-fff` under Pi-Bolt only, and compiles the extensions in (verified, with automatic rollback on failure). On Windows, subagent children still run the bun `pi`.
+The Windows twin is native PowerShell — no `python3`, no Git Bash — and it runs Pi-Bolt's own signed Windows installer:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1            # set it up
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1 --check    # what is set up; changes nothing
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1 --undo     # back to plain pi only
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\pi-bolt-compile.ps1            # refused on Windows; the script says so
+```
+
+The setup keeps the bun `pi`, because `setup-deps.sh` finds pi's own packages by following it and exposes them through a `node_modules` link at the repo root; the board pane and every suite resolve `@earendil-works/*` through that link — or, in the four scopes that carry one, through their tsconfig `paths` entry instead. It adds two Pi-Bolt-only settings that plain pi ignores, swaps pi-fff for the JIT-free `opensec-pi-fff` under Pi-Bolt only, and compiles the extensions in (verified, with automatic rollback on failure) — on Windows that compile is skipped, so extensions load at run time. On Windows, subagent children still run the bun `pi`.
 
 ## OS Compatibility
 
@@ -351,6 +369,7 @@ Linux, macOS, and Windows. The configuration itself is plain JSON/TypeScript/Mar
 | `~/.pi` pointer | symlink (`ln -s`) | directory junction (`mklink /J`) |
 | PATH | appends to `.bashrc`/`.zshrc` | user-registry `PATH` |
 | dependency install | `scripts/setup-deps.sh` | `scripts/setup-deps.ps1` (Git Bash fallback) |
+| Pi-Bolt setup | `scripts/migrate-pi-bolt.sh` + `pi-bolt-compile.sh` | `scripts/migrate-pi-bolt.ps1` + `pi-bolt-compile.ps1` (native, no `python3`) |
 
 Two things are genuinely Linux/macOS-only and degrade on Windows: the `--verify` runtime gate needs a Docker daemon (the loop reports `inconclusive` without one, it never assumes success), and the git `pre-commit` hook runs through Git Bash. Everything pi *loads* — extensions, subagents, skills, provider wiring — is identical across platforms; `display-file` and the subagent tool both branch on `process.platform` for the parts that touch the OS.
 

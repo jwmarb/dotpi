@@ -21,14 +21,21 @@
 #   5d. offers to install the herdr CLI, which the subagent tool delegates through
 #   5e. adds ~\.bun\bin to the user PATH, when missing
 #   6. copies agent\.env.example to agent\.env for you to fill in
+#   7. asks whether to set up Pi-Bolt (the AOT-compiled pi) beside pi -
+#      recommended; --yes or no terminal means plain pi - via
+#      scripts\migrate-pi-bolt.ps1; pi keeps working either way
 #
 # It never writes credentials. Step 6 leaves placeholders; you edit the file.
 #
 # Flags:
 #   --dir <path>   clone here and junction ~\.pi at it (default: clone to ~\.pi)
 #   --ref <ref>    branch or tag to check out (default: master)
-#   --yes          assume yes for the backup and herdr prompts (unattended installs)
+#   --yes          assume yes for the backup and herdr prompts (unattended installs);
+#                  picks plain pi at the Pi-Bolt question
 #   --no-pi        do not install pi even if it is missing
+#   --pi-bolt      set up Pi-Bolt without asking (scripts\migrate-pi-bolt.ps1);
+#                  pi stays the fallback
+#   --no-pi-bolt   plain pi only, without asking
 #   --help
 #
 # Exit codes: 0 ok · 1 usage/precondition · 2 refused to touch an existing ~\.pi
@@ -98,8 +105,12 @@ dotpi installer (Windows) — turns a bare Windows machine into a working pi con
 Flags:
   --dir <path>   clone here and junction ~\.pi at it (default: clone to ~\.pi)
   --ref <ref>    branch or tag to check out (default: master)
-  --yes          assume yes for the backup and herdr prompts (unattended installs)
+  --yes          assume yes for the backup and herdr prompts (unattended installs);
+                 picks plain pi at the Pi-Bolt question
   --no-pi        do not install pi even if it is missing
+  --pi-bolt      set up Pi-Bolt without asking (scripts\migrate-pi-bolt.ps1);
+                 pi stays the fallback
+  --no-pi-bolt   plain pi only, without asking
   --help         show this help
 
 Exit codes: 0 ok · 1 usage/precondition · 2 refused to touch an existing ~\.pi
@@ -117,6 +128,8 @@ $CLONE_DIR = ""
 $REF = "master"
 $ASSUME_YES = $false
 $INSTALL_PI = $true
+$PI_BOLT = $null
+$PI_BOLT_WHY = ""
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = $args[$i]
@@ -130,6 +143,12 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $ASSUME_YES = $true
     } elseif ($a -eq "--no-pi") {
         $INSTALL_PI = $false
+    } elseif ($a -eq "--pi-bolt") {
+        if ($PI_BOLT -eq $false) { Die "--pi-bolt and --no-pi-bolt: pick one" }
+        $PI_BOLT = $true; $PI_BOLT_WHY = "--pi-bolt"
+    } elseif ($a -eq "--no-pi-bolt") {
+        if ($PI_BOLT -eq $true) { Die "--pi-bolt and --no-pi-bolt: pick one" }
+        $PI_BOLT = $false; $PI_BOLT_WHY = "--no-pi-bolt"
     } elseif ($a -eq "--help" -or $a -eq "-h") {
         Show-Help
     } else {
@@ -156,6 +175,81 @@ function Confirm([string]$prompt) {
     $reply = ""
     try { $reply = Read-Host "$prompt [y/N]" } catch { return $false }
     return ($reply -eq "y" -or $reply -eq "Y" -or $reply -eq "yes" -or $reply -eq "Yes")
+}
+# Pi-Bolt is its own question, separate from the yes/no prompts above, so it
+# carries a tri-state: $null = ask if we can, $true = set it up, $false =
+# plain pi. The question is conservative: --yes and no terminal both pick
+# plain pi. Reads from the console, never from stdin (which, when the script
+# is piped through iex, is the script's own bytes) - the same rule Confirm
+# follows with [Console]::IsInputRedirected.
+function Choose-PiBolt {
+    if ($null -ne $script:PI_BOLT) { return }
+    if ($ASSUME_YES) { $script:PI_BOLT = $false; $script:PI_BOLT_WHY = "--yes"; return }
+    if ([Console]::IsInputRedirected) { $script:PI_BOLT = $false; $script:PI_BOLT_WHY = "no terminal"; return }
+
+    Step "Choosing pi or Pi-Bolt"
+    # The shared prompt block. Identical to install.sh apart from the command
+    # slots and option 2: under 1 this file adds the pi-shim non-port note
+    # (AGENTS.md NOTES); under 2 the rationale lines after the heading differ
+    # entirely, three in install.sh to our four (there: the re-compile loop and
+    # its command; here: the compile upstream refuses, so extensions run
+    # interpreted, plus one runtime instead of two). The already-installed note is
+    # folded into the same block so both twins DIM it alike.
+    $prompt = @'
+  Run pi alone, or Pi-Bolt beside it? pi stays installed either way, and
+  both share ~/.pi/agent, so this choice is not permanent.
+
+    1) Pi-Bolt (recommended) - pi compiled ahead of time: it starts faster,
+       streams with less CPU and uses less memory.
+       On Windows, subagent children still run the bun pi.
+    2) plain pi - pick this if you are editing the harness itself
+       (agent/extensions, settings). Upstream refuses pi-bolt compile on
+       Windows, so an edited extension runs interpreted under Pi-Bolt - its
+       default build has no JIT - and JIT-compiled under plain pi. Plain pi
+       is also one runtime, not pi-bolt plus the bun pi for children.
+
+  Add Pi-Bolt later:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1
+  Undo it later:      powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1 --undo
+'@
+    # Only when pi-bolt is already on PATH: option 2 never uninstalls it. Joined
+    # to the same block so it renders in the same DIM as the rest of the prompt.
+    if (Get-Cmd "pi-bolt") {
+        $prompt += "`n  Pi-Bolt is already installed here; 2 leaves it as it is (no uninstall)."
+    }
+    if ($script:UseColor) {
+        Write-Host $prompt -ForegroundColor DarkGray
+    } else {
+        Write-Host $prompt
+    }
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        try {
+            $reply = Read-Host "  Choice [1/2, Enter = 1]"
+        } catch {
+            $script:PI_BOLT = $false
+            $script:PI_BOLT_WHY = "no terminal"
+            return
+        }
+        if ($null -eq $reply) {
+            $script:PI_BOLT = $false
+            $script:PI_BOLT_WHY = "no terminal"
+            return
+        }
+        $answer = $reply.Trim().ToLowerInvariant()
+        if ($answer -eq "" -or $answer -eq "1" -or $answer -eq "b" -or $answer -eq "bolt" -or $answer -eq "pi-bolt") {
+            $script:PI_BOLT = $true
+            $script:PI_BOLT_WHY = "chosen"
+            return
+        }
+        if ($answer -eq "2" -or $answer -eq "p" -or $answer -eq "pi") {
+            $script:PI_BOLT = $false
+            $script:PI_BOLT_WHY = "chosen"
+            return
+        }
+        Write-Host "  Please answer 1 or 2 (Enter = 1)."
+    }
+    Warn "no clear answer to the Pi-Bolt question; picking plain pi"
+    $script:PI_BOLT = $false
+    $script:PI_BOLT_WHY = "no clear answer"
 }
 
 # Find a command on PATH (the Windows stand-in for bash `command -v`).
@@ -572,6 +666,47 @@ if (Test-Path $envFile) {
 }
 
 # ---------------------------------------------------------------------------
+# 7. Pi-Bolt (asked; --pi-bolt / --no-pi-bolt / --yes decide unattended)
+#
+# Pi-Bolt installs beside pi and shares agent/, so this only adds: the
+# binary, two Pi-Bolt-only settings entries, opensec-pi-fff, and a compiled
+# build (upstream refuses the compile on Windows, so there that part is
+# skipped and extensions load at run time). Never fatal: a failure leaves
+# pi working as before, and scripts\migrate-pi-bolt.ps1 --undo restores
+# settings.json.
+# ---------------------------------------------------------------------------
+$PI_BOLT_OK = $false
+$PI_BOLT_FAILED = $false
+$migratePs = Join-Path $PWD "scripts\migrate-pi-bolt.ps1"
+if (-not (Test-Path $migratePs)) {
+    if ($PI_BOLT -eq $true) {
+        Warn "this ref has no scripts\migrate-pi-bolt.ps1; Pi-Bolt skipped"
+    }
+    $PI_BOLT = $false
+    $PI_BOLT_WHY = "no migrate script at this ref"
+} else {
+    Choose-PiBolt
+    if ($PI_BOLT -eq $true) {
+        Step "Setting up Pi-Bolt"
+        try {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $migratePs
+            $rc = $LASTEXITCODE
+        } catch {
+            $rc = 1
+        }
+        if ($rc -eq 0) {
+            $PI_BOLT_OK = $true
+            Ok "Pi-Bolt ready: run pi-bolt (pi still works)"
+        } else {
+            $PI_BOLT_FAILED = $true
+            Warn "Pi-Bolt setup did not finish; pi is unaffected. Retry: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1"
+        }
+    } else {
+        Ok "plain pi ($PI_BOLT_WHY)"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 Write-Host ""
@@ -613,7 +748,26 @@ if ($PATH_ADDED) {
 
 Write-Host "Then start it:"
 Write-Host ""
-Write-Host "    pi"
+if ($PI_BOLT_OK) {
+    Write-Host "    pi-bolt      # or pi; both share this config"
+} else {
+    Write-Host "    pi"
+    # Three honest states: attempted and failed, already installed and left alone,
+    # never set up. Composed once so the long retry command is not repeated.
+    $migrateCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\migrate-pi-bolt.ps1"
+    if ($PI_BOLT_FAILED) {
+        $whyMsg = "Pi-Bolt setup did not finish; pi is unaffected. Retry: $migrateCmd"
+    } elseif (Get-Cmd "pi-bolt") {
+        $whyMsg = "Pi-Bolt was already installed and this run left it as it is ($PI_BOLT_WHY); run pi-bolt any time."
+    } else {
+        $whyMsg = "Pi-Bolt not set up ($PI_BOLT_WHY). Add it any time: $migrateCmd"
+    }
+    if ($script:UseColor) {
+        Write-Host $whyMsg -ForegroundColor DarkGray
+    } else {
+        Write-Host $whyMsg
+    }
+}
 Write-Host ""
 Write-Host "Verify it works:"
 Write-Host "    pi /mcp            # are the MCP servers reachable with your keys?"

@@ -226,6 +226,9 @@ echo "${bold}Running this repo's tests${off} ${dim}(agent/git is vendored and gi
 # gate people learn to bypass. Loadability is what staged mode exists to check
 # (it is the startup-fatal class, and it *is* checked against the index above);
 # a test failure is not file-local, so the working tree is the honest subject.
+# Four scopes instead declare a `@earendil-works/*` tsconfig `paths` entry, which
+# bun honours before this walk-up (Bun 1.4.4); the skew argument above holds either
+# way, since it is about *which* copy the walk-up reaches.
 cd "$REPO" || exit 1
 mapfile -t tests < <(find agent/extensions quant-trader/extensions -name '*.test.ts' -type f -not -path '*/node_modules/*' | sort)
 if [ ${#tests[@]} -eq 0 ]; then
