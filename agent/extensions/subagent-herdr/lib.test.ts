@@ -2931,6 +2931,8 @@ describe("the fleet delegation graph (agents/*.md callable_by)", () => {
   // The designed graph, written out once. Every edge here is backed by a
   // `subagent(agent: ...)` instruction in the caller's prompt body; an edge
   // that is not here is refused at spawn and absent from the caller's roster.
+  // Known exception: `worker → reviewer, verifier` are an intentionally unused
+  // capability (`agent/AGENTS.md`); everything else must stay body-backed.
   // Changing an agent's callers is a deliberate edit to BOTH this table and the
   // agent file.
   const EXPECTED: Record<string, string[]> = {
@@ -2979,25 +2981,88 @@ describe("the fleet delegation graph (agents/*.md callable_by)", () => {
     }
   })();
 
-  test.skipIf(!fleetOnDisk)("only worker declares a self-grading pass — the premise of the prompt's worker gate", async () => {
-    // `dynamic-prompt.ts` grants the "do not re-grade a child's diff" exemption to `worker`
-    // alone, and withholds the whole exemption in a roster without it, because `worker.md`
-    // is the only body that ends its own run with a grading pass. Agent bodies are prose a
-    // human edits, so the premise is pinned, not assumed: an agent that starts self-grading
-    // has to be added to that gate, and one that stops has to be taken back out of it.
-    // Fence-stripped: worker.md's report template quotes a "## Quality Pass" heading, and a
-    // heading inside a code fence is not that agent's contract. A loose predicate here would
-    // certify any agent whose body merely shows such a heading, so the gate it protects
-    // ("only worker self-grades") would rest on a match that means nothing.
+  test.skipIf(!fleetOnDisk)("no agent declares a self-grading pass — the orchestrator's single pass is the only grade", async () => {
+    // `dynamic-prompt.ts` tells the orchestrator that no child's diff arrives graded and that
+    // it grades each deliverable once. Agent bodies are prose a human edits, so that premise
+    // is pinned: an agent that starts self-grading turns the orchestrator's pass back into a
+    // duplicate. The worker → reviewer/verifier edges in EXPECTED stay as an unused capability;
+    // enforcing the rule as data means removing them from callable_by, which refuses the spawn
+    // through `lineageRejection`.
+    // Fence-stripped: a code fence may quote a heading or instruction (e.g. a
+    // report template) without it being that agent's contract. A loose predicate
+    // would certify any agent whose body merely shows such a heading, so the gate
+    // it protects ("no agent self-grades") would rest on a match that means nothing.
     const selfGrades = (body: string) => {
       const prose = body.replace(/```[\s\S]*?```/g, "");
-      return /^## Quality Pass$/m.test(prose) || /run the quality pass/i.test(prose);
+      return (
+        /^#{1,6}\s*quality pass/im.test(prose) ||
+        /^#{1,6}\s*(grade|review)\b.*\b(your|own)\b/im.test(prose) ||
+        /run(s|ing)?( the| a)? (quality|grading|code-review) pass\b/i.test(prose) ||
+        /grade your own/i.test(prose)
+      );
     };
+    // Positive controls: each disjunct must be able to fire, or the `toEqual([])`
+    // below proves nothing. The renamed-heading arm (`## Grade your diff`) is the
+    // gap the spawn-call check alone would leave open.
+    expect(selfGrades("## Quality Pass\nhand your diff to the reviewer")).toBe(true);
+    expect(selfGrades("## Grade your diff\nDelegate the pass to the reviewer.")).toBe(true);
+    expect(selfGrades("run the quality pass before reporting")).toBe(true);
+    expect(selfGrades("run a grading pass before reporting")).toBe(true);
+    expect(selfGrades("run the code-review pass before reporting")).toBe(true);
+    expect(selfGrades("grade your own work before reporting")).toBe(true);
+    // Negative controls: grading-shaped words without the grading context must not
+    // fire, or an unrelated edit to some other agent's prose turns this gate red
+    // with a self-grading message.
+    expect(selfGrades("run the password manager once")).toBe(false);
+    expect(selfGrades("run a passenger check")).toBe(false);
+    expect(selfGrades("running passes")).toBe(false);
     const fleet = await discoverAgents(agentsDir());
     // Guarded by `test.skipIf` above: with no fleet on disk there is no body to read.
     const all = [...fleet, ...(await discoverSkillAgents(skillsDir()))];
     const graded = all.filter((a) => selfGrades((a as { promptBody?: string }).promptBody ?? "")).map((a) => a.name);
-    expect(graded).toEqual(["worker"]);
+    expect(graded).toEqual([]);
+
+    // Fence-blind structural check: no agent body — fleet or skill-shipped — may
+    // instruct a reviewer/verifier spawn, in any spacing, quote style, or call
+    // shape, inside fences or not. The role alternation stays: a body may
+    // instruct other spawns (worker's research section does), and those are
+    // legitimate.
+    const spawnCall = /\bsubagent\s*\(\s*[{[]?\s*agent\s*:\s*["'`](reviewer|verifier)["'`]/;
+    // Positive controls: the pin must fire on every variant a reintroduced spawn
+    // instruction can take — not just the canonical form the first version of
+    // this test was written against.
+    expect(spawnCall.test('subagent(agent: "reviewer", task: "x")')).toBe(true);
+    expect(spawnCall.test('subagent (agent: "verifier", task: "y")')).toBe(true);
+    expect(spawnCall.test('subagent(agent : "reviewer", task: "z")')).toBe(true);
+    expect(spawnCall.test("subagent(agent: `verifier`, task: \"w\")")).toBe(true);
+    expect(spawnCall.test('subagent({agent: "reviewer", task: "v"})')).toBe(true);
+    // A spawn of a non-grader is legitimate and must not trip the pin.
+    expect(spawnCall.test('subagent(agent: "librarian", task: "q")')).toBe(false);
+    const graderCallers = new Set(
+      all
+        .filter((a) => a.name === "reviewer" || a.name === "verifier")
+        .flatMap((a) => a.callableBy ?? [])
+        .filter((c) => c !== "orchestrator" && c !== "any"),
+    );
+    // Capability control: the loop below is blanket, so this is what proves the
+    // worker → reviewer/verifier edge still exists in the data — without it a
+    // silent `callable_by` drop would make the blanket check pass vacuously.
+    expect(graderCallers.has("worker")).toBe(true);
+    for (const a of all) {
+      expect({ agent: a.name, spawnsGrader: spawnCall.test((a as { promptBody?: string }).promptBody ?? "") }).toEqual({
+        agent: a.name,
+        spawnsGrader: false,
+      });
+    }
+
+    const worker = all.find((a) => a.name === "worker") as { promptBody?: string; description?: string } | undefined;
+    expect(worker?.promptBody ?? "").toContain("graded: none");
+    expect(worker?.promptBody ?? "").not.toContain('subagent(agent: "reviewer"');
+    expect(worker?.promptBody ?? "").not.toContain('subagent(agent: "verifier"');
+    // The description is the routing signal in the orchestrator's agents table; it must
+    // not name a section ("the quality pass") that only exists in grader-equipped installs.
+    expect(worker?.description ?? "").toContain("the orchestrator grades it");
+    expect(worker?.description ?? "").not.toContain("quality pass");
   });
 
   test("every named caller is a real agent, `orchestrator`, or `any`", async () => {

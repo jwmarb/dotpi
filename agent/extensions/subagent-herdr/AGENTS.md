@@ -56,9 +56,10 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-0
 - **Health checks diagnose, they do not complete runs.** A `stalled`/unanswered target spawns at most one read-only
   `healthcheck` child, keyed by `healthCheckOf`. The target's briefing is held until that child finishes.
 - **`interrupt`** = reconcile → Escape → bounded idle wait (30 s) → replacement prompt.
-- **A run is not finished while runs it launched are unfinished.** `agent/agents/worker.md` tells a delegating child to end
-  its turn and be woken by its graders, and a clean `agent_end` holding a `<result>` used to read as completion — it shut
-  the waiting worker down (measured: 83 of 116 nested graders reported after their worker was closed). Both detectors
+- **A run is not finished while runs it launched are unfinished.** `agent/agents/worker.md` tells a delegating child (a
+  `worker` waiting on its `librarian`) to end its turn and be woken by the run it launched, and a clean `agent_end`
+  holding a `<result>` used to read as completion — it shut the waiting worker down (measured while workers still
+  launched graders: 83 of 116 nested graders reported after their worker was closed). Both detectors
   defer on **one** rule, `pendingSpawnsOf` (`rundir.ts:474`): the child returns from `agent_end` with no sidecar, notice,
   nudge or close (`child-done.ts:853`), and the parent declines to settle it (`completionSignal`'s third input).
   Unfinished means **no `.exit` sidecar AND a status that is not terminal** (`isTerminalRecord`: `done`,
@@ -80,7 +81,7 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-0
   into the reader's context). A finished child is labelled "delivery not provable
   from disk" unless its notice is proven collected; `COLLECTED_DONE_IDS` is empty **on purpose** — an `input` hook answering `handled` returns before pi creates
   a message, so a swallowed notice is nowhere on disk, and a briefing header is text a model can also write. The label states what the disk supports (nothing
-  proves delivery), never that the block above omitted the verdict: after the deferral a delegating worker settles *because* its graders woke it.
+  proves delivery), never that the block above omitted the verdict: after the deferral a delegating child settles *because* the runs it launched woke it.
 
 ## COMMANDS
 

@@ -170,7 +170,7 @@ describe("the quality pass is gated on the grading agents existing", () => {
   const agent = (name: string) =>
     ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
 
-  test("withheld from a subagent, whose own body carries its grading contract", () => {
+  test("withheld from a subagent, whose own body carries its grading rule", () => {
     const inv = [agent("reviewer"), agent("verifier"), agent("planner")];
     const p = build({ agentInventory: inv, isSubagent: true });
     expect(p).not.toContain("## Quality Pass");
@@ -179,30 +179,27 @@ describe("the quality pass is gated on the grading agents existing", () => {
     expect(build({ agentInventory: inv })).toContain("## Quality Pass");
   });
 
-  test("the Quality Pass opener keeps its own antecedent in both branches", () => {
-    // "that standard" needs the graded-child sentence in front of it. With the worker clause
-    // gated off, a bare "that standard" pointed at *being the worst judge* — it told the model
-    // to meet the standard of the worst judge. The no-worker branch states the standard itself.
+  test("the Quality Pass opens with the decision in both branches", () => {
     const withWorker = build({
       agentInventory: [agent("worker"), agent("reviewer"), agent("verifier")],
     });
-    expect(section(withWorker, "## Quality Pass")).toContain(
-      "Hold yourself to that standard: finish your own implementation work the same way.",
-    );
-    expect(section(withWorker, "## Quality Pass")).toContain(
-      "not a second grader launch over a diff a child already had graded",
-    );
+    const s = section(withWorker, "## Quality Pass").replace("## Quality Pass\n", "").trimStart();
+    expect(s.startsWith("**Decide first: does this deliverable still owe its pass?**")).toBe(true);
+    expect(s).toContain("what does each worker's receipt say was run");
+    // Question 2 must cover the orchestrator's own edits too, not only worker receipts:
+    // the pass's scope includes "the edits you made yourself, and the glue".
+    expect(s).toContain("what have the project's own checks already shown on your own edits and glue");
+    expect(s).not.toContain("delegate a quality pass");
+    expect(s).not.toContain("Hold yourself to");
+
     const noWorker = build({
       agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
     });
-    const s = section(noWorker, "## Quality Pass");
-    // Two phrases: the source wraps between them, so one long assertion would straddle a newline.
-    expect(s).toContain("Hold yourself to the standard a grader would apply: finish your own implementation work");
-    expect(s).toContain("as an agent that did not write it would.");
-    expect(s).not.toContain("that standard");
-    expect(s).not.toContain("the same way");
-    // The "diff a child already had graded" tail presumes a self-grading child too.
-    expect(s).toContain("not a second grader launch over work you have already checked yourself");
+    const s2 = section(noWorker, "## Quality Pass").replace("## Quality Pass\n", "").trimStart();
+    expect(s2.startsWith("**Decide first: does this deliverable still owe its pass?**")).toBe(true);
+    expect(s2).toContain("what have the project's own checks already shown");
+    expect(s2).not.toContain("worker");
+    expect(s2).not.toContain("receipt");
   });
 
   test("absent when neither grader is in the inventory", () => {
@@ -309,54 +306,40 @@ describe("the planning section is gated on the planner agent existing", () => {
     const p = build({
       agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
     });
-    expect(p).toContain("grading obligation");
+    expect(p).toContain("ends in one quality pass");
     expect(p).toContain("graded by `reviewer` and `verifier`");
     expect(p).toContain("`reviewer` reads the implementation for correctness");
     expect(p).toContain("`verifier` proves it actually runs");
   });
 
-  test("keeps the worker exemption, so a self-graded diff is not graded twice", () => {
-    // A `worker` ends its own run by handing its diff to these same two agents.
-    // Re-grading it buys a duplicate pass and nothing else, and the Quality Pass
-    // section already says so — the two must not contradict each other.
-    const p = build({
-      agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
-    });
-    expect(p).toContain("a `worker` has passed its own diff through these graders");
-    expect(p).toContain("Grade what **you** implemented");
-  });
 
-  test("grants the worker exemption only where a worker exists", () => {
-    // The exemption is a licence to skip a pass. In a roster with graders and no
-    // self-grading implementer, granting it cites an agent the session cannot spawn and
-    // cancels the only pass that exists — and the delegation section tells that install
-    // the opposite, so the prompt would contradict itself between its sections.
+  test("points at Quality Pass instead of restating it", () => {
     const noWorker = build({ agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")] });
-    expect(noWorker).not.toContain("worker");
-    expect(noWorker).toContain("Grade what **you** implemented");
-    expect(noWorker).not.toContain("has passed its own diff through");
-    expect(noWorker).not.toContain("passed through these agents");
-    // The obligation, not the absence, is the lead: a bold "no child's diff comes graded"
-    // read alone is a licence to do nothing.
-    expect(noWorker).toContain("The pass on what comes back is yours");
+    const plan = section(noWorker, "## Plan Before You Implement");
+    expect(plan).toContain("ends in one quality pass");
+    expect(plan).toContain("See **Quality Pass** below");
+    expect(plan).not.toContain("Launch");
+    expect(plan).not.toContain("Grade what");
+    expect(plan).not.toContain("worker");
+    expect(noWorker).toContain("See **Quality Pass** below");
     expect(noWorker).toContain("No agent in this roster ends its own run with a grading pass");
-    // Same gate, single grader: the carve-out's singular form ("through this agent") is a
-    // distinct template branch, so its absence needs its own proof.
+
     const single = build({ agentInventory: [agent("planner"), agent("reviewer")] });
-    expect(single).not.toContain("worker");
-    expect(single).not.toContain("passed through this agent");
+    expect(section(single, "## Plan Before You Implement")).not.toContain("worker");
   });
 
-  test("drops the grading obligation when no grader can be spawned", () => {
+  test("the planning section ships without the pointer when no grader can be spawned", () => {
     // Naming a grader this install lacks is the bug the gate exists to prevent,
-    // and here it would also promise a pass that can never run.
+    // and here it would also promise a pass that can never run. The generic
+    // planning prose is what stays; the pointer goes with the roster.
     const p = build({ agentInventory: [agent("planner")] });
     expect(p).toContain("## Plan Before You Implement");
-    expect(p).not.toContain("grading obligation");
+    expect(p).toContain("delegate the plan to `planner` before you");
+    expect(p).not.toContain("ends in one quality pass");
     expect(p).not.toContain("## Quality Pass");
   });
 
-  test("agrees in number with a single grader, in both single-grader installs", () => {
+  test("Quality Pass agrees in number with a single grader, in both single-grader installs", () => {
     // Regression: the "Launch them in one turn so they run concurrently ... those
     // two tasks" wording was hardcoded outside the conditional, so a one-grader
     // install was told to launch two agents concurrently when only one existed.
@@ -364,34 +347,31 @@ describe("the planning section is gated on the planner agent existing", () => {
     for (const other of ["reviewer", "verifier"]) {
       const p = build({ agentInventory: [agent("planner"), agent("worker"), agent(other)] });
       const section = p.slice(
-        p.indexOf("## Plan Before You Implement"),
         p.indexOf("## Quality Pass"),
+        p.indexOf("Current date:"),
       );
       expect(section).toContain("Launch it, then end your turn");
-      expect(section).toContain("how to write that task");
-      expect(section).toContain("through this grader");
       // The plural forms must be absent, not merely outnumbered.
-      expect(section).not.toContain("Launch them");
+      expect(section).not.toContain("Launch the graders");
       expect(section).not.toContain("they run concurrently");
-      expect(section).not.toContain("those two tasks");
-      expect(section).not.toContain("these graders");
     }
   });
 
-  test("uses the plural only when both graders are present", () => {
+  test("Quality Pass uses the plural only when both graders are present", () => {
     const p = build({
       agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
     });
     const section = p.slice(
-      p.indexOf("## Plan Before You Implement"),
       p.indexOf("## Quality Pass"),
+      p.indexOf("Current date:"),
     );
-    expect(section).toContain("Launch them");
+    expect(section).toContain("Launch the graders");
     expect(section).toContain("they run concurrently");
-    expect(section).toContain("those two tasks");
-    expect(section).toContain("these graders");
+    expect(section).toContain("Launch the graders in one turn so they run concurrently");
     expect(section).not.toContain("Launch it,");
-    expect(section).not.toContain("this grader");
+    // Live plural discriminator: the receipt clause ships "the grader task"
+    // (singular) only with one grader; a number regression flips this pair.
+    expect(section).toContain("the grader tasks");
   });
 
   test("pairs each grader with its own role, never the other's", () => {
@@ -419,9 +399,9 @@ describe("the planning section is gated on the planner agent existing", () => {
   });
 
   test("states the verifier's obligation as conditional, not absolute", () => {
-    // Quality Pass and `agents/worker.md` both qualify the verifier on the change
-    // being runtime-testable. The section that *introduces* the obligation must
-    // agree, or the model launches a container run for a prose edit.
+    // Quality Pass qualifies the verifier on the change being runtime-testable.
+    // The sentence that *introduces* the obligation must agree, or the model
+    // launches a container run for a prose edit.
     const both = build({
       agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")],
     });
@@ -435,7 +415,7 @@ describe("the planning section is gated on the planner agent existing", () => {
     expect(ver).not.toContain("always applies");
 
     const rev = build({ agentInventory: [agent("planner"), agent("reviewer")] });
-    expect(rev).not.toContain("applies when the change");
+    expect(rev).not.toContain("execution can settle the change");
   });
 
   test("leaves no dangling comma or empty clause in the role list", () => {
@@ -451,14 +431,24 @@ describe("the planning section is gated on the planner agent existing", () => {
       // its whitespace is only covered by the shape that has the tool.
       for (const hasKanban of [false, true]) {
         const p = build({ agentInventory: inv, hasKanban });
-        const section = p.slice(
+        // Planning section: the pointer and the board clause are siblings, and neither
+        // may emit a dangling joiner.
+        const plan = p.slice(
           p.indexOf("## Plan Before You Implement"),
+          p.indexOf("## Delegate the Implementation"),
+        ).replace(/\n+$/, "");
+        expect(plan).not.toContain("\u2014 ,");
+        expect(plan).not.toContain(", and .");
+        expect(plan).not.toMatch(/\n\n\n/);
+        // Quality Pass section: the grader list and caveat are the join-prone part.
+        const qp = p.slice(
           p.indexOf("## Quality Pass"),
-        );
-        expect(section).not.toContain("\u2014 ,");
-        expect(section).not.toContain(", and .");
-        expect(section).not.toContain("done \u2014 .");
-        expect(section).not.toMatch(/\n\n\n/);
+          p.indexOf("Current date:"),
+        ).replace(/\n+$/, "");
+        expect(qp).not.toContain("\u2014 ,");
+        expect(qp).not.toContain(", and .");
+        expect(qp).not.toContain("done \u2014 .");
+        expect(qp).not.toMatch(/\n\n\n/);
       }
     }
   });
@@ -505,6 +495,38 @@ describe("the planning section is gated on the planner agent existing", () => {
     expect(p).not.toContain("planner");
     // The generic fallbacks must be what is left behind.
     expect(p).toContain("3. Design a step-by-step plan");
+  });
+});
+
+describe("the planning pointer is a pure pointer, number-neutral and grader-free", () => {
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+
+  test("points at Quality Pass in every grader shape and names no grader", () => {
+    for (const inv of [
+      [agent("planner"), agent("reviewer")],
+      [agent("planner"), agent("verifier")],
+      [agent("planner"), agent("reviewer"), agent("verifier")],
+    ]) {
+      const p = build({ agentInventory: inv });
+      const plan = section(p, "## Plan Before You Implement");
+      expect(plan).toContain("**A `planner` plan ends in one quality pass.**");
+      expect(plan).toContain("See **Quality Pass** below");
+      // The pointer must stay a pointer: no grader name, no launch instruction,
+      // no restatement of the pass itself.
+      expect(plan).not.toMatch(/reviewer|verifier/);
+      expect(plan).not.toContain("Launch");
+      expect(plan).not.toContain("graded by");
+    }
+  });
+
+  test("does not change its wording with grader count", () => {
+    const one = build({ agentInventory: [agent("planner"), agent("reviewer")] });
+    const two = build({ agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")] });
+    const pointer = (p: string) =>
+      p.split("\n").find((l) => l.startsWith("**A `planner` plan ends in one quality pass")) ?? "";
+    expect(pointer(two)).toBe(pointer(one));
+    expect(pointer(two)).not.toBe("");
   });
 });
 
@@ -664,12 +686,12 @@ describe("the kanban board section is gated on the tool existing", () => {
       build({ agentInventory: [agent("spiker"), agent("reviewer")] }),
       "## Delegate the Implementation",
     );
-    expect(s).toContain("Executing a whole plan inline when a row does both is work no child graded");
+    expect(s).toContain("Executing a whole plan inline when a row does both is work no one can see.");
     expect(s).toContain("how it will be checked — and a row does both");
     expect(s).toContain("do line by line — and a row does both");
     expect(s).toContain("never a row that edits files");
     const w = section(build({ agentInventory: [agent("worker")] }), "## Delegate the Implementation");
-    expect(w).toContain("Executing a whole plan inline is work no child graded and no one can see.");
+    expect(w).toContain("Executing a whole plan inline is work no one can see.");
     expect(w).not.toContain("a row does both");
   });
 
@@ -768,7 +790,7 @@ describe("the delegation-first section is gated on a delegation-capable roster",
   test("absent on an empty roster, and withheld from a child", () => {
     expect(build()).not.toContain("## Delegate the Implementation");
     expect(build()).not.toContain("worker");
-    // A child's own body carries its grading contract; the planning and Quality Pass
+    // A child's own body carries its grading rule; the planning and Quality Pass
     // sections already withhold on the same conjunct, and this one must join them.
     const child = build({
       hasKanban: true,
@@ -814,24 +836,27 @@ describe("the delegation-first section is gated on a delegation-capable roster",
 
   test("agrees in number with its own roster", () => {
     // The house rule: every phrase around a computed list is derived from it, so a
-    // one-grader install is never told to launch two passes.
-    const one = delegation(["worker", "reviewer"]);
-    expect(one).toContain("graded by `reviewer` — do not order that pass again");
-    expect(one).toContain("how to write that task");
-    expect(one).not.toContain("those tasks");
+    // one-grader install is never told to launch two passes. The delegation section
+    // itself carries no number-bearing prose — it only points — so the agreement is
+    // asserted on the Quality Pass it points at, whose branches emit the singular
+    // and the plural forms.
+    const one = section(build({ agentInventory: [agent("worker"), agent("reviewer")] }), "## Quality Pass");
+    expect(one).toContain("Launch it, then end your turn");
+    expect(one).not.toContain("Launch the graders");
+    expect(one).toContain("the grader task —");
+    expect(one).not.toContain("the grader tasks");
 
-    const both = delegation(["worker", "reviewer", "verifier"]);
-    expect(both).toContain(
-      "graded by `reviewer` and `verifier` (the `verifier` only when execution can settle the change) — do not order that pass again",
+    const both = section(
+      build({ agentInventory: [agent("worker"), agent("reviewer"), agent("verifier")] }),
+      "## Quality Pass",
     );
-    expect(both).toContain("how to write those tasks");
-    expect(both).not.toContain("how to write that task");
+    expect(both).toContain("Launch the graders in one turn");
+    expect(both).not.toContain("Launch it,");
+    expect(both).toContain("the grader tasks");
+    expect(both).not.toMatch(/the grader task\b/);
   });
 
-  test("states the grading rule Quality Pass states, in the same direction", () => {
-    // Three sections now carry the worker self-grade exemption (planning, Quality Pass,
-    // delegation). They must agree: a child's pass is not ordered twice, and what the
-    // orchestrator owns is its own work plus the integration of what came back.
+  test("names the receipt's shape and owns no rule; Quality Pass alone says what it means", () => {
     const p = build({
       agentInventory: [
         agent("planner"),
@@ -840,17 +865,32 @@ describe("the delegation-first section is gated on a delegation-capable roster",
         agent("verifier"),
       ],
     });
-    expect(section(p, "## Delegate the Implementation")).toContain("do not order that pass");
-    expect(p).toContain("Grade what **you** implemented");
-    // The whole-check is the project's own checks, not a grader launch: the shipped
-    // sentence named "the check that the whole does what the goal asked" with no tie to
-    // an edit, so a fully delegated plan satisfied it and fired the duplicate pass the
-    // other two sections forbid. What is owned is glue the orchestrator edited.
-    expect(section(p, "## Quality Pass")).toContain("glue **you edited yourself** while integrating");
-    expect(section(p, "## Quality Pass")).toContain("not a second grader launch");
-    expect(section(p, "## Delegate the Implementation")).toContain(
-      "the glue you edited while integrating what",
+    const del = section(p, "## Delegate the Implementation");
+    const qp = section(p, "## Quality Pass");
+    // Shape in delegation, matching worker.md's grammar (verification commands only).
+    expect(del).toContain("one `checks:` line per verification command it ran");
+    expect(del).toContain("See **Quality Pass** below");
+    // Meaning has exactly one home: a receipt is never read as a verdict.
+    expect(del).not.toMatch(/evidence of what ran|not a grade|never a judgement/);
+    expect(qp).toContain("A receipt is evidence of what ran, never a judgement");
+    expect(qp).toContain("they do not replace the pass");
+    expect(p.split("evidence of what ran").length - 1).toBe(1);
+    expect(qp).toContain("glue **you edited yourself** while integrating");
+    expect(p).not.toContain("Grade what **you** implemented");
+    expect(p).not.toContain("do not order that pass");
+    expect(p).not.toContain("not a second grader launch");
+  });
+
+  test("the receipt-is-not-a-verdict clause agrees in number and is gated on a worker", () => {
+    const one = section(
+      build({ agentInventory: [agent("worker"), agent("reviewer")] }),
+      "## Quality Pass",
     );
+    expect(one).toContain("its `checks:` lines go into the grader task —");
+    expect(one).not.toContain("the grader tasks");
+
+    const none = build({ agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")] });
+    expect(section(none, "## Quality Pass")).not.toMatch(/receipt|never a judgement/);
   });
 
   test("hands the pass to the orchestrator when no child self-grades", () => {
@@ -865,63 +905,47 @@ describe("the delegation-first section is gated on a delegation-capable roster",
     expect(s).toContain("both conditions, read off the Available Agents table");
     expect(s).toContain("whose role is a throwaway spike is not an implementer");
     expect(s).toContain("No agent in this roster ends its own run with a grading pass");
-    expect(s).toContain("See **Quality Pass** below for how to write those tasks");
+    expect(s).toContain("See **Quality Pass** below");
     expect(s).not.toContain("do not order that pass again");
   });
 
-  test("keeps the verifier's condition on the child's own pass", () => {
-    // `agents/worker.md` qualifies `verifier` on the change being runtime-testable, and
-    // this module's rule is that the obligation is conditional *wherever* it is stated.
-    // Unconditional here reads as "the child's run was verified", so the orchestrator
-    // declines the pass a docs change still needs; the child's report of what it skipped
-    // is the only thing that would save it, and the prompt has to point at it.
-    const both = delegation(["worker", "reviewer", "verifier"]);
-    expect(both).toContain("(the `verifier` only when execution can settle the change)");
-    expect(both).toContain("anything it says it skipped is yours");
-    // Reviewer-only has no condition to state, and must not borrow one.
-    expect(delegation(["worker", "reviewer"])).not.toContain("execution can settle the change");
-  });
-
   test("routes a step that changes no files away from an implementer", () => {
-    // The child's grading pass is mandatory on every run, so delegating a build, a test
-    // run, or an inspection buys a grader launch over an empty diff plus a turn of
-    // waiting; a read-heavy step belongs with a read-only agent, not the implementer.
+    // No child grades, so delegating a build, a test run, or an inspection buys
+    // nothing but a turn of waiting; a read-heavy step belongs with a read-only agent.
     const s = delegation(["worker", "reviewer", "verifier"]);
     expect(s).toContain("A step changes no files");
     expect(s).toContain("a read-only agent from the table above");
     expect(s).not.toContain("a build, a test run, or a sweep");
   });
-
   test("sits between the planning section and the quality pass it defers to", () => {
     const p = build({
       agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
     });
     const at = (h: string) => p.indexOf(h);
-    expect(at("## Plan Before You Implement")).toBeGreaterThan(-1);
+    // Full chain in one prompt: the agent table precedes the planning section,
+    // which precedes the delegation section, which defers to Quality Pass,
+    // which precedes the footer.
+    expect(at("## Available Agents")).toBeLessThan(at("## Plan Before You Implement"));
     expect(at("## Plan Before You Implement")).toBeLessThan(at("## Delegate the Implementation"));
     expect(at("## Delegate the Implementation")).toBeLessThan(at("## Quality Pass"));
+    expect(at("## Quality Pass")).toBeLessThan(at("Current date:"));
   });
 
   test("does not assume a grader in the empty-diff bullet", () => {
-    // The bullet's point is that a child run over an empty diff buys nothing. In an
-    // install that withholds Quality Pass there is no "graded implementer run" to buy, so
-    // the sentence must degrade to the cost that does exist: a turn of waiting.
-    expect(delegation(["worker"])).toContain("Run it yourself");
-    expect(delegation(["worker"])).not.toContain("grader launch");
-    const graded = delegation(["worker", "reviewer", "verifier"]);
-    expect(graded).toContain("A step changes no files");
-    expect(graded).toContain("buys a grader launch");
-    // Graders with no self-grading implementer: this section says no child arrives checked, so
-    // the launch is the orchestrator's to order — "a graded implementer run" contradicts that.
-    // (`delegation()` already returns the section — wrapping it in `section()` again
-    // would look for a heading inside it.)
-    const gradersNoWorker = delegation(["planner", "reviewer", "verifier"]);
-    expect(gradersNoWorker).toContain(
-      "no child here comes back with its diff graded, so an empty one buys you a grader launch to order",
-    );
-    expect(gradersNoWorker).not.toContain("A graded implementer run");
-    const selfGrading = delegation(["worker", "reviewer"]);
-    expect(selfGrading).toContain("A graded implementer run over an empty diff buys a grader launch");
+    // The bullet is roster-constant: it must not vary with grader availability, so
+    // it is asserted in all three roster shapes. The per-shape discriminators keep
+    // the shapes distinguishable instead of asserting one shared constant.
+    const noGraders = delegation(["worker"]);
+    expect(noGraders).toContain("Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing");
+    expect(noGraders).not.toContain("See **Quality Pass** below");
+
+    const graders = delegation(["worker", "reviewer", "verifier"]);
+    expect(graders).toContain("Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing");
+    expect(graders).toContain("See **Quality Pass** below");
+
+    const noWorker = delegation(["planner", "reviewer", "verifier"]);
+    expect(noWorker).toContain("Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing");
+    expect(noWorker).not.toContain("opens with a receipt");
   });
 
   test("states the outcome when no roster agent can implement", () => {
@@ -963,9 +987,7 @@ describe("the quality pass agrees in number with its own roster", () => {
     ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
 
   const qualityPass = (names: string[]) => {
-    // `worker` rides along: the carve-out for a self-graded child diff is worker-gated
-    // (an install without it has no self-grading child), and these tests are about the
-    // number the prose agrees with, not about that clause.
+    // `worker` rides along so its receipt branch is the one exercised.
     const p = build({ agentInventory: [agent("worker"), ...names.map(agent)] });
     return p.slice(p.indexOf("## Quality Pass"), p.indexOf("Current date:"));
   };
@@ -974,19 +996,15 @@ describe("the quality pass agrees in number with its own roster", () => {
     for (const only of ["reviewer", "verifier"]) {
       const section = qualityPass([only]);
       expect(section).toContain("- Launch it, then end your turn.");
-      expect(section).toContain("passed through this agent");
       expect(section).not.toContain("Launch the graders");
       expect(section).not.toContain("they run concurrently");
-      expect(section).not.toContain("through these agents");
     }
   });
 
   test("uses the plural only when both graders exist", () => {
     const section = qualityPass(["reviewer", "verifier"]);
     expect(section).toContain("Launch the graders in one turn so they run concurrently");
-    expect(section).toContain("passed through these agents");
     expect(section).not.toContain("Launch it, then end your turn.");
-    expect(section).not.toContain("through this agent");
   });
 
   test("emits one subagent call per grader, matching the number it describes", () => {
@@ -1266,6 +1284,82 @@ describe("caller-supplied text", () => {
     expect(p).toContain("GUIDE-ONE");
     expect(p).toContain("GUIDE-TWO");
   });
+});
+
+describe("workers grade nothing, and the orchestrator grades once per deliverable", () => {
+  const agent = (name: string) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global" }) as never;
+
+  test("a worker roster carries no per-step obligation and no carve-out", () => {
+    const p = build({
+      agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
+    });
+    expect(p).not.toContain("do not re-grade");
+    expect(p).not.toContain("do not order that pass again");
+    expect(p).not.toContain("has passed its own diff");
+    expect(p).not.toContain("already had graded");
+    expect(p).not.toContain("Grade what **you** implemented");
+    expect(p).not.toContain("grading obligation");
+    expect(section(p, "## Plan Before You Implement")).not.toContain("Launch");
+  });
+
+  test("the single-pass rule is stated once and names the receipt", () => {
+    const p = build({
+      agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
+    });
+    const qp = section(p, "## Quality Pass");
+    expect(qp).toContain("It gets **one** quality pass");
+    expect(qp).toContain("Not one per step");
+    expect(qp).toContain("each worker's receipt");
+    expect(qp).toContain("**At most one re-grade**");
+    expect(section(p, "## Plan Before You Implement")).not.toMatch(/reviewer|verifier/);
+    expect(section(p, "## Delegate the Implementation")).toContain("`graded: none`");
+    expect(section(p, "## Plan Before You Implement")).not.toContain("receipt");
+  });
+
+  test("every capability shape reads correctly", () => {
+    const wr = build({ agentInventory: [agent("worker"), agent("reviewer")] });
+    expect(section(wr, "## Quality Pass")).toContain(
+      "graded by `reviewer` before you report it done — it reads the implementation for correctness.",
+    );
+    expect(section(wr, "## Quality Pass")).not.toContain("verifier");
+
+    const wv = build({ agentInventory: [agent("worker"), agent("verifier")] });
+    expect(section(wv, "## Quality Pass")).toContain(
+      "`verifier` applies only when execution can settle the change.",
+    );
+    expect(section(wv, "## Quality Pass")).not.toContain("always applies");
+
+    const wp = build({ agentInventory: [agent("worker"), agent("planner")] });
+    expect(wp).not.toContain("Quality Pass");
+    expect(section(wp, "## Delegate the Implementation")).toContain("No child's diff comes graded in this install");
+    // No Quality Pass here, so the receipt's meaning lives in delegation instead — still once.
+    expect(section(wp, "## Delegate the Implementation")).toContain("A receipt line is evidence of what ran, not a grade");
+    expect(wp.split("evidence of what ran").length - 1).toBe(1);
+
+    const prp = build({ agentInventory: [agent("planner"), agent("reviewer"), agent("verifier")] });
+    expect(prp).not.toContain("worker");
+    expect(prp).not.toContain("receipt");
+
+    const noSub = build({
+      hasSubagent: false,
+      agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
+    });
+    expect(noSub).not.toContain("## Quality Pass");
+    expect(noSub).not.toContain("receipt");
+
+    const child = build({
+      isSubagent: true,
+      agentInventory: [agent("planner"), agent("worker"), agent("reviewer"), agent("verifier")],
+    });
+    expect(child).not.toContain("## Quality Pass");
+
+    for (const p of [wr, wv, wp, prp, noSub, child]) {
+      expect(p).not.toContain("${");
+    }
+
+  });
+
 });
 
 describe("section ordering", () => {

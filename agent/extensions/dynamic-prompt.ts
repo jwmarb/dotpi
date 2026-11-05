@@ -413,7 +413,7 @@ export function buildOrchestratorPrompt(opts: {
   /**
    * True when this process is itself a delegated subagent (non-empty
    * lineage). The planning and Quality Pass sections are written for the
-   * human's orchestrator; a subagent's own body carries its grading contract
+   * human's orchestrator; a subagent's own body carries its grading rule
    * (`worker.md`), so they are withheld rather than duplicated in the wrong voice.
    */
   isSubagent?: boolean;
@@ -599,9 +599,8 @@ Do not restate the board in your replies — the user sees it. Re-read it with \
     : '';
 
   // --- Grading roster ---
-  // Shared by the three sections below (planning, delegation, quality pass), each of which
-  // names these agents directly.
-  // Gated on them actually being spawnable, like askUserSection is gated on the
+  // Shared by the three sections below (planning, delegation, quality pass); only the
+  // Quality Pass section names the agents directly — the other two point at it.
   // questionnaire tool: a prompt that orders a delegation to an agent this
   // install does not have is an instruction the model cannot obey.
   // The `subagent` conjunct is what makes a roster actionable: without the spawn
@@ -627,12 +626,12 @@ Do not restate the board in your replies — the user sees it. Re-read it with \
   const graderRoles = plural
     ? graders.map((g) => `\`${g}\` ${ROLE[g]}`).join(', and ')
     : `it ${graders[0] ? ROLE[graders[0]] : ''}`;
-  // The verifier's obligation is conditional wherever else it is stated — Quality
-  // Pass below and `agents/worker.md` both qualify it on the change being
-  // runtime-testable — so the sentence that *introduces* it must not read as
-  // absolute, or the model launches a container run for a prose edit. It is its
-  // own trailing sentence rather than an inline aside, because inlining it
-  // collided with the clause that follows the list in the single-grader case.
+  // The verifier's obligation is conditional — Quality Pass below is the single
+  // site that qualifies it on the change being runtime-testable — so the
+  // sentence that *introduces* it must not read as absolute, or the model
+  // launches a container run for a prose edit. It is its own trailing sentence
+  // rather than an inline aside, because inlining it collided with the clause
+  // that follows the list in the single-grader case.
   const verifierCaveat = graders.includes('verifier')
     ? ` \`verifier\` applies only when execution can settle the change${
         plural ? '; `reviewer` always applies' : ''
@@ -659,19 +658,8 @@ Do not restate the board in your replies — the user sees it. Re-read it with \
   // returns an ordered, file-specific plan, and improvising that order instead is
   // how a half-finished refactor gets left behind.
   //
-  // The grading obligation is stated *here* rather than left to the Quality Pass
-  // section alone, because a plan nobody checked against the result is a
-  // document and not an engineering step. The one carve-out is the same one
-  // Quality Pass already makes — a `worker` ends its own run by handing its diff
-  // to these graders, so re-grading it would buy a duplicate pass and nothing
-  // else.
-  //
-  // The exemption names `worker`, so it is gated on `worker`: a roster without it has no
-  // self-grading child, and `delegationSection` tells that install the opposite ("No
-  // child's diff comes graded in this install"). Granting the exemption there is a
-  // licence to skip the only pass that exists, citing an agent the roster lacks — the
-  // identical bug one level down, which AGENTS.md records as this module's habit.
-  // Quality Pass gates its three `worker` branches for the same reason.
+  // Grading is stated once, in Quality Pass; this section only points at it,
+  // and only when that section is emitted (`graders.length > 0`).
   const hasPlanner =
     opts.hasSubagent && !opts.isSubagent && opts.agentInventory.some((a) => a.name === 'planner');
   const planningSection = hasPlanner
@@ -699,23 +687,7 @@ exists to prevent.
 ${
   graders.length > 0
     ? `
-**A \`planner\` plan carries a grading obligation.** Whenever you call
-\`planner\`, the implementation that follows it gets graded by ${graderList} before
-you report it done — ${graderRoles}.${verifierCaveat} ${
-  plural
-    ? `Launch them
-in one turn so they run concurrently, then end your turn. See **Quality Pass**
-below for how to write those two tasks.`
-    : `Launch it, then end your turn. See **Quality Pass**
-below for how to write that task.`
-}
-
-The pairing is the point: a plan nobody checked against the result is a document,
-not an engineering step.${hasWorker
-  ? `
-
-The single exception is the one Quality Pass already names: a \`worker\` has passed its own diff through ${plural ? 'these graders' : 'this grader'}, so do not re-grade it.`
-  : ''} Grade what **you** implemented.
+**A \`planner\` plan ends in one quality pass.** See **Quality Pass** below.
 `
     : ''
 }${
@@ -731,69 +703,31 @@ is a conversation, not a plan of record.
     : '';
 
   // --- Delegation-first section ---
-  // The orchestrator's second weakest moment: it takes a plan it did not write and
-  // executes the whole thing inline, so the implementation is graded by nobody and the
-  // user watches a wall of edits from the agent meant to coordinate. A `worker` ends
-  // its own run graded, so pushing work to the child also pushes it behind a gate.
-  // Gate: a roster this session can delegate to. The agent name is gated one level
-  // finer (`implName`), and every grader phrase — the Quality Pass pointer included —
-  // is gated on `graders`, because that section is emitted on exactly that condition
-  // and a pointer to a section that was never printed is the dangling reference this
-  // module keeps having to fix.
-  // The child's self-grade is derived, never hardcoded, for two reasons this module has
-  // already been burned by: `verifier` is conditional in `agents/worker.md` (as it is in
-  // Quality Pass below), and in an install with no spawnable grader *no* child is graded
-  // at all. Stating the pass as unconditional is how the orchestrator comes to believe a
-  // docs change was verified and declines the one pass still owed — so each phrase below
-  // prints only the pass that exists.
-  // Singular states the condition without naming the agent twice: the list already
-  // named it, and `verifierCaveat` is a separate sentence for exactly this reason.
-  const verifierParen = !graders.includes('verifier')
-    ? ''
-    : plural
-      ? ' (the `verifier` only when execution can settle the change)'
-      : ' (only when execution can settle the change)';
-  const childSelfGrade = graders.length > 0 ? `graded by ${graderList}${verifierParen}` : '';
-  const childReports = childSelfGrade
-    ? `has its own diff ${childSelfGrade} before it reports`
-    : 'reports what it ran — the check on it is yours';
+  // A child grades nothing, so every child diff arrives unchecked and the pass
+  // on it is the orchestrator's (Quality Pass). The pointer is gated on
+  // `graders`, because a pointer to a section that was not emitted dangles;
+  // the receipt sentence is gated on `hasWorker`, because only worker.md
+  // emits one.
   const implSentence = hasWorker
-    ? `When a plan has implementation steps, delegate them to \`${WORKER_AGENT}\`: it edits the files, runs the project's checks, and ${childReports}.`
+    ? `When a plan has implementation steps, delegate them to \`${WORKER_AGENT}\`: it edits the files, runs the project's checks, and reports what it changed and ran.`
     : `When a plan has implementation steps, delegate them to ${implName} — both conditions, read off the Available Agents table: ${writerCount}, and a row that can write but whose role is a throwaway spike is not an implementer either. If no row does both, this install has no implementer: the editing is yours, and so is the pass on it.`;
   const qualityPassPointer =
     graders.length > 0
-      ? ` See **Quality Pass** below for how to write ${plural ? 'those tasks' : 'that task'}.`
+      ? ` See **Quality Pass** below.`
       : '';
-  // The exemption from ordering a grader pass is an instruction to obey only where a
-  // graded child pass exists. `worker` is the only roster agent whose body ends its run
-  // with one, and with no grader spawnable there is no pass to decline — so the
-  // paragraph is gated on both, and the inverse is stated out loud rather than left
-  // out: an ungraded child's work must not read as work that was checked.
+  // Receipt grammar lives in agents/worker.md. This line only names the receipt's shape. What a
+  // receipt means (evidence, never a verdict) has one home per install: Quality Pass when it is
+  // emitted, otherwise this paragraph, since a no-grader install has no Quality Pass to point at.
+  const receiptLine = hasWorker
+    ? ` A \`${WORKER_AGENT}\` result opens with a receipt — \`files:\`, one \`checks:\` line per verification command it ran, and \`graded: none\`.`
+    : '';
   const gradingParagraph =
-    graders.length > 0 && hasWorker
-      ? `**Grading follows the work, not the doer.** A child that implements ends its own run
-by having its diff ${childSelfGrade} — do not order that pass again. Read the child's
-report of that pass: anything it says it skipped is yours. What is yours is what no child
-graded: the work you implemented yourself, and the glue you edited while integrating what
-came back.${qualityPassPointer}`
-      : `**The pass on what comes back is yours.** ${
-        graders.length > 0
-          ? `No agent in this roster ends its own run with a grading pass, so no child's diff arrives checked.${qualityPassPointer}`
-          : `No child's diff comes graded in this install: nothing here grades it, so run the project's own checks on what comes back, and fix what they report before you report the work done.`
-      }`;
-  // Delegating a step with nothing to implement buys a grading pass over an empty diff —
-  // where such a pass exists, and where a child's run is the thing that comes graded. So
-  // the tail is three-way: a self-grading implementer (a launch is spent for nothing); a
-  // roster with graders but no self-grading implementer (the section above says no child
-  // arrives checked, so the launch is one the orchestrator must order itself — saying "a
-  // graded implementer run" there contradicts it); and no graders at all, where the cost
-  // is only the turn of waiting.
+    graders.length > 0
+      ? `No agent in this roster ends its own run with a grading pass, so no child's diff arrives checked.${receiptLine}${qualityPassPointer}`
+      : `No child's diff comes graded in this install: nothing here grades it, so run the project's own checks on what comes back, and fix what they report before you report the work done.${receiptLine}${hasWorker ? ' A receipt line is evidence of what ran, not a grade: re-run its checks yourself rather than trusting the line.' : ''}`;
+  // No child grades, so the cost of delegating an empty step is the wait alone, in every roster.
   const emptyDiffBullet =
-    graders.length > 0 && hasWorker
-      ? '- A step changes no files — a build, a test run, an inspection, a report. A graded implementer run over an empty diff buys a grader launch and a turn of waiting for nothing'
-      : graders.length > 0
-        ? '- A step changes no files — a build, a test run, an inspection, a report. Run it yourself: no child here comes back with its diff graded, so an empty one buys you a grader launch to order and a turn of waiting for nothing'
-        : '- A step changes no files — a build, a test run, an inspection, a report. Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing';
+    '- A step changes no files — a build, a test run, an inspection, a report. Run it yourself: a child run with nothing to implement buys a turn of waiting for nothing';
 
   // The skip rule presumes the delegation it skips. In a roster where no row can write, the
   // opener makes self-editing the outcome, so every implementation step would be a "named skip"
@@ -809,8 +743,8 @@ came back.${qualityPassPointer}`
 
 ${hasWorker ? 'You coordinate; the child implements.' : 'You coordinate; a child implements where one can.'} ${implSentence} ${
   hasWorker
-    ? 'Executing a whole plan inline is work no child graded and no one can see.'
-    : 'Executing a whole plan inline when a row does both is work no child graded and no one can see.'}
+    ? 'Executing a whole plan inline is work no one can see.'
+    : 'Executing a whole plan inline when a row does both is work no one can see.'}
 
 **Delegate when:**
 - A step changes files and the plan already specifies it: the file, the function, what to change, how it will be checked${hasWorker ? '' : ' — and a row does both'}
@@ -832,42 +766,38 @@ ${gradingParagraph}
     : '';
 
   // --- Quality pass section ---
-  // The orchestrator is the one agent with no parent to grade it. A `worker`
-  // ends its run by handing the diff to `reviewer`/`verifier`, so work routed
-  // through delegation is graded by construction — but the orchestrator edits
-  // files directly too, and that path had no gate at all. This closes it, so
-  // "who checks the implementation" has the same answer either way. The planning
-  // section above makes the same obligation explicit for plan-driven work.
+  // The single statement of the grading rule: one pass per deliverable, over
+  // worker diffs, the orchestrator's own edits and its glue. No child
+  // self-grades (pinned in subagent-herdr/lib.test.ts), so this pass is the
+  // only check on child output.
   const qualityPassSection =
     graders.length > 0
       ? `
 ## Quality Pass
 
-When **you** implemented something yourself — edited files, wrote a feature, fixed
-a bug — you are the worst available judge of it.${hasWorker
-  ? ` A \`worker\` you delegate to ends its run by having its diff graded by an agent that did
-not write it. Hold yourself to that standard: finish your own implementation work the same way.`
-  : ` Hold yourself to the standard a grader would apply: finish your own implementation work
-as an agent that did not write it would.`}
+**Decide first: does this deliverable still owe its pass?** A deliverable is the whole of
+what one request or one plan changes. It gets **one** quality pass, after its last
+implementation step and before you tell the user it is done. Not one per step, and not
+one per child.${hasWorker ? ` A \`worker\` grades nothing: this pass is the only check on its
+output by an agent that did not write it.` : ''}
 
-Before you tell the user an implementation is done, delegate a quality pass:
+Answer two questions before you launch: has this deliverable already had its pass, and
+${hasWorker ? "what does each worker's receipt say was run, and what have the project's own checks already shown on your own edits and glue" : "what have the project's own checks already shown"}?
+If it has had its pass and no executable code changed since, launch nothing.${hasWorker ? ` A receipt is evidence of what ran, never a judgement: its \`checks:\` lines go into ${plural ? 'the grader tasks' : 'the grader task'} — they do not replace the pass.` : ''}
+The pass: the deliverable is graded by ${graderList} before you report it done — ${graderRoles}.${verifierCaveat}
 
 \`\`\`
-${graders.map((g) => `subagent(agent: "${g}", task: "${g === 'verifier' ? '<goal + absolute project path + the command that checks it>' : '<goal + the exact files you touched, as absolute paths>'}")`).join('\n')}
+${graders.map((g) => `subagent(agent: "${g}", task: "${g === 'verifier' ? '<goal + absolute project path + the command that checks it>' : hasWorker ? '<goal + every file the deliverable changed — the \`files:\` lines of each worker receipt, plus your own edits and glue — as absolute paths>' : '<goal + every file the deliverable changed — your own edits and glue — as absolute paths>'}")`).join('\n')}
 \`\`\`
 
 Ask for exactly this: **a full and thorough quality pass over the implementation
 for any remaining bugs, issues, or quality-of-life improvements.**
 
-**When it applies:** you changed code, config, or anything executable, and the
-change is more than a typo or a one-line string. It does **not** apply to work you
-only read, planned, or researched.${hasWorker
-  ? ` Nor does it apply to a change a child already had graded: do not re-grade a
-\`worker\`'s diff it has itself passed through ${plural ? 'these agents' : 'this agent'}.`
-  : ''}
-It applies to glue **you edited yourself** while integrating what the children returned —
-no child graded that glue. Confirming the whole does what the goal asked is the project's
-own checks, not a second grader launch over ${hasWorker ? 'a diff a child already had graded' : 'work you have already checked yourself'}.
+**What it covers:** everything the deliverable changed in code, config, or anything
+executable — ${hasWorker ? "each worker's files, " : ''}the edits you made yourself, and the
+glue **you edited yourself** while integrating what the children returned. Name every one
+of those files in ${plural ? 'each task' : 'the task'}. It does **not** apply to work you only read, planned, or
+researched, or to a typo or a one-line string.
 
 **How to delegate it well:**
 - Write the task self-contained: the child cannot see this conversation. Name the
@@ -885,11 +815,14 @@ ${graders.includes('verifier') ? `- \`verifier\` expects a container image tag t
 re-run the project's own checks, and take the small local Suggestions. Report
 findings you deliberately did not act on, with the severity the grader gave them,
 rather than quietly dropping them. A quality pass you did not act on is a quality
-pass you wasted — and a \`FAIL\` means the work is not done, whatever your own
-earlier command reported.
+pass you wasted${graders.includes('verifier') ? ' — and a \`FAIL\` means the work is not done, whatever your own earlier command reported' : ''}.
 
 Tell the user what the pass found and what you changed in response. If you judge a
 change too trivial to grade, say that you skipped it and why; do not skip silently.
+
+**At most one re-grade**, and only after your fixes changed executable code. A fix to
+prose, comments or naming is not re-graded. No second re-grade is owed: report what is
+still open instead.
 `
       : '';
 

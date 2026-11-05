@@ -41,7 +41,10 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 - **`skills:` is the only way a child sees skills**; it also needs `read`/`read_skill`. Identity is
   the leaf dir name (category is path only); skill-tree lookup belongs to `extensions/lib/skill-tree.ts`.
 - **`callable_by` is the delegation graph; absent = orchestrator-only.** Sentinels `orchestrator`
-  and `any` (unused). Live edges: `worker → reviewer, verifier, librarian`; `reviewer, verifier,
+  and `any` (unused). Live edges: `worker → librarian` (its `reviewer, verifier` edges are an
+  unused capability — `worker.md` grades nothing and the orchestrator grades once per deliverable;
+  to enforce that, drop `worker` from their `callable_by` and from `EXPECTED`, and
+  `lineageRejection` refuses the spawn); `reviewer, verifier,
   spiker, oracle → librarian`; `librarian → summarizer, spiker, explorer`. Adding an edge = callee's
   `callable_by` + caller's body + `EXPECTED` in `subagent-herdr/lib.test.ts`. Enforced by
   `lineageRejection`/`delegationRoster` in `extensions/lib/agents.ts`.

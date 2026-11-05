@@ -60,6 +60,14 @@ The lib graph has no cycles. Suite names do not map 1:1 to modules: `skill-catal
   gained mid-run appears on the **next** run, and there is **no `unregisterTool`**.
 - **The two prompt builders yield to a persona switch.** `dynamic-prompt.ts:147` and `quant-prompt.ts` return
   `undefined` while `personaOverride()` is set. Do not rely on filename load order.
+- **`dynamic-prompt.ts` states grading exactly once per install.** With a grader installed that statement
+  lives in `## Quality Pass` (one pass per deliverable), and the planning and delegation sections only point
+  at it. In a no-grader install there is no Quality Pass, so the single statement is the delegation
+  section's "No child's diff comes graded in this install…" The receipt-meaning clause (a receipt is
+  evidence, never a verdict) moves with the install: Quality Pass when it is emitted, the delegation
+  paragraph when it is not. No agent body self-grades (pinned in `subagent-herdr/lib.test.ts`); every
+  grader phrase derives from the filtered `graders` roster, and every `worker`/receipt phrase is gated on
+  `hasWorker`.
 - **Profiles** symlink individual files from here. Sibling imports resolve through the realpath. A profile's own
   tsconfig must `include` its own files by name, never `*.ts`, or it typechecks this directory twice.
 - **Typecheck:** `tsconfig.json` covers `*.ts` + `lib/*.ts` only (`auto-update/` and `trade-journal/` are not
