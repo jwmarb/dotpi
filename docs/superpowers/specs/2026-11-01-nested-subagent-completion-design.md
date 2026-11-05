@@ -1,5 +1,7 @@
 # Nested subagent completion — design
 
+> **2026-11-05:** the nesting this spec describes (worker → reviewer/verifier) was later removed: workers no longer launch their graders, and the orchestrator grades each deliverable once.
+
 Date: 2026-11-01 · Module: `agent/extensions/subagent-herdr/`
 Full analysis: `/tmp/oracle-full.md` · Plan: `../plans/2026-11-01-nested-subagent-completion.md`
 

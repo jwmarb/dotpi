@@ -239,12 +239,13 @@ describe("run lifecycle: the completion predicate", () => {
 });
 
 describe("run lifecycle: a delegating run holds itself open", () => {
-  // The waiting-turn bug: a worker launches its graders, writes a `<result>`
-  // saying the pass is pending, and ends its turn so their notices can wake it.
-  // Its pane reports `done` (herdr's "ready for input") and its answer is clean,
-  // so the two-input predicate finished it and closed the pane out from under the
-  // verdicts it was waiting for. `hasPendingSpawns` is the third input that stops
-  // that; the gone-pane arm is the one place it is deliberately not asked.
+  // The waiting-turn bug: a delegating child launches its subagents, writes a
+  // `<result>` saying the run is still pending, and ends its turn so their
+  // notices can wake it. Its pane reports `done` (herdr's "ready for input")
+  // and its answer is clean, so the two-input predicate finished it and closed
+  // the pane out from under the results it was waiting for. `hasPendingSpawns`
+  // is the third input that stops that; the gone-pane arm is the one place it
+  // is deliberately not asked.
 
   test("a live done pane, a clean answer, and an unfinished spawn: no transition at all", async () => {
     const w = world();

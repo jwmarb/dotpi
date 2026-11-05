@@ -387,8 +387,9 @@ describe.skipIf(!existsSync(REAL_RUNS))("isTerminalRecord against the recorded c
       (r) => r.status === "failed" && r.failedAttempts !== undefined && nested(r),
     );
     // Floors, not exact counts: the live dir grows with every nested run, so an
-    // exact pin turns the next cancelled grader into a red suite. What must hold
-    // on ANY corpus is the loop below — every such record releases its parent.
+    // exact pin turns the next cancelled nested run into a red suite. What must
+    // hold on ANY corpus is the loop below — every such record releases its
+    // parent.
     // The exact quadruple is pinned on the frozen fixture in settle-stuck.test.ts.
     expect(cancelled.length).toBeGreaterThanOrEqual(3);
     expect(failedWithAttempt.length).toBeGreaterThanOrEqual(1);

@@ -1610,7 +1610,7 @@ describe("run ownership (cross-process sweep)", () => {
           paneId: "w9:pW",
         },
       ]);
-      // A grader the worker launched, planted by another process after load: it is
+      // A subagent the worker launched, planted by another process after load: it is
       // stamped with the worker's run id, and its task is an injection attempt.
       writeMetaAfterLoad(dir, {
         runId: "sub-b0b0",

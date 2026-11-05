@@ -2212,7 +2212,7 @@ describe("createChildDoneHandshake: a child waiting on its own spawns", () => {
     const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
     const answer = { messages: [withText(ANSWERED, "stop")], systemPrompt: RESULT_PROMPT };
 
-    // A worker that calls subagent_done once per grader wake is doing what it
+    // A child that calls subagent_done once per subagent wake is doing what it
     // was told; waiting is not misbehaviour, so no bound spends itself here.
     for (let i = 0; i < 5; i++) {
       const outcome = handshake.complete("/tmp/s.jsonl", () => {}, answer);
@@ -2230,14 +2230,14 @@ describe("createChildDoneHandshake: a child waiting on its own spawns", () => {
     const handshake = createChildDoneHandshake(effects, { ...BASE_ENV });
     const answered = { messages: [withText(ANSWERED, "stop")], systemPrompt: RESULT_PROMPT };
 
-    // Three grader wakes, three pending refusals — none of them the answer
+    // Three subagent wakes, three pending refusals — none of them the answer
     // gate's, so its budget is untouched.
     for (let i = 0; i < 3; i++) {
       const outcome = handshake.complete("/tmp/s.jsonl", () => {}, answered);
       expect(outcome.kind).toBe("no-answer");
     }
 
-    // The graders report; the pending list empties. The final sign-off now
+    // The subagents report; the pending list empties. The final sign-off now
     // goes through the answer gate, which is still whole: it refuses a
     // no-answer completion twice, then lets it through.
     pending = [];
