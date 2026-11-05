@@ -98,6 +98,7 @@ Verified 2026-10-30 — line refs read against the tree on that date; a touched 
 | Check the repo loads, type-checks and passes tests | `scripts/check.sh` (`CHECK_STAGED=1` for the index) |
 | Fresh machine → working pi config | `install.sh` (Linux/macOS) / `install.ps1` (Windows) |
 | Explain the setup to a human | `README.md` |
+| Make anything **branded** (README header, service theme, social card, diagram, icon) | `~/jwmarb` — read its `AGENTS.md` first; the brand's values, its contrast rules, and the mark all live there, not here |
 
 ## CONVENTIONS
 
