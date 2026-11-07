@@ -17,7 +17,7 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 | Prompt templates | `prompts/git-commit.md` (`name: git-commits`) |
 | Builtins / packages / router | `settings.json`: `+builtin:mcp`, `+codemode`, `-llama.cpp`, `-tool-search`, `-herdr`; `defaultProvider/defaultModel` = `fallback/auto`; `modelFallback.*`; `packages`; `piBolt.*` |
 | Provider overrides | `models.json` — `providers.<name>.{baseUrl, api, apiKey, models[{id, contextWindow, maxTokens}]}`; `eagle` → `http://eagle.lan:8080/v1` (LAN host, not portable) |
-| MCP servers | `mcp.json`: only `robinhood`, `enabled: false`, OAuth (`oauth.clientName`). `persona-mcp.json`: `github` with `Authorization: Bearer ${GITHUB_TOKEN}`, `exposure: "direct"` |
+| MCP servers | `mcp.json`: only `robinhood`, `exposure: "direct"`, OAuth (`oauth.clientName`). `persona-mcp.json`: `github` with `Authorization: Bearer ${GITHUB_TOKEN}`, `exposure: "direct"` |
 | Secret key names | `.env.example` (`LITELLM_API_KEY`, `LITELLM_BASE_URL`, `FIRECRAWL_API_URL`, `GITHUB_TOKEN`); real `.env` is ignored |
 | Theme keys | `themes/tokyo-night.json` (`$schema` → pi's bundled `theme-schema.json`) |
 | Verifier container | `docker/verify-base.Dockerfile` — `node:24-slim`, `AGENT_BROWSER_VERSION=0.38.1`, no CMD/ENTRYPOINT; parent of generated `verify-images/<proj>-<hash>/` |

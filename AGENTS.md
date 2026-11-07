@@ -15,7 +15,7 @@ Personal configuration repository for the `pi` coding agent (`@earendil-works/pi
 - `agent/prompts/` — prompt templates (`git-commit.md`: Conventional Commits)
 - `agent/themes/` — TUI theme (`tokyo-night.json`)
 - `agent/settings.json` — pi config: default provider/model/thinking level, retry policy, installed packages (`git:`/`npm:` refs)
-- `agent/mcp.json` — MCP servers for **pi's built-in MCP extension** (`+builtin:mcp`). One server: `robinhood`, **disabled** (`enabled: false` — no secret in the file: it authenticates by OAuth, whose client+token state lands in the gitignored `agent/mcp-auth.json`). The builtin validates `url` with `URL.canParse()` *before* expansion, so a secret URL cannot be a `${VAR}` placeholder in `url` itself; `${VAR}`/`!cmd` are expanded in `headers`/`env` only
+- `agent/mcp.json` — MCP servers for **pi's built-in MCP extension** (`+builtin:mcp`). One server: `robinhood`, **enabled** with `exposure: "direct"` (its tools are declared to the model like built-ins; no secret in the file: it authenticates by OAuth, whose client+token state lands in the gitignored `agent/mcp-auth.json`). The builtin validates `url` with `URL.canParse()` *before* expansion, so a secret URL cannot be a `${VAR}` placeholder in `url` itself; `${VAR}`/`!cmd` are expanded in `headers`/`env` only
 - `agent/models.json` — provider overrides; defines `eagle` (`http://eagle.lan:8080/v1`, LAN-only). `agent/persona-mcp.json` holds the `github` MCP server
 - `agent/.env` — the ONLY file with live credentials (gitignored; `agent/.env.example` is the committed template)
 - `agent/docker/verify-base.Dockerfile` — tracked reference image for runtime verification

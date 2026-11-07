@@ -95,8 +95,8 @@ coding profile, not this one.
   a stalled quant child dies "Unknown agent".
 - `prompts`, `themes`, `bin`, `.env`, `.env.example` — symlinks into `agent/`
   (secrets shared, never duplicated). `mcp.json` is a real file: only `robinhood`
-  (disabled) — the coding profile's `github` server is a remote write path a
-  a research desk that keeps `bash` as its write path does not want.
+  (enabled, `exposure: "direct"`) — the coding profile's `github` server is a
+  remote write path a research desk that keeps `bash` as its write path does not want.
 
 ## SYSTEM.md — deleted, and why
 
