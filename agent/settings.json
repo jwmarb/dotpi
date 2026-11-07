@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/pi-settings.schema.json",
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "defaultProvider": "fallback",
   "defaultModel": "auto",
   "defaultThinkingLevel": "xhigh",
@@ -80,5 +80,10 @@
       "npm:opensec-pi-fff@0.11.1"
     ],
     "packagesOverlay": true
+  },
+  "extensionChangelogVersions": {
+    "{\"source\":\"git:github.com/samfoy/pi-lsp-extension\",\"scope\":\"user\"}": "1.4.0",
+    "{\"source\":\"npm:pi-better-edit\",\"scope\":\"user\"}": "2.17.0",
+    "{\"source\":\"npm:pi-blackhole\",\"scope\":\"user\"}": "0.5.17"
   }
 }
