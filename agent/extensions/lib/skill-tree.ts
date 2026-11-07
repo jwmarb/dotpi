@@ -135,6 +135,42 @@ export async function findSkills(
 }
 
 /**
+ * Finds every skill under an ordered list of skills roots, highest precedence
+ * first.
+ *
+ * The list is the project-layer shape (`project-layer.ts`'s
+ * `ResourceRoots.skillsDirs`): a project skills dir before the profile's.
+ * Skills are identified by directory name (the {@link SkillLocation.dir}
+ * rule in this module's header), and the FIRST root to claim a name wins: a
+ * project skill fully shadows the same-named profile skill — its `SKILL.md`,
+ * its `agents/`, its `tools:` — the way pi's own project-before-user order
+ * does.
+ *
+ * A missing or unreadable root costs only that branch, exactly as
+ * {@link findSkills} does; the remaining roots are still walked.
+ *
+ * @param dirs - Skills roots, highest precedence first.
+ * @param readdir - Injectable lister, forwarded to {@link findSkills}.
+ * @returns The union of the roots' skills, deduplicated by skill directory
+ *          name with the first root winning, sorted by identity.
+ */
+export async function findSkillsIn(
+  dirs: readonly string[],
+  readdir?: (p: string) => Promise<string[]>,
+): Promise<SkillLocation[]> {
+  const seen = new Set<string>();
+  const out: SkillLocation[] = [];
+  for (const dir of dirs) {
+    for (const skill of await findSkills(dir, readdir)) {
+      if (seen.has(skill.dir)) continue; // first root wins the name
+      seen.add(skill.dir);
+      out.push(skill);
+    }
+  }
+  return out.sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
+/**
  * The category directory a skill's `SKILL.md` sits under, if any.
  *
  * Derived from the path rather than read from frontmatter, so the tree the human
@@ -160,4 +196,15 @@ export function categoryFromPath(
   // category, so a deeper tier joins into one POSIX-separated label.
   const segments = rel.split(sep).filter(Boolean);
   return segments.length > 2 ? segments.slice(0, -2).join("/") : undefined;
+}
+/**
+ * True when `p` is `root` itself or nested under it, honoring the separator:
+ * `/a/bc` is NOT under `/a/b`. Pure string logic — no `realpath`, so a caller
+ * that needs identity compares realpaths first and passes the resolved forms.
+ *
+ * @param root - The root to test against.
+ * @param p - The path to test.
+ */
+export function isUnder(root: string, p: string): boolean {
+  return p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
 }

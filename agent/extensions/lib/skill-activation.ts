@@ -22,7 +22,8 @@
  * deactivates a skill short of a new session — deliberate, because a tool
  * disappearing mid-task is worse than one lingering.
  *
- * Pure module: `node:path` only, no pi import (the `lib/` rule).
+ * Pure module: `node:fs/promises` + `node:path` only, no pi import (the `lib/`
+ * rule).
  *
  * @module extensions/lib/skill-activation
  */
@@ -208,71 +209,110 @@ export function parseOwnedTools(frontmatter: string): string[] {
 }
 
 /**
- * Builds the tool → owning-skill map by reading every skill's frontmatter.
+ * Builds the tool → owning-skill map by reading every skill's frontmatter,
+ * across one skills root or an ordered list of roots, highest precedence
+ * first.
  *
- * Returns an empty map on any failure, and skips an unreadable `SKILL.md`, so a
- * broken skill costs only its own gating rather than every tool in the session.
- * When two skills claim one tool the first by skill-name order wins, and the
- * duplicate is ignored — a contested tool stays reachable through one owner
- * rather than becoming unreachable.
+ * Returns an empty map on any failure, and an unreadable `SKILL.md` costs the
+ * skill its tools only (the skill's NAME is still claimed, so it shadows), so a
+ * broken skill costs only its own gating rather than every tool in the
+ * session.
  *
- * Finds skills at any depth via `skill-tree.ts`, so a skill keeps its tool when
- * it is filed under a category. The key is always the skill *directory* name,
- * never its category path, because that is what the active set holds.
+ * Precedence is FIRST ROOT WINS: within one root, skills are ordered by
+ * directory name (the `findSkills` sort); across roots, in the caller's root
+ * order. So a tool owned by BOTH a project skill and a profile skill is owned
+ * by the project skill — the first root — matching the fleet's project-wins
+ * rule (`project-layer.ts`). A contested tool stays reachable through one
+ * owner rather than becoming unreachable.
  *
- * Reads every skill's frontmatter once per process and memoizes the result: the
- * gate runs on every `before_agent_start`, and re-reading 50-odd `SKILL.md`
- * files per turn buys nothing — a new skill needs a pi restart to be loadable
- * anyway. An explicit reader/lister bypasses the cache so tests stay
- * deterministic.
+ * Shadowing is whole-skill, not per-tool: a skill name an earlier root already
+ * claimed is hidden in the later roots and contributes NO tools — the same way
+ * `findSkillsIn` hides a same-named profile skill. So if the shadowing
+ * (project) skill declares no tools while the hidden profile one did, the
+ * tools go dark: shadowing is wholesale, by design.
  *
- * @param skillsDirPath - Absolute path to the skills library.
+ * Finds skills at any depth via `skill-tree.ts`, so a skill keeps its tool
+ * when it is filed under a category. The key is always the skill *directory*
+ * name, never its category path, because that is what the active set holds.
+ *
+ * Reads every skill's frontmatter once per process and memoizes the result
+ * PER DIRECTORY: the gate runs on every `before_agent_start`, and re-reading
+ * 50-odd `SKILL.md` files per turn buys nothing — a new skill needs a pi
+ * restart to be loadable anyway. The cache key is always a single dir path, so
+ * an ordered list merges the per-directory memo, first root winning; the
+ * merged result itself is not cached, so a list call always reflects the
+ * current per-dir state. An explicit reader/lister bypasses the cache (and
+ * writes nothing to it) so tests stay deterministic.
+ *
+ * @param skillsDirPath - A skills library, or an ordered list of libraries,
+ *                        highest precedence first.
  * @param readFile - Injectable reader (tests pass a fake; the extension uses fs).
  * @param readdir - Injectable directory lister, forwarded to the tree walker.
  */
 export async function loadSkillToolOwners(
-  skillsDirPath: string,
+  skillsDirPath: string | readonly string[],
   readFile?: (p: string) => Promise<string>,
   readdir?: (p: string) => Promise<string[]>,
 ): Promise<Map<string, string>> {
+  const dirs = Array.isArray(skillsDirPath) ? skillsDirPath : [skillsDirPath];
   const injected = Boolean(readFile || readdir);
-  if (!injected) {
-    const cached = ownersCache.get(skillsDirPath);
-    if (cached) return cached;
+  const merged = new Map<string, string>();
+  const claimed = new Set<string>();
+  for (const dir of dirs) {
+    let owners = ownersCache.get(dir);
+    if (injected || !owners) owners = await scanSkillDir(dir, readFile, readdir);
+    if (!injected) ownersCache.set(dir, owners);
+    for (const [skill, tools] of owners) {
+      if (!claimed.has(skill)) for (const tool of tools) merged.set(tool, merged.get(tool) ?? skill);
+    }
+    for (const skill of owners.keys()) claimed.add(skill);
   }
+  return merged;
+}
 
+/**
+ * One directory's contribution to the tool-owner map: every DISCOVERED skill,
+ * keyed by its directory name, with the tools it declares — an empty list when
+ * it declares none. The key is what lets the cross-root merge claim skill
+ * NAMES: a shadowing skill must be visible to that claim even when it owns
+ * nothing, so shadowed skills are kept in the map, only out of the merged
+ * tool map.
+ * @param dir - Absolute path to the skills library.
+ * @param readFile - Injectable reader (tests pass a fake; the extension uses fs).
+ * @param readdir - Injectable directory lister, forwarded to the tree walker.
+ */
+async function scanSkillDir(
+  dir: string,
+  readFile?: (p: string) => Promise<string>,
+  readdir?: (p: string) => Promise<string[]>,
+): Promise<Map<string, string[]>> {
   const rf = readFile ?? ((p: string) => fsReadFile(p, "utf-8"));
 
   // Location is `skill-tree.ts`'s job, not this module's: a skill is nested
   // under its category, and a local `readdir` here would silently stop finding
   // `tools:` the moment one moved (verified — it returned an empty map).
-  const located = await findSkills(skillsDirPath, readdir);
+  const located = await findSkills(dir, readdir);
 
-  const owners = new Map<string, string>();
+  // The skill *directory* name, not its path: that is the identity the gate
+  // checks against the active set, and the name the cross-root claim keys on.
+  const owners = new Map<string, string[]>();
   for (const skill of located) {
-    let text: string;
+    let tools: string[] = [];
     try {
-      text = await rf(skill.path);
+      const fm = frontmatterOf(await rf(skill.path));
+      if (fm) tools = parseOwnedTools(fm);
     } catch {
-      continue; // unreadable: this skill simply owns nothing
+      // unreadable: this skill simply owns nothing
     }
-    const fm = frontmatterOf(text);
-    if (!fm) continue;
-    for (const tool of parseOwnedTools(fm)) {
-      // The skill *directory* name, not its path: that is the identity the gate
-      // checks against the active set.
-      if (!owners.has(tool)) owners.set(tool, skill.dir);
-    }
+    if (!owners.has(skill.dir)) owners.set(skill.dir, tools); // first-discovered wins the name, matching findSkillsIn (skill-tree.ts)
   }
-
-  if (!injected) ownersCache.set(skillsDirPath, owners);
   return owners;
 }
 
-/** Memoized {@link loadSkillToolOwners} results, keyed by skills directory. */
-const ownersCache = new Map<string, Map<string, string>>();
+/** Memoized {@link loadSkillToolOwners} per-dir scans, keyed by skills directory. */
+const ownersCache = new Map<string, Map<string, string[]>>();
 
-/** Clears the owners cache. For tests, and for a deliberate re-scan. */
+/** Clears the owners cache. For tests, for the reload wiring, and for a deliberate re-scan. */
 export function clearSkillToolOwnersCache(): void {
   ownersCache.clear();
 }

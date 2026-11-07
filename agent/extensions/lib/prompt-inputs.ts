@@ -17,7 +17,7 @@
  * @module lib/prompt-inputs
  */
 import { gateTools } from "./skill-activation.js";
-import { categoryFromPath } from "./skill-tree.js";
+import { categoryFromPath, isUnder } from "./skill-tree.js";
 
 // ---------------------------------------------------------------------------
 // Tool-name constants
@@ -84,8 +84,15 @@ export interface DeriveInputsOptions {
   owners: ReadonlyMap<string, string>;
   /** Whether a skill directory is active this session. */
   isActive: (skillDir: string) => boolean;
-  /** Absolute path to the skills library these skills belong to. */
-  skillsLibrary: string;
+  /**
+   * The skills library these skills belong to: one absolute path, or the
+   * ordered roots from `project-layer.ts` (project layer first). The category
+   * lookup uses the FIRST root a skill's path lies under — a project skill is
+   * categorized against the project dir, a profile skill against the profile
+   * dir — and a skill under no root falls through to the first root, which is
+   * exactly the single-library behaviour.
+   */
+  skillsLibrary: string | readonly string[];
 }
 
 /** The derived inventories and capability flags — not the builder-only fields. */
@@ -134,16 +141,27 @@ export function derivePromptInputs(o: DeriveInputsOptions): DerivedPromptInputs 
   // --- Build skill inventory ---
   // The category comes from the skill's own path when it has one, so the tree
   // on disk is the source of truth and refiling a skill needs no code edit.
-  // `skillsLibrary` is the library these skills came from; a package or
-  // project-local skill lies outside it and falls through to the name-keyed map
-  // instead. A caller that already resolved a category (the switched profile's
+  // Against the ordered roots, each skill is categorized under the FIRST root
+  // its path lies under (a project skill against the project dir, a profile
+  // skill against the profile dir); a skill under no root falls through
+  // against the first root and yields no category, as it does against a single
+  // library. A caller that already resolved a category (the switched profile's
   // own library walk) keeps its answer.
-  const skillInventory = o.skills.map((skill) => ({
-    name: skill.name,
-    description: skill.description,
-    filePath: skill.filePath,
-    pathCategory: skill.pathCategory ?? categoryFromPath(o.skillsLibrary, skill.filePath),
-  }));
+  const libraries = Array.isArray(o.skillsLibrary) ? o.skillsLibrary : [o.skillsLibrary];
+  const skillInventory = o.skills.map((skill) => {
+    const matched = libraries.find((lib) => isUnder(lib, skill.filePath));
+    // A flat project skill (`<root>/<skill>/SKILL.md`, no category dir) has no
+    // path category of its own; the synthetic "project" label keeps it out of
+    // the "other" catch-all. Only the project root (never the LAST one, the
+    // profile's) gets it — a flat profile skill stays uncategorized.
+    const category = skill.pathCategory ?? categoryFromPath(matched ?? libraries[0]!, skill.filePath);
+    return {
+      name: skill.name,
+      description: skill.description,
+      filePath: skill.filePath,
+      pathCategory: category ?? (matched !== undefined && matched !== libraries[libraries.length - 1] ? "project" : undefined),
+    };
+  });
 
   // --- Build context file inventory ---
   const contextInventory = o.contextFiles.map((f) => ({

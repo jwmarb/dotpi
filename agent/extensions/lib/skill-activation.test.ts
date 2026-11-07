@@ -11,9 +11,13 @@
  * Run from the repo root: `bun test agent/extensions/lib/skill-activation.test.ts`
  */
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   SkillActivation,
+  clearSkillToolOwnersCache,
   gateTools,
   isSkillLoad,
   loadSkillToolOwners,
@@ -309,6 +313,18 @@ describe("loadSkillToolOwners", () => {
     expect([...owners.values()]).not.toContain("nested");
   });
 
+  test("one root: the first-discovered same-named skill dir owns the tools", async () => {
+    // Sorted DFS reaches depth-1 `aaa` before `zzz/aaa`, so the FIRST-discovered
+    // dir wins the name — the same rule `findSkillsIn` applies across roots.
+    const f = fake({
+      "aaa/SKILL.md": "---\nname: aaa\ntools: first_tool\n---\n",
+      "zzz/aaa/SKILL.md": "---\nname: aaa\ntools: second_tool\n---\n",
+    });
+    const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    expect(owners.get("first_tool")).toBe("aaa");
+    expect(owners.has("second_tool")).toBe(false);
+  });
+
   test("an unreadable skills directory yields an empty map, gating nothing", async () => {
     const owners = await loadSkillToolOwners(
       "/nope",
@@ -320,5 +336,172 @@ describe("loadSkillToolOwners", () => {
       },
     );
     expect(owners.size).toBe(0);
+  });
+  /**
+   * A fake of two skills roots, keyed by path under each root.
+   *
+   * The single-root fake above cannot express "the same tool claimed by two
+   * roots": the path prefix would have to distinguish them, and it does not.
+   */
+  const fakeRoots = (roots: Record<string, Record<string, string>>) => ({
+    readdir: async (p: string) => {
+      for (const [root, files] of Object.entries(roots)) {
+        if (p !== root && !p.startsWith(root + "/")) continue;
+        const rel = p.slice(root.length).replace(/^\//, "");
+        const prefix = rel ? `${rel}/` : "";
+        const children = new Set<string>();
+        for (const path of Object.keys(files)) {
+          if (!path.startsWith(prefix)) continue;
+          const next = path.slice(prefix.length).split("/")[0];
+          if (next) children.add(next);
+        }
+        if (children.size === 0) throw new Error("ENOTDIR");
+        return [...children];
+      }
+      throw new Error("ENOTDIR");
+    },
+    readFile: async (p: string) => {
+      for (const [root, files] of Object.entries(roots)) {
+        if (!p.startsWith(root + "/")) continue;
+        const rel = p.slice(root.length + 1);
+        if (rel in files) return files[rel];
+      }
+      throw new Error("ENOENT");
+    },
+  });
+
+  test("merges an ordered dir list, first root winning a contested tool", async () => {
+    // The project layer is the first root: a tool owned by both a project
+    // skill and a profile skill is owned by the project skill.
+    const f = fakeRoots({
+      "/proj/.pi/skills": {
+        "cat/aaa/SKILL.md": "---\nname: aaa\ntools: shared, proj_only\n---\n",
+      },
+      "/home/u/.pi/agent/skills": {
+        "cat/zzz/SKILL.md": "---\nname: zzz\ntools: shared, prof_only\n---\n",
+      },
+    });
+    const owners = await loadSkillToolOwners(
+      ["/proj/.pi/skills", "/home/u/.pi/agent/skills"],
+      f.readFile,
+      f.readdir,
+    );
+    expect(owners.get("shared")).toBe("aaa");
+    expect(owners.get("proj_only")).toBe("aaa");
+    expect(owners.get("prof_only")).toBe("zzz");
+  });
+
+  test("a shadowed skill contributes no tools: the shadowing skill's silence wins", async () => {
+    // The project `foo` declares no tools; the profile `foo` owns `t`. The
+    // profile skill is SHADOWED wholesale, so its tools go dark — they are not
+    // re-offered by the hidden skill.
+    const f = fakeRoots({
+      "/proj/.pi/skills": {
+        "cat/foo/SKILL.md": "---\nname: foo\n---\n",
+      },
+      "/home/u/.pi/agent/skills": {
+        "cat/foo/SKILL.md": "---\nname: foo\ntools: t\n---\n",
+      },
+    });
+    const owners = await loadSkillToolOwners(
+      ["/proj/.pi/skills", "/home/u/.pi/agent/skills"],
+      f.readFile,
+      f.readdir,
+    );
+    expect(owners.has("t")).toBe(false);
+  });
+
+  test("a shadowed skill's tools fall to a sibling, not to the hidden skill", async () => {
+    // Profile `foo` (shadowed by the project `foo`) owns `x`, and profile
+    // `zzz` owns it too: `zzz` is not shadowed, so `x` stays reachable through
+    // it.
+    const f = fakeRoots({
+      "/proj/.pi/skills": {
+        "cat/foo/SKILL.md": "---\nname: foo\n---\n",
+      },
+      "/home/u/.pi/agent/skills": {
+        "cat/foo/SKILL.md": "---\nname: foo\ntools: x\n---\n",
+        "cat/zzz/SKILL.md": "---\nname: zzz\ntools: x\n---\n",
+      },
+    });
+    const owners = await loadSkillToolOwners(
+      ["/proj/.pi/skills", "/home/u/.pi/agent/skills"],
+      f.readFile,
+      f.readdir,
+    );
+    expect(owners.get("x")).toBe("zzz");
+  });
+  test("reversing the root order reverses the winner", async () => {
+    const f = fakeRoots({
+      "/proj/.pi/skills": {
+        "cat/aaa/SKILL.md": "---\nname: aaa\ntools: shared\n---\n",
+      },
+      "/home/u/.pi/agent/skills": {
+        "cat/zzz/SKILL.md": "---\nname: zzz\ntools: shared\n---\n",
+      },
+    });
+    const owners = await loadSkillToolOwners(
+      ["/home/u/.pi/agent/skills", "/proj/.pi/skills"],
+      f.readFile,
+      f.readdir,
+    );
+    expect(owners.get("shared")).toBe("zzz");
+  });
+
+  test("a single dir works through the union signature", async () => {
+    const f = fake({
+      "finance/technical-analysis/SKILL.md":
+        "---\nname: technical-analysis\ntools: trade_journal\n---\n",
+    });
+    const owners = await loadSkillToolOwners("/skills", f.readFile, f.readdir);
+    expect(owners.get("trade_journal")).toBe("technical-analysis");
+  });
+
+  test("memoizes per directory, and clearSkillToolOwnersCache forces a re-scan", async () => {
+    const root = join(tmpdir(), `skill-owners-cache-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const dir = join(root, "cat", "foo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), "---\nname: foo\ntools: first\n---\n");
+    const first = await loadSkillToolOwners(root);
+    expect(first.get("first")).toBe("foo");
+
+    // The file changed on disk; the cached map still says what it read.
+    writeFileSync(join(dir, "SKILL.md"), "---\nname: foo\ntools: second\n---\n");
+    const cached = await loadSkillToolOwners(root);
+    expect(cached.get("first")).toBe("foo");
+    expect(cached.has("second")).toBe(false);
+
+    clearSkillToolOwnersCache();
+    const fresh = await loadSkillToolOwners(root);
+    expect(fresh.get("second")).toBe("foo");
+    expect(fresh.has("first")).toBe(false);
+  });
+
+  test("a list call keeps the per-directory memo, first root winning after a re-scan", async () => {
+    const mk = (label: string, skillName: string, tools: string) => {
+      const root = join(tmpdir(), `skill-owners-list-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const dir = join(root, "cat", skillName);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `---\nname: ${skillName}\ntools: ${tools}\n---\n`);
+      return root;
+    };
+    const a = mk("a", "foo", "first");
+    const b = mk("b", "bar", "other");
+    const merged = await loadSkillToolOwners([a, b]);
+    expect(merged.get("first")).toBe("foo");
+    expect(merged.get("other")).toBe("bar");
+
+    // rootA changed on disk; the per-dir memo keeps the old entry until
+    // cleared — the merged result is always rebuilt from the per-dir state.
+    const dirA = join(a, "cat", "foo");
+    writeFileSync(join(dirA, "SKILL.md"), "---\nname: foo\ntools: first2\n---\n");
+    const mergedStale = await loadSkillToolOwners([a, b]);
+    expect(mergedStale.get("first")).toBe("foo");
+    expect(mergedStale.get("other")).toBe("bar");
+
+    clearSkillToolOwnersCache();
+    const mergedFresh = await loadSkillToolOwners([a, b]);
+    expect(mergedFresh.get("first2")).toBe("foo");
+    expect(mergedFresh.get("other")).toBe("bar");
   });
 });

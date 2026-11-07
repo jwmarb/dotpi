@@ -12,11 +12,13 @@ import { join } from "node:path";
 import {
   delegationRoster,
   discoverAgents,
+  discoverAgentsIn,
   discoverSkillAgents,
   mergeAgents,
   parseAgentFile,
   type AgentInfo,
 } from "./agents.js";
+import { resourceRoots } from "./project-layer.js";
 
 // ---------------------------------------------------------------------------
 // parseAgentFile
@@ -249,37 +251,114 @@ describe("discoverSkillAgents", () => {
     expect(a.promptBody).toBe("Body for observer.");
   });
 });
+// ---------------------------------------------------------------------------
+// discoverAgentsIn
+// ---------------------------------------------------------------------------
+
+describe("discoverAgentsIn", () => {
+  test("first dir wins a name collision, and origin follows the project root", async () => {
+    const project = agentsFixture("in-project", { "worker.md": def("worker") });
+    const profile = agentsFixture("in-profile", {
+      "worker.md": def("worker"),
+      "explorer.md": def("explorer"),
+    });
+    const agents = await discoverAgentsIn([project, profile], { projectDir: project });
+    expect(agents.map((a) => a.name)).toEqual(["explorer", "worker"]);
+    const worker = agents.find((a) => a.name === "worker")!;
+    expect(worker.origin).toBe("project");
+    expect(agents.find((a) => a.name === "explorer")!.origin).toBe("profile");
+  });
+
+  test("without a projectDir every dir is profile", async () => {
+    const dir = agentsFixture("in-plain", { "worker.md": def("worker") });
+    const agents = await discoverAgentsIn([dir]);
+    expect(agents[0].origin).toBe("profile");
+  });
+
+  test("a dir nested under the project root is project", async () => {
+    // The real layout: projectDir = cwd/.pi, the agents dir = projectDir/agents.
+    const base = join(tmpdir(), `in-nested-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const projectDir = join(base, ".pi");
+    const agentsDir = join(projectDir, "agents");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(join(agentsDir, "worker.md"), def("worker"));
+    const agents = await discoverAgentsIn([agentsDir], { projectDir });
+    expect(agents[0].origin).toBe("project");
+  });
+
+  test("a missing dir costs only itself", async () => {
+    const profile = agentsFixture("in-missing", { "explorer.md": def("explorer") });
+    const agents = await discoverAgentsIn([join(tmpdir(), "no-such-dir-xyz"), profile]);
+    expect(agents.map((a) => a.name)).toEqual(["explorer"]);
+    expect(agents[0].origin).toBe("profile");
+  });
+});
+
 
 // ---------------------------------------------------------------------------
 // mergeAgents
 // ---------------------------------------------------------------------------
 
 describe("mergeAgents", () => {
-  const mk = (name: string, skill?: string): AgentInfo => ({
+  const mk = (name: string, opts?: { skill?: string; origin?: "project" | "profile" }): AgentInfo => ({
     name,
     description: "",
     promptBody: "",
     filePath: `${name}.md`,
-    ...(skill ? { skill } : {}),
+    ...(opts?.skill ? { skill: opts.skill } : {}),
+    ...(opts?.origin ? { origin: opts.origin } : {}),
   });
 
-  test("merges and sorts by name", () => {
-    const merged = mergeAgents([mk("worker"), mk("explorer")], [mk("observer", "ta")]);
-    expect(merged.map((a) => a.name)).toEqual(["explorer", "observer", "worker"]);
+  test("merges layers in order and sorts by name", () => {
+    const { agents } = mergeAgents(
+      [mk("worker", { origin: "project" }), mk("explorer", { origin: "profile" })],
+      [mk("observer", { skill: "ta", origin: "profile" })],
+    );
+    expect(agents.map((a) => a.name)).toEqual(["explorer", "observer", "worker"]);
   });
 
-  test("a global agent wins a name collision", () => {
-    const merged = mergeAgents([mk("worker")], [mk("worker", "ta"), mk("observer", "ta")]);
-    expect(merged.map((a) => `${a.name}:${a.skill ?? "global"}`)).toEqual([
-      "observer:ta",
-      "worker:global",
+  test("the first layer wins a name collision, and the loser is reported", () => {
+    const { agents, shadowed } = mergeAgents(
+      [mk("worker", { origin: "project" })],
+      [mk("worker", { origin: "profile" }), mk("observer", { origin: "profile" })],
+    );
+    expect(agents.map((a) => a.name)).toEqual(["observer", "worker"]);
+    expect(agents.find((a) => a.name === "worker")!.origin).toBe("project");
+    expect(shadowed).toEqual([{ name: "worker", winner: "project", loser: "profile" }]);
+  });
+
+  test("skill provenance rides along in the shadow report", () => {
+    const { shadowed } = mergeAgents(
+      [mk("worker", { origin: "project", skill: "pfoo" })],
+      [mk("worker", { origin: "profile", skill: "pfoo" })],
+    );
+    expect(shadowed).toEqual([
+      { name: "worker", winner: "project", loser: "profile", winnerSkill: "pfoo", loserSkill: "pfoo" },
     ]);
   });
 
-  test("handles either side being empty", () => {
-    expect(mergeAgents([], [mk("observer", "ta")]).map((a) => a.name)).toEqual(["observer"]);
-    expect(mergeAgents([mk("worker")], []).map((a) => a.name)).toEqual(["worker"]);
-    expect(mergeAgents([], [])).toEqual([]);
+  test("later layers cannot reclaim a name an earlier layer took", () => {
+    // The old global-wins rule, now expressed as layer order: whatever layer
+    // owns the name first keeps it, no matter what the rest of the stack says.
+    const { agents, shadowed } = mergeAgents(
+      [mk("worker", { origin: "project" })],
+      [mk("digger", { origin: "profile" })],
+      [mk("worker", { origin: "profile", skill: "research" })],
+    );
+    expect(agents.map((a) => a.name)).toEqual(["digger", "worker"]);
+    expect(agents.find((a) => a.name === "worker")!.origin).toBe("project");
+    expect(shadowed).toHaveLength(1);
+    expect(shadowed[0].name).toBe("worker");
+    expect(shadowed[0].loserSkill).toBe("research");
+  });
+
+  test("handles empty layers", () => {
+    expect(mergeAgents([], [mk("observer", { skill: "ta" })]).agents.map((a) => a.name)).toEqual([
+      "observer",
+    ]);
+    expect(mergeAgents([mk("worker")], []).agents.map((a) => a.name)).toEqual(["worker"]);
+    expect(mergeAgents([], []).agents).toEqual([]);
+    expect(mergeAgents([], []).shadowed).toEqual([]);
   });
 });
 
@@ -296,7 +375,7 @@ function agentsFixture(label: string, files: Record<string, string>): string {
 }
 
 describe("delegationRoster", () => {
-  test("merges global and skill agents, sorted by name", async () => {
+  test("merges profile and skill agents, sorted by name", async () => {
     const agentsDir = agentsFixture("merge", {
       "worker.md": def("worker"),
       "explorer.md": def("explorer"),
@@ -304,7 +383,7 @@ describe("delegationRoster", () => {
     const skillsDir = skillsFixture("roster-merge", {
       "technical-analysis": { "observer.md": def("observer") },
     });
-    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    const roster = await delegationRoster({ roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] }, lineage: [] });
     expect(roster.all.map((a) => `${a.name}:${a.skill ?? "global"}`)).toEqual([
       "explorer:global",
       "observer:technical-analysis",
@@ -314,15 +393,20 @@ describe("delegationRoster", () => {
     expect(roster.spawnable.map((a) => a.name)).toEqual(["explorer", "observer", "worker"]);
   });
 
-  test("a global agent wins over a same-named skill agent", async () => {
+  test("a profile agent wins over a same-named skill agent", async () => {
     const agentsDir = agentsFixture("collide", { "worker.md": def("worker") });
     const skillsDir = skillsFixture("roster-collide", {
       research: { "worker.md": def("worker"), "digger.md": def("digger") },
     });
-    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    const roster = await delegationRoster({ roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] }, lineage: [] });
     expect(roster.all.map((a) => `${a.name}:${a.skill ?? "global"}`)).toEqual([
       "digger:research",
       "worker:global",
+    ]);
+    // The legacy path is a profile-only root set: the profile layer still
+    // sits above the profile-skill layer, and the shadow is reported.
+    expect(roster.shadowed).toEqual([
+      { name: "worker", winner: "profile", loser: "profile", loserSkill: "research" },
     ]);
   });
 
@@ -332,7 +416,7 @@ describe("delegationRoster", () => {
       "technical-analysis": { "observer.md": def("observer") },
       research: { "digger.md": def("digger") },
     });
-    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: [] });
+    const roster = await delegationRoster({ roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] }, lineage: [] });
     expect(roster.all.map((a) => a.name)).toEqual(["digger", "observer"]);
   });
 
@@ -344,15 +428,13 @@ describe("delegationRoster", () => {
     });
     // Matched on the skill's directory name, not its category path (`cat-research`).
     const roster = await delegationRoster({
-      agentsDir,
-      skillsDir,
+      roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] },
       lineage: [],
       activeSkills: ["technical-analysis"],
     });
     expect(roster.all.map((a) => a.name)).toEqual(["observer", "worker"]);
     const byCategory = await delegationRoster({
-      agentsDir,
-      skillsDir,
+      roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] },
       lineage: [],
       activeSkills: ["cat-research"],
     });
@@ -366,9 +448,89 @@ describe("delegationRoster", () => {
       "oracle.md": def("oracle", "callable_by: orchestrator\n"),
     });
     const skillsDir = skillsFixture("roster-lineage", {});
-    const roster = await delegationRoster({ agentsDir, skillsDir, lineage: ["worker"] });
+    const roster = await delegationRoster({ roots: { agentsDirs: [agentsDir], skillsDirs: [skillsDir] }, lineage: ["worker"] });
     expect(roster.all.map((a) => a.name)).toEqual(["oracle", "reviewer", "worker"]);
     // worker is a cycle and oracle is orchestrator-only; reviewer names worker.
     expect(roster.spawnable.map((a) => a.name)).toEqual(["reviewer"]);
   });
 });
+// ---------------------------------------------------------------------------
+// delegationRoster with roots (the project layer)
+// ---------------------------------------------------------------------------
+
+describe("delegationRoster with roots", () => {
+  /**
+   * A project tree the way the trust gate sees it: `<base>/.pi/agents/*.md`
+   * plus `<base>/.pi/skills/<category>/<skill>/{SKILL.md,agents/*.md}`.
+   * Returns `base`, so `resourceRoots({ cwd: base })` finds its `.pi`.
+   */
+  function projectTree(label: string): string {
+    const base = join(tmpdir(), `pl-proj-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const projectDir = join(base, ".pi");
+    mkdirSync(join(projectDir, "agents"), { recursive: true });
+    writeFileSync(join(projectDir, "agents", "worker.md"), def("worker"));
+    const foo = join(projectDir, "skills", "cat-foo", "foo");
+    mkdirSync(join(foo, "agents"), { recursive: true });
+    writeFileSync(join(foo, "SKILL.md"), "---\nname: foo\ndescription: foo\n---\nBody.");
+    writeFileSync(join(foo, "agents", "journal.md"), def("journal"));
+    return base;
+  }
+
+  /** A profile tree: `<dir>/agents/*.md` plus `<dir>/skills/<category>/<skill>/…`. */
+  function profileTree(label: string): string {
+    const profileDir = join(tmpdir(), `pl-prof-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(join(profileDir, "agents"), { recursive: true });
+    writeFileSync(join(profileDir, "agents", "worker.md"), def("worker"));
+    writeFileSync(join(profileDir, "agents", "explorer.md"), def("explorer"));
+    const foo = join(profileDir, "skills", "cat-foo", "foo");
+    mkdirSync(join(foo, "agents"), { recursive: true });
+    writeFileSync(join(foo, "SKILL.md"), "---\nname: foo\ndescription: foo (profile)\n---\nBody.");
+    writeFileSync(join(foo, "agents", "journal.md"), def("journal"));
+    const research = join(profileDir, "skills", "cat-research", "research");
+    mkdirSync(join(research, "agents"), { recursive: true });
+    writeFileSync(join(research, "SKILL.md"), "---\nname: research\ndescription: research\n---\nBody.");
+    writeFileSync(join(research, "agents", "digger.md"), def("digger"));
+    return profileDir;
+  }
+
+  test("a project agent and a project-skill agent shadow their profile twins", async () => {
+    const base = projectTree("shadow");
+    const profileDir = profileTree("shadow");
+    const roster = await delegationRoster({
+      roots: resourceRoots({ profileDir, cwd: base, projectTrusted: true }),
+      lineage: [],
+    });
+    // worker: the project agent beats the profile agent — a real merge
+    // collision, reported.
+    // journal: the project skill foo replaces the profile skill foo WHOLESALE
+    // (findSkillsIn), so the profile copy of its agent is never discovered at
+    // all: the roster carries the project journal with no shadow entry, the
+    // skill shadowing is the reason.
+    // digger/explorer: profile-only, untouched.
+    expect(roster.all.map((a) => `${a.name}:${a.origin}:${a.skill ?? "core"}`)).toEqual([
+      "digger:profile:research",
+      "explorer:profile:core",
+      "journal:project:foo",
+      "worker:project:core",
+    ]);
+    expect(roster.shadowed).toEqual([{ name: "worker", winner: "project", loser: "profile" }]);
+    expect(roster.spawnable.map((a) => a.name)).toEqual(["digger", "explorer", "journal", "worker"]);
+  });
+
+  test("an untrusted project is invisible: profile-only roots, nothing shadowed", async () => {
+    const base = projectTree("untrusted");
+    const profileDir = profileTree("untrusted");
+    const roster = await delegationRoster({
+      roots: resourceRoots({ profileDir, cwd: base, projectTrusted: false }),
+      lineage: [],
+    });
+    expect(roster.all.map((a) => `${a.name}:${a.origin}`)).toEqual([
+      "digger:profile",
+      "explorer:profile",
+      "journal:profile",
+      "worker:profile",
+    ]);
+    expect(roster.shadowed).toEqual([]);
+  });
+});
+

@@ -118,10 +118,11 @@
  * @module subagent-herdr
  */
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { hasTrustRequiringProjectResources, ProjectTrustStore, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { LINEAGE_ENV as SHARED_LINEAGE_ENV } from "../lib/agents.js";
@@ -137,14 +138,19 @@ import {
   buildChildArgv,
   buildChildEnv,
   buildHealthCheckTask,
+  childApproveFlag,
   childAncestry,
+  childTrustDecisionSaved,
   childNameRejection,
   discoverSkills,
   extractRunResult,
   herdrAgentName,
   makeRunId,
+  normalizeChildCwd,
   parseLineage,
+  projectLayerNotices,
   readReports,
+  rootsForRun,
   type HealthCheckTrigger,
   type RunResult,
   selectSkills,
@@ -158,8 +164,9 @@ import {
   type AgentInfo,
   delegationRoster,
 } from "../lib/agents.js";
-import { agentDir, agentsDir, profileDir, skillsDir } from "../lib/layout.js";
+import { agentDir, profileDir } from "../lib/layout.js";
 import { personaOverride } from "../lib/persona.js";
+import { projectRoots, type ResourceRoots, TrustRequiringSnapshot } from "../lib/project-layer.js";
 import {
   ancestorLabel,
   CARD_ID_PATTERN,
@@ -791,6 +798,25 @@ export async function launchAttempt(
     tools: agent.tools,
     systemPromptPath: promptPath,
     card: rec.card,
+    projectApprove: childApproveFlag({
+      childCwd: rec.cwd,
+      projectDir: rec.projectDir,
+      // Mirrors `rootsForRun`: a record that does not say it was trusted was
+      // not; presence of `projectDir` is not a trust grant.
+      projectTrusted: rec.projectTrusted === true,
+      // The store must be the CHILD's, not this process's: `buildChildEnv`
+      // retargets the child's PI_CODING_AGENT_DIR to profileDir() (the persona
+      // override, else this process's dir), so under a `/agent` switch the
+      // child reads `<profile>/trust.json` and `agentDir()` would consult the
+      // parent's file. `get` walks to the nearest ancestor entry; `null` is
+      // "no saved decision".
+      childTrustRequired: hasTrustRequiringProjectResources(rec.cwd),
+      // A throwing lookup counts as "no saved decision" (`childTrustDecisionSaved`
+      // fails closed): a malformed trust.json or a contended store lock must never
+      // hand a foreign child silent trust, and pi's own trust resolution has no
+      // fallback for a store that throws here.
+      childTrustSaved: childTrustDecisionSaved(() => new ProjectTrustStore(profileDir()).get(rec.cwd)),
+    }),
   });
   // Registered under a *run-scoped* name: herdr agent names are globally
   // unique, so the bare `agent.name` let one live child lock out every sibling
@@ -866,23 +892,37 @@ export async function launchAttempt(
  * transcript and burned tokens; re-running it is a decision for the caller,
  * not a reflex here.
  */
-async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutcome> {
+async function spawnRun(params: SpawnParams, baseCwd: string, roots: ResourceRoots): Promise<SpawnOutcome> {
   // This process's ancestry, written by whoever spawned us. Drives both the
   // cycle check and `callable_by`, and is the one input here a model cannot
   // influence.
   const lineage = parseLineage(process.env[LINEAGE_ENV]);
-  // Resolve against the global roster PLUS every skill's agents. Unlike the
-  // prompt inventory this does not gate on the loaded set: spawning happens with
-  // no session context, and a skill loaded mid-session would otherwise be
-  // invisible here and fail a delegation the agent was just told to make.
-  const roster = await delegationRoster({ agentsDir: agentsDir(), skillsDir: skillsDir(), lineage });
+  // The health-check path hands us `target.cwd` straight from a hostile /
+  // truncated meta.json (`loadRegistry` validates only the runId), so a
+  // non-string baseCwd is possible: the trust probes below
+  // (`hasTrustRequiringProjectResources`, `join`) would throw on it. Bogus
+  // cwds are now refused by `admitSpawn` before any pane; `baseCwdSafe` stays
+  // only as the stamping guard.
+  const baseCwdSafe = typeof baseCwd === "string" && baseCwd ? baseCwd : undefined;
+  // Resolve against the ordered roots the caller computed — the project layer
+  // first, when it is active — plus every skill's agents. Unlike the prompt
+  // inventory this does not gate on the loaded set: spawning happens with no
+  // session context, and a skill loaded mid-session would otherwise be invisible
+  // here and fail a delegation the agent was just told to make.
+  const roster = await delegationRoster({ roots, lineage });
 
   // Refuse before spending anything: no run dir, no registry entry, no pane.
   const admission = admitSpawn(
     {
       agent: params.agent,
       task: params.task,
-      cwd: params.cwd ?? baseCwd,
+      // A relative model-chosen cwd is resolved against the parent's cwd
+      // (never the herdr server's) before admission, so the record, the
+      // pane, and the trust flag all see one absolute path.
+      cwd:
+        typeof params.cwd === "string"
+          ? normalizeChildCwd(params.cwd, baseCwd, homedir())
+          : params.cwd ?? baseCwd,
       model: params.model,
       origin: params.origin,
     },
@@ -901,11 +941,23 @@ async function spawnRun(params: SpawnParams, baseCwd: string): Promise<SpawnOutc
   const nameProblem = childNameRejection(agent.name, runId);
   if (nameProblem) return { ok: false, error: nameProblem };
 
+  // The project's `.pi` dir the record tracks, whenever the admission project
+  // carried trust-requiring resources: `resourceRoots` sets it when the layer
+  // was loaded, and the fallback keeps it tracked when the layer was NOT, so
+  // an untrusted child still gets its `--no-approve` (`childApproveFlag`
+  // derives from the pair). Presence is not the trust state — that is
+  // `projectTrusted`; legacy records lack both and load as profile-only.
+  const trustRequired = baseCwdSafe !== undefined && hasTrustRequiringProjectResources(baseCwdSafe);
+  const trackedProjectDir = roots.projectDir ?? (trustRequired ? join(baseCwdSafe!, ".pi") : undefined);
+
   const rec: RunRecord = {
     runId,
     agent: agent.name,
     task: admission.task,
     cwd: admission.cwd,
+    ...(trackedProjectDir !== undefined
+      ? { projectDir: trackedProjectDir, projectTrusted: roots.projectDir !== undefined }
+      : {}),
     // The parsed head ref, for diagnostics only: the child runs on the router,
     // and which physical model answers is up to it.
     model: parseChainItem(chain[0]!)!.ref,
@@ -979,6 +1031,14 @@ async function launchRegisteredRun(
     };
   };
 
+  // The roots this record was admitted under, re-derived for the launch:
+  // `rootsForRun` is the one re-derivation — a record that tracked a project
+  // dir gets the granted dir's roots, trusted exactly when `projectTrusted`
+  // says it was; a record without one falls back to its admission
+  // cwd profile-only. `rec.cwd` is the admission cwd — the same one the
+  // child pane opens in.
+  const roots = rootsForRun(rec, profileDir());
+
   // The child's system prompt. Its body is the agent definition verbatim, plus
   // a skills catalogue when the agent declared one: pi builds `## Available
   // Skills` for the orchestrator only, so a subagent cannot otherwise know a
@@ -995,8 +1055,8 @@ async function launchRegisteredRun(
     // target's, so the switch always scans the (retargeted) skills dir
     // instead of reusing it.
     const available = personaOverride()
-      ? await discoverSkills(skillsDir())
-      : (piSkillCatalogue ?? (await discoverSkills(skillsDir())));
+      ? await discoverSkills(roots.skillsDirs)
+      : (piSkillCatalogue ?? (await discoverSkills(roots.skillsDirs)));
     const selected = selectSkills(agent.skills, available);
     const canRead = !agent.tools || agent.tools.length === 0 ||
       agent.tools.some((t) => READING_TOOLS.has(t));
@@ -1107,6 +1167,13 @@ async function spawnHealthCheckRun(
       origin: { kind: "system-health-check", targetRunId: target.runId },
     },
     target.cwd,
+    // A health check inherits the TRUST GRANT of the run it diagnoses — the
+    // dir the grant was made for, never trust for the model-chosen cwd:
+    // `rootsForRun` re-derives the target's roots from its record, so a
+    // cross-cwd check gets the GRANTED dir's project roots, not roots for
+    // the target's own cwd — and with a different `.pi`, the strongest flag
+    // is `--no-approve`.
+    rootsForRun(target, profileDir()),
   );
 }
 
@@ -1364,6 +1431,17 @@ export default function (pi: ExtensionAPI): void {
       })
     : undefined;
 
+
+  // The trust gate's second half, frozen per session: pi decides
+  // `isProjectTrusted()` once at startup, but `hasTrustRequiringProjectResources`
+  // is a live disk walk — in an agents-only repo the model's own
+  // `.pi/settings.json` would flip the gate mid-session with no prompt
+  // (proven live). The snapshot re-probes only when `session_start` resets
+  // it, so both halves are judged at the moment pi judged trust. The
+  // CHILD-side probes (`childTrustRequired`, the spawn stamp) stay live: a
+  // child decides trust fresh at its own startup.
+  const trustSnapshot = new TrustRequiringSnapshot(hasTrustRequiringProjectResources);
+
   // -------------------------------------------------------------------------
   // Skill catalogue capture
   // -------------------------------------------------------------------------
@@ -1382,6 +1460,51 @@ export default function (pi: ExtensionAPI): void {
       if (Array.isArray(skills)) piSkillCatalogue = skillEntriesFromPi(skills);
     } catch {
       // Leave the previous catalogue (or undefined) in place.
+    }
+  });
+
+  // A project `.pi/agents/` the trust gate keeps unloaded is otherwise silent
+  // (the user writes agents, sees no effect, no error), and a shadowed fleet
+  // name is otherwise visible only as a changed From cell. Both say themselves
+  // here, once per fresh parent session. A fleet child skips it: its cwd is the
+  // parent's admission cwd and the parent already saw the notice.
+  pi.on("session_start", async (event, ctx) => {
+    // pi re-decides project trust on EVERY reason, so the frozen snapshot of
+    // the trust gate's second half re-probes with it (factory scope above).
+    trustSnapshot.reset();
+    if (process.env.PI_SUBAGENT_RUN_ID) return;
+    if (event.reason !== "startup" && event.reason !== "new") return;
+    try {
+      const trusted = ctx.isProjectTrusted();
+      const trustRequired = trustSnapshot.get(ctx.cwd);
+      let hasProjectAgentFiles = false;
+      try {
+        hasProjectAgentFiles = readdirSync(join(ctx.cwd, ".pi", "agents")).some((n) => n.endsWith(".md"));
+      } catch {
+        // No project agents dir: nothing to notice.
+      }
+      const roots = projectRoots({
+        profileDir: profileDir(),
+        cwd: ctx.cwd,
+        isProjectTrusted: trusted,
+        hasTrustRequiringResources: trustRequired,
+      });
+      const { shadowed } = await delegationRoster({
+        roots,
+        lineage: parseLineage(process.env[LINEAGE_ENV]),
+      });
+      for (const msg of projectLayerNotices({
+        hasProjectAgentFiles,
+        projectTrusted: trusted && trustRequired,
+        isProjectTrusted: trusted,
+        hasTrustRequiring: trustRequired,
+        shadowed,
+      })) {
+        if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+        else console.error(msg);
+      }
+    } catch {
+      // A notice is never worth a failed session start.
     }
   });
 
@@ -1433,6 +1556,12 @@ export default function (pi: ExtensionAPI): void {
       const out = await spawnRun(
         { agent, task, cwd, model, card, origin: { kind: "tool-delegation" } },
         ctx.cwd,
+        projectRoots({
+          profileDir: profileDir(),
+          cwd: ctx.cwd,
+          isProjectTrusted: ctx.isProjectTrusted(),
+          hasTrustRequiringResources: trustSnapshot.get(ctx.cwd),
+        }),
       );
       if (!out.ok || !out.rec) {
         return {

@@ -3,15 +3,17 @@
  *
  * Run from the repo root: `bun test agent/extensions/subagent-herdr/`
  */
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 
 import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
 import { ENV_AGENT_DIR, agentsDir, skillsDir } from "../lib/layout.js";
 import { setPersonaOverride } from "../lib/persona.js";
+import { resourceRoots } from "../lib/project-layer.js";
 import { LEASE_DIR_ENV } from "../model-fallback/concurrency.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { CARD_ID_PATTERN as BOARD_CARD_ID_PATTERN } from "../kanban/lib.js";
@@ -21,13 +23,17 @@ import {
   buildChildArgv,
   buildChildEnv,
   childAncestry,
+  childApproveFlag,
+  childTrustDecisionSaved,
   buildHealthCheckTask,
   agentNameRejection,
   childNameRejection,
   childFallbackChain,
   DONE_TOOL_NAME,
   extractRunResult,
+  normalizeChildCwd,
   pickSessionName,
+  projectLayerNotices,
   herdrAgentName,
   makeRunId,
   formatLineage,
@@ -37,6 +43,7 @@ import {
   parseLineage,
   readReports,
   readRunRecordFromDisk,
+  rootsForRun,
   REPORT_TOOL_NAME,
   selectSkills,
   skillEntriesFromPi,
@@ -45,7 +52,7 @@ import {
 } from "./lib.js";
 import { endedCleanly } from "./child-done.js";
 import { classifyExecFailure, errorPayload, paneRectFrom, probeFromCall, splitArgs, waitArgs, type HerdrCall } from "./herdr.js";
-import { createTerminalResultCache, interruptRun, launchAttempt, type Launcher } from "./index.js";
+import factory, { createTerminalResultCache, interruptRun, launchAttempt, type Launcher } from "./index.js";
 import { completionSignal, type RunObservation } from "./run-lifecycle.js";
 import {
   ANCESTRY_ENV,
@@ -145,6 +152,210 @@ describe("buildChildArgv", () => {
     expect(argv).toContain(FALLBACK_MODEL_REF);
     expect(argv).toContain("--append-system-prompt");
     expect(argv[argv.length - 1]).toBe("/abs/runs/sub-0001/system-prompt.md");
+  });
+
+  test("projectApprove 'approve' emits --approve and never --no-approve", () => {
+    const argv = buildChildArgv({ ...base, projectApprove: "approve" });
+    expect(argv).toContain("--approve");
+    expect(argv).not.toContain("--no-approve");
+  });
+
+  test("projectApprove 'no-approve' emits --no-approve and never --approve", () => {
+    const argv = buildChildArgv({ ...base, projectApprove: "no-approve" });
+    expect(argv).toContain("--no-approve");
+    expect(argv).not.toContain("--approve");
+  });
+
+  test("projectApprove undefined emits neither trust flag", () => {
+    const argv = buildChildArgv(base);
+    expect(argv).not.toContain("--approve");
+    expect(argv).not.toContain("--no-approve");
+  });
+  // A cross-cwd record: `childApproveFlag` sees a different `.pi`, so no flag
+  // crosses, and the argv must carry neither trust flag at the argv level.
+  test("a cross-cwd record launches with neither trust flag", () => {
+    const flag = childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: true });
+    expect(flag).toBeUndefined();
+    const argv = buildChildArgv({ ...base, projectApprove: flag });
+    expect(argv).not.toContain("--approve");
+    expect(argv).not.toContain("--no-approve");
+  });
+
+  // A cross-cwd record whose cwd is trust-requiring with no saved decision:
+  // `childApproveFlag` now crosses `no-approve`, and the argv must carry it.
+  test("a foreign cwd, trust required, unsaved — launches with --no-approve", () => {
+    const flag = childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: true, childTrustRequired: true, childTrustSaved: false });
+    expect(flag).toBe("no-approve");
+    const argv = buildChildArgv({ ...base, projectApprove: flag });
+    expect(argv).toContain("--no-approve");
+    expect(argv).not.toContain("--approve");
+  });
+});
+
+describe("rootsForRun", () => {
+  const profile = "/home/u/.pi/agent";
+
+  test("a record without `projectTrusted` is NOT a trust grant", () => {
+    const r = rootsForRun({ cwd: "/work/repo", projectDir: "/work/repo/.pi" }, profile);
+    expect(r).toEqual(resourceRoots({ profileDir: profile, cwd: "/work/repo", projectTrusted: false }));
+  });
+
+  test("projectTrusted:false re-derives profile-only roots at the granted dir", () => {
+    const r = rootsForRun({ cwd: "/work/repo", projectDir: "/work/repo/.pi", projectTrusted: false }, profile);
+    expect(r).toEqual(resourceRoots({ profileDir: profile, cwd: "/work/repo", projectTrusted: false }));
+  });
+
+  test("the granted dir, not the admission cwd, is the root", () => {
+    const r = rootsForRun({ cwd: "/other", projectDir: "/x/.pi", projectTrusted: true }, profile);
+    expect(r.projectDir).toBe("/x/.pi");
+  });
+
+  test("a non-string projectDir is hostile: profile-only at the admission cwd", () => {
+    const r = rootsForRun({ cwd: "/other", projectDir: 42 }, profile);
+    expect(r).toEqual(resourceRoots({ profileDir: profile, cwd: "/other", projectTrusted: false }));
+  });
+
+  test("a non-string cwd is hostile too: profile-only, no throw", () => {
+    // The health-check path reads target.cwd from a hostile meta.json; a
+    // non-string must degrade, not escape into wake-note composition.
+    const r = rootsForRun({ cwd: 42 as unknown as string, projectDir: 42 }, profile);
+    expect(r).toEqual(resourceRoots({ profileDir: profile, cwd: 42 as unknown as string, projectTrusted: false }));
+  });
+});
+describe("projectLayerNotices", () => {
+  type Shadow = { name: string; winner: string; loser: string; loserSkill?: string };
+  const base = {
+    hasProjectAgentFiles: false,
+    projectTrusted: false,
+    isProjectTrusted: false,
+    hasTrustRequiring: false,
+    shadowed: [] as Shadow[],
+  };
+
+  test("agents-only trust-bypass: exactly one notice, pointing at settings.json", () => {
+    // Trust exists (nothing to trust — agents-only), so the notice is the
+    // "add a settings.json" wording, not the "approve the prompt" one.
+    const out = projectLayerNotices({ ...base, hasProjectAgentFiles: true, isProjectTrusted: true, hasTrustRequiring: false });
+    expect(out).toHaveLength(1);
+    const agentsOnlyMsg = out[0]!;
+    expect(agentsOnlyMsg).toBe(
+      "Project `.pi/agents/` ignored: the project has no trust-requiring resource (settings.json, mcp.json, extensions/, skills/, …), so pi shows no trust prompt. Add a `.pi/settings.json` (even an empty {}), then approve the prompt on next start or run with `--approve`."
+    );
+    // The old ending promised `--approve` works while nothing trust-requiring
+    // exists — it cannot, so the string must not carry that promise again.
+    expect(agentsOnlyMsg).not.toMatch(/— or pass --approve/);
+  });
+
+  test("untrusted project with resources: one notice naming --approve", () => {
+    const out = projectLayerNotices({ ...base, hasProjectAgentFiles: true, hasTrustRequiring: true });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toBe(
+      "Project `.pi/agents/` ignored: this project is not trusted. Run with `--approve`, or approve the trust prompt on next start (a saved 'do not trust' decision suppresses it)."
+    );
+  });
+
+  test("a loaded, trusted layer is silent", () => {
+    const out = projectLayerNotices({ ...base, hasProjectAgentFiles: true, projectTrusted: true, isProjectTrusted: true, hasTrustRequiring: true });
+    expect(out).toEqual([]);
+  });
+
+  test("six shadowed names: the first five are named, the sixth counted", () => {
+    const shadowed = Array.from({ length: 6 }, (_, i) => ({ name: `a${i}`, winner: "project", loser: "profile" }));
+    const out = projectLayerNotices({ ...base, shadowed });
+    expect(out).toHaveLength(1);
+    for (let i = 0; i < 5; i++) expect(out[0]).toContain(`a${i}`);
+    expect(out[0]).not.toContain("a5");
+    expect(out[0]).toContain("(+1 more)");
+  });
+
+  test("a profile-vs-profile-skill collision is NOT reported", () => {
+    const shadowed: Shadow[] = [{ name: "worker", winner: "profile", loser: "profile", loserSkill: "x" }];
+    const out = projectLayerNotices({ ...base, shadowed });
+    expect(out).toEqual([]);
+  });
+
+  test("a project loser IS reported", () => {
+    const shadowed: Shadow[] = [{ name: "worker", winner: "profile", loser: "project" }];
+    const out = projectLayerNotices({ ...base, shadowed });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("worker");
+  });
+
+  test("nothing to say: no files, no shadows, an empty list", () => {
+    expect(projectLayerNotices({ ...base })).toEqual([]);
+  });
+});
+
+describe("childApproveFlag", () => {
+  test("same .pi and trusted → 'approve'", () => {
+    expect(childApproveFlag({ childCwd: "/r", projectDir: "/r/.pi", projectTrusted: true })).toBe("approve");
+  });
+
+  test("same .pi and untrusted → 'no-approve'", () => {
+    expect(childApproveFlag({ childCwd: "/r", projectDir: "/r/.pi", projectTrusted: false })).toBe("no-approve");
+  });
+
+  test("a different child cwd shares no .pi → undefined", () => {
+    expect(childApproveFlag({ childCwd: "/other", projectDir: "/r/.pi", projectTrusted: true })).toBeUndefined();
+  });
+
+  test("foreign cwd + trust required + unsaved → 'no-approve'", () => {
+    expect(childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: true, childTrustRequired: true, childTrustSaved: false })).toBe("no-approve");
+    // No project layer at all — same rule, the foreign path.
+    expect(childApproveFlag({ childCwd: "/other", projectDir: undefined, projectTrusted: true, childTrustRequired: true, childTrustSaved: false })).toBe("no-approve");
+  });
+
+  test("foreign cwd + trust required + a saved decision (either way) → undefined — never override a human", () => {
+    expect(childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: true, childTrustRequired: true, childTrustSaved: true })).toBeUndefined();
+  });
+
+  test("foreign cwd, nothing trust-requiring → undefined", () => {
+    expect(childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: true, childTrustRequired: false, childTrustSaved: false })).toBeUndefined();
+  });
+
+  test("never 'approve' for a foreign cwd, trusted or not", () => {
+    expect(childApproveFlag({ childCwd: "/other", projectDir: "/x/.pi", projectTrusted: false, childTrustRequired: true, childTrustSaved: false })).toBe("no-approve");
+  });
+  test("no project dir → undefined, trusted or not", () => {
+    expect(childApproveFlag({ childCwd: "/r", projectDir: undefined, projectTrusted: true })).toBeUndefined();
+    expect(childApproveFlag({ childCwd: "/r", projectDir: undefined, projectTrusted: false })).toBeUndefined();
+  });
+
+  test("resolve-identity: redundant path components of the same .pi still match", () => {
+    expect(childApproveFlag({ childCwd: "/r/.", projectDir: "/r/.pi", projectTrusted: true })).toBe("approve");
+  });
+
+  test("realpath identity: a symlinked spelling of the same .pi still matches", () => {
+    // The child's cwd is an alias for the granted dir's parent: the `.pi`
+    // the child sees is the same dir the trust grant was made for, so the
+    // flag must cross.
+    const tmp = mkdtempSync(join(tmpdir(), "sub-approve-symlink-"));
+    const real = join(tmp, "repo");
+    mkdirSync(join(real, ".pi"), { recursive: true });
+    const alias = join(tmp, "alias");
+    symlinkSync(real, alias);
+    expect(childApproveFlag({ childCwd: alias, projectDir: join(real, ".pi"), projectTrusted: true })).toBe("approve");
+    expect(childApproveFlag({ childCwd: alias, projectDir: join(alias, ".pi"), projectTrusted: false })).toBe("no-approve");
+  });
+});
+describe("childTrustDecisionSaved", () => {
+  test("a stored decision (true or false) counts as saved; null does not", () => {
+    expect(childTrustDecisionSaved(() => true)).toBe(true);
+    expect(childTrustDecisionSaved(() => false)).toBe(true);
+    expect(childTrustDecisionSaved(() => null)).toBe(false);
+  });
+
+  test("a throwing lookup fails CLOSED: no saved decision, and it never throws", () => {
+    // A malformed trust.json or a contended store lock must not abort the
+    // launch (the child pane is already open by now) and must not read as
+    // "saved", which would send a foreign child out with no flag at all.
+    expect(childTrustDecisionSaved(() => {
+      throw new Error("Failed to read trust store: Unexpected token");
+    })).toBe(false);
+    // And the flag that results for a trust-requiring foreign cwd is no-approve.
+    expect(
+      childApproveFlag({ childCwd: "/other", projectDir: undefined, projectTrusted: false, childTrustRequired: true, childTrustSaved: childTrustDecisionSaved(() => { throw new Error("ELOCKED"); }) }),
+    ).toBe("no-approve");
   });
 });
 
@@ -2291,6 +2502,176 @@ describe("launchAttempt fallback chain handoff", () => {
 });
 
 // ---------------------------------------------------------------------------
+// launchAttempt — approve-flag wiring (the record fields at the call site)
+// ---------------------------------------------------------------------------
+
+describe("launchAttempt approve-flag wiring", () => {
+  // The trust-store lookup inside launchAttempt resolves against profileDir(),
+  // so PI_CODING_AGENT_DIR is repointed at a temp dir for the suite's duration
+  // (restored in afterAll, mirroring wake.test.ts): the real
+  // ~/.pi/agent/trust.json is never read or written.
+  const originalAgentDir = process.env[ENV_AGENT_DIR];
+  const suiteAgentDir = mkdtempSync(join(tmpdir(), "sub-herdr-approve-wiring-"));
+
+  beforeAll(() => {
+    process.env[ENV_AGENT_DIR] = suiteAgentDir;
+  });
+
+  afterAll(() => {
+    if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+    else process.env[ENV_AGENT_DIR] = originalAgentDir;
+    rmSync(suiteAgentDir, { recursive: true, force: true });
+  });
+
+  // The fixtures must be REAL dirs: hasTrustRequiringProjectResources stats the
+  // tree, and childApproveFlag compares realpath identity.
+  const P = mkdtempSync(join(tmpdir(), "sub-herdr-approve-p-"));
+  const Q = mkdtempSync(join(tmpdir(), "sub-herdr-approve-q-"));
+  // Q/.pi/settings.json makes Q trust-requiring.
+  mkdirSync(join(Q, ".pi"), { recursive: true });
+  writeFileSync(join(Q, ".pi", "settings.json"), "{}");
+
+  const rec = (over: Partial<Parameters<typeof launchAttempt>[1]>) =>
+    ({ ...stubRec, ...over } as Parameters<typeof launchAttempt>[1]);
+
+  test("trusted, same .pi: the child's argv carries --approve", async () => {
+    const r = recordingLauncher();
+    const out = await launchAttempt(stubAgent, rec({ cwd: P, projectDir: join(P, ".pi"), projectTrusted: true }), "/tmp", "/tmp/p.md", r.launcher, stubChain);
+    expect(out.ok).toBe(true);
+    const argv = r.argv()!;
+    expect(argv).toContain("--approve");
+    expect(argv).not.toContain("--no-approve");
+  });
+
+  test("trusted, foreign trust-requiring cwd: the child's argv carries --no-approve", async () => {
+    const r = recordingLauncher();
+    const out = await launchAttempt(stubAgent, rec({ cwd: Q, projectDir: join(P, ".pi"), projectTrusted: true }), "/tmp", "/tmp/p.md", r.launcher, stubChain);
+    expect(out.ok).toBe(true);
+    const argv = r.argv()!;
+    expect(argv).toContain("--no-approve");
+    // A standalone --approve would silently trust a model-chosen cwd.
+    expect(argv).not.toContain("--approve");
+  });
+
+  test("untrusted, same .pi: the child's argv carries --no-approve", async () => {
+    const r = recordingLauncher();
+    const out = await launchAttempt(stubAgent, rec({ cwd: P, projectDir: join(P, ".pi"), projectTrusted: false }), "/tmp", "/tmp/p.md", r.launcher, stubChain);
+    expect(out.ok).toBe(true);
+    const argv = r.argv()!;
+    expect(argv).toContain("--no-approve");
+    expect(argv).not.toContain("--approve");
+  });
+
+  test("a saved 'do not trust' decision is honored silently: neither flag crosses", async () => {
+    // The suite's premise is "no saved decision"; a decision in the child's
+    // store changes the verdict, so write one, check, and delete it in a
+    // finally — the key is realpath'd, as the store normalizes it.
+    new ProjectTrustStore(suiteAgentDir).set(realpathSync(Q), false);
+    try {
+      const r = recordingLauncher();
+      const out = await launchAttempt(stubAgent, rec({ cwd: Q, projectDir: join(P, ".pi"), projectTrusted: true }), "/tmp", "/tmp/p.md", r.launcher, stubChain);
+      expect(out.ok).toBe(true);
+      const argv = r.argv()!;
+      expect(argv).not.toContain("--approve");
+      expect(argv).not.toContain("--no-approve");
+    } finally {
+      rmSync(join(suiteAgentDir, "trust.json"), { force: true });
+    }
+  });
+
+  test("a saved 'trust' decision is honored silently too: no flag crosses to a foreign cwd", async () => {
+    new ProjectTrustStore(suiteAgentDir).set(realpathSync(Q), true);
+    try {
+      const r = recordingLauncher();
+      const out = await launchAttempt(stubAgent, rec({ cwd: Q, projectDir: join(P, ".pi"), projectTrusted: true }), "/tmp", "/tmp/p.md", r.launcher, stubChain);
+      expect(out.ok).toBe(true);
+      const argv = r.argv()!;
+      expect(argv).not.toContain("--approve");
+      expect(argv).not.toContain("--no-approve");
+    } finally {
+      rmSync(join(suiteAgentDir, "trust.json"), { force: true });
+    }
+  });
+
+  test("the session_start notice handler fires for startup, not for reload", async () => {
+    // The factory registers the handler on the pi API; a capture stub hands it
+    // back so the test can dispatch the event directly. The stub is complete for
+    // registration: the factory only calls pi.on and pi.registerTool at top level.
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    factory({
+      on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(event, handler);
+      },
+      registerTool: () => undefined,
+    } as unknown as Parameters<typeof factory>[0]);
+
+    // A fleet child (PI_SUBAGENT_RUN_ID set) skips the notice: clear it for the
+    // dispatch and restore it afterwards.
+    const runId = process.env.PI_SUBAGENT_RUN_ID;
+    delete process.env.PI_SUBAGENT_RUN_ID;
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "sub-herdr-session-start-"));
+      mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+      writeFileSync(join(dir, ".pi", "agents", "x.md"), "---\nname: x\n---\n");
+      const notified: string[] = [];
+      const ctx = {
+        cwd: dir,
+        isProjectTrusted: () => false,
+        hasUI: true,
+        ui: { notify: (msg: string) => notified.push(msg) },
+      };
+      await handlers.get("session_start")!({ reason: "startup" }, ctx);
+      expect(notified).toHaveLength(1);
+      expect(notified[0]).toContain(".pi/agents/");
+      notified.length = 0;
+      await handlers.get("session_start")!({ reason: "reload" }, ctx);
+      expect(notified).toHaveLength(0);
+    } finally {
+      if (runId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
+      else process.env.PI_SUBAGENT_RUN_ID = runId;
+    }
+  });
+
+  test("the session_start notice handler fires for reason 'new', and a fleet child skips it", async () => {
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    factory({
+      on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(event, handler);
+      },
+      registerTool: () => undefined,
+    } as unknown as Parameters<typeof factory>[0]);
+
+    const runId = process.env.PI_SUBAGENT_RUN_ID;
+    delete process.env.PI_SUBAGENT_RUN_ID;
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "sub-herdr-session-start-new-"));
+      mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+      writeFileSync(join(dir, ".pi", "agents", "x.md"), "---\nname: x\n---\n");
+      const notified: string[] = [];
+      const ctx = {
+        cwd: dir,
+        isProjectTrusted: () => false,
+        hasUI: true,
+        ui: { notify: (msg: string) => notified.push(msg) },
+      };
+      // reason "new": pi re-decided trust, so the notice fires again.
+      await handlers.get("session_start")!({ reason: "new" }, ctx);
+      expect(notified).toHaveLength(1);
+      expect(notified[0]).toContain(".pi/agents/");
+      // A fleet child (PI_SUBAGENT_RUN_ID set) skips it: the parent already
+      // saw the notice for the same admission cwd.
+      process.env.PI_SUBAGENT_RUN_ID = "sub-1234";
+      notified.length = 0;
+      await handlers.get("session_start")!({ reason: "new" }, ctx);
+      expect(notified).toHaveLength(0);
+    } finally {
+      if (runId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
+      else process.env.PI_SUBAGENT_RUN_ID = runId;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // classifyExecFailure — recovering a code from a non-zero exit
 // ---------------------------------------------------------------------------
 
@@ -2797,6 +3178,33 @@ describe("lineageRejection: callable_by", () => {
   });
 });
 
+describe("normalizeChildCwd", () => {
+  const base = "/home/u/work";
+  const home = "/home/u";
+
+  test('"." is the parent cwd itself', () => {
+    expect(normalizeChildCwd(".", base, home)).toBe(base);
+  });
+
+  test("a bare word is relative to the parent cwd, not the herdr server cwd", () => {
+    expect(normalizeChildCwd("repo", base, home)).toBe("/home/u/work/repo");
+  });
+
+  test('"../x" climbs out of the parent cwd', () => {
+    expect(normalizeChildCwd("../x", base, home)).toBe("/home/u/x");
+  });
+
+  test('"~/x" and "~" expand to the home dir', () => {
+    expect(normalizeChildCwd("~/x", base, home)).toBe("/home/u/x");
+    expect(normalizeChildCwd("~", base, home)).toBe("/home/u");
+  });
+
+  test("an absolute cwd passes through, resolved", () => {
+    expect(normalizeChildCwd("/else/where", base, home)).toBe("/else/where");
+    expect(normalizeChildCwd("/else/./where", base, home)).toBe("/else/where");
+  });
+});
+
 describe("admitSpawn", () => {
   const mk = (name: string, extra: Partial<AgentInfo> = {}): AgentInfo => ({
     name,
@@ -2851,6 +3259,13 @@ describe("admitSpawn", () => {
     });
   });
 
+  test("the unknown-agent list marks a project-origin agent with (project)", () => {
+    const rosterWithProject = [...roster, mk("proj-agent", { origin: "project", callableBy: ["any"] })];
+    const out = admitSpawn(req("nobody"), rosterWithProject, ["worker"]) as { ok: boolean; error: string };
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("proj-agent (project)");
+  });
+
   test("a cycle is refused", () => {
     expect(admitSpawn(req("reviewer"), roster, ["worker", "reviewer"])).toEqual({
       ok: false,
@@ -2884,6 +3299,22 @@ describe("admitSpawn", () => {
       ok: false,
       error:
         'Agent "modelless" declares no usable model: its model/fallback_models contains no reference the router can serve. Fix the agent definition — children launch on fallback/auto, which needs at least one entry.',
+    });
+  });
+
+  test("a non-string cwd (a hostile meta.json) is refused before anything is spent", () => {
+    const out = admitSpawn({ ...req("worker"), cwd: 42 as unknown as string }, roster, ["orchestrator"]);
+    expect(out).toEqual({
+      ok: false,
+      error: "subagent: the run's working directory is not a usable path.",
+    });
+  });
+
+  test("an empty-string cwd is refused too", () => {
+    const out = admitSpawn({ ...req("worker"), cwd: "" }, roster, ["orchestrator"]);
+    expect(out).toEqual({
+      ok: false,
+      error: "subagent: the run's working directory is not a usable path.",
     });
   });
 

@@ -8,7 +8,7 @@
  *
  * @module dynamic-prompt
  */
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { hasTrustRequiringProjectResources, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   delegationRoster,
   LINEAGE_ENV,
@@ -16,7 +16,8 @@ import {
   type AgentInfo,
   type DelegationRoster,
 } from './lib/agents.js';
-import { agentsDir, skillsDir } from './lib/layout.js';
+import { profileDir, skillsDir } from './lib/layout.js';
+import { projectRoots, TrustRequiringSnapshot, type ResourceRoots } from './lib/project-layer.js';
 import { personaOverride } from './lib/persona.js';
 // The kanban board's per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per
 // call") is restated as a numeral in this file's prose; change the cap, change it here.
@@ -24,6 +25,7 @@ import { KANBAN_TOOL, QUESTIONNAIRE_TOOL, derivePromptInputs } from './lib/promp
 import { groupByCategory } from './lib/skill-categories.js';
 import {
   SkillActivation,
+  clearSkillToolOwnersCache,
   loadSkillToolOwners,
 } from './lib/skill-activation.js';
 
@@ -63,6 +65,15 @@ type Grader = 'reviewer' | 'verifier';
 // ---------------------------------------------------------------------------
 
 /**
+ * The resource roots the last `before_agent_start` computed (project layer
+ * included when the trust rule admitted it). Module scope, because
+ * `refreshActiveTools` runs on `tool_call`, where no event `ctx` is in scope to
+ * re-derive trust from — it must scan the same skills dirs the prompt scan did.
+ * `undefined` until the process's first `before_agent_start`.
+ */
+let lastRoots: ResourceRoots | undefined;
+
+/**
  * Extension entry point. Hooks into `before_agent_start` to inject
  * a dynamically built orchestrator system prompt.
  *
@@ -73,13 +84,35 @@ export default function (pi: ExtensionAPI) {
   // `systemPromptOptions.skills` cannot answer this: it is the catalogue of every
   // discovered skill (40 here) on every turn, not the loaded set.
   const activation = new SkillActivation();
+  // The trust gate's second half, frozen per session: pi decides trust once per
+  // session, and a trust-requiring resource created mid-session must not open
+  // the project layer on the next turn (the trap project-layer.ts's header
+  // names). Reset at every session_start, probed at first use.
+  const trustSnapshot = new TrustRequiringSnapshot(hasTrustRequiringProjectResources);
+  // The trust rule (the single owner of the rationale is project-layer.ts's
+  // header): project roots load only when the project is trusted AND it carries
+  // trust-requiring resources — an agents-only `.pi` never prompts, so trust
+  // alone is not a load gate. Spelled once in `projectRoots` (lib/project-layer.ts):
+  // pi's two facts cross as data, and the pi import stays at the edge.
+  function computeRoots(cwd: string, isTrusted: boolean): ResourceRoots {
+    return projectRoots({
+      profileDir: profileDir(),
+      cwd,
+      isProjectTrusted: isTrusted,
+      hasTrustRequiringResources: trustSnapshot.get(cwd),
+    });
+  }
 
   // Only a genuinely new conversation resets the set. `reload` and `fork` keep the
   // same transcript — a loaded skill's guidance is still in context, so dropping
   // activation there would re-gate a tool mid-task, which is the one failure this
   // is supposed to prevent. `startup` needs no reset (the set is already empty).
   pi.on('session_start', async (event) => {
+    trustSnapshot.reset();
     if (event.reason === 'new' || event.reason === 'resume') activation.reset();
+    // A reload re-discovers the session's resources, so an owners scan cached
+    // from the pre-reload tree would gate against the wrong skills.
+    if (event.reason === 'reload') clearSkillToolOwnersCache();
   });
 
   // A model-invoked skill arrives as a read_skill/read of a SKILL.md, never in
@@ -115,7 +148,7 @@ export default function (pi: ExtensionAPI) {
   async function refreshActiveTools(): Promise<void> {
     if (typeof pi.getActiveTools !== 'function' || typeof pi.setActiveTools !== 'function') return;
     try {
-      const owners = await loadSkillToolOwners(skillsDir());
+      const owners = await loadSkillToolOwners(lastRoots?.skillsDirs ?? skillsDir());
       if (owners.size === 0) return;
       const active = new Set(pi.getActiveTools());
       let changed = false;
@@ -149,12 +182,12 @@ export default function (pi: ExtensionAPI) {
     // Everything that touches disk or env is loaded here; promptInputs is pure.
     // The roster carries agents shipped by ACTIVE skills only, so an unrelated
     // session is never advertised journal or research agents.
-    const library = skillsDir();
-    const owners = await loadSkillToolOwners(library);
+    const roots = computeRoots(ctx.cwd, ctx.isProjectTrusted());
+    lastRoots = roots;
+    const owners = await loadSkillToolOwners(roots.skillsDirs);
     const lineage = parseLineage(process.env[LINEAGE_ENV]);
     const roster = await delegationRoster({
-      agentsDir: agentsDir(),
-      skillsDir: library,
+      roots,
       lineage,
       activeSkills: activation.list(),
     });
@@ -165,7 +198,8 @@ export default function (pi: ExtensionAPI) {
       roster,
       owners,
       isActive: (d) => activation.has(d),
-      skillsLibrary: library,
+      // The category lookup needs the ordered roots (project layer included when the trust rule admitted it), not this process's library alone.
+      skillsLibrary: roots.skillsDirs,
     });
 
     // --- Apply the gate to this run ---
@@ -213,8 +247,14 @@ export interface PromptInputsOptions {
   owners: ReadonlyMap<string, string>;
   /** Whether a skill directory is active this session. */
   isActive: (skillDir: string) => boolean;
-  /** Absolute path to this repo's skills library. */
-  skillsLibrary: string;
+  /**
+   * The skills library for the CATEGORY lookup: one path, or the ordered roots
+   * from `project-layer.ts` (the handler passes `roots.skillsDirs`). The
+   * builder field `buildOptions.skillsLibrary` stays a single path — the
+   * profile's `skillsDir()` when an ordered root set is passed — because the
+   * rendered "Most live at …" sentence names one library.
+   */
+  skillsLibrary: string | readonly string[];
 }
 
 /** What {@link promptInputs} assembles. */
@@ -270,7 +310,7 @@ export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
       customPrompt: spo.customPrompt,
       appendSystemPrompt: spo.appendSystemPrompt,
       cwd: spo.cwd,
-      skillsLibrary: opts.skillsLibrary,
+      skillsLibrary: typeof opts.skillsLibrary === "string" ? opts.skillsLibrary : skillsDir(),
     },
   };
 }
@@ -467,6 +507,17 @@ ${opts.toolInventory.map((t) => `| ${cell(t.name)} | ${cell(t.description)} |`).
   // something that process can actually do.
 
   // --- Agent inventory section ---
+  // The From column: four provenances, one cell. A project agent shipped by a
+  // project skill, a skill's agent, a project agent, or a global one.
+  const fromCell = (a: AgentInfo): string =>
+    a.skill && a.origin === 'project'
+      ? `project skill: ${a.skill}`
+      : a.skill
+        ? `skill: ${a.skill}`
+        : a.origin === 'project'
+          ? 'project'
+          : 'global';
+
   const agentSection =
     opts.hasSubagent && opts.agentInventory.length > 0
       ? `
@@ -481,7 +532,7 @@ The Model column is markdown-escaped, so a \`\\|\` inside a cell is one \`|\`: a
 
 | Agent | Description | Model | Tools | From |
 |-------|-------------|-------|-------|------|
-${opts.agentInventory.map((a) => `| ${cell(a.name)} | ${cell(a.description)} | ${cell(a.model ?? 'default')} | ${cell((a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all')} | ${cell(a.skill ? `skill: ${a.skill}` : 'global')} |`).join('\n')}
+${opts.agentInventory.map((a) => `| ${cell(a.name)} | ${cell(a.description)} | ${cell(a.model ?? 'default')} | ${cell((a.tools?.length ?? 0) > 0 ? a.tools!.join(', ') : 'all')} | ${cell(fromCell(a))} |`).join('\n')}
 
 **Agent usage notes:**
 - Each agent has a focused role — pick the right one for the task

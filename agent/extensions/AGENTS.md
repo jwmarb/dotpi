@@ -33,8 +33,9 @@ have their own AGENTS.md.
 | Module | Owns · imported by |
 |---|---|
 | `layout.ts` | Agent-dir/profile path resolution. Never throws. Imported by nearly everything |
+| `project-layer.ts` | `projectRoots` (pi's two facts) + `TrustRequiringSnapshot` as the entry points, `resourceRoots` the low-level form; project-first agents/skills dirs for a cwd (`cwd/.pi`, trust-bypass rationale in its header) · dynamic-prompt, persona, subagent-herdr, quant-prompt |
 | `persona.ts` | Switch state on `globalThis[Symbol.for("pi.persona.override")]` (lib can load twice through a profile symlink), `personaDenies` · persona, dynamic-prompt, kanban, subagent-herdr, layout |
-| `agents.ts` | `agents/*.md` + SKILL.md list grammar, lineage · dynamic-prompt, persona, ralph-loop, subagent-herdr |
+| `agents.ts` | `agents/*.md` + SKILL.md list grammar, lineage · dynamic-prompt, persona, ralph-loop, subagent-herdr, quant-prompt |
 | `runtime.ts` | Pi-Bolt detection, `piExecutable()` · auto-update, kanban, ralph-loop, subagent-herdr, startup-fetch, pi-bolt-host |
 | `widget.ts` | `fitLines`/`fittedWidget`/`frame` · every widget-drawing extension |
 | `todo.ts` | Todo model, `RUN_TODOS_EVENT` (the kanban ↔ herdr progress channel), and the one newest-snapshot walk `latestTodoCounts`/`latestTodoCountsOfEntries` · todo, kanban, subagent-herdr |

@@ -169,10 +169,14 @@ async function freshExtension(): Promise<StubPi> {
   };
 }
 
-function makeCtx(entries: unknown[], hasUI = true, confirmResult = true) {
+function makeCtx(entries: unknown[], hasUI = true, confirmResult = true, cwd = "/w", trusted = false) {
   const notifications: string[] = [];
   return {
     sessionManager: { getEntries: () => entries },
+    // The before_agent_start takeover reads the run's cwd and trust state;
+    // an untrusted stub cwd keeps the resource roots profile-only.
+    cwd,
+    isProjectTrusted: () => trusted,
     hasUI,
     ui: {
       confirm: async () => confirmResult,
@@ -251,7 +255,7 @@ describe("the tool_call enforcement path", () => {
       contextFiles: [],
       promptGuidelines: [],
     };
-    await ext.handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: opts });
+    await ext.handlers.get("before_agent_start")!({ messageType: "user", prompt: "hi", systemPromptOptions: opts }, ctx);
     expect(opts.selectedTools).toContain("mcp__github__search");
   });
 
@@ -396,7 +400,7 @@ describe("the takeover feeds the target's inputs to the builder", () => {
       messageType: "user",
       prompt: run.prompt ?? "hi",
       systemPromptOptions,
-    } as never);
+    } as never, ctx);
     return systemPromptOptions;
   }
 
@@ -465,5 +469,79 @@ describe("the takeover feeds the target's inputs to the builder", () => {
 
     const opts = (globalThis as { __personaQuantOpts?: unknown }).__personaQuantOpts as Captured;
     expect(opts.contextInventory[0]?.path).toBe(join(quantReal, "AGENTS.md"));
+  });
+});
+
+describe("the takeover honors the project trust gate", () => {
+  // The trust gate's second half is a per-session snapshot of pi's
+  // hasTrustRequiringProjectResources: a project carrying trust-requiring
+  // resources loads its agents and skills into the takeover's inputs when
+  // trusted, and stays out when not.
+
+  /** A tmp project dir: `.pi/settings.json` + one project agent + one FLAT project skill. */
+  function projectTree() {
+    const tmp = mkdtempSync(join(tmpdir(), "persona-project-"));
+    mkdirSync(join(tmp, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(tmp, ".pi", "settings.json"), "{}");
+    writeFileSync(
+      join(tmp, ".pi", "agents", "desk-agent.md"),
+      "---\nname: desk-agent\ndescription: Project desk marker\ncallable_by: any\n---\n# Desk\n",
+    );
+    mkdirSync(join(tmp, ".pi", "skills", "proj-skill"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".pi", "skills", "proj-skill", "SKILL.md"),
+      "---\nname: proj-skill\ndescription: Flat project skill\n---\nBody.\n",
+    );
+    return tmp;
+  }
+
+  interface Captured {
+    agentInventory: Array<{ name: string; origin?: string }>;
+    skillInventory: Array<{ name: string; filePath: string; pathCategory?: string }>;
+  }
+
+  async function runTakeoverAt(ext: StubPi, cwd: string, trusted: boolean) {
+    const ctx = makeCtx(
+      [switchEntry({ profile: "research", dir: researchReal, widened: false, confirmed: false, dropped: [] })],
+      true,
+      true,
+      cwd,
+      trusted,
+    );
+    await ext.handlers.get("session_start")!({ reason: "resume" }, ctx);
+    const systemPromptOptions = {
+      cwd,
+      selectedTools: ["read", "subagent"],
+      skills: [],
+      promptGuidelines: [],
+      contextFiles: [],
+    };
+    await ext.handlers.get("before_agent_start")!(
+      { messageType: "user", prompt: "hi", systemPromptOptions } as never,
+      ctx,
+    );
+  }
+
+  test("trusted: the project agent and the flat project skill reach the builder", async () => {
+    const ext = await freshExtension();
+    const tmp = projectTree();
+    await runTakeoverAt(ext, tmp, true);
+    expect(personaOverride()?.name).toBe("research");
+    const opts = (globalThis as { __personaOrchOpts?: unknown }).__personaOrchOpts as Captured;
+    expect(opts.agentInventory.some((a) => a.name === "desk-agent")).toBe(true);
+    const skill = opts.skillInventory.find((s) => s.name === "proj-skill");
+    expect(skill).toBeDefined();
+    // A flat project skill (no category dir) carries the synthetic label, not "other".
+    expect(skill?.pathCategory).toBe("project");
+  });
+
+  test("untrusted: the project layer stays out of the builder's inputs", async () => {
+    const ext = await freshExtension();
+    const tmp = projectTree();
+    await runTakeoverAt(ext, tmp, false);
+    expect(personaOverride()?.name).toBe("research");
+    const opts = (globalThis as { __personaOrchOpts?: unknown }).__personaOrchOpts as Captured;
+    expect(opts.agentInventory.some((a) => a.name === "desk-agent")).toBe(false);
+    expect(opts.skillInventory.some((s) => s.name === "proj-skill")).toBe(false);
   });
 });

@@ -9,16 +9,18 @@
  *
  * @module subagent-herdr/lib
  */
+import { realpathSync } from "node:fs";
 import { open, readdir, readFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
-import { type AgentInfo, frontmatterOf } from "../lib/agents.js";
+import { type AgentInfo, type AgentShadow, frontmatterOf } from "../lib/agents.js";
 import { ENV_AGENT_DIR } from "../lib/layout.js";
 import { personaOverride } from "../lib/persona.js";
 // The lease dir's env name is owned by the extension that reads it, so the
 // crossing child and the router cannot drift apart.
 import { LEASE_DIR_ENV, leaseDir } from "../model-fallback/concurrency.js";
-import { findSkills } from "../lib/skill-tree.js";
+import { resourceRoots, type ResourceRoots } from "../lib/project-layer.js";
+import { findSkills, findSkillsIn } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
 // halves of the handoff cannot drift apart (one parser per format).
 import {
@@ -102,6 +104,14 @@ export interface ChildLaunchOptions {
    * child only for a card run.
    */
   card?: string;
+  /**
+   * The child's trust flag, when the child's effective cwd shares the run's
+   * project `.pi` dir (see {@link childApproveFlag}): the parent may hold an
+   * ephemeral `--approve` that the fresh child pane does not inherit, so an
+   * unattended child in a trusted project would otherwise hang on the trust
+   * prompt — and in an untrusted one it must not prompt at all.
+   */
+  projectApprove?: "approve" | "no-approve";
 }
 
 /**
@@ -287,6 +297,13 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
     "--model",
     FALLBACK_MODEL_REF,
   ];
+  // The trust flag crosses only for a project child (see childApproveFlag):
+  // appended after the --model constant, before the tools block, so the argv
+  // stays deterministic. Undefined appends nothing — a profile-only child
+  // launches exactly as before.
+  if (opts.projectApprove !== undefined) {
+    argv.push(opts.projectApprove === "approve" ? "--approve" : "--no-approve");
+  }
   if (opts.tools && opts.tools.length > 0) {
     // `subagent_ask` is registered in the child only for a pattern-valid card
     // (`buildChildEnv` gates the same way) — an allowlisted tool the child
@@ -298,6 +315,108 @@ export function buildChildArgv(opts: ChildLaunchOptions): string[] {
   return argv;
 }
 
+/**
+ * The child's trust flag for its launch argv, per the binding rule:
+ *
+ * - the child's effective cwd shares the run's project `.pi` dir →
+ *   `"approve"` when the project is trusted, `"no-approve"` when not (the
+ *   parent may hold an ephemeral `--approve` that a fresh, unattended child
+ *   pane does not inherit — without the flag the child would hang on the
+ *   trust prompt; an untrusted project must not prompt at all, the child has
+ *   nobody to answer);
+ * - a different cwd, or no project layer at all → `"no-approve"` when
+ *   `childTrustRequired` is `true` and `childTrustSaved` is not — the cwd
+ *   carries trust-requiring resources and the trust store holds no decision
+ *   for it — else `undefined`. A saved decision (either way) is honored
+ *   silently, never overridden; `"approve"` is never returned for a foreign
+ *   cwd.
+ *
+ * Silence for a foreign cwd was proven unsafe live: the pane is unattended,
+ * pi's "Trust project folder?" select defaults to "Trust", and herdr's
+ * task-prompt keystrokes + Enter answer it — PERSISTING trust for a
+ * model-chosen directory into the trust store. Accepted trade-off: a
+ * `defaultProjectTrust: "always"` user loses auto-trust for cross-cwd
+ * children (fail-safe); a saved decision still wins.
+ *
+ * "Same `.pi`" is by realpath identity (falling back to `path.resolve` when a
+ * side cannot be resolved) of `join(childCwd, ".pi")` and the run's
+ * `projectDir`, so relative, redundant, and symlinked spellings of the same
+ * dir agree. Pure, so the launch path can be tested without a pane.
+ */
+export function childApproveFlag(opts: {
+  childCwd: string;
+  projectDir?: string;
+  projectTrusted: boolean;
+  childTrustRequired?: boolean;
+  childTrustSaved?: boolean;
+}): "approve" | "no-approve" | undefined {
+  if (opts.projectDir !== undefined && realIdentity(join(opts.childCwd, ".pi")) === realIdentity(opts.projectDir)) {
+    return opts.projectTrusted ? "approve" : "no-approve";
+  }
+  return opts.childTrustRequired === true && opts.childTrustSaved !== true ? "no-approve" : undefined;
+}
+
+/**
+ * `childTrustSaved` for {@link childApproveFlag}: does the child's trust store
+ * hold a decision for `cwd`? `lookup` is injected (pi's
+ * `new ProjectTrustStore(profileDir()).get`) so this stays pure and testable.
+ *
+ * Fails CLOSED: a throwing lookup — a malformed trust.json, the store lock held
+ * past pi's ~200ms budget, a failed mkdir — counts as "no saved decision", so
+ * the child gets `--no-approve` whenever the directory is trust-requiring.
+ * That is safe in both directions: an explicit `--no-approve` outranks the
+ * store in pi's decision order, so a child still launches in a directory whose
+ * saved decision was to trust, and a corrupt store can never hand a child
+ * silent trust. A broken store that throws for us throws for the child too,
+ * and pi's own trust resolution has no fallback for that.
+ */
+export function childTrustDecisionSaved(lookup: () => unknown): boolean {
+  try {
+    return lookup() !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `realpath` with a `resolve` fallback: the same dir spelled through a symlink
+ * must compare equal, and a dir that does not exist yet cannot be
+ * resolved, so it degrades to plain path identity.
+ */
+function realIdentity(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+/**
+ * The resource roots a persisted record was admitted under, re-derived for
+ * the launch — the ONE re-derivation of roots from a record.
+ *
+ * A record that tracked a project dir was admitted in a project that carried
+ * trust-requiring resources, and its roots must come from the GRANTED dir
+ * (`dirname(projectDir)`), never from `rec.cwd`: the admission cwd is where
+ * the pane opens, which the model may have chosen elsewhere. The layer is
+ * trusted exactly when the record says it was (`projectTrusted`); a record
+ * without a string `projectDir` is profile-only at its admission cwd.
+ *
+ * The `typeof` guard is deliberate: the run dir is hostile, and a non-string
+ * `projectDir` is NOT a trust grant — the same discipline as `ownerPaneOf` /
+ * `healthCheckOfId`, where a present non-string value is treated as absent,
+ * so a planted value cannot claim a project layer.
+ *
+ * @param rec - The persisted record; only `cwd` and `projectDir` /
+ *   `projectTrusted` are read.
+ * @param profileDir - The profile's agent directory (`layout.ts`'s
+ *   `profileDir()`).
+ */
+export function rootsForRun(rec: { cwd: string; projectDir?: unknown; projectTrusted?: unknown }, profileDir: string): ResourceRoots {
+  if (typeof rec.projectDir !== "string") return resourceRoots({ profileDir, cwd: rec.cwd, projectTrusted: false });
+  const trusted = rec.projectTrusted === true; // a record that does not say it was trusted was not; presence of projectDir is not a grant
+  return resourceRoots({ profileDir, cwd: dirname(rec.projectDir), projectTrusted: trusted });
+}
 /** One skill as the catalogue needs it: what it is, and where to read it. */
 export interface SkillEntry {
   /** Skill directory name — the identity `skills:` matches on. */
@@ -455,11 +574,13 @@ export function appendCardBrief(promptBody: string, card: string): string {
  * This is the **fallback** path — normally a child's catalogue comes from pi's
  * own resolved skill list via {@link skillEntriesFromPi}, which also covers
  * packages and project scope.
- *
- * @param skillsDirPath - Absolute path to the skills library.
+ * @param dirs - One skills root (the profile's `agent/skills/`), or the ordered
+ *   roots from `project-layer.ts` `resourceRoots` (project layer first): the
+ *   launch path hands the child the same roots the roster scanned, so a
+ *   project skill a child may declare is discoverable here too.
  */
-export async function discoverSkills(skillsDirPath: string): Promise<SkillEntry[]> {
-  const located = await findSkills(skillsDirPath);
+export async function discoverSkills(dirs: string | readonly string[]): Promise<SkillEntry[]> {
+  const located = typeof dirs === "string" ? await findSkills(dirs) : await findSkillsIn(dirs);
 
   const out: SkillEntry[] = [];
   for (const skill of located) {
@@ -1070,6 +1191,28 @@ export type SpawnOrigin =
   | { kind: "tool-delegation" }
   | { kind: "system-health-check"; targetRunId: string };
 
+/**
+ * The child's working directory, absolute — the one path the record, the
+ * herdr pane, and the trust flag all see.
+ *
+ * `params.cwd` is model-chosen text, and the two consumers of a relative
+ * spelling disagree: the herdr server resolves `--cwd` against the herdr
+ * SERVER's cwd, while the trust probes (`childApproveFlag`'s `childCwd`,
+ * pi's `resolvePath`) resolve against the PARENT's `process.cwd()`. Left
+ * relative, a `cwd: "."` opens the pane in the server's dir while the flag
+ * is computed for the parent's — proven live. Normalized here, once.
+ *
+ * A leading `~`/`~/` expands to `home`; anything else is `path.resolve`d
+ * against `baseCwd` (the parent's cwd) — which is also what an absent
+ * `params.cwd` resolves to when the caller passes `baseCwd` through. Pure
+ * (home and base injected) so the resolution is testable without touching
+ * `process.cwd()`.
+ */
+export function normalizeChildCwd(cwd: string, baseCwd: string, home: string): string {
+  const expanded = cwd === "~" || cwd.startsWith("~/") ? join(home, cwd.slice(2)) : cwd;
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(baseCwd, expanded);
+}
+
 /** One spawn request, as {@link admitSpawn} judges it. */
 export interface SpawnAdmissionRequest {
   /** The agent definition name asked for. */
@@ -1103,7 +1246,9 @@ export type SpawnAdmission =
  * Decides whether a spawn may proceed, before anything is spent: no run dir,
  * no registry entry, no pane. Pure — the roster and lineage come in.
  *
- * Three checks, in this order: the agent must exist in `rosterAll` (the
+ * Four checks, in this order: `cwd` must be a non-empty string (a hostile
+ * meta.json can hand the health-check path anything, and an empty model
+ * `cwd` is no path at all), then the agent must exist in `rosterAll` (the
  * refusal lists what this lineage may spawn under normal rules), then
  * {@link lineageRejection} (with `{ system: true }` only for a health check),
  * then {@link childFallbackChain} must yield a chain. The herdr name check is
@@ -1118,6 +1263,13 @@ export function admitSpawn(
   rosterAll: readonly AgentInfo[],
   lineage: string[],
 ): SpawnAdmission {
+  // A hostile meta.json can hand the health-check path a non-string cwd, and a
+  // model can pass an empty one: both would throw inside the trust probes and
+  // the argv build after a pane is already open, so they are refused here,
+  // before anything is spent.
+  if (typeof request.cwd !== "string" || request.cwd === "") {
+    return { ok: false, error: "subagent: the run's working directory is not a usable path." };
+  }
   // Looked up in the whole roster, not the spawnable part: a known agent this
   // caller may not spawn must get lineageRejection's specific refusal, not
   // "Unknown agent".
@@ -1128,7 +1280,10 @@ export function admitSpawn(
     // (non-system) lineage rules, whatever the origin.
     const available =
       spawnableAgents(rosterAll, lineage)
-        .map((a) => (a.skill ? `${a.name} (skill: ${a.skill})` : a.name))
+        // Provenance like the roster's From column: a skill agent names its
+        // skill, a project agent says so — the list is where a model learns
+        // what exists, and a project agent the list hides is one it cannot ask for.
+        .map((a) => `${a.name}${a.skill ? ` (skill: ${a.skill})` : ""}${a.origin === "project" ? " (project)" : ""}`)
         .join(", ") || "none";
     return { ok: false, error: `Unknown agent "${request.agent}". Available agents: ${available}.` };
   }
@@ -1244,4 +1399,61 @@ export function childNameRejection(agentName: string, runId: string): string | u
 export function agentNameRejection(name: string): string | undefined {
   if (HERDR_AGENT_NAME.test(name)) return undefined;
   return `Agent name "${name}" is not usable by herdr: a name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 characters). Rename the agent definition file's \`name\` field.`;
+}
+
+/**
+ * The input to {@link projectLayerNotices}. Deliberately plain facts, not
+ * paths or a ctx: the caller does the filesystem check and the trust
+ * computation, this function only words them.
+ */
+export interface ProjectLayerNoticeInput {
+  /** The project's `.pi/agents/` holds at least one `*.md` definition. */
+  hasProjectAgentFiles: boolean;
+  /** The full gate — `isProjectTrusted() && hasTrustRequiringProjectResources(cwd)`. */
+  projectTrusted: boolean;
+  /** pi's `isProjectTrusted()` alone (the first half of the gate). */
+  isProjectTrusted: boolean;
+  /** pi's `hasTrustRequiringProjectResources(cwd)` alone (the second half). */
+  hasTrustRequiring: boolean;
+  /** Name collisions the layer merge resolved (see `agents.ts` `AgentShadow`). */
+  shadowed: ReadonlyArray<AgentShadow>;
+}
+
+/**
+ * One-time notices for the project layer, worded for a human at the prompt.
+ *
+ * A project `.pi/agents/` the trust gate keeps unloaded is otherwise silent —
+ * the user writes agents, sees no effect, and no error (this is exactly the
+ * agents-only trust-bypass shape `project-layer.ts` documents). And a shadowed
+ * fleet name is otherwise visible only as a changed `From` cell. So both
+ * cases say themselves here, once, and nowhere else.
+ *
+ * Only collisions the project layer caused are announced: a profile-vs-
+ * profile-skill collision (a profile agent over a profile-skill agent) predates
+ * the project layer and is already visible in the roster's `From` column, so it
+ * is deliberately NOT reported here.
+ *
+ * Pure: no fs, no pi import — the caller checks and computes, this words.
+ * Returns at most one notice per cause.
+ *
+ * @param input - Plain facts about the session's project state.
+ * @returns Zero to two notice strings, empty when nothing is worth saying.
+ */
+export function projectLayerNotices(input: ProjectLayerNoticeInput): string[] {
+  const out: string[] = [];
+  if (input.hasProjectAgentFiles && !input.projectTrusted) {
+    out.push(
+      input.isProjectTrusted
+        ? // Trust exists because there was nothing to trust — the agents-only shape.
+          "Project `.pi/agents/` ignored: the project has no trust-requiring resource (settings.json, mcp.json, extensions/, skills/, …), so pi shows no trust prompt. Add a `.pi/settings.json` (even an empty {}), then approve the prompt on next start or run with `--approve`."
+        : "Project `.pi/agents/` ignored: this project is not trusted. Run with `--approve`, or approve the trust prompt on next start (a saved 'do not trust' decision suppresses it)."
+    );
+  }
+  const projectShadows = input.shadowed.filter((s) => s.winner === "project" || s.loser === "project");
+  if (projectShadows.length > 0) {
+    const shown = projectShadows.slice(0, 5).map((s) => `\`${s.name}\` (${s.winner} over ${s.loser})`);
+    const more = projectShadows.length > shown.length ? ` (+${projectShadows.length - shown.length} more)` : "";
+    out.push(`Project layer shadows fleet agents: ${shown.join(", ")}${more}.`);
+  }
+  return out;
 }

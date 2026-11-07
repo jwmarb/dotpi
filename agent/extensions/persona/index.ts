@@ -28,11 +28,12 @@
  *
  * @module persona
  */
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
-  McpServerConfig,
+import {
+  hasTrustRequiringProjectResources,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type McpServerConfig,
 } from "@earendil-works/pi-coding-agent";
 import { existsSync, writeFileSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
@@ -41,11 +42,12 @@ import { join } from "node:path";
 type OrchestratorModule = typeof import("../dynamic-prompt.js");
 type QuantModule = typeof import("../../../quant-trader/extensions/quant-prompt.js");
 import { LINEAGE_ENV, delegationRoster, frontmatterOf, parseLineage } from "../lib/agents.js";
-import { agentDir, profileDir, repoRoot, skillsDir, agentsDir } from "../lib/layout.js";
-import { personaDenies, personaOverride, setPersonaOverride } from "../lib/persona.js";
+import { agentDir, profileDir, repoRoot, skillsDir } from "../lib/layout.js";
+import { projectRoots, TrustRequiringSnapshot } from "../lib/project-layer.js";
+import { personaOverride, setPersonaOverride } from "../lib/persona.js";
 import { derivePromptInputs } from "../lib/prompt-inputs.js";
-import { SkillActivation, loadSkillToolOwners } from "../lib/skill-activation.js";
-import { categoryFromPath, findSkills } from "../lib/skill-tree.js";
+import { SkillActivation, clearSkillToolOwnersCache, loadSkillToolOwners } from "../lib/skill-activation.js";
+import { categoryFromPath, findSkillsIn, isUnder } from "../lib/skill-tree.js";
 import {
   appliedMcpApplies,
   computeTargetTools,
@@ -363,11 +365,21 @@ export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENT_RUN_ID) return;
 
   const activation = new SkillActivation();
+  // The trust gate's second half, frozen per session: pi decides trust once per
+  // session, and a trust-requiring resource created mid-session must not open
+  // the project layer on the next turn (the trap project-layer.ts's header
+  // names). Reset at every session_start, probed at first use.
+  const trustSnapshot = new TrustRequiringSnapshot(hasTrustRequiringProjectResources);
 
   // A skill is only in the roster once it is loaded; the switched library's
   // skills are re-activated from this process's own prompt and tool signals.
   pi.on("session_start", async (event) => {
+    trustSnapshot.reset();
     if (event.reason === "new" || event.reason === "resume") activation.reset();
+    // A reload re-discovers the session's resources, so an owners scan memoized
+    // against the pre-reload tree would gate tools against the wrong skills.
+    // (Persona keeps its own module instance, so the shared cache is its to clear.)
+    if (event.reason === "reload") clearSkillToolOwnersCache();
   });
 
   pi.on("session_start", async (event, ctx) => {
@@ -448,7 +460,7 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const opts = event.systemPromptOptions;
     activation.notePrompt(event.messageType === "user" ? event.prompt : "");
 
@@ -495,19 +507,33 @@ export default function (pi: ExtensionAPI) {
     probeSelectedTools = [...opts.selectedTools];
 
     // --- What the switched profile's prompt needs ---
+    // The trust rule (the single owner of the rationale is project-layer.ts's
+    // header): project roots load only when the project is trusted AND it
+    // carries trust-requiring resources — the switch only runs in a live
+    // session, so this handler's ctx is the run's own trust state.
+    const roots = projectRoots({
+      profileDir: profileDir(),
+      cwd: ctx.cwd,
+      isProjectTrusted: ctx.isProjectTrusted(),
+      hasTrustRequiringResources: trustSnapshot.get(ctx.cwd),
+    });
     const library = skillsDir();
     const lineage = parseLineage(process.env[LINEAGE_ENV]);
     const roster = await delegationRoster({
-      agentsDir: agentsDir(),
-      skillsDir: library,
+      roots,
       lineage,
       activeSkills: activation.list(),
     });
 
-    // The skill inventory: the skills pi's own list places under the switched
-    // library, plus what that library holds that the list does not cover (pi
-    // discovers against the process's directory, not the switched one).
-    const realLibrary = await realpath(library).catch(() => library);
+    // The skill inventory: the skills pi's own list places under any resolved
+    // root (the project layer included when the trust rule admitted it), plus
+    // what those roots hold that the list does not cover (pi discovers against
+    // the process's directory, not the project's).
+    const realRoots = await Promise.all(
+      roots.skillsDirs.map(async (dir) => ({ dir, real: await realpath(dir).catch(() => dir) })),
+    );
+    const underRoot = (real: string) =>
+      realRoots.find((r) => isUnder(r.real, real));
     const covered = new Set<string>();
     const inventory: Array<{
       name: string;
@@ -517,18 +543,22 @@ export default function (pi: ExtensionAPI) {
     }> = [];
     for (const skill of opts.skills ?? []) {
       const real = await realpath(skill.filePath).catch(() => skill.filePath);
-      if (real === realLibrary || real.startsWith(realLibrary + "/")) {
+      const root = underRoot(real);
+      if (root) {
         covered.add(real);
         inventory.push({
           name: skill.name,
           description: skill.description,
           filePath: skill.filePath,
-          pathCategory: categoryFromPath(library, skill.filePath),
+          pathCategory: categoryFromPath(root.dir, skill.filePath) ??
+            (root !== realRoots[realRoots.length - 1] ? "project" : undefined),
         });
       }
     }
-    for (const located of await findSkills(library)) {
-      if (covered.has(located.path)) continue;
+    for (const located of await findSkillsIn(roots.skillsDirs)) {
+      // covered holds realpaths (pi's list may name the project layer through a
+      // symlinked .pi), so compare the located path resolved the same way.
+      if (covered.has(await realpath(located.path).catch(() => located.path))) continue;
       let description = "";
       try {
         const fm = frontmatterOf(await readFile(located.path, "utf-8"));
@@ -539,7 +569,15 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // unreadable: no description
       }
-      inventory.push({ name: located.dir, description, filePath: located.path, pathCategory: located.category });
+      // A flat project skill (no category dir) gets the synthetic "project"
+      // category — only for a project root, the profile's last root included.
+      const locatedRoot = realRoots.findIndex((r) => isUnder(r.dir, located.root));
+      inventory.push({
+        name: located.dir,
+        description,
+        filePath: located.path,
+        pathCategory: located.category ?? (locatedRoot >= 0 && locatedRoot !== realRoots.length - 1 ? "project" : undefined),
+      });
     }
 
     // The context: the home AGENTS.md entry is replaced by the target's, when
@@ -561,7 +599,7 @@ export default function (pi: ExtensionAPI) {
     // derivation.
     const owners = quantModule
       ? new Map<string, string>() // quant does not gate skill-owned tools; trade_journal is offered ungated by design
-      : await loadSkillToolOwners(library);
+      : await loadSkillToolOwners(roots.skillsDirs);
     const d = derivePromptInputs({
       selectedTools: opts.selectedTools ?? [],
       toolSnippets: opts.toolSnippets,

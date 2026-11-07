@@ -21,6 +21,7 @@ import {
   launchedBy,
   pendingSpawnsOf,
   readExitSidecarAt,
+  readRunRecordFromDisk,
   type RunRecord,
 } from "./rundir.js";
 
@@ -415,5 +416,60 @@ describe.skipIf(!existsSync(REAL_RUNS))("isTerminalRecord against the recorded c
       const pastWindow = finite(settled) && now - settled >= REVIVAL_WINDOW_MS;
       expect(isTerminalRecord(r, now)).toBe(pastWindow);
     }
+  });
+});
+
+describe("RunRecord.projectDir round-trip", () => {
+  /** A runs dir holding one run dir whose meta.json is `meta` verbatim. */
+  const runsDirWith = (runId: string, meta: unknown): string => {
+    const runsDir = mkdtempSync(join(tmpdir(), "rundir-projectdir-"));
+    const runDir = join(runsDir, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "meta.json"), typeof meta === "string" ? meta : JSON.stringify(meta, null, 2));
+    return runsDir;
+  };
+
+  test("a record with projectDir persists it through meta.json", () => {
+    const runsDir = runsDirWith("sub-cd12", record({ runId: "sub-cd12", projectDir: "/r/.pi" }));
+    const loaded = readRunRecordFromDisk(runsDir, "sub-cd12");
+    expect(loaded).toBeDefined();
+    expect(loaded?.projectDir).toBe("/r/.pi");
+  });
+
+  test("a legacy record without projectDir loads with it undefined", () => {
+    // The field is simply absent from the JSON — the pre-change shape.
+    const meta = { ...record({ runId: "sub-cd13" }) };
+    const runsDir = runsDirWith("sub-cd13", meta);
+    const loaded = readRunRecordFromDisk(runsDir, "sub-cd13");
+    expect(loaded).toBeDefined();
+    expect(loaded?.projectDir).toBeUndefined();
+  });
+
+  test("a meta whose only oddity is a projectDir string is not record-fatal", () => {
+    const runsDir = runsDirWith("sub-cd14", record({ runId: "sub-cd14", projectDir: "/r/.pi" }));
+    expect(readRunRecordFromDisk(runsDir, "sub-cd14")?.projectDir).toBe("/r/.pi");
+  });
+
+  test("projectTrusted round-trips alongside projectDir", () => {
+    for (const [runId, projectTrusted] of [
+      ["sub-d1d1", true],
+      ["sub-d2d2", false],
+    ] as const) {
+      const runsDir = runsDirWith(runId, record({ runId, projectDir: "/r/.pi", projectTrusted }));
+      const loaded = readRunRecordFromDisk(runsDir, runId);
+      expect(loaded?.projectDir).toBe("/r/.pi");
+      expect(loaded?.projectTrusted).toBe(projectTrusted);
+    }
+  });
+
+  test("a record with projectDir but no projectTrusted loads as UNtrusted", () => {
+    // The legacy shape: the field is simply absent from the JSON, so the
+    // reader must not invent a grant (see the RunRecord docs in rundir.ts).
+    const meta = { ...record({ runId: "sub-d3d3", projectDir: "/r/.pi" }) };
+    expect("projectTrusted" in meta).toBe(false);
+    const runsDir = runsDirWith("sub-d3d3", meta);
+    const loaded = readRunRecordFromDisk(runsDir, "sub-d3d3");
+    expect(loaded?.projectDir).toBe("/r/.pi");
+    expect(loaded?.projectTrusted).toBeUndefined();
   });
 });

@@ -70,6 +70,12 @@ export async function resolveGateAgent(
 ): Promise<ResolvedGateAgent> {
 	const { name, fallbackModel, defaultTools } = defaults;
 	try {
+		// Profile-only, BY DESIGN: gate agents deliberately do not follow the
+		// project layer (lib/project-layer.ts) — a repo that could shadow
+		// `verifier` via `.pi/agents/verifier.md` could make its own verification
+		// gate approve everything, so the gate must stay independent of the code
+		// it judges. This resolution is the one place the layer rule is
+		// deliberately excluded.
 		const file = join(agentsDir(), `${name}.md`);
 		const content = await readFile(file, "utf8");
 		const info = parseAgentFile(content, `${name}.md`);

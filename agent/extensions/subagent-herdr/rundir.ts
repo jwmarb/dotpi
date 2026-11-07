@@ -365,6 +365,29 @@ export interface RunRecord {
 	 * the guarded read sites), so a planted value cannot claim a parent.
 	 */
 	parentRunId?: string;
+	/**
+	 * The tracked `<cwd>/.pi` of the project this run was admitted under,
+	 * whenever that project carried trust-requiring resources. `resourceRoots`
+	 * (lib/project-layer.ts) sets it when the project layer was loaded; the
+	 * spawn stamp keeps tracking it when the layer was NOT, so an untrusted
+	 * child can be told `--no-approve` about the very dir it must not prompt
+	 * about. Presence is NOT the trust state — that is {@link projectTrusted}:
+	 * an absent or non-`true` `projectTrusted` means UNtrusted, so a record
+	 * carrying `projectDir` alone loads as profile-only. The readers are
+	 * tolerant ({@link hasRunId} looks only at `runId`), so a record without
+	 * the field at all still loads.
+	 */
+	projectDir?: string;
+	/**
+	 * Whether that project's layer was actually loaded at spawn: the trust
+	 * grant (`isProjectTrusted() && hasTrustRequiringProjectResources`). The
+	 * child's launch flag (`childApproveFlag` in `subagent-herdr/lib.ts`)
+	 * derives from the pair, and `rootsForRun` (same lib) re-derives the
+	 * record's roots from it. An absent or non-`true` value means UNtrusted —
+	 * a legacy record carrying `projectDir` alone therefore loads as
+	 * profile-only, never as a trust grant.
+	 */
+	projectTrusted?: boolean;
 }
 
 // ---------------------------------------------------------------------------

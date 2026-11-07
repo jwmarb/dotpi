@@ -164,4 +164,45 @@ describe("derivePromptInputs", () => {
     });
     expect(out.skillInventory.map((s) => s.pathCategory)).toEqual(["local", undefined]);
   });
+
+  // A skill is categorized against the FIRST root its path lies under, not
+  // the last or the process's own library: a project skill under the project
+  // root keeps its project category, a profile skill keeps its profile
+  // category, and a skill under no root stays uncategorized.
+  test("an ordered root set categorizes each skill under its own root", () => {
+    const out = inputs({
+      skillsLibrary: ["/proj/.pi/skills", LIB],
+      skills: [
+        { name: "proj-skill", description: "d", filePath: "/proj/.pi/skills/local/proj-skill/SKILL.md" },
+        { name: "lib-skill", description: "d", filePath: `${LIB}/review/lib-skill/SKILL.md` },
+        { name: "pkg", description: "d", filePath: "/home/u/.pi/other/pkg/SKILL.md" },
+      ],
+    });
+    expect(out.skillInventory.map((s) => s.pathCategory)).toEqual(["local", "review", undefined]);
+  });
+
+  // A flat project skill (`<project-skills>/<skill>/SKILL.md`) has no category
+  // in its path. Without the synthetic "project" label it would render under
+  // the "other" catch-all, the group for skills this repo does not own.
+  test("a flat project skill gets the synthetic 'project' category; a flat profile skill does not", () => {
+    const out = inputs({
+      skillsLibrary: ["/proj/.pi/skills", LIB],
+      skills: [
+        { name: "proj-skill", description: "d", filePath: "/proj/.pi/skills/proj-skill/SKILL.md" },
+        { name: "lib-skill", description: "d", filePath: `${LIB}/review/lib-skill/SKILL.md` },
+        { name: "flat-lib", description: "d", filePath: `${LIB}/flat-lib/SKILL.md` },
+      ],
+    });
+    expect(out.skillInventory.map((s) => s.pathCategory)).toEqual(["project", "review", undefined]);
+  });
+
+  test("with a single library root nothing is 'project'", () => {
+    // The profile-only shape: the one root IS the last root, so a flat skill
+    // there stays uncategorized, as before.
+    const out = inputs({
+      skillsLibrary: LIB,
+      skills: [{ name: "flat-lib", description: "d", filePath: `${LIB}/flat-lib/SKILL.md` }],
+    });
+    expect(out.skillInventory.map((s) => s.pathCategory)).toEqual([undefined]);
+  });
 });

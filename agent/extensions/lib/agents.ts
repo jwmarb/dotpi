@@ -23,9 +23,10 @@
  * @module extensions/lib/agents
  */
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
-import { findSkills } from "./skill-tree.js";
+import type { ResourceRoots } from "./project-layer.js";
+import { findSkills, findSkillsIn, isUnder } from "./skill-tree.js";
 
 /**
  * Metadata for a subagent definition parsed from `agent/agents/<name>.md`.
@@ -102,6 +103,21 @@ export interface AgentInfo {
    * is loaded, and an unknown-agent error can say which skill to load.
    */
   skill?: string;
+  /**
+   * Which layer this definition was discovered in: `"project"` for the
+   * repo's own `.pi/agents/` (and the `agents/` of a project skill),
+   * `"profile"` for the global profile.
+   *
+   * Set by the layered discovery — {@link discoverAgentsIn} and
+   * {@link discoverSkillAgents} with an ordered dir list — from
+   * `project-layer.ts`'s `projectDir`; {@link discoverAgents} takes a single
+   * dir and leaves it undefined, because one dir cannot say which layer it is.
+   *
+   * Provenance, not decoration: a project agent loads only under a real
+   * project-trust decision (the trust rule in `project-layer.ts`), and
+   * {@link mergeAgents} reports who shadowed whom by this tag.
+   */
+  origin?: "project" | "profile";
 }
 
 /**
@@ -133,33 +149,93 @@ export async function discoverAgents(agentsDir: string): Promise<AgentInfo[]> {
 }
 
 /**
- * Scans every skill's `agents/` directory for agent definitions, wherever that
- * skill sits in the category tree.
+ * True when `dir` is `root` itself or nested under it.
+ *
+ * Resolved comparison: callers pass `project-layer.ts` paths, which are
+ * already resolved, but a relative cwd must not escape the test.
+ */
+function underRoot(dir: string, root: string | undefined): boolean {
+  if (!root) return false;
+  return isUnder(resolve(root), resolve(dir));
+}
+
+/**
+ * Discovers agents from an ordered list of agent dirs, highest precedence
+ * first.
+ *
+ * The order is the project-layer shape (`project-layer.ts`'s
+ * `ResourceRoots.agentsDirs`): a project dir before the profile dir. The
+ * FIRST dir to claim an agent `name` wins — the same first-wins rule pi
+ * applies to skills — and each agent is tagged with {@link AgentInfo.origin}:
+ * `"project"` when its dir is at or under `opts.projectDir`, else
+ * `"profile"`.
+ *
+ * A missing or unreadable dir costs only itself (inherited from
+ * {@link discoverAgents}); the rest of the list is still walked.
+ *
+ * @param dirs - Agent-definition dirs, highest precedence first.
+ * @param opts.projectDir - The project `.pi` dir; dirs at or under it are
+ *   tagged `"project"`. Omit (profile-only lists) and every agent is tagged
+ *   `"profile"`.
+ * @returns A first-wins, name-sorted list of agents with origin tags.
+ */
+export async function discoverAgentsIn(
+  dirs: readonly string[],
+  opts?: { projectDir?: string },
+): Promise<AgentInfo[]> {
+  const out: AgentInfo[] = [];
+  const taken = new Set<string>();
+  for (const dir of dirs) {
+    const origin: AgentInfo["origin"] = underRoot(dir, opts?.projectDir) ? "project" : "profile";
+    for (const agent of await discoverAgents(dir)) {
+      if (taken.has(agent.name)) continue; // first dir wins the name
+      taken.add(agent.name);
+      out.push({ ...agent, origin });
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Scans every skill's `agents/` directory for agent definitions, across one
+ * skills library or an ordered list of them, wherever a skill sits in its
+ * category tree.
  *
  * Skills may ship their own subagents beside the skill that drives them — a
- * journal-writing agent belongs with the journal skill, not in the global roster
- * where it is noise to every unrelated session. Each discovered agent carries
- * {@link AgentInfo.skill} so callers can gate on, or report, its origin.
+ * journal-writing agent belongs with the journal skill, not in the global
+ * roster where it is noise to every unrelated session. Each discovered agent
+ * carries {@link AgentInfo.skill} so callers can gate on, or report, its
+ * origin, and — when the list carries a project layer —
+ * {@link AgentInfo.origin}.
  *
  * `agents/` has long held an optional `openai.yaml` presentation file; only
  * `.md` files with parseable frontmatter become agents, so existing skills are
  * unaffected.
  *
- * @param skillsDir - Absolute path to the skills library (skills live under
- *                    category directories; `skill-tree.ts` finds them).
+ * @param skillsDirs - A skills library, or an ordered list of libraries, highest
+ *                    precedence first (the project-layer shape: a project skills
+ *                    dir before the profile's). The list goes through
+ *                    `findSkillsIn`, so a project skill fully shadows the
+ *                    same-named profile skill — `agents/` included.
  * @param only - When given, restrict discovery to these skill directory names
  *               (the loaded set) — matched on the skill's own directory name,
  *               not its category path. Omit to scan every skill.
+ * @param projectDir - The project `.pi` dir, when the list carries a project
+ *                    layer: an agent whose skill dir is at or under it is
+ *                    tagged `origin: "project"`, the rest `"profile"`. Omit
+ *                    and every agent is tagged `"profile"`.
  * @returns A sorted (by name) list of agents, or `[]` on any failure.
  */
 export async function discoverSkillAgents(
-  skillsDir: string,
+  skillsDirs: string | readonly string[],
   only?: Iterable<string>,
+  projectDir?: string,
 ): Promise<AgentInfo[]> {
+  const dirs = Array.isArray(skillsDirs) ? skillsDirs : [skillsDirs];
   // Locating skills belongs to `skill-tree.ts`: skills are nested under a
   // category, and the one-level readdir this used to do returned no agents at
   // all once a skill moved — with no error, so the agents just vanished.
-  let skills = await findSkills(skillsDir);
+  let skills = await findSkillsIn(dirs);
   if (only) {
     // Filter on the skill directory name, not the path, so `skills:
     // technical-analysis` keeps working regardless of which category files it.
@@ -170,32 +246,83 @@ export async function discoverSkillAgents(
   for (const skill of skills) {
     // One skill's unreadable agents/ dir costs only that skill: discoverAgents
     // already returns [] rather than throwing.
+    const origin: AgentInfo["origin"] = underRoot(skill.root, projectDir) ? "project" : "profile";
     for (const agent of await discoverAgents(join(skill.root, "agents"))) {
-      agents.push({ ...agent, skill: skill.dir });
+      agents.push({ ...agent, skill: skill.dir, origin });
     }
   }
   return agents.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
- * Merges global and skill-shipped agents into one roster.
- *
- * A global agent wins a name collision: the roster in `agent/agents/` is the
- * stable contract every session depends on, and a skill must not be able to
- * silently redirect `worker` or `reviewer` by shipping a file with that name.
- * The shadowed skill agent is dropped, not renamed, so the collision shows up
- * as "my agent isn't there" rather than as a subtly different `worker`.
- *
- * @param global - Agents from `agent/agents/`.
- * @param skillAgents - Agents from every `<skill>/agents/`, across skills (not one
- *                      skill's — {@link discoverSkillAgents} returns them merged).
- * @returns One sorted roster, global definitions taking precedence.
+ * Why one agent definition lost a name collision, as reported by
+ * {@link mergeAgents}.
  */
-export function mergeAgents(global: AgentInfo[], skillAgents: AgentInfo[]): AgentInfo[] {
-  const taken = new Set(global.map((a) => a.name));
-  return [...global, ...skillAgents.filter((a) => !taken.has(a.name))].sort((a, b) =>
-    a.name.localeCompare(b.name),
-  );
+export interface AgentShadow {
+  /** The contested agent name. */
+  name: string;
+  /** The winner's provenance, undefined when the winning layer was untagged. */
+  winner?: AgentInfo["origin"];
+  /** The loser's provenance, undefined when the losing layer was untagged. */
+  loser?: AgentInfo["origin"];
+  /** The skill shipping the winner, when the winner is a skill agent. */
+  winnerSkill?: string;
+  /** The skill shipping the loser, when the loser is a skill agent. */
+  loserSkill?: string;
+}
+
+/** The output of {@link mergeAgents}: the merged roster and its collisions. */
+export interface MergedAgents {
+  /** The merged roster, sorted by name. */
+  agents: AgentInfo[];
+  /** Every name collision resolved, in the order it was encountered. */
+  shadowed: AgentShadow[];
+}
+
+/**
+ * Merges ordered agent layers into one roster, highest precedence first.
+ *
+ * The precedence rule is FIRST LAYER WINS a name collision — and it FLIPS
+ * the old global-wins rule. The flip is the user requirement: a repo's own
+ * `.pi/agents/` must override the global profile ("local overrides"), and pi's
+ * own skill order (project before user, first name wins) is the precedent this
+ * repo extends to the fleet. The old anti-hijack rationale — a skill must not
+ * silently redirect `worker` or `reviewer` — now lives behind pi's trust gate:
+ * a project agent loads only under a real project-trust decision
+ * (`isProjectTrusted() && hasTrustRequiringProjectResources(cwd)`,
+ * `project-layer.ts`), so the hijack it guarded against is exactly the risk
+ * the trust prompt covers.
+ *
+ * A loser is dropped, not renamed, and recorded in `shadowed` so the
+ * collision shows up as a reportable fact ("my agent isn't there" → here is
+ * what shadowed it) rather than as a silently missing agent.
+ *
+ * @param layers - Agent layers, highest precedence first.
+ * @returns The merged roster (sorted by name) and the shadowed entries.
+ */
+export function mergeAgents(...layers: Array<readonly AgentInfo[]>): MergedAgents {
+  const agents: AgentInfo[] = [];
+  const shadowed: AgentShadow[] = [];
+  const taken = new Map<string, AgentInfo>();
+  for (const layer of layers) {
+    for (const agent of layer) {
+      const winner = taken.get(agent.name);
+      if (!winner) {
+        taken.set(agent.name, agent);
+        agents.push(agent);
+      } else {
+        shadowed.push({
+          name: agent.name,
+          winner: winner.origin,
+          loser: agent.origin,
+          ...(winner.skill !== undefined ? { winnerSkill: winner.skill } : {}),
+          ...(agent.skill !== undefined ? { loserSkill: agent.skill } : {}),
+        });
+      }
+    }
+  }
+  agents.sort((a, b) => a.name.localeCompare(b.name));
+  return { agents, shadowed };
 }
 
 /**
@@ -409,10 +536,13 @@ export function spawnableAgents<T extends Pick<AgentInfo, "name" | "callableBy">
 
 /** Inputs to {@link delegationRoster}. */
 export interface DelegationRosterOptions {
-  /** Absolute path to the global `agent/agents/` directory. */
-  agentsDir: string;
-  /** Absolute path to the skills library. */
-  skillsDir: string;
+  /**
+   * The ordered roots (project layer + profile), highest precedence first.
+   * Fully determines which dirs are scanned — every call site computes them
+   * with `project-layer.ts` (the trust gate included), so there is no legacy
+   * pair to fall back to.
+   */
+  roots: ResourceRoots;
   /** Ancestry of the asking process, oldest first (`PI_SUBAGENT_LINEAGE`). */
   lineage: string[];
   /**
@@ -422,28 +552,55 @@ export interface DelegationRosterOptions {
   activeSkills?: Iterable<string>;
 }
 
-/** The merged agent roster, and the part of it this lineage may spawn. */
+/** The merged agent roster, the part of it this lineage may spawn, and the collisions the merge resolved. */
 export interface DelegationRoster {
-  /** Global agents plus skill agents, global winning a name collision, sorted by name. */
+  /** Every layer's agents, first layer winning a name collision, sorted by name. */
   all: AgentInfo[];
   /** `all` filtered by {@link spawnableAgents} for the given lineage. */
   spawnable: AgentInfo[];
+  /** Every name collision the layer merge resolved (see {@link AgentShadow}). */
+  shadowed: AgentShadow[];
 }
 
 /**
  * Discovers the delegation roster: the one composition of
- * {@link discoverAgents}, {@link discoverSkillAgents}, {@link mergeAgents} and
- * {@link spawnableAgents} that both the prompt inventory and the spawn path use,
- * so what a process is told it can delegate to is what it can.
+ * {@link discoverAgentsIn}, {@link discoverSkillAgents}, {@link mergeAgents}
+ * and {@link spawnableAgents} that both the prompt inventory and the spawn
+ * path use, so what a process is told it can delegate to is what it can.
+ *
+ * Layer order, highest first: project agents, profile agents, project-skill
+ * agents, profile-skill agents. The 3-above-4 order follows from skill
+ * shadowing: `findSkillsIn` makes a project skill replace the same-named
+ * profile skill wholesale, so a skill agent's layer is decided by its skill's
+ * layer.
+ *
+ * Each agent dir is a layer of its own (no cross-dir name dedupe before the
+ * merge), so {@link mergeAgents} is the single place a name collision is
+ * resolved and the one that reports it in `shadowed` — a project `worker`
+ * shadowing the profile `worker` must be visible there, and that requires
+ * both definitions to reach the merge.
+ *
+ * `roots` selects the dirs (project layer included): every call site computes
+ * them with `project-layer.ts` first, so the roster never guesses a layout.
  *
  * The two callers differ only in `activeSkills`: the prompt passes the loaded
  * set, the spawn path omits it (it has no session context, and a skill loaded
  * mid-session must not be invisible to the spawn it just advertised).
  */
 export async function delegationRoster(opts: DelegationRosterOptions): Promise<DelegationRoster> {
-  const all = mergeAgents(
-    await discoverAgents(opts.agentsDir),
-    await discoverSkillAgents(opts.skillsDir, opts.activeSkills),
+  const roots = opts.roots;
+  // One layer per dir, in root order (project first): a single-dir
+  // `discoverAgentsIn` call tags origin without deduping across dirs, which is
+  // what the merge — and only the merge — is for.
+  const agentLayers = await Promise.all(
+    roots.agentsDirs.map((dir) => discoverAgentsIn([dir], { projectDir: roots.projectDir })),
   );
-  return { all, spawnable: spawnableAgents(all, opts.lineage) };
+  const skillLayer = await discoverSkillAgents(roots.skillsDirs, opts.activeSkills, roots.projectDir);
+  const merged = mergeAgents(
+    ...agentLayers,
+    skillLayer.filter((a) => a.origin === "project"),
+    skillLayer.filter((a) => a.origin !== "project"),
+  );
+  const all = merged.agents;
+  return { all, spawnable: spawnableAgents(all, opts.lineage), shadowed: merged.shadowed };
 }

@@ -43,6 +43,12 @@ const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 // pre-suite value and restore it once, matching the PI_CODING_AGENT_DIR
 // handling above.
 const TEST_OWN_PANE = "w9:pOwn";
+
+// The `subagent` tool's spawn path reads the tool ctx's `cwd` and
+// `isProjectTrusted()` (the project-trust gate). The stub pi hands it a bare
+// `{}`, which would make that read throw — so the tool calls pass this ctx:
+// an untrusted temp cwd, which is the profile-only arm the tests pin.
+const toolCtx = { cwd: join(tmpdir(), "sub-herdr-tool-cwd"), isProjectTrusted: () => false };
 const originalPaneId = process.env.HERDR_PANE_ID;
 process.env.HERDR_PANE_ID = TEST_OWN_PANE;
 
@@ -311,8 +317,9 @@ async function spawnThroughTool(
   stub: ReturnType<typeof stubPi>,
   id: string,
   params: Record<string, unknown>,
+  ctx: { cwd: string; isProjectTrusted: () => boolean } = toolCtx,
 ): Promise<any> {
-  const pending = stub.getTool("subagent").execute(id, params, undefined, () => {}, {});
+  const pending = stub.getTool("subagent").execute(id, params, undefined, () => {}, ctx);
   await advance(PROMPT_SETTLE_MS);
   return pending;
 }
@@ -1215,7 +1222,7 @@ describe("run ownership (cross-process sweep)", () => {
       try {
         const out = (await stub
           .getTool("subagent")
-          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, toolCtx)) as {
           details: { ok: boolean };
         };
         expect(out.details.ok).toBe(false);
@@ -1241,6 +1248,110 @@ describe("run ownership (cross-process sweep)", () => {
       } finally {
         herdrState.startAgent = realStart;
         herdrState.closePane = realClose;
+      }
+      stub.getShutdownHandler()();
+    },
+  );
+
+  test(
+    "the spawn stamp pins projectDir and projectTrusted on the tool path, and the argv carries the matching flag",
+    async () => {
+      // A real trust-requiring project: `.pi/settings.json` makes
+      // `hasTrustRequiringProjectResources(cwd)` true, so the stamp tracks
+      // `join(cwd, ".pi")` and the trust state is the ctx's `isProjectTrusted`.
+      const cwd = mkdtempSync(join(tmpdir(), "herdr-spawn-stamp-"));
+      mkdirSync(join(cwd, ".pi"), { recursive: true });
+      writeFileSync(join(cwd, ".pi", "settings.json"), "{}");
+      try {
+        for (const trusted of [false, true]) {
+          const createExtension = await freshExtension([]);
+          const stub = stubPi();
+          createExtension(stub.pi);
+
+          // Only meta.json is needed, so force the launch to fail at
+          // startAgent — the record is saved before the verdict.
+          let seenArgv: string[] | undefined;
+          const realStart = herdrState.startAgent;
+          herdrState.startAgent = async (_name: string, _paneId: string, argv: string[]) => {
+            seenArgv = argv;
+            return { ok: false, error: null };
+          };
+          try {
+            const out = (await spawnThroughTool(
+              stub,
+              `t${trusted ? 1 : 0}`,
+              { agent: "healthcheck", task: "a self-contained task" },
+              { cwd, isProjectTrusted: () => trusted },
+            )) as { details: { ok: boolean } };
+            expect(out.details.ok).toBe(false);
+
+            const runsDir = join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs");
+            const entries = readdirSync(runsDir);
+            expect(entries.length).toBe(1);
+            const meta = JSON.parse(readFileSync(join(runsDir, entries[0]!, "meta.json"), "utf-8")) as Record<
+              string,
+              unknown
+            >;
+            expect(meta.projectDir).toBe(join(cwd, ".pi"));
+            expect(meta.projectTrusted).toBe(trusted);
+            // The argv's trust flag matches the stamp: the child shares the
+            // record's `.pi`, so the flag is decided by projectTrusted alone.
+            if (trusted) {
+              expect(seenArgv).toContain("--approve");
+              expect(seenArgv).not.toContain("--no-approve");
+            } else {
+              expect(seenArgv).toContain("--no-approve");
+              expect(seenArgv).not.toContain("--approve");
+            }
+          } finally {
+            herdrState.startAgent = realStart;
+          }
+          stub.getShutdownHandler()();
+        }
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    "a model-chosen relative cwd is normalized to the parent's absolute cwd before admission",
+    async () => {
+      // `cwd: "."` is the regression: left relative, the herdr server would
+      // open the pane in ITS cwd while the flag is computed for the parent's.
+      const cwd = mkdtempSync(join(tmpdir(), "herdr-spawn-cwd-"));
+      let seenPaneCwd: string | undefined;
+      const realCreate = herdrState.createChildPane;
+      herdrState.createChildPane = async (c: string, label: string, env?: Record<string, string>) => {
+        seenPaneCwd = c;
+        return realCreate(c, label, env);
+      };
+      const stub = stubPi();
+      try {
+        const createExtension = await freshExtension([]);
+        createExtension(stub.pi);
+        createExtension(stub.pi);
+        const out = (await spawnThroughTool(
+          stub,
+          "t1",
+          { agent: "healthcheck", task: "a self-contained task", cwd: "." },
+          { cwd, isProjectTrusted: () => false },
+        )) as { details: { ok: boolean; task: string } };
+        expect(out.details.ok).toBe(true);
+
+        const runsDir = join(process.env.PI_CODING_AGENT_DIR!, "subagent-runs");
+        const entries = readdirSync(runsDir);
+        expect(entries.length).toBe(1);
+        const meta = JSON.parse(readFileSync(join(runsDir, entries[0]!, "meta.json"), "utf-8")) as Record<
+          string,
+          unknown
+        >;
+        // The record, the pane, and the flag all see the parent's absolute cwd.
+        expect(meta.cwd).toBe(cwd);
+        expect(seenPaneCwd).toBe(cwd);
+      } finally {
+        herdrState.createChildPane = realCreate;
+        rmSync(cwd, { recursive: true, force: true });
       }
       stub.getShutdownHandler()();
     },
@@ -1370,7 +1481,7 @@ describe("run ownership (cross-process sweep)", () => {
         // requested model, not the agent file.
         const out = (await stub
           .getTool("subagent")
-          .execute("t1", { agent: "healthcheck", task: "a self-contained task", model: "fallback/auto" }, undefined, () => {}, {})) as {
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task", model: "fallback/auto" }, undefined, () => {}, toolCtx)) as {
           content: { text: string }[];
           details: { ok: boolean };
         };
@@ -1380,7 +1491,7 @@ describe("run ownership (cross-process sweep)", () => {
         // A ref the item grammar rejects is refused the same way.
         const out2 = (await stub
           .getTool("subagent")
-          .execute("t2", { agent: "healthcheck", task: "a self-contained task", model: "bad ref:" }, undefined, () => {}, {})) as {
+          .execute("t2", { agent: "healthcheck", task: "a self-contained task", model: "bad ref:" }, undefined, () => {}, toolCtx)) as {
           content: { text: string }[];
           details: { ok: boolean };
         };
@@ -4361,7 +4472,7 @@ describe("the launch window (registered, pane not yet attached)", () => {
   async function startSpawn(stub: ReturnType<typeof stubPi>) {
     const pending = stub
       .getTool("subagent")
-      .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {}) as Promise<{
+      .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, toolCtx) as Promise<{
       content: Array<{ text: string }>;
       details: { ok: boolean };
     }>;
@@ -4565,7 +4676,7 @@ describe("the launch window (registered, pane not yet attached)", () => {
       try {
         const out = (await stub
           .getTool("subagent")
-          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, {})) as {
+          .execute("t1", { agent: "healthcheck", task: "a self-contained task" }, undefined, () => {}, toolCtx)) as {
           content: Array<{ text: string }>;
           details: { ok: boolean };
         };

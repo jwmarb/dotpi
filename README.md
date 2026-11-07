@@ -209,6 +209,23 @@ No model column on purpose: a hand-copied one drifts from the frontmatter the mo
 Every agent declares `model` + `fallback_models`, and together they are that agent's **runtime** model chain: the child runs on `fallback/auto` and walks that chain when its own model calls fail (provider down, rate-limited, unknown model) — not when it fails its task. A declaration with no usable reference is refused before launch. The handoff machinery (`childFallbackChain`, `PI_FALLBACK_CHAIN`) is owned by [agent/extensions/subagent-herdr/AGENTS.md](agent/extensions/subagent-herdr/AGENTS.md); the user-facing walkthrough is [docs/model-configuration.md](docs/model-configuration.md). Read-only agents carry no `write`/`edit`: the `tools` list is the enforcement.
 A child delegated a **kanban card** works by the list it keeps: it builds the card's steps into its `todo` list before other work, and `subagent_done` is refused (through the same bounded budget as a missing answer) while the list is empty or items are still open. The kanban board reads that list straight from the child's session file and renders per-card progress, so the list *is* the card's progress.
 
+### Repo-local agents and skills (`<REPO_ROOT>/.pi/`)
+
+Run pi from a checkout that carries its own `.pi/` and that tree layers over the active profile, project first:
+
+```
+<REPO_ROOT>/.pi/
+├── settings.json   # even `{}` — makes pi ask for trust (see below)
+├── agents/         # *.md, same frontmatter as agent/agents/; worker.md here replaces the global worker
+├── skills/         # <skill>/SKILL.md (or <category>/<skill>/SKILL.md), shadows a same-named global skill
+├── mcp.json        # pi core: project MCP servers / overrides
+└── SYSTEM.md, prompts/, themes/, extensions/   # pi core
+```
+
+Agents resolve first-wins by name — project agent, then profile agent, then agents shipped by project skills, then by profile skills — and the roster's **From** column shows `project` / `project skill: x`. Nothing in the project layer loads until pi trusts the project (the prompt on first run, or `--approve`). pi does not treat `agents/` alone as needing trust, so a `.pi/` holding *only* `agents/` would never be asked about: it is **ignored** until it also has a trust-requiring file such as `settings.json`. Delegated children in the same repo inherit the decision (`--approve`/`--no-approve`); a child in a *different* directory gets `--no-approve` when that directory is trust-requiring with no saved decision (a saved one is honored), and the `ralph-loop` gate's reviewer/verifier always stay the global ones.
+
+Prefer skills nested under `.pi/agents/` (`.pi/agents/skills/<skill>/SKILL.md`)? pi core loads them from `.pi/settings.json` → `{ "skills": ["agents/skills"] }` (project paths resolve from `.pi/`; live-checked: listed under `--approve`, absent under `--no-approve`). Such a dir is pi-catalogue-only, though: skill-shipped agents, `tools:` gating and a persona-switched prompt scan `.pi/skills/` alone, so keep a skill there when it ships agents or tools.
+
 ## Profiles 🛰
 
 A *profile* is an agent directory under the repo root, and pi runs it as its whole configuration. The switch is `PI_CODING_AGENT_DIR` — an env var **both** the bun `pi` and the Pi-Bolt executable read, and the only mechanism that works on both (neither exposes an `--agent-dir` flag at 1.4.0). Bare `pi` and bare `pi-bolt` need no launcher: they are the default orchestrator, `~/.pi/agent` — canonical, never moved. Non-default personas launch from `scripts/pi-profile.sh` (sourced from `~/.bashrc`):

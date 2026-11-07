@@ -55,6 +55,7 @@ Continuations go through `setTimeout(…, 0)` inside a `try/catch` (a throw in a
   loop running inside a delegated child inherits that child's chain. It is not reentrant, so gates must run one at a time.
 - The `verifying` latch is cleared in `finally` (`index.ts:432-434`). If it is not, the loop wedges.
 - Gate agents come from `agentsDir()`, so under a `/agent quant` switch the gate has no reviewer or verifier to use.
+  They never come from a repo's `.pi/agents/` (by design, `gate-agent.ts`): a repo that could rewrite its own gate could make it approve everything.
 
 ## COMMANDS
 

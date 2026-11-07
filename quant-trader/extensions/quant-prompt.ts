@@ -17,14 +17,15 @@
  *
  * @module quant-prompt
  */
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { hasTrustRequiringProjectResources, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   delegationRoster,
   LINEAGE_ENV,
   parseLineage,
   type AgentInfo,
 } from './lib/agents.js';
-import { agentsDir, skillsDir } from './lib/layout.js';
+import { profileDir, skillsDir } from './lib/layout.js';
+import { projectRoots, TrustRequiringSnapshot } from './lib/project-layer.js';
 import { personaOverride } from './lib/persona.js';
 import { SkillActivation } from './lib/skill-activation.js';
 import { groupByCategory } from './lib/skill-categories.js';
@@ -325,11 +326,16 @@ export default function (pi: ExtensionAPI) {
   // use. Sticky, and rebuilt per session — `systemPromptOptions.skills` is the
   // catalogue of every discovered skill on every turn, not the loaded set.
   const activation = new SkillActivation();
+  // The trust gate's second half, frozen per session: pi decides trust once per
+  // session, and a trust-requiring resource created mid-session must not open
+  // the project layer on the next turn (the trap project-layer.ts's header
+  // names). Reset at every session_start, probed at first use.
+  const trustSnapshot = new TrustRequiringSnapshot(hasTrustRequiringProjectResources);
 
   // Only a genuinely new conversation resets the set. `startup` needs no reset
   // (the set is already empty).
   pi.on('session_start', async (event) => {
-    if (event.reason === 'new' || event.reason === 'resume') activation.reset();
+    trustSnapshot.reset();
   });
 
   // A model-invoked skill arrives as a read_skill/read of a SKILL.md, never in the
@@ -366,11 +372,19 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Everything that touches disk or env is loaded here; buildQuantPrompt is pure.
+    // The trust rule (the single owner of the rationale is project-layer.ts's
+    // header): project roots load only when the project is trusted AND it
+    // carries trust-requiring resources.
+    const roots = projectRoots({
+      profileDir: profileDir(),
+      cwd: ctx.cwd,
+      isProjectTrusted: ctx.isProjectTrusted(),
+      hasTrustRequiringResources: trustSnapshot.get(ctx.cwd),
+    });
     const library = skillsDir();
     const lineage = parseLineage(process.env[LINEAGE_ENV]);
     const roster = await delegationRoster({
-      agentsDir: agentsDir(),
-      skillsDir: library,
+      roots,
       lineage,
       activeSkills: activation.list(),
     });
@@ -388,7 +402,10 @@ export default function (pi: ExtensionAPI) {
       lineage,
       owners: new Map(),
       isActive: () => false,
-      skillsLibrary: library,
+      // The category lookup needs the ordered roots (project layer included
+      // when the trust rule admitted it); the builder field below stays the
+      // profile's single library.
+      skillsLibrary: roots.skillsDirs,
     });
 
     const quantPrompt = buildQuantPrompt({

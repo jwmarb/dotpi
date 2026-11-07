@@ -243,6 +243,42 @@ describe("the quality pass is gated on the grading agents existing", () => {
     expect(section).not.toContain("${");
   });
 });
+describe("the agent inventory's From column renders provenance", () => {
+  // The table is the only place the model sees where an agent came from, so
+  // each of the four provenances must render its own label — a project agent
+  // shipped by a project skill, a skill's agent, a project agent, a global one.
+  const agent = (name: string, extra: Partial<AgentInfo> = {}) =>
+    ({ name, description: "d", model: "m", tools: [], source: "global", ...extra }) as never;
+
+  // The From column is the table's last cell; the test values carry no pipes,
+  // so a plain split is safe.
+  const fromCellOf = (prompt: string, name: string): string => {
+    const line = prompt.split("\n").find((l) => l.startsWith(`| ${name} |`));
+    if (!line) return "";
+    const cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split(" | ").map((c) => c.trim());
+    return cells[cells.length - 1];
+  };
+
+  test("a project agent shipped by a project skill says 'project skill: <name>'", () => {
+    const p = build({ agentInventory: [agent("journal-agent", { skill: "journal", origin: "project" })] });
+    expect(fromCellOf(p, "journal-agent")).toBe("project skill: journal");
+  });
+
+  test("a skill's agent says 'skill: <name>'", () => {
+    const p = build({ agentInventory: [agent("journal-agent", { skill: "journal" })] });
+    expect(fromCellOf(p, "journal-agent")).toBe("skill: journal");
+  });
+
+  test("a project agent says 'project'", () => {
+    const p = build({ agentInventory: [agent("project-agent", { origin: "project" })] });
+    expect(fromCellOf(p, "project-agent")).toBe("project");
+  });
+
+  test("a global agent says 'global'", () => {
+    const p = build({ agentInventory: [agent("global-agent")] });
+    expect(fromCellOf(p, "global-agent")).toBe("global");
+  });
+});
 
 describe("the planning section is gated on the planner agent existing", () => {
   // Same gate as the questionnaire and the quality pass: a prompt that orders a
@@ -1583,7 +1619,10 @@ describe("the before_agent_start handler", () => {
         promptGuidelines: [],
       },
     };
-    const result = await startHandler!(event as never, undefined as never);
+    // The handler reads trust from the event's ctx; an untrusted stub cwd keeps
+    // the roots profile-only, so the scan this test asserts on is unchanged.
+    const ctx = { cwd: "/work/repo", isProjectTrusted: () => false } as never;
+    const result = await startHandler!(event as never, ctx);
     return {
       result,
       selectedTools: event.systemPromptOptions.selectedTools as string[],
@@ -1616,6 +1655,123 @@ describe("the before_agent_start handler", () => {
     expect(prompt).toContain("## Core Responsibilities");
     // No skill-owned tools in the stub tree, so the gate leaves the list alone.
     expect(selectedTools).toEqual(["read", "bash"]);
+  });
+/**
+   * The `start` helper with a real project cwd and a chosen trust state: the
+   * trusted-path tests need `hasTrustRequiringProjectResources(cwd)` to see a
+   * real `.pi/settings.json`, so the cwd is a tmp dir, not the stub `/work/repo`.
+   */
+  async function startAt(cwd: string, trusted: boolean, selectedTools: string[]) {
+    const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
+    dynamicExtension({
+      on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+        handlers.set(name, handler);
+      },
+    } as never);
+    const startHandler = handlers.get("before_agent_start")!;
+    const event = {
+      messageType: "user",
+      prompt: "",
+      systemPromptOptions: {
+        cwd,
+        selectedTools,
+        skills: [],
+        contextFiles: [],
+        promptGuidelines: [],
+      },
+    };
+    const result = await startHandler(event as never, { cwd, isProjectTrusted: () => trusted } as never);
+    return (result as { systemPrompt: string } | undefined)?.systemPrompt ?? "";
+  }
+
+  /** A tmp project dir: `.pi/settings.json` (trust-requiring) + one project agent. */
+  function projectTree() {
+    const tmp = mkdtempSync(join(tmpdir(), "dp-project-trusted-"));
+    mkdirSync(join(tmp, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(tmp, ".pi", "settings.json"), "{}");
+    writeFileSync(
+      join(tmp, ".pi", "agents", "e2e-agent.md"),
+      "---\nname: e2e-agent\ndescription: Project-layer e2e marker\ncallable_by: any\n---\n# E2E\n",
+    );
+    return tmp;
+  }
+
+  /**
+   * Like `startAt`, but reuses ONE extension instance (one handler map, one
+   * trust snapshot) across turns — the freeze test needs the same handlers to
+   * run three times with a `session_start` in between.
+   */
+  function oneSession() {
+    const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
+    dynamicExtension({
+      on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+        handlers.set(name, handler);
+      },
+    } as never);
+    const startHandler = handlers.get("before_agent_start")!;
+    const turn = async (cwd: string, trusted: boolean) => {
+      const event = {
+        messageType: "user",
+        prompt: "",
+        systemPromptOptions: {
+          cwd,
+          selectedTools: ["read", "subagent"],
+          skills: [],
+          contextFiles: [],
+          promptGuidelines: [],
+        },
+      };
+      const result = await startHandler(event as never, { cwd, isProjectTrusted: () => trusted } as never);
+      return (result as { systemPrompt: string } | undefined)?.systemPrompt ?? "";
+    };
+    return {
+      turn,
+      sessionStart: async (reason: string) => {
+        await handlers.get("session_start")!({ reason } as never, {} as never);
+      },
+    };
+  }
+
+  /** A tmp project dir with ONLY `.pi/agents/` — no trust-requiring resource. */
+  function agentsOnlyTree() {
+    const tmp = mkdtempSync(join(tmpdir(), "dp-agents-only-"));
+    mkdirSync(join(tmp, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".pi", "agents", "e2e-agent.md"),
+      "---\nname: e2e-agent\ndescription: Project-layer e2e marker\ncallable_by: any\n---\n# E2E\n",
+    );
+    return tmp;
+  }
+
+  test("a trusted project's agent loads into the roster, marked project", async () => {
+    const tmp = projectTree();
+    const prompt = await startAt(tmp, true, ["read", "subagent"]);
+    expect(prompt).toContain("## Available Agents");
+    expect(prompt).toContain("| e2e-agent | Project-layer e2e marker | default | all | project |");
+  });
+
+  test("an untrusted project's agent stays out of the roster", async () => {
+    const tmp = projectTree();
+    const prompt = await startAt(tmp, false, ["read", "subagent"]);
+    expect(prompt).not.toContain("e2e-agent");
+  });
+
+  test("the trust gate's second half is frozen per session: a settings.json written mid-session does not open it until the next session_start", async () => {
+    setPersonaOverride(undefined);
+    const tmp = agentsOnlyTree();
+    const session = oneSession();
+    // Turn 1: an agents-only `.pi` carries no trust-requiring resource, so the
+    // probe says false and the project agent is out even though trusted.
+    expect(await session.turn(tmp, true)).not.toContain("e2e-agent");
+    // Mid-session, something creates the trust-requiring resource (the model,
+    // a script, a git pull).
+    writeFileSync(join(tmp, ".pi", "settings.json"), "{}");
+    // Turn 2: same handlers, same session — the frozen probe still says no.
+    expect(await session.turn(tmp, true)).not.toContain("e2e-agent");
+    // A new session re-decides: pi re-runs the trust decision, the snapshot
+    // resets, the probe re-reads disk, and the agent joins.
+    await session.sessionStart("new");
+    expect(await session.turn(tmp, true)).toContain("e2e-agent");
   });
 });
 describe("the tool_call handler", () => {
@@ -1668,6 +1824,23 @@ describe("the tool_call handler", () => {
       });
     }
     try {
+      // Prime the module-scoped `lastRoots` for THIS suite's agentRoot: the
+      // `tool_call` refresh reads `lastRoots?.skillsDirs`, and a stale value from
+      // an earlier suite would scan the wrong (empty) skills dir.
+      await handlers.get("before_agent_start")!(
+        {
+          messageType: "user",
+          prompt: "",
+          systemPromptOptions: {
+            cwd: agentRoot,
+            selectedTools: ["read", "bash"],
+            skills: [],
+            contextFiles: [],
+            promptGuidelines: [],
+          },
+        } as never,
+        { cwd: agentRoot, isProjectTrusted: () => false } as never,
+      );
       const handler = handlers.get("tool_call");
       expect(handler).toBeDefined();
       await handler!(

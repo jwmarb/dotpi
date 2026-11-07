@@ -274,6 +274,9 @@ describe("the before_agent_start handler", () => {
     selectedTools: string[];
     lineage?: string;
     appendSystemPrompt?: string;
+    cwd?: string;
+    trusted?: boolean;
+    skills?: Array<{ name: string; description: string; filePath: string }>;
   }) {
     const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
     quantExtension({
@@ -286,20 +289,26 @@ describe("the before_agent_start handler", () => {
     const originalLineage = process.env[LINEAGE_ENV];
     if (overrides.lineage === undefined) delete process.env[LINEAGE_ENV];
     else process.env[LINEAGE_ENV] = overrides.lineage;
+    // `cwd`/`trusted`/`skills` are the project-layer test shape: a real tmp
+    // project dir and a chosen trust state, with pi's own skill list supplied
+    // the way pi would supply it (project skills only when trusted).
+    const cwd = overrides.cwd ?? "/work/desk";
+    const trusted = overrides.trusted ?? false;
     try {
       const event = {
         messageType: "user",
         prompt: "",
         systemPromptOptions: {
-          cwd: "/work/desk",
+          cwd,
           selectedTools: overrides.selectedTools,
-          skills: [],
+          skills: overrides.skills ?? [],
           contextFiles: [],
           promptGuidelines: [],
           appendSystemPrompt: overrides.appendSystemPrompt,
         },
       };
-      const result = (await startHandler!(event as never, undefined as never)) as {
+      const ctx = { cwd, isProjectTrusted: () => trusted } as never;
+      const result = (await startHandler!(event as never, ctx)) as {
         systemPrompt: string;
       };
       return {
@@ -388,6 +397,47 @@ describe("the before_agent_start handler", () => {
     const off = await start({ selectedTools: ["read"] });
     expect(off.systemPrompt).not.toContain("market-scout");
   });
+
+  /** A tmp project dir: `.pi/settings.json` + one project agent + one FLAT project skill. */
+  function projectTree() {
+    const tmp = mkdtempSync(join(tmpdir(), "quant-project-"));
+    mkdirSync(join(tmp, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(tmp, ".pi", "settings.json"), "{}");
+    writeFileSync(
+      join(tmp, ".pi", "agents", "desk-agent.md"),
+      "---\nname: desk-agent\ndescription: Project desk marker\ncallable_by: any\n---\n# Desk\n",
+    );
+    mkdirSync(join(tmp, ".pi", "skills", "proj-skill"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".pi", "skills", "proj-skill", "SKILL.md"),
+      "---\nname: proj-skill\ndescription: Flat project skill\n---\nBody.\n",
+    );
+    return tmp;
+  }
+
+  test("a trusted project's agent joins the roster and its flat skill gets the 'project' category; untrusted keeps both out", async () => {
+    const tmp = projectTree();
+    // pi lists a project skill in systemPromptOptions.skills only while the
+    // project layer is trusted — the trusted call simulates that with one
+    // entry, the untrusted one with an empty list.
+    const trusted = await start({
+      selectedTools: ["read", "subagent"],
+      cwd: tmp,
+      trusted: true,
+      skills: [
+        { name: "proj-skill", description: "Flat project skill", filePath: join(tmp, ".pi", "skills", "proj-skill", "SKILL.md") },
+      ],
+    });
+    expect(trusted.systemPrompt).toContain("| desk-agent |");
+    expect(trusted.systemPrompt).toContain("**project**");
+    // Not under the profile library, so its line carries the full path inline.
+    expect(trusted.systemPrompt).toContain("**project**\n- **proj-skill**");
+    expect(trusted.systemPrompt).toContain("— Flat project skill");
+
+    const untrusted = await start({ selectedTools: ["read", "subagent"], cwd: tmp, trusted: false, skills: [] });
+    expect(untrusted.systemPrompt).not.toContain("desk-agent");
+    expect(untrusted.systemPrompt).not.toContain("proj-skill");
+  });
 });
 
 describe("the persona yield", () => {
@@ -433,7 +483,8 @@ describe("the persona yield", () => {
         promptGuidelines: [],
       },
     };
-    const result = await startHandler!(event as never, undefined as never);
+    const ctx = { cwd: "/work/desk", isProjectTrusted: () => false } as never;
+    const result = await startHandler!(event as never, ctx);
     return { result, selectedTools: event.systemPromptOptions.selectedTools as string[] };
   }
 
