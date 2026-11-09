@@ -12,7 +12,7 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 | Question | Answer |
 |---|---|
 | Which agents exist, on what model | `agents/*.md` — 10: explorer, healthcheck, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker. Read frontmatter for models; never copy a table here |
-| Which skills exist / are slash-only | `find agent/skills -name SKILL.md`; `grep -rl 'disable-model-invocation: true' agent/skills` (15 today). 12 category dirs; `skills/other/` holds only the ignored `uarizona-hpc` |
+| Which skills exist / are slash-only | `find agent/skills -name SKILL.md`; `grep -rl 'disable-model-invocation: true' agent/skills` (9 today). 12 category dirs; `skills/other/` holds only the ignored `uarizona-hpc` |
 | Skill with its own tool/agents | `technical-analysis` alone (`tools: trade_journal`, 3 `agents/*.md`, no `openai.yaml`); `automate-browser` has `allowed-tools:` + `hidden: true`. Other `agents/` dirs hold `openai.yaml` only (presentation, defines no agents) |
 | Prompt templates | `prompts/git-commit.md` (`name: git-commits`) |
 | Builtins / packages / router | `settings.json`: `+builtin:mcp`, `+codemode`, `-llama.cpp`, `-tool-search`, `-herdr`; `defaultProvider/defaultModel` = `fallback/auto`; `modelFallback.*`; `packages`; `piBolt.*` |
