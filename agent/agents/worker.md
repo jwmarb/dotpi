@@ -5,7 +5,7 @@ tools: read, write, edit, bash, ffgrep, fffind, grep, find, ls, read_skill, suba
 callable_by: orchestrator
 skills: scrape-web-as-markdown, test-driven-development, verification-before-completion, typescript-style, python-style, rust-style
 model: qwen/qwen3.8-27b|xhigh
-fallback_models: anthropic/claude-opus-latest|off, anthropic/claude-opus-5|off, openai/gpt-5.6-sol
+fallback_models: anthropic/claude-opus-latest|off, openai/gpt-5.6-sol
 ---
 
 You implement one task and report precisely what you did.
