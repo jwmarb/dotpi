@@ -1,7 +1,7 @@
 # ralph-loop — settle-driven completion loop, plus the oracle/verifier `--verify` gates and their Docker images
 
 The command surface, the completion tag and the `--verify` modes are in the root `AGENTS.md`. This file covers
-the internals. Line refs were checked on 2026-10-31.
+the internals. Line refs were checked on 2026-11-10.
 
 ## WHERE TO LOOK
 
@@ -9,13 +9,13 @@ the internals. Line refs were checked on 2026-10-31.
 |---|---|
 | `index.ts` (754) | Session wiring only: loop state, footer, the three `registerCommand`s (`:728-744`), and the `agent_settled` handler (`:334`), which is the whole contract |
 | `lib.ts` (849) | Pure logic with **zero imports**: `parseArgs` (`:180`, the one place verify mode is decided), `detectCompletion` (`:264`), fingerprinting, prompt rendering, verdict parsing, and `decideVerificationTransition` (`:628`) |
-| `gate-agent.ts` (99) | `resolveGateAgent` (`:68`) reads `agents/<name>.md` via `agentsDir()` and returns `{chain, tools, promptBody}`. It is the one seam both gates use |
+| `gate-agent.ts` (105) | `resolveGateAgent` (`:68`) reads `agents/<name>.md` via `join(agentsDir(), …)` (`:79`) and returns `{chain, tools, promptBody}`. It is the one seam both gates use |
 | `gate.ts` (251) | Static gate (`oracle`): `captureBaseline` (`:108`), `withChainEnv` (`:70`), `runGate` |
 | `runtime-gate.ts` (320) | Runtime gate (`verifier`, `RUNTIME_TIMEOUT_MS` 600 s `:61`, `parseRuntimeVerdict` `:74`). The docker-run recipe is *prompt text* for the verifier. This code never runs the tests itself |
 | `image.ts` (612) | `ensureImage` (`:513`): project profile and digest, web detection, Dockerfile synthesis, base-image build. Docker is used only for `image inspect`/`version`/`build` |
 | `lib.test.ts` | The only suite (it also imports `index.js` for `GATE_FALLBACK_MODEL`) |
 
-## THE SETTLE HANDLER (`index.ts:334-405`), in order
+## THE SETTLE HANDLER (`index.ts:334-404`), in order
 
 1. Bail while `stopping`/`awaitingDecision`/`verifying`. Yield if `ctx.hasPendingMessages()`.
 2. If `lastStop` is `aborted`, stop as cancelled. If it is `error`, stop as error.
@@ -35,7 +35,7 @@ Continuations go through `setTimeout(…, 0)` inside a `try/catch` (a throw in a
 - Static runs first and short-circuits on any non-approve. Runtime runs only for `runtime|both`.
   `DEFAULT_MAX_VERIFICATIONS` = 3 (`lib.ts:348`). The static timeout is 180 s (`lib.ts:351`).
 - `inconclusive` is a first-class verdict. It **stops the loop** and never approves. The causes include no Docker
-  daemon, no manifest and an unbuildable image (`image.ts:518-554`).
+  daemon (`image.ts:518-523`), no manifest (`:549-555`) and a failed image build (`:565-591`).
 - The gate children are headless `piExecutable() -p --no-session --model fallback/auto --tools …`, with the chain
   set as `PI_FALLBACK_CHAIN` by `withChainEnv`. Never pass `--provider` or `--no-extensions`, because the serving
   provider is `litellm.ts`, which is an extension. If an agent file has no `model`, the fallbacks are `oracle` →
@@ -53,7 +53,7 @@ Continuations go through `setTimeout(…, 0)` inside a `try/catch` (a throw in a
   `CHAIN_ENV` and `FALLBACK_MODEL_REF` come from `../model-fallback/lib.js`.
 - `withChainEnv` mutates `process.env` and **restores the previous value** rather than deleting it, because a
   loop running inside a delegated child inherits that child's chain. It is not reentrant, so gates must run one at a time.
-- The `verifying` latch is cleared in `finally` (`index.ts:432-434`). If it is not, the loop wedges.
+- The `verifying` latch is cleared in `finally` (`index.ts:575-577`; `finish` clears it too at `:435`). Else the loop wedges.
 - Gate agents come from `agentsDir()`, so under a `/agent quant` switch the gate has no reviewer or verifier to use.
   They never come from a repo's `.pi/agents/` (by design, `gate-agent.ts`): a repo that could rewrite its own gate could make it approve everything.
 

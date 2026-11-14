@@ -71,7 +71,7 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
   `trust.json`, `run-history.jsonl`, `settings.json.bak`, `*.log`. **Exception:** tracked
   `pi-blackhole/pi-blackhole-config.json` (edit directly or `/blackhole settings`). Ignore shapes differ
   (contents vs path); check `git check-ignore -v <path>`.
-- `du`/`grep -r` over all of `agent/` (~1.1 GB: runs, sessions, skill `node_modules`, npm).
+- `du`/`grep -r` over all of `agent/` (~1.9 GB: runs, sessions, skill `node_modules`, npm).
 - Following `git/github.com/obra/superpowers/AGENTS.md` — the vendored package's guide, not this repo's.
 - Editing `docker/verify-base.Dockerfile` without building and running it; every line was a bug first.
 - Duplicating a skill to tweak a section, or restating one `superpowers` already ships.

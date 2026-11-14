@@ -12,9 +12,8 @@ have their own AGENTS.md.
 | `ask-user.ts` | `questionnaire` tool: TUI option list + free-text fallback |
 | `changed-files.ts` | `/changed-files`, `/diff`: session change widget (emits the event kanban listens to) |
 | `display-file.ts` | `display_file` tool: spawns the platform opener detached |
-| `dynamic-prompt.ts` | `before_agent_start`: replaces pi's system prompt. Registers no tool. 1051 lines |
-| `firecrawl-cli.ts` | Registers **nothing** (its factory takes no `pi`). Loads `agent/.env` so `FIRECRAWL_API_URL` reaches `process.env`, and sets the no-telemetry/no-update env |
-| `git-hooks.ts` | On `startup` only: arms `core.hooksPath`, then runs `setup-deps.ps1` on Windows or `setup-deps.sh` |
+| `dynamic-prompt.ts` | `before_agent_start`: replaces pi's system prompt. Registers no tool. 1035 lines |
+| `git-hooks.ts` | On the `session_start` reason `startup` only (`:37`): arms `core.hooksPath`, then runs `setup-deps.ps1` on Windows or `setup-deps.sh` |
 | `init.ts` | `/init`: deterministic AGENTS.md tiering. Its `NESTED_LINE_RANGE` is the 30-80 budget these files obey |
 | `litellm.ts` | `async`. Fetches the model catalog at load and registers nothing if the host is unreachable. The pure `buildModels`/`thinkingLevelMapFor` are tested in `lib/litellm.test.ts`, and a reply with no `data` now warns |
 | `local.ts` | 7-line host shim: re-points the builtin `openai` provider at a LAN host. It is tracked and loads on every machine |
@@ -25,7 +24,7 @@ have their own AGENTS.md.
 | `thinking-indicator.ts` | alt+t spinner + `setHiddenThinkingLabel`. Most hooks of any single file |
 | `todo.ts` | `todo` tool + `/todos`. **Registered only in a subagent child** (`PI_SUBAGENT_RUN_ID`, `:166`) |
 | `auto-update/` | `/update` + `pi_update` tool. The pure `compareSemver` (semver prerelease order) and `planUpdateCheck` are tested in `lib/auto-update.test.ts`; a failed check is reported as an error, never as "up to date" |
-| `persona/` | `/agent` in-session profile switch (`index.ts` wiring, `lib.ts` pure, including the single prompt-kind reader `promptKindOf`). Has its **own `tsconfig.json`** scope |
+| `persona/` | `/agent` in-session profile switch (`index.ts` wiring, `lib.ts` pure, including the single prompt-kind reader `promptKindOf`). A profile is any non-dot sibling of `agentDir()` holding `settings.json`; the switch keeps `PI_CODING_AGENT_DIR` and only `profileDir()` follows the override. Per-profile MCP comes from `<dir>/persona-mcp.json` (registered before the child-bail-out, so children get MCP only); `PI_AGENT_PERSONA` switches at startup, `PI_PERSONA_PROBE_FILE` writes the probe. Has its **own `tsconfig.json`** scope, no AGENTS.md of its own |
 | `trade-journal/` | `trade_journal` tool. `AGENTIC_TRADING_JOURNAL` overrides the journal dir |
 
 ## lib/ — module → consumers (no AGENTS.md of its own, by decision)
@@ -44,8 +43,11 @@ have their own AGENTS.md.
 | `dotenv.ts`, `git-env.ts` | `.env` parser; git env scrub · firecrawl-cli, litellm; changed-files, init |
 | single-consumer | `skill-categories.ts` (dynamic-prompt), `startup-images.ts` + `distro-logos.ts` (startup-fetch; logo arrays are **generated** art, do not hand-edit), `trade-journal-store.ts` (trade-journal; kept here as the journal grammar) |
 
-The lib graph has no cycles. Suite names do not map 1:1 to modules: `skill-catalogue.test.ts` walks the live tree,
-`profiles.test.ts` checks the real profile trees (no `dynamic-prompt.ts` by name or by realpath, only symlinks into `agent/` or pinned own files, `.env`/`sessions/` gitignored), and `dynamic-prompt.test.ts`/`sessions.test.ts` test top-level files. Count them with `ls lib/*.ts`.
+The lib graph has no cycles: 16 modules + 24 suites (`ls lib/*.ts`), and suite names do not map 1:1 to modules —
+`skill-catalogue.test.ts` walks the live tree, `profiles.test.ts` checks the real profile trees (no `dynamic-prompt.ts`
+by name or by realpath, only symlinks into `agent/` or pinned own files, `.env`/`sessions/` gitignored), and
+`dynamic-prompt.test.ts`/`sessions.test.ts`/`sleep.test.ts`/`init.test.ts`/`changed-files.test.ts`/`startup-fetch.test.ts`
+test top-level files through `../<name>.js`.
 
 ## CONVENTIONS
 
@@ -57,9 +59,9 @@ The lib graph has no cycles. Suite names do not map 1:1 to modules: `skill-catal
 - **`lib/` imports no pi package.** `widget.ts` → `pi-tui` is the one exception. A throw there is a startup failure
   with no diagnostic, so `layout.ts` never throws and `dotenv.ts` defers `requireEnv`.
 - **Registration happens at load, before the session API exists.** A setting a registration depends on is read from
-  disk at import. `getActiveTools`/`setActiveTools` are not on every event's API (`dynamic-prompt.ts:116`), a tool
+  disk at import. `getActiveTools`/`setActiveTools` are not on every event's API (`dynamic-prompt.ts:149`), a tool
   gained mid-run appears on the **next** run, and there is **no `unregisterTool`**.
-- **The two prompt builders yield to a persona switch.** `dynamic-prompt.ts:147` and `quant-prompt.ts` return
+- **The two prompt builders yield to a persona switch.** `dynamic-prompt.ts:180` and `quant-prompt.ts:362` return
   `undefined` while `personaOverride()` is set. Do not rely on filename load order.
 - **`dynamic-prompt.ts` states grading exactly once per install.** With a grader installed that statement
   lives in `## Quality Pass` (one pass per deliverable), and the planning and delegation sections only point
