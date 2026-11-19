@@ -2,8 +2,8 @@
 name: healthcheck
 description: Read-only diagnosis of a stalled or unanswered delegated subagent run. Inspects the target's run directory (meta.json, .exit sidecar, reports, system prompt, and the JSONL transcript) incrementally and returns the target's status, what happened, findings/work so far, and a recommendation. Spawned automatically by the subagent-herdr extension, not normally delegated by hand.
 tools: read, bash, ffgrep, fffind, grep, find, ls
-model: openai/gpt-5.6-sol
-fallback_models: anthropic/claude-opus-latest|off, qwen/qwen3.8-27b
+model: qwen/qwen3.8-flash-next
+fallback_models: deepseek/deepseek-v4-flash
 callable_by: orchestrator
 # `orchestrator` names no agent file; only the empty lineage (the human's orchestrator process) passes `lineageRejection`.
 ---
