@@ -108,6 +108,9 @@ herdr.jsonl
 # Loose scratch files from debugging sessions.
 g.jsonl
 o3.raw
+# A browser-automation probe a session evaluated against a shadow DOM to find a
+# component's real tag name. Re-derive it in the next session that needs it.
+stage-tag.js
 
 # ---- Local caches -----------------------------------------------------------
 */fff/
