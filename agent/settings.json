@@ -83,7 +83,7 @@
   },
   "extensionChangelogVersions": {
     "{\"source\":\"git:github.com/samfoy/pi-lsp-extension\",\"scope\":\"user\"}": "1.4.0",
-    "{\"source\":\"npm:pi-better-edit\",\"scope\":\"user\"}": "2.18.0",
+    "{\"source\":\"npm:pi-better-edit\",\"scope\":\"user\"}": "2.19.0",
     "{\"source\":\"npm:pi-blackhole\",\"scope\":\"user\"}": "0.5.18"
   }
 }
