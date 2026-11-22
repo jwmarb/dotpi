@@ -246,16 +246,35 @@ describe("the lib/ table in agent/extensions/AGENTS.md", () => {
     // checkout at two paths (`~/.pi` and the host path), and realpath cannot
     // collapse a bind mount even though both names reach one directory. Two
     // genuinely different trees never share an inode.
-    const here = statSync(EXT_ROOT);
-    const mine = statSync(CHECKOUT_ROOT);
+    const idOf = (p: string): { dev: number; ino: number } | undefined => {
+      try {
+        const s = statSync(p);
+        return { dev: s.dev, ino: s.ino };
+      } catch {
+        return undefined;
+      }
+    };
+    const here = idOf(EXT_ROOT);
+    const mine = idOf(CHECKOUT_ROOT);
+    const advice = [
+      `this suite walks ${EXT_ROOT}, which is not the checkout it lives in (${CHECKOUT_ROOT}).`,
+      "It would otherwise assert another tree's invariants and pass.",
+      "Point HOME/PI_CODING_AGENT_DIR at this checkout - the working directory does not decide it.",
+    ].join("\n");
+    // A missing root must still report the advice, not a bare syscall error.
+    expect(here, advice).toBeDefined();
+    expect(mine, advice).toBeDefined();
+    expect(`${here!.dev}:${here!.ino}`, advice).toBe(`${mine!.dev}:${mine!.ino}`);
+    // This pin's own non-vacuity guard: a filesystem that synthesizes a constant
+    // inode would make the line above compare `0:0` to `0:0` and pass for any tree.
     expect(
-      `${here.dev}:${here.ino}`,
+      [here!.dev, here!.ino, mine!.dev, mine!.ino].every((n) => Number.isInteger(n) && n !== 0),
       [
-        `this suite walks ${EXT_ROOT}, which is not the checkout it lives in (${CHECKOUT_ROOT}).`,
-        "It would otherwise assert another tree's invariants and pass. Run it from the repo,",
-        "or point HOME/PI_CODING_AGENT_DIR at this checkout.",
+        `cannot trust the checkout pin on this filesystem: ${EXT_ROOT} is`,
+        `${here!.dev}:${here!.ino} and ${CHECKOUT_ROOT} is ${mine!.dev}:${mine!.ino}.`,
+        "A zero or non-integer device/inode means two different trees could compare equal.",
       ].join("\n"),
-    ).toBe(`${mine.dev}:${mine.ino}`);
+    ).toBe(true);
   });
   test("walks a real tree: modules and rows both exist (the non-vacuity guard)", () => {
     // Without this, a typo'd root or a renamed heading yields zero modules and zero

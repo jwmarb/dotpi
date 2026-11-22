@@ -116,7 +116,6 @@ export interface RunEvidenceDeps {
   now(): number;
 }
 
-
 /**
  * A cheap fingerprint of a run's completion evidence: its session file's and
  * its `system-prompt.md`'s size and mtime. Revival extracts a failed run's

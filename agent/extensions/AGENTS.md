@@ -31,7 +31,7 @@ have their own AGENTS.md.
 | Module | Owns · imported by |
 |---|---|
 | `layout.ts` | Agent-dir path resolution. Never throws · dynamic-prompt, git-hooks, kanban, model-fallback, pi-bolt-host, ralph-loop, startup-fetch, subagent-herdr |
-| `settings.ts` | The load-safe `settings.json` seam. Reads merge project `.pi/settings.json` over the agent file with a **whole-object replace per key**; `{}` and never a throw. Both writers target the **global file only** and write it atomically (`<file>.<pid>.tmp` + `renameSync`), so a project's own key is never copied into the user's config — and a project pin therefore shadows those writes · model-fallback, startup-fetch |
+| `settings.ts` | The load-safe `settings.json` seam. Reads merge project `.pi/settings.json` over the agent file with a **whole-object replace per key**; `{}` and never a throw. The one writer, `patchSettingsKey`, targets the **global file only** and writes it atomically (`<file>.<pid>.tmp` + `renameSync`), so a project's own key is never copied into the user's config — and a project pin therefore shadows those writes · model-fallback, startup-fetch |
 | `project-layer.ts` | `projectRoots` (pi's two facts) + `TrustRequiringSnapshot` as the entry points, `resourceRoots` the low-level form; project-first agents/skills dirs for a cwd (`cwd/.pi`, trust-bypass rationale in its header) · dynamic-prompt, subagent-herdr |
 | `agents.ts` | `agents/*.md` + SKILL.md list grammar, lineage · dynamic-prompt, ralph-loop, subagent-herdr |
 | `runtime.ts` | Pi-Bolt detection, `piExecutable()` · auto-update, kanban, ralph-loop, subagent-herdr, startup-fetch, pi-bolt-host |

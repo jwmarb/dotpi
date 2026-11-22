@@ -37,8 +37,9 @@
  * ## One write rule (the writes)
  *
  * The one writer (`patchSettingsKey`) answers a user command, so it must not be
- * next start: a half-written `settings.json` is not a reported error but a
- * startup failure — pi's loader is a plain `JSON.parse`, and every load-time
+ * able to cost pi its next start: a half-written `settings.json` is not a
+ * reported error but a startup failure — pi's loader is a plain `JSON.parse`,
+ * and every load-time
  * reader in this repo would then see "no configuration". So a write goes to
  * `<file>.<pid>.tmp` and `renameSync` moves it into place; on any error the temp
  * file is removed and the caller is told `false`. The file is written as

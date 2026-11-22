@@ -198,7 +198,6 @@ describe("completionEvidence", () => {
   });
 });
 
-
 describe("inferredFromClause", () => {
   test("names the two sources with the exact display wording", async () => {
     const { reader } = world();

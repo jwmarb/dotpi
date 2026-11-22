@@ -16,7 +16,7 @@
  * Run from the repo root: `bun test agent/extensions/lib/settings.test.ts`
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -107,13 +107,12 @@ describe("readSettings / readSettingsKey", () => {
 	});
 });
 
-
 describe("patchSettingsKey", () => {
 	test("shallow-merges into the existing global namespace", () => {
 		writeGlobal(JSON.stringify({ other: 1, startupFetch: { mode: "cycle", height: 20 } }));
 		expect(patchSettingsKey("startupFetch", { style: "quad" })).toBe(true);
 		expect(globalJson()).toEqual({ other: 1, startupFetch: { mode: "cycle", height: 20, style: "quad" } });
-		expect(readdirSync(agent).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+		expect(readdirSync(agent)).toEqual(["settings.json"]);
 	});
 
 	test("creates the namespace when the key is absent", () => {
@@ -165,6 +164,7 @@ describe("patchSettingsKey", () => {
 	});
 	test("a missing file is an empty base, so the first write creates it", () => {
 		rmSync(settingsFile(), { force: true });
+		expect(existsSync(globalFile())).toBe(false);
 		expect(patchSettingsKey("startupFetch", { style: "quad" })).toBe(true);
 		expect(globalJson()).toEqual({ startupFetch: { style: "quad" } });
 	});

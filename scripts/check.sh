@@ -246,19 +246,33 @@ else
 	grouped=()
 	isolated=()
 	for suite in "${tests[@]}"; do
-		# The classifier's input is the suite's own text, so it is deliberately
-		# permissive about the spelling (`mock.module (` with a space, a newline
-		# before the specifier) and admits the known blind spot: a suite that
-		# mocks a builtin through an imported helper, or through a variable
-		# specifier, still lands in the grouped run. Nothing here can see that;
-		# the rule it enforces is the one the two mocking suites state in their
-		# own headers.
-		if grep -qE "mock\.module\([[:space:]]*['\"\`]node:" "$suite"; then
+		# The classifier's input is the suite's own text, so the pattern allows
+		# whitespace anywhere a formatter may insert it (`mock.module (` and a
+		# specifier on the next line both count) and reads the whole file as one
+		# record (`-z`) precisely so a line break cannot hide a match. It still
+		# cannot see a builtin mocked through an imported helper or a variable
+		# specifier: those land in the grouped run, which is why nothing below
+		# may quietly classify nothing.
+		if grep -Ezq "mock\.module[[:space:]]*\([[:space:]]*['\"\`]node:" "$suite"; then
 			isolated+=("$suite")
 		else
 			grouped+=("$suite")
 		fi
 	done
+
+	# Not "nothing to isolate": a suite that mocks a builtin moves into its own
+	# invocation, so an empty `isolated` while some suite still reads like a
+	# builtin-mocker means the pattern broke, not that the hazard went away. Fail
+	# loudly rather than let a classifier slip silently re-arm the shared process.
+	if [ ${#isolated[@]} -eq 0 ]; then
+		for suite in "${tests[@]}"; do
+			if grep -qE 'mock\.module' "$suite" && grep -qE 'node:' "$suite"; then
+				fails=$((fails + 1))
+				note "$red" "FAIL" "a suite looks like a builtin-mocker but none was isolated: $suite"
+				break
+			fi
+		done
+	fi
 
 	# One runner call per invocation, reported identically whatever the file list.
 	# Captured rather than piped so the exit code is the runner's, not `tail`'s, and
