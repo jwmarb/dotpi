@@ -55,6 +55,7 @@ import { completionSignal, type RunObservation } from "./run-lifecycle.js";
 import {
   ANCESTRY_ENV,
   ancestorLabel,
+  asRunRecord,
   CARD_ID_PATTERN,
   exitPath,
   formatExitSidecar,
@@ -1086,24 +1087,25 @@ describe("extractRunResult", () => {
     expect(completionSignal(false, silent)).toBe(false);
   });
 
-  test("the lifecycle's completed() and the factory's evidence read call the same predicate, bounded by the shared cap", () => {
+  test("the lifecycle's completed() and the evidence read call the same predicate, bounded by the shared cap", () => {
     // The completion predicate is spelled once in run-lifecycle.ts. This pin
     // fails if either call site drifts back to restating the rule. The regexes
-    // pin the rule — a one-line delegation, and the factory's evidence read
-    // passing the sidecar it checked itself (the local, `false` at that point)
-    // — not the formatting (variable names, line layout), so a layout change
-    // does not break the pin.
+    // pin the rule — a one-line delegation, and the evidence read (now
+    // `run-evidence.ts`, the read the factory's display arms and the reroute
+    // proof share) passing the sidecar it checked itself (the local, `false` at
+    // that point) — not the formatting (variable names, line layout), so a layout
+    // change does not break the pin.
     const lifecycle = readFileSync(new URL("./run-lifecycle.ts", import.meta.url), "utf-8");
-    const factory = readFileSync(new URL("./index.ts", import.meta.url), "utf-8");
+    const reader = readFileSync(new URL("./run-evidence.ts", import.meta.url), "utf-8");
     expect(/const completed = \(rec: RunRecord, result: RunResult\): boolean =>\s*completionSignal\(/.test(lifecycle)).toBe(true);
-    expect(/completionSignal\(sidecar,/.test(factory)).toBe(true);
-    // The wake path's evidence read is bounded: the factory passes the shared
+    expect(/completionSignal\(sidecar,/.test(reader)).toBe(true);
+    // The wake path's evidence read is bounded: the reader passes the shared
     // cap as the tail argument. Without it `extractRunResult` reverts to a
     // whole-transcript read on the serialized flush path (the corpus max is
     // 7.90 MB) and every test in this suite would still pass — so the call
     // site is pinned, not just the predicate.
     // A trailing comma is allowed: the pin guards the ARGUMENT, not the formatting.
-    expect(/extractRunResult\([\s\S]{0,60}?EVIDENCE_TAIL_BYTES\s*,?\s*\)/.test(factory)).toBe(true);
+    expect(/extractRunResult\([\s\S]{0,60}?EVIDENCE_TAIL_BYTES\s*,?\s*\)/.test(reader)).toBe(true);
     // And the cap itself: defined, and at most 4 MB — the corpus max (7.90
     // MB, measured 2026-10-30) is what the bound keeps off the serialized
     // path, so a cap above 4 MB is a whole-file read in disguise.
@@ -1802,6 +1804,16 @@ describe("rundir record shapes", () => {
       expect(isRunRecord({ runId: "sub-1", status })).toBe(true);
     }
     expect(isRunStatus("unknown")).toBe(false);
+  });
+
+  test("asRunRecord widens a run-id-only record without checking or copying", () => {
+    // The load/adoption tolerance `hasRunId` grants is carried into the registry
+    // by this one cast: the same object comes back, and the strict reader guard
+    // still refuses the record. Tolerance moved location; it did not grow.
+    const truncated = { runId: "sub-1" };
+    expect(hasRunId(truncated)).toBe(true);
+    expect(asRunRecord(truncated)).toBe(truncated);
+    expect(isRunRecord(truncated)).toBe(false);
   });
 
   test("readRunRecordFromDisk adopts a record with no status", () => {

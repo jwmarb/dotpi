@@ -8,16 +8,18 @@
 import { describe, expect, test } from "bun:test";
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
 import type { Notice, RunRecord } from "./rundir.js";
-import { DEFER_MAX_MS } from "./rundir.js";
+import { DEFER_MAX_MS, deferWithin, withinLifetime } from "./rundir.js";
 import type { LifecycleTransition, RunObservation, SweepResult } from "./run-lifecycle.js";
 import {
   createReleaseLedger,
+  foreignRunningRecord,
   LIVENESS_BACKSTOP_MS,
   MAX_DEGRADED_RELEASE_ATTEMPTS,
   NOTICE_COALESCE_MS,
   ownsRunningRecord,
   renderSpawnsBlock,
   SPAWNS_BLOCK_MAX_LINES,
+  undeliverableClause,
   withRerouteNote,
   type HealthCheckSpawnOutcome,
   type ReleaseLedgerDeps,
@@ -863,6 +865,57 @@ describe("ownsRunningRecord: who is allowed to tick", () => {
   });
 });
 
+describe("foreignRunningRecord / undeliverableClause: the query arms' two questions", () => {
+  // Both are conjunctions the `subagent_tasks` arms used to spell inline, so the
+  // assertions are the truth table itself — including which leg answers first.
+
+  test("foreignRunningRecord is the conjunction, not either leg", () => {
+    // foreign + running: the case the evidence inference exists for.
+    expect(foreignRunningRecord(rec({ runId: "sub-1401", ownerPane: FOREIGN }), OWN)).toBe(true);
+    // own + running: the owner's to probe and settle.
+    expect(foreignRunningRecord(rec({ runId: "sub-1402" }), OWN)).toBe(false);
+    // foreign + terminal: its own status already answers the question.
+    expect(
+      foreignRunningRecord(rec({ runId: "sub-1403", ownerPane: FOREIGN, status: "done", finishedAt: NOW }), OWN),
+    ).toBe(false);
+    // A legacy record (no `ownerPane`) is foreign to every pane, and so is one
+    // read by a process that does not know its own pane.
+    expect(foreignRunningRecord(rec({ runId: "sub-1404", ownerPane: undefined }), OWN)).toBe(true);
+    expect(foreignRunningRecord(rec({ runId: "sub-1405" }), undefined)).toBe(true);
+  });
+
+  test("undeliverableClause names the three reasons, and nothing when delivery is possible", () => {
+    const launching = new Set(["sub-1410"]);
+    expect(undeliverableClause(rec({ runId: "sub-1406", status: "failed" }), launching)).toBe(
+      "not running (failed)",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1410", paneId: undefined }), launching)).toBe(
+      "still launching",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1407", paneId: undefined }), launching)).toBe(
+      "no pane recorded",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1408" }), launching)).toBeUndefined();
+  });
+
+  test("the status leg answers before the paneless one", () => {
+    // A cancelled launch is both: the arms said "not running (cancelled)", never
+    // "no pane recorded", and `launching` is consulted only after `!paneId`.
+    const launched = new Set(["sub-1411"]);
+    expect(
+      undeliverableClause(rec({ runId: "sub-1411", paneId: undefined, status: "cancelled" }), launched),
+    ).toBe("not running (cancelled)");
+  });
+
+  test("it answers from the observed status argument, not the record in hand", () => {
+    // The interrupt arm's case: the never-throws seam reconciled the run and
+    // reported `done`, while the record it was handed is still `running`.
+    const running = rec({ runId: "sub-1412" });
+    expect(undeliverableClause(running, new Set(), "done")).toBe("not running (done)");
+    expect(running.status).toBe("running");
+  });
+});
+
 describe("renderSpawnsBlock: what a finished run left behind it", () => {
   const PARENT = rec({ runId: "sub-a000", startedAt: NOW - 60_000 });
   const child = (over: Partial<RunRecord> & { runId: string }) => ({
@@ -969,6 +1022,32 @@ describe("renderSpawnsBlock: what a finished run left behind it", () => {
       dir: "/runs/sub-b011",
     };
     expect(renderSpawnsBlock(legacyParent, [ancient], new Set(), NOW, noSidecars)).toBeUndefined();
+  });
+
+  test("a child exactly at the deferral bound is not printed on the fallback", () => {
+    // The boundary itself, not just past it: `deferWithin` excludes
+    // `NOW - DEFER_MAX_MS`, and the fallback prints only what `pendingSpawnsOf`
+    // could be holding, so neither reaches this child.
+    const legacyParent = rec({ runId: "sub-a003", paneId: "w1:p7", startedAt: NOW - 60_000 });
+    const boundary = {
+      rec: rec({ runId: "sub-b012", ownerPane: "w1:p7", startedAt: NOW - DEFER_MAX_MS }),
+      dir: "/runs/sub-b012",
+    };
+    expect(deferWithin(boundary.rec, NOW)).toBe(false);
+    expect(renderSpawnsBlock(legacyParent, [boundary], new Set(), NOW, noSidecars)).toBeUndefined();
+  });
+
+  test("the lifetime window includes a child that started at its parent's own instant", () => {
+    // Inclusive lower edge: the window starts at the parent's `startedAt`, so a
+    // record stamped in the same instant is its launch, not pane reuse.
+    const legacyParent = rec({ runId: "sub-a004", paneId: "w1:p7", startedAt: NOW - 60_000 });
+    const sameInstant = {
+      rec: rec({ runId: "sub-b013", ownerPane: "w1:p7", startedAt: NOW - 60_000 }),
+      dir: "/runs/sub-b013",
+    };
+    expect(withinLifetime(sameInstant.rec, legacyParent.startedAt)).toBe(true);
+    const text = renderSpawnsBlock(legacyParent, [sameInstant], new Set(), NOW, noSidecars)!;
+    expect(text).toContain("sub-b013");
   });
 
   test("a long fan-out is bounded and says how many it left out", () => {

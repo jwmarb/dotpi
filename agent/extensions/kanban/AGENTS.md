@@ -8,7 +8,7 @@ Line refs were checked on 2026-11-10. The files change often, so grep for the ex
 | Question | Answer |
 |---|---|
 | Op semantics, id minting, note rules | `lib.ts` `applyOp` (`:212`, pure: never mutates `prev`, throws `KanbanError` to refuse). `KanbanOp` (`:113`): add/move/note/rename/link/unlink/drop/clear_done — `show` is not an op, it short-circuits in `index.ts:561`. Column aliases (`todo`, `wip`, `doing`, …) are accepted for humans |
-| Caps | `lib.ts:100-111`: `MAX_CARDS` 200, `MAX_TITLE` 200 (enforced `:193`), `MAX_NOTE` 500 (`:199`), `MAX_RUNS_PER_CARD` 8, `MAX_ADD_PER_CALL` 20. The last is also written out by hand in `dynamic-prompt.ts:642` ("up to 20 titles per call"). The only link between them is a literal-string assertion in `lib/dynamic-prompt.test.ts:606`, so raising the cap fails nothing. Change all three together |
+| Caps | `lib.ts:100-111`: `MAX_CARDS` 200, `MAX_TITLE` 200 (enforced `:193`), `MAX_NOTE` 500 (`:199`), `MAX_RUNS_PER_CARD` 8, `MAX_ADD_PER_CALL` 20. The last reaches the prompt only through the refusal message at `:224`, which interpolates the constant, so raising the cap breaks no prose |
 | How state survives reload/rewind | `lib.ts` `reconstructFromEntries` (`:392`) replays the session branch: tool-result `details.state` plus `kanban-state` custom entries from `/kanban`. A malformed newest snapshot is skipped in favour of the previous one. `index.ts` `repair()` re-appends when the digest differs |
 | Settle guard | `lib.ts` `SETTLE_DISPOSITION` (`:587`, the one rule table) → `settleDisposition`/`actionableCards`/`settleSignature`/`nudgeFor` (`:686`). The nudge's move clauses come from `NUDGE_MOVE_TARGETS` (`:650`; a non-exempt target is a compile error), and the prompt sentence is `SETTLE_GUIDELINE` (`:613`), hand-written but tested against the table. Wired at `index.ts:759` (`agent_before_settle`; `agent_settled` at `:746` only repairs + refreshes the widget). It acts only when `outcome === "completed"` and dedupes by signature (columns **and** run statuses) |
 | Who owes an action | Read `SETTLE_DISPOSITION`; in prose: done/blocked are exempt. A card whose linked run is positively `running` is exempt. in_progress is always actionable. backlog/review are exempt only while something else is waiting |
@@ -44,7 +44,7 @@ Line refs were checked on 2026-11-10. The files change often, so grep for the ex
 
 ```sh
 bun test agent/extensions/kanban/lib.test.ts agent/extensions/kanban/gate.test.ts
-bun test agent/extensions/kanban/publish.test.ts   # alone: mock.module("node:fs") is process-wide
+bun test agent/extensions/kanban/publish.test.ts   # alone: mock.module("node:fs") is process-wide; check.sh §3 isolates it
 cd agent/extensions/kanban && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json   # tests not in include
 ```
 

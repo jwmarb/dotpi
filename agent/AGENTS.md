@@ -32,8 +32,8 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 - **MCP is pi's built-in extension** (`+builtin:mcp`); no local `extensions/mcp/`. `${VAR}` expands
   in `headers`/`env` only — `url` is validated before expansion, so a secret URL needs
   `pi.registerMcpServer()` from an extension. OAuth tokens land in ignored `mcp-auth.json`
-  (`mcp-auth/` is old leftovers). Manage with `/mcp`. The forced orchestrator/takeover
-  prompts suppress core's sections, so `dynamic-prompt.ts` synthesizes the
+  (`mcp-auth/` is old leftovers). Manage with `/mcp`. The forced orchestrator prompt
+  suppresses core's sections, so `dynamic-prompt.ts` synthesizes the
   indirect-MCP-servers note from `mcp.json` at prompt time
   (`extensions/lib/mcp-config.ts`).
   What is NOT in `extensions` is load-bearing too: there is no `-builtin:tool-search`, so

@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { basename, join } from "node:path";
 import { setCapabilities, resetCapabilitiesCache, visibleWidth } from "@earendil-works/pi-tui";
@@ -8,27 +8,84 @@ import { FALLBACK_MODEL_ID, FALLBACK_PROVIDER, type ChainEntry } from "../model-
 import { publishServedRouter, servedRouter, type ServedRouter } from "../model-fallback/served.ts";
 import { chooseImage, listImages } from "./startup-images.ts";
 import { LOGO_KEYS, pickLogo, renderLogo, truecolor } from "./distro-logos.ts";
+import { ENV_AGENT_DIR, settingsFile } from "./layout.ts";
 
-const settings = (obj: unknown) => {
-	const dir = mkdtempSync(join(os.tmpdir(), "sf-"));
-	const f = join(dir, "settings.json");
+/**
+ * `readConfig` / `writeSetting` go through the settings seam (`lib/settings.ts`),
+ * which resolves the global file through `layout.ts` **at call time**. So these tests
+ * move the agent directory with `ENV_AGENT_DIR` instead of passing a path, and the
+ * `expect` inside `beforeEach` is what proves the move took — an un-moved
+ * `settingsFile()` would otherwise have the real `agent/settings.json` as its write
+ * target, which no test may touch.
+ */
+const envBefore = process.env[ENV_AGENT_DIR];
+let agentTmp = "";
+let projCwd = "";
+
+beforeEach(() => {
+	agentTmp = mkdtempSync(join(os.tmpdir(), "sf-env-agent-"));
+	projCwd = mkdtempSync(join(os.tmpdir(), "sf-cwd-"));
+	process.env[ENV_AGENT_DIR] = agentTmp;
+	expect(settingsFile().startsWith(agentTmp)).toBe(true);
+});
+
+afterEach(() => {
+	if (envBefore === undefined) delete process.env[ENV_AGENT_DIR];
+	else process.env[ENV_AGENT_DIR] = envBefore;
+	rmSync(agentTmp, { recursive: true, force: true });
+	rmSync(projCwd, { recursive: true, force: true });
+});
+
+/** Write the temp agent dir's settings file — the one `writeSetting` will patch. */
+const writeGlobal = (obj: Record<string, unknown>) => writeFileSync(settingsFile(), JSON.stringify(obj));
+
+/** The temp agent dir's settings file, parsed. */
+const globalJson = () => JSON.parse(readFileSync(settingsFile(), "utf-8")) as Record<string, unknown>;
+
+/** A project `.pi/settings.json` inside the temp cwd. */
+const writeProject = (obj: Record<string, unknown>) => {
+	const f = join(projCwd, ".pi", "settings.json");
+	mkdirSync(join(f, ".."), { recursive: true });
 	writeFileSync(f, JSON.stringify(obj));
 	return f;
 };
 
+/**
+ * Run `fn` with the process cwd at `dir`, restored after: `readConfig`'s project file
+ * is `join(process.cwd(), ".pi", "settings.json")`, so a cwd-sensitive assertion has to
+ * move the real cwd (this repo has no `.pi/settings.json`, but a future one must not
+ * silently change what these tests read).
+ */
+function atCwd<T>(dir: string, fn: () => T): T {
+	const prior = process.cwd();
+	process.chdir(dir);
+	try {
+		return fn();
+	} finally {
+		process.chdir(prior);
+	}
+}
+
 describe("readConfig", () => {
 	test("mode, image, ~ expansion", () => {
-		const c = readConfig(settings({ startupFetch: { mode: "cycle", image: "~/a.png" } }));
+		const c = readConfig({ mode: "cycle", image: "~/a.png" });
 		expect(c.mode).toBe("cycle");
 		expect(c.image).toBe(join(os.homedir(), "a.png"));
-		expect(readConfig(settings({ startupFetch: { mode: "bogus", image: "duck.png" } }))).toMatchObject({ mode: "fixed", image: "duck.png" });
+		expect(readConfig({ mode: "bogus", image: "duck.png" })).toMatchObject({ mode: "fixed", image: "duck.png" });
 	});
 	test("height bounds and defaults", () => {
-		expect(readConfig(settings({ startupFetch: { height: 20 } })).height).toBe(20);
-		expect(readConfig(settings({ startupFetch: { height: 2 } })).height).toBe(13);
-		expect(readConfig(settings({ startupFetch: { height: "x" } })).height).toBe(13);
-		expect(readConfig(settings({})).image).toBeUndefined();
-		expect(readConfig("/nonexistent/settings.json")).toMatchObject({ mode: "fixed", height: 13 });
+		expect(readConfig({ height: 20 }).height).toBe(20);
+		expect(readConfig({ height: 2 }).height).toBe(13);
+		expect(readConfig({ height: "x" }).height).toBe(13);
+		expect(readConfig({}).image).toBeUndefined();
+		// No `startupFetch` at all — what the seam reports when neither settings file
+		// exists, which is the case the old `/nonexistent` path stood for.
+		expect(readConfig(undefined)).toMatchObject({ mode: "fixed", height: 13 });
+		expect(readConfig("nonsense")).toMatchObject({ mode: "fixed", height: 13 });
+	});
+	test("the default argument reads the temp settings file through the seam", () => {
+		writeGlobal({ startupFetch: { mode: "cycle", style: "octant", height: 22 } });
+		expect(atCwd(projCwd, () => readConfig())).toMatchObject({ mode: "cycle", style: "octant", height: 22 });
 	});
 });
 
@@ -124,10 +181,36 @@ describe("style setting", () => {
 	test("parse, default, write keeps other keys", () => {
 		expect(parseStyle("sextant")).toBe("sextant");
 		expect(parseStyle("bogus")).toBe("half");
-		expect(readConfig(settings({ startupFetch: { style: "braille" } })).style).toBe("braille");
-		const f = settings({ other: 1, startupFetch: { mode: "cycle" } });
-		expect(writeSetting("style", "quad", f)).toBe(true);
-		expect(JSON.parse(readFileSync(f, "utf-8"))).toEqual({ other: 1, startupFetch: { mode: "cycle", style: "quad" } });
+		expect(readConfig({ style: "braille" }).style).toBe("braille");
+		writeGlobal({ other: 1, startupFetch: { mode: "cycle" } });
+		expect(writeSetting("style", "quad")).toBe(true);
+		expect(globalJson()).toEqual({ other: 1, startupFetch: { mode: "cycle", style: "quad" } });
+		// The file just written is what `readConfig()` reads next: no path in between.
+		expect(atCwd(projCwd, () => readConfig().style)).toBe("quad");
+	});
+
+	test("startupFetch is project-overridable end to end", () => {
+		// Nothing in this extension knows about the project layer: the seam merges
+		// `<cwd>/.pi/settings.json` over the agent file per key, whole-object, so a repo
+		// pin replaces the user's whole `startupFetch`, not just the field it names.
+		writeGlobal({ startupFetch: { style: "half", height: 30 } });
+		writeProject({ startupFetch: { style: "braille" } });
+		const seen = atCwd(projCwd, () => readConfig());
+		expect(seen.style).toBe("braille");
+		expect(seen.height).toBe(13); // the global `height` is replaced, not merged into
+	});
+
+	test("writeSetting never promotes a project field into the global file", () => {
+		// The accepted consequence of a global-only write: the repo keeps its own pin
+		// untouched, and none of its fields are copied into the user's configuration.
+		writeGlobal({ startupFetch: { mode: "cycle" } });
+		const pinned = writeProject({ startupFetch: { style: "braille", image: "duck.png" } });
+		expect(atCwd(projCwd, () => writeSetting("style", "quad"))).toBe(true);
+		expect(globalJson()).toEqual({ startupFetch: { mode: "cycle", style: "quad" } });
+		expect(globalJson().startupFetch).not.toHaveProperty("image");
+		expect(readFileSync(pinned, "utf-8")).toBe(JSON.stringify({ startupFetch: { style: "braille", image: "duck.png" } }));
+		// And the pin still shadows what was written: `/fetch style` there has no visible effect.
+		expect(atCwd(projCwd, () => readConfig().style)).toBe("braille");
 	});
 });
 
@@ -268,6 +351,19 @@ describe("gpu / disk / updates", () => {
 	test("updateLines: packages only has no changelog; npm check fills pi row", () => {
 		expect(updateLines(theme, { update: { kind: "checking" }, notices: { packages: ["x"] } }).join("\n")).not.toContain("changelog");
 		expect(updateLines(theme, { update: { status: "available", currentVersion: "1", latestVersion: "2.0.0" }, notices: {} }).join("\n")).toContain("2.0.0");
+	});
+	test("updateLines: under Pi-Bolt the arrow follows auto-update's verdict, not a 'current' status", () => {
+		// The release row's `latest` is a Pi-Bolt version while `current` may be Pi's.
+		// A "current" npm verdict therefore must not print Pi's number beside a
+		// Pi-Bolt release: the arrow is dropped instead. An "available" verdict is
+		// auto-update's own current, so that one is shown.
+		const notices = { release: { version: "9.9.9" } };
+		const currentStatus = { status: "current", currentVersion: "1.2.3" } as const;
+		const available = { status: "available", currentVersion: "1.2.3", latestVersion: "2.0.0" } as const;
+		expect(updateLines(theme, { update: currentStatus, notices }, true).join("\n")).not.toContain("1.2.3");
+		expect(updateLines(theme, { update: available, notices }, true).join("\n")).toContain("v1.2.3 →");
+		// Not compiled: the arrow falls back to VERSION, as it always has.
+		expect(updateLines(theme, { update: currentStatus, notices }, false).join("\n")).toContain("→");
 	});
 	test("captureNotices: captures with a listener, falls through without one", () => {
 		const drawn: unknown[] = [];

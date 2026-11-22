@@ -9,6 +9,9 @@
  * scanned, and in what order, for a cwd. It does not read them — that is
  * `agents.ts`' and `skill-tree.ts`' job.
  *
+ * "profile" here means the global agent dir (`layout.ts` `agentDir()`); it is
+ * unrelated to the profiles feature removed in 2026-11.
+ *
  * ## The trust-bypass trap
  *
  * A repo containing ONLY `.pi/agents/` resolves `isProjectTrusted() === true`

@@ -1,5 +1,5 @@
 /**
- * The prompt-input derivation shared by every prompt builder in this repo.
+ * The prompt-input derivation for this repo's one prompt builder.
  *
  * The builder is `dynamic-prompt.ts` (orchestrator); this module is the one
  * derivation of the inputs it assembles, so a caller's derived inputs cannot
@@ -36,7 +36,7 @@ export const SUBAGENT_TOOL = "subagent";
  * orchestrator only — the factory returns as soon as `PI_SUBAGENT_RUN_ID` is set —
  * so this flag is naturally false in a child and needs no `isSubagent` conjunct of
  * its own. Nothing from `kanban/lib.ts` is imported here: the *capability* reaches
- * the builders as a boolean, and a top-level extension taking a dependency on a
+ * the builder as a boolean, and a top-level extension taking a dependency on a
  * sibling's internals is the coupling that gate avoids — pi-tui resolves at the
  * repo root and `lib/runtime.test.ts` imports `../kanban/lib.js`, so the bar is
  * architectural, not technical.
@@ -123,7 +123,7 @@ export interface DerivedPromptInputs {
  * The builder-specific fields (`agentInventory`, `customPrompt`,
  * `appendSystemPrompt`, `cwd`, `skillsLibrary`) deliberately are *not* derived
  * here: they are read straight off the caller's own options, so this module has
- * no opinion about a shape its two callers do not share.
+ * no opinion about a shape its only caller has of its own.
  */
 export function derivePromptInputs(o: DeriveInputsOptions): DerivedPromptInputs {
   // --- Gate skill-owned tools on their skill being active ---

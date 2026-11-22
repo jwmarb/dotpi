@@ -102,11 +102,11 @@ export const MAX_TITLE = 200;
 export const MAX_NOTE = 500;
 export const MAX_RUNS_PER_CARD = 8;
 /**
- * Cards per `add` call. `dynamic-prompt.ts` states this number in prose ("up to 20 titles
- * per call"), and nothing ties the two at test time: that module deliberately does not import
- * a sibling extension's module (board facts reach it through `promptInputs`), which is an
- * architectural choice, not a missing dependency — pi-tui resolves at the repo root and
- * `lib/runtime.test.ts` already imports this file. If you change this cap, change the prose.
+ * Cards per `add` call. Enforced at `:224`, whose `KanbanError` interpolates this constant, so
+ * the refusal the model gets is the only place the number is spelled out. `dynamic-prompt.ts`
+ * names the cap in its prose without restating it, and deliberately does not import this module
+ * (board facts reach it through `promptInputs`) — an architectural choice, not a missing
+ * dependency: pi-tui resolves at the repo root and `lib/runtime.test.ts` already imports this.
  */
 export const MAX_ADD_PER_CALL = 20;
 

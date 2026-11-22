@@ -114,7 +114,7 @@ import {
 } from "./concurrency.js";
 
 import { publishServedRouter } from "./served.js";
-import { readSettingsKey } from "./settings.js";
+import { readSettingsKey } from "../lib/settings.js";
 
 /** Footer key for the hop notice. */
 const STATUS_KEY = "model-fallback";
@@ -231,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 	publishServedRouter(undefined);
 	// Read from disk, not `pi.getSettings()`: that is a throwing stub during
 	// extension load, and the chain must be known now because
-	// `registerVirtualModel` happens at load. See `settings.ts`.
+	// `registerVirtualModel` happens at load. See `../lib/settings.ts`.
 	const raw = readSettingsKey(SETTINGS_KEY);
 	// The whole registration decision — source pick, disable switch, malformed
 	// env warning, source-dependent threshold — is `planRegistration` in `lib.ts`.
@@ -240,7 +240,7 @@ export default function (pi: ExtensionAPI) {
 	if (!plan.register) return;
 	const chain = plan.chain;
 	const config = readConfig(raw);
-	// The per-model global caps ride the same load-time read (see `settings.ts`),
+	// The per-model global caps ride the same load-time read (see `../lib/settings.ts`),
 	// and the lease directory is resolved once here: it is a filesystem path,
 	// not a session fact, so it does not move on `session_start`.
 	const concurrency = readConcurrency(raw);

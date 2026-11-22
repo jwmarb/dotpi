@@ -494,7 +494,7 @@ export function parseChain(entries: readonly unknown[]): ChainEntry[] {
 	return parseChainReport(entries).chain;
 }
 
-/** One rejected `settings.json` chain entry, as {@link parseChainReport} saw it. */
+/** One chain entry a parser rejected, as {@link parseChainReport} or {@link parseChainEnvReport} saw it. */
 export interface DroppedEntry {
 	/** The raw entry, exactly as configured. */
 	input: unknown;
@@ -550,17 +550,40 @@ export function parseChainReport(entries: readonly unknown[]): { chain: ChainEnt
  * `model:`/`fallback_models:` uses, which is what keeps the two surfaces
  * interchangeable. Dedup is by ref, case-insensitively, first occurrence
  * winning, exactly as {@link parseChain} does for `settings.json`.
+ * {@link parseChainEnvReport} is this function's loop, and also reports the
+ * tokens it dropped.
  */
 export function parseChainEnv(value: string | undefined): ChainEntry[] {
-	if (!value) return [];
-	const out: ChainEntry[] = [];
+	return parseChainEnvReport(value).chain;
+}
+
+/**
+ * {@link parseChainEnv}'s loop, reporting every token it dropped.
+ *
+ * A token {@link parseChainItem} rejects is reported with the reason, the way
+ * {@link parseChainReport} reports a rejected `settings.json` entry. Empty
+ * tokens are **not** drops: separators may repeat or trail, so `"a/1,"` is a
+ * complete chain and must not start a warning over punctuation. Dedup is not a
+ * drop either, and neither is an invalid `|level` pin — {@link parseChainItem}
+ * degrades one to the bare ref on purpose, as in {@link parseChainReport}.
+ */
+export function parseChainEnvReport(value: string | undefined): { chain: ChainEntry[]; dropped: DroppedEntry[] } {
+	if (!value) return { chain: [], dropped: [] };
+	const chain: ChainEntry[] = [];
+	const dropped: DroppedEntry[] = [];
 	const seen = new Set<string>();
 	for (const token of value.split(/[,\s]+/)) {
+		// Repeated or trailing separators leave empty tokens. They carry no
+		// intent to report, so they are skipped before parsing, not dropped.
+		if (!token.trim()) continue;
 		const entry = parseChainItem(token);
-		if (!entry) continue;
-		pushUnique(out, seen, entry);
+		if (!entry) {
+			dropped.push({ input: token, reason: "not a model reference" });
+			continue;
+		}
+		pushUnique(chain, seen, entry);
 	}
-	return out;
+	return { chain, dropped };
 }
 
 /**
@@ -644,13 +667,17 @@ export interface RegistrationPlan {
  *    a chain the parent already committed it to. It also wins over the
  *    settings chain: the launcher knows which agent is running here, and
  *    `settings.json` does not.
- * 2. **A set but unparseable env value warns.** It cannot serve: the
- *    settings.json chain is the fallback when there is one, and without one
- *    the session's own model selection decides silently. The warning names
- *    which of the two happens (it reads the settings chain even when the
- *    switch is off, exactly as the load path always has). An empty or
- *    malformed env value parses to nothing, so it cannot mask a valid
- *    settings chain: a non-empty env chain is what picks the source.
+ * 2. **A set env value that does not fully parse warns, one of two ways.**
+ *    When **nothing** parses it cannot serve: the settings.json chain is the
+ *    fallback when there is one, and without one the session's own model
+ *    selection decides silently — the warning names which of the two happens
+ *    (it reads the settings chain even when the switch is off, exactly as the
+ *    load path always has). When only **part** of it parses, the survivors
+ *    register and {@link parseChainEnvReport}'s drops are named once, in the
+ *    same warning slot, because no other process can see this process's value.
+ *    An empty or wholly-malformed env value parses to nothing, so it cannot
+ *    mask a valid settings chain: a non-empty env chain is what picks the
+ *    source.
  * 3. **Disabled and no env chain registers nothing.** The switch governs
  *    exactly the sessions that got no chain from a parent.
  * 4. **Registration is source-dependent** — {@link shouldRegisterRouter} owns
@@ -669,24 +696,30 @@ export function planRegistration(input: {
 	envName?: string;
 }): RegistrationPlan {
 	const { settings, envValue, envName = CHAIN_ENV } = input;
-	const envChain = parseChainEnv(envValue);
+	const { chain: envChain, dropped: envDropped } = parseChainEnvReport(envValue);
 	const { chain: settingsChain, dropped, shapeError } = readChain(settings);
 	let envWarning: string | undefined;
 	if (envValue !== undefined && envChain.length === 0) {
 		envWarning =
 			`model-fallback: ${envName} is set to "${envValue}" but no entry parses; ` +
 			(settingsChain.length > 0 ? "falling back to the settings.json chain" : "the router registers nothing");
+	} else if (envDropped.length > 0) {
+		// Part of the value parsed, so the chain still serves; the tokens it
+		// lost are named once rather than vanishing into a shorter chain.
+		envWarning = `model-fallback: ${envName} ${formatDroppedEntries(envDropped)}`;
 	}
 	// The settings chain only reaches the user when the env gave nothing: an
 	// env-launched child runs on a parent's chain, and warning about the same
 	// stale settings entries in every child would print the complaint once
 	// per process. A switched-off feature's entries never load, so they stay
-	// silent too.
+	// silent too. The silence is settings-only: the same stale entries reappear
+	// in every child, whereas a {@link CHAIN_ENV} value arrives from this
+	// process's parent, which cannot see what the child actually got — so this
+	// is the only place a {@link CHAIN_ENV} drop can ever be reported.
 	const settingsSilenced = envChain.length > 0 || isDisabled(settings);
 	const dropWarning =
 		!settingsSilenced && dropped.length > 0
-			? `model-fallback: settings.json modelFallback.chain dropped ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"}: ` +
-				dropped.map((d) => `${JSON.stringify(d.input) ?? String(d.input)} (${d.reason})`).join("; ")
+			? `model-fallback: settings.json modelFallback.chain ${formatDroppedEntries(dropped)}`
 			: undefined;
 	const shapeWarning = !settingsSilenced && shapeError ? `model-fallback: settings.json ${shapeError}` : undefined;
 	// Today at most one of the two is set — `readChain` reports a `shapeError`
@@ -715,6 +748,20 @@ function pushUnique(out: ChainEntry[], seen: Set<string>, entry: ChainEntry): vo
 	if (seen.has(key)) return;
 	seen.add(key);
 	out.push(entry);
+}
+
+/**
+ * The dropped-entry tail of a load-time warning: each entry as `"input" (reason)`, joined with a semicolon and
+ * preceded by the count. {@link planRegistration} uses it for
+ * both surfaces (`settings.json` and {@link CHAIN_ENV}) so their wordings
+ * cannot drift apart.
+ */
+function formatDroppedEntries(dropped: readonly DroppedEntry[]): string {
+	const n = dropped.length;
+	return (
+		`dropped ${n} entr${n === 1 ? "y" : "ies"}: ` +
+		dropped.map((d) => `${JSON.stringify(d.input) ?? String(d.input)} (${d.reason})`).join("; ")
+	);
 }
 
 /** Where {@link advance} says the next request should go. */

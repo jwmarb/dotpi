@@ -19,8 +19,6 @@ import {
 import { agentDir, skillsDir } from './lib/layout.js';
 import { promptMcpServersSection } from './lib/mcp-config.js';
 import { projectRoots, TrustRequiringSnapshot, type ResourceRoots } from './lib/project-layer.js';
-// The kanban board's per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per
-// call") is restated as a numeral in this file's prose; change the cap, change it here.
 import { KANBAN_TOOL, QUESTIONNAIRE_TOOL, derivePromptInputs } from './lib/prompt-inputs.js';
 import { groupByCategory } from './lib/skill-categories.js';
 import {
@@ -639,7 +637,8 @@ Run the work on the board. The user watches it beside this conversation, and a s
 that is not on it is a step nobody can see you do.
 
 **Open it before you start.** For work of two or more steps, call \`kanban\` \`add\`
-(up to 20 titles per call) with one card per step, in the order you intend to do them;
+(the tool refuses a call over its per-card cap and names the number)
+with one card per step, in the order you intend to do them;
 \`show\` first, so you extend the board instead of duplicating it. One card per step: not
 one per file, and not one card for "the rest".
 Skip the board for a single step, or for trivial work — a board for a one-line fix is

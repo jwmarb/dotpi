@@ -86,6 +86,7 @@
 import { LIVENESS_BACKSTOP_MS, type ReleaseLedgerDeps } from "./release-ledger.js";
 import type { RunRecord } from "./rundir.js";
 import type { AgentProbe } from "./herdr.js";
+import type { CompletionEvidence } from "./run-evidence.js";
 
 /**
  * Patience for the wake path's parent probe. `probeAgent` shares the
@@ -126,7 +127,7 @@ export interface ParentProofEffects {
     dir: string,
     runId: string,
     paneId?: string,
-  ): Promise<{ finished: true; from: "sidecar" | "answer" } | { finished: false }>;
+  ): Promise<CompletionEvidence>;
   /** The clock the memo's TTL is measured on. */
   now(): number;
 }

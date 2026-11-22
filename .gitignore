@@ -4,7 +4,7 @@
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
 #
 # Machine-state and secret paths are pinned to a leading `*/` (any agent dir:
-# agent/, the orchestrator symlink, ...), because the same files a run generates
+# `agent/` and any sibling agent dir), because the same files a run generates
 # must be ignored in every agent dir, not just the one this repo started with.
 
 # ---- Secrets ----------------------------------------------------------------

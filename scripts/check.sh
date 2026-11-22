@@ -230,17 +230,79 @@ if [ ${#tests[@]} -eq 0 ]; then
 	note "$red" "FAIL" "no test files found — discovery is broken"
 	fails=$((fails + 1))
 else
-	# Captured rather than piped so the exit code is the runner's, not `tail`'s.
-	out=$(bun test "${tests[@]}" 2>&1)
-	test_status=$?
-	# Named failures first. Also surface an "Unhandled error between tests": a
-	# suite that fails to *load* reports no `(fail)` line at all, so grepping only
-	# for those prints a bare "1 fail" with nothing to act on — which is how the
-	# resolution skew above cost an hour to find.
-	printf '%s\n' "$out" | grep -E '^\(fail\)' | head -10 | while IFS= read -r line; do printf '        %s\n' "$line"; done
-	printf '%s\n' "$out" | grep -E '^(SyntaxError|TypeError|ReferenceError|error):|^# Unhandled error' | head -5 | while IFS= read -r line; do printf '        %s\n' "$line"; done
-	printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail|error)' | while IFS= read -r line; do printf '       %s\n' "$line"; done
-	[ "$test_status" -eq 0 ] || fails=$((fails + 1))
+	# Partition by CONTENT, not by path. bun's `mock.module` is process-wide and
+	# retroactive, so a suite that mocks a `node:` builtin is a hazard to every other
+	# suite in the same invocation: `kanban/publish.test.ts` replaces
+	# `fs.renameSync` with Windows semantics (EPERM while the target exists), which is
+	# precisely what an atomic tmp+rename writer needs to succeed — `lib/settings.ts`
+	# (the settings seam) and `lib/runtime.ts`'s shim retargeting, both reached from
+	# suites that sort AFTER `kanban/` and so would run under that mock. Bun 1.4.4 does
+	# not visibly leak the mock into another file's destructured `node:fs` bindings (the
+	# pairings pass today), but that is one runner's behaviour, not a promise, so the
+	# rule the suite's own header states is made structural here instead of left to
+	# luck. A suite that mocks a repo-relative specifier
+	# (`subagent-herdr/wake.test.ts:117` mocks `./herdr.js`) rewrites only that one
+	# specifier and stays in the grouped run.
+	grouped=()
+	isolated=()
+	for suite in "${tests[@]}"; do
+		# The classifier's input is the suite's own text, so the pattern allows
+		# whitespace anywhere a formatter may insert it (`mock.module (` and a
+		# specifier on the next line both count) and reads the whole file as one
+		# record (`-z`) precisely so a line break cannot hide a match. It still
+		# cannot see a builtin mocked through an imported helper or a variable
+		# specifier: those land in the grouped run, which is why nothing below
+		# may quietly classify nothing.
+		if grep -Ezq "mock\.module[[:space:]]*\([[:space:]]*['\"\`]node:" "$suite"; then
+			isolated+=("$suite")
+		else
+			grouped+=("$suite")
+		fi
+	done
+
+	# Not "nothing to isolate": a suite that mocks a builtin moves into its own
+	# invocation, so an empty `isolated` while some suite still reads like a
+	# builtin-mocker means the pattern broke, not that the hazard went away. Fail
+	# loudly rather than let a classifier slip silently re-arm the shared process.
+	if [ ${#isolated[@]} -eq 0 ]; then
+		for suite in "${tests[@]}"; do
+			if grep -qE 'mock\.module' "$suite" && grep -qE 'node:' "$suite"; then
+				fails=$((fails + 1))
+				note "$red" "FAIL" "a suite looks like a builtin-mocker but none was isolated: $suite"
+				break
+			fi
+		done
+	fi
+
+	# One runner call per invocation, reported identically whatever the file list.
+	# Captured rather than piped so the exit code is the runner's, not `tail`'s, and
+	# every non-zero status costs one check — a failure in any invocation fails this
+	# gate, whichever it happened in.
+	run_suite() {
+		local label=$1
+		shift
+		local out test_status
+		out=$(bun test "$@" 2>&1)
+		test_status=$?
+		note "$dim" "run  " "$label"
+		# Named failures first. Also surface an "Unhandled error between tests": a
+		# suite that fails to *load* reports no `(fail)` line at all, so grepping only
+		# for those prints a bare "1 fail" with nothing to act on — which is how the
+		# resolution skew above cost an hour to find.
+		printf '%s\n' "$out" | grep -E '^\(fail\)' | head -10 | while IFS= read -r line; do printf '        %s\n' "$line"; done
+		printf '%s\n' "$out" | grep -E '^(SyntaxError|TypeError|ReferenceError|error):|^# Unhandled error' | head -5 | while IFS= read -r line; do printf '        %s\n' "$line"; done
+		printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail|error)' | while IFS= read -r line; do printf '       %s\n' "$line"; done
+		[ "$test_status" -eq 0 ] || fails=$((fails + 1))
+	}
+
+	# The grouped run first: it is the bulk of the suite, and a failure there is the
+	# one worth reading before the two singletons.
+	[ ${#grouped[@]} -eq 0 ] || run_suite "${#grouped[@]} suites, one invocation" "${grouped[@]}"
+	if [ ${#isolated[@]} -gt 0 ]; then
+		for suite in "${isolated[@]}"; do
+			run_suite "isolated (mocks a node: builtin): $suite" "$suite"
+		done
+	fi
 fi
 
 echo

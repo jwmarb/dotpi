@@ -57,6 +57,7 @@ import {
 	levelFor,
 	parseChain,
 	parseChainEnv,
+	parseChainEnvReport,
 	parseChainItem,
 	parseModelEntry,
 	parseModelRef,
@@ -331,6 +332,39 @@ describe("parseChainEnv", () => {
 
 	test("an invalid pin degrades to the bare model, matching the object form", () => {
 		expect(parseChainEnv("a/1|ultra")).toEqual([{ ref: "a/1" }]);
+	});
+
+	test("the report names the malformed tokens, not the empty ones separators leave", () => {
+		const { chain, dropped } = parseChainEnvReport("a/1, bogus:token ,b/2|low");
+		expect(chain.map(formatModelRef)).toEqual(["a/1", "b/2"]);
+		expect(dropped).toEqual([{ input: "bogus:token", reason: "not a model reference" }]);
+	});
+
+	test("a repeated or trailing separator is punctuation, not a drop", () => {
+		// `"a/1,"` is a complete chain. Reporting it would have every child whose
+		// parent wrote a trailing comma start up with a complaint.
+		expect(parseChainEnvReport("a/1,,b/2  ").dropped).toEqual([]);
+		expect(parseChainEnvReport("   ").dropped).toEqual([]);
+	});
+
+	test("a degraded pin and a dedup are documented behaviour, not drops", () => {
+		expect(parseChainEnvReport("a/1|ultra,a/1").dropped).toEqual([]);
+	});
+
+	test("reporting does not change the chain the wrapper returns", () => {
+		for (const value of [
+			"a/1,b/2",
+			"a/1, b/2  c/3",
+			"a/1,b/2|low",
+			"a/1,A/1|high",
+			"a/1|ultra",
+			"a/1,bogus,b/2",
+			"",
+			"   ",
+			undefined,
+		]) {
+			expect(parseChainEnvReport(value).chain).toEqual(parseChainEnv(value));
+		}
 	});
 });
 
@@ -2611,6 +2645,56 @@ describe("planRegistration", () => {
 		expect(planRegistration({ settings: {}, envValue: undefined }).warning).toBeUndefined();
 		expect(planRegistration({ settings: { chain: "a/1" }, envValue: "b/2" }).warning).toBeUndefined();
 		expect(planRegistration({ settings: { chain: "a/1", enabled: false }, envValue: undefined }).warning).toBeUndefined();
+	});
+
+	test("a partially malformed env chain warns once, naming exactly the bad tokens", () => {
+		expect(
+			planRegistration({ settings: undefined, envValue: "a/1|high,bogus:tok,b/2", envName: "OTHER" }).warning,
+		).toBe(`model-fallback: OTHER dropped 1 entry: "bogus:tok" (not a model reference)`);
+	});
+
+	test("the partial-drop warning is one line naming every bad token", () => {
+		// The `:high` suffix is what makes these two unusable — a bare `bad1` is a
+		// reference pi resolves on its own (see `parseModelRef`), so it registers
+		// instead of dropping.
+		const { warning } = plan(undefined, "a/1,bad1:high b/2 bad2:high");
+		expect(warning).toBeDefined();
+		expect(warning).not.toContain("\n");
+		expect(warning).toContain("dropped 2 entries:");
+		expect(warning).toContain("bad1");
+		expect(warning).toContain("bad2");
+		expect(warning).not.toContain("a/1");
+		expect(warning).not.toContain("b/2");
+	});
+
+	test("survivors still register while the dropped tokens are named", () => {
+		expect(plan(undefined, "a/1,bogus:tok,b/2")).toEqual({
+			register: true,
+			chain: [{ ref: "a/1" }, { ref: "b/2" }],
+			source: "environment",
+			warning: `model-fallback: ${CHAIN_ENV} dropped 1 entry: "bogus:tok" (not a model reference)`,
+		});
+	});
+
+	test("a wholly-bad env value keeps the total-failure message and does not also report drops", () => {
+		const { warning } = plan(undefined, "a:b, /c");
+		expect(warning).toContain("but no entry parses");
+		expect(warning).not.toContain("dropped");
+	});
+
+	test("settings drops stay silent even when the env chain only partly parsed", () => {
+		const { warning } = planRegistration({ settings: { chain: ["x|high"] }, envValue: "a/1,bogus:tok" });
+		expect(warning).toContain("bogus");
+		expect(warning).not.toContain("settings.json");
+	});
+
+	test("a fully valid env chain warns nothing, pins and all", () => {
+		expect(plan(undefined, "a/1|high,b/2  c/3")).toEqual({
+			register: true,
+			chain: [{ ref: "a/1", thinking: "high" }, { ref: "b/2" }, { ref: "c/3" }],
+			source: "environment",
+		});
+		expect(plan(undefined, "a/1, ,b/2").warning).toBeUndefined();
 	});
 });
 

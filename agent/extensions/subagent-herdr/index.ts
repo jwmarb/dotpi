@@ -117,7 +117,7 @@
  *
  * @module subagent-herdr
  */
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,7 +152,6 @@ import {
   readReports,
   rootsForRun,
   type HealthCheckTrigger,
-  type RunResult,
   selectSkills,
   type SkillEntry,
   skillEntriesFromPi,
@@ -167,9 +166,9 @@ import {
 import { agentDir } from "../lib/layout.js";
 import { projectRoots, type ResourceRoots, TrustRequiringSnapshot } from "../lib/project-layer.js";
 import {
+  asRunRecord,
   ancestorLabel,
   CARD_ID_PATTERN,
-  EVIDENCE_TAIL_BYTES,
   hasExitSidecar,
   hasRunId,
   isRunStatus,
@@ -179,11 +178,11 @@ import {
   pendingSpawnsOf,
   readExitSidecarAt,
   readRunRecordFromDisk,
-  pickSessionName,
   type Notice,
   parseNotice,
   RUN_ID_PATTERN,
   type RunRecord,
+  type RunIdBearing,
   runDir,
   runDirBasesOf,
   runsDir,
@@ -206,7 +205,6 @@ import {
 } from "./herdr.js";
 import { piShimDir, prependPathCommand, runningCompiled } from "../lib/runtime.js";
 import {
-  completionSignal,
   createRunLifecycle,
   type PaneObservation,
   type RunLifecycle,
@@ -214,16 +212,18 @@ import {
 } from "./run-lifecycle.js";
 import {
   createReleaseLedger,
+  foreignRunningRecord,
   healthCheckOfId,
   isOwnedBy,
   ownsRunningRecord,
-  renderSpawnsBlock,
   LIVENESS_BACKSTOP_MS,
   ownerPaneOf,
-  type ReleasedTarget,
+  undeliverableClause,
 } from "./release-ledger.js";
 import { createParentProof } from "./parent-proof.js";
 import { settleOrphans, settleStuckRecords, STUCK_SIDECAR_MIN_AGE_MS } from "./settle-stuck.js";
+import { createBriefing, formatResultHeader, startedAtOf } from "./briefing.js";
+import { createEvidenceReader, evidenceStamp } from "./run-evidence.js";
 
 // The terminal result cache moved to the release ledger; re-exported so its
 // importers keep their path.
@@ -260,11 +260,25 @@ const adoptedRunDirs = new Map<string, string>();
  */
 const dirFor = (runId: string): string => adoptedRunDirs.get(runId) ?? runDir(agentDir(), runId);
 
+/**
+ * The shared completion-evidence READ (`run-evidence.ts`): the one answer to
+ * "is this run's work already on disk?", bound to this process's dir reads, its
+ * candidate scan and its clock, and consumed by the `subagent_tasks` display arms
+ * and the reroute proof alike. Its memo is per-process state, like the registry,
+ * and it reads without ever settling — settling stays the lifecycle's.
+ */
+const evidence = createEvidenceReader({
+  hasExitSidecar,
+  evidenceStamp,
+  extractRunResult,
+  // Through a thunk: the candidate scan is declared below with the writers that
+  // invalidate it, and module init must not touch it (TDZ).
+  allRunCandidates: () => allRunCandidates(),
+  now: () => Date.now(),
+});
+
 /** Directory of this extension, so `child-done.ts` can be passed to a child by absolute path. */
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
-
-/** Answers are truncated in tool output at this size; the transcript stays complete on disk. */
-const RESULT_MAX_CHARS = 20_000;
 
 /**
  * Settle delay between `agent start` resolving and the first prompt. herdr
@@ -415,7 +429,7 @@ function loadRegistry(): void {
       // what the equality keeps a planted `runId` of `../x` off; the pattern
       // keeps a dir whose name is not a run id off.
       if (hasRunId(parsed) && RUN_ID_PATTERN.test(parsed.runId) && parsed.runId === d) {
-        runs.set(parsed.runId, parsed);
+        runs.set(parsed.runId, asRunRecord(parsed));
       }
     } catch {
       // Partial dir (crashed mid-spawn): ignored.
@@ -452,19 +466,6 @@ const allRunCandidates = (): { rec: RunRecord; dir: string }[] => {
 };
 
 /**
- * Does this run have a launch of its own that has not finished?
- *
- * {@link pendingSpawnsOf} over {@link allRunCandidates}: no `.exit` sidecar and
- * a status that is not terminal ({@link isTerminalRecord}), bounded by
- * `DEFER_MAX_MS` inside the predicate. Both the
- * lifecycle's completion decision and the child's own deferral ask this one
- * question, which is the point of the shared predicate: a worker must not be
- * settled by its parent while its own graders are still out.
- */
-const hasPendingSpawns = (run: { runId: string; paneId?: string }): boolean =>
-  pendingSpawnsOf(run, allRunCandidates(), Date.now()).length > 0;
-
-/**
  * The claimed parent's record and the run dir it lives in, from {@link runDirBases} —
  * the first base that has it. Reads the record *without* registering it (no
  * `runs.set`, no `adoptedRunDirs` entry): a reroute marker's `parentRunId` is
@@ -479,91 +480,6 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
     if (rec) return { rec, dir: join(base, runId) };
   }
   return undefined;
-};
-
-/**
- * The completion evidence for one run dir, read *without settling*: the
- * `.exit` sidecar, or a clean transcript answer read as a bounded tail — the
- * {@link completionSignal} rule, spelled once. `parentRunIsFinished` (the
- * reroute proof) and the display-only answer for a foreign `running` record
- * in `status`/`result` both consume it. A read, never a write: no transition,
- * no meta save, no pane close — so a run this pane does not own is never
- * settled by it, and the owning pane's process stays the one to do that.
- *
- * `result` is the extraction the decision rested on (absent when the sidecar
- * decided, since the transcript need not be read), so a caller that renders
- * the answer does not read the transcript twice. The negative arm carries
- * none: no caller renders a negative's extraction (the display arms render
- * mid-run reports from `reports.jsonl` instead), so it is not stored.
- *
- * `from` names the evidence the verdict rested on, `sidecar` or `answer`;
- * the negative arm carries none, and no caller consults `from` without a
- * `finished: true`.
- *
- * Memoized on the dir plus the run id, stamped on the session file's and
- * the prompt file's size/mtime (`evidenceStamp`): without the memo, the display path would
- * pay a bounded 4 MB tail read plus the `system-prompt.md` read for every
- * foreign `running` record on every `status`/`result` call, serially in
- * the id loop — on the answer branch; the sidecar branch pays neither,
- * with or without the memo, because `hasExitSidecar` decides first. The
- * sidecar check runs before the memo, so a sidecar that arrives re-proves;
- * the stamp re-proves a transcript (or prompt file) that moves. No TTL:
- * the verdict is a function of the on-disk bytes the read sees, and both
- * movers invalidate the stamp — the one byte mover the stamp cannot see
- * is an equal-size restore (the Nextcloud sync restore `readSessionTail`
- * documents): a transcript (or prompt file) restored with identical size and mtime serves
- * the cached verdict, which is the right one when the bytes are in fact
- * identical. One thing the stamp cannot see is one of the run's own spawns
- * finishing, which is also an input to the verdict now: a cached `not finished`
- * can therefore outlive the pending spawn by one transcript write. That is the
- * conservative direction (a run the reader would finish is held), and the sidecar
- * the child writes when it really does finish is checked before the memo. The map is never pruned: its entries are bounded by the
- * distinct (dir, run id) pairs ever read while sidecarless —
- * `hasExitSidecar` decides before the memo is touched, so a run whose sidecar
- * is already on disk never adds a key; keys are not removed when a run later
- * finishes (hundreds, not a growth path). It
- * contrasts with the parent-proof memo (positives only, TTL-bounded): see
- * `createParentProof` in parent-proof.ts.
- *
- * The dir is in the key, not left to `dirFor`: `agentDir()` reads
- * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a restart in
- * a different agent dir, no `adoptedRunDirs` entry) must not serve a verdict
- * stamped in the other dir.
- */
-type CompletionEvidence =
-  | { finished: true; from: "sidecar" | "answer"; result?: RunResult }
-  | { finished: false };
-
-const completionEvidenceMemo = new Map<
-  string,
-  { stamp: string | undefined; value: CompletionEvidence }
->();
-
-const completionEvidence = async (
-  dir: string,
-  runId: string,
-  paneId?: string,
-): Promise<CompletionEvidence> => {
-  const sidecar = hasExitSidecar(dir, runId);
-  if (sidecar) return { finished: true, from: "sidecar" };
-  const stamp = evidenceStamp(dir, runId);
-  const key = `${dir}\u0000${runId}`;
-  const hit = completionEvidenceMemo.get(key);
-  if (hit !== undefined && hit.stamp === stamp) return hit.value;
-  const result = await extractRunResult(dir, runId, EVIDENCE_TAIL_BYTES);
-  // The same third input the lifecycle gets, so the evidence read and the
-  // lifecycle cannot disagree about a delegating run (see `completionSignal`).
-  // The record's own pane, passed by the caller: every call site holds the
-  // record in hand, and a run missing from this process's registry is not a
-  // run with no pane — the legacy `ownerPane` relation is exactly what an
-  // unregistered record speaks, and dropping it would make `finished` MORE
-  // likely, the direction a read must not lean.
-  const hasPending = hasPendingSpawns({ runId, paneId });
-  const value: CompletionEvidence = completionSignal(sidecar, result, hasPending)
-    ? { finished: true, from: "answer", result }
-    : { finished: false };
-  completionEvidenceMemo.set(key, { stamp, value });
-  return value;
 };
 
 /**
@@ -603,37 +519,6 @@ function adoptRunFromDisk(runId: string): RunRecord | undefined {
 }
 
 /**
- * A cheap fingerprint of a run's completion evidence: its session file's and
- * its `system-prompt.md`'s size and mtime. Revival extracts a failed run's
- * transcript only when this moved, and the memoized evidence verdict re-proves
- * the same way. The prompt file is part of the verdict — it decides the
- * `<result>` contract the answer is judged against — so a rewrite of it must
- * move the fingerprint too; its absence is a stamp value, not an error, a
- * missing prompt degrades the verdict to the weaker rule, and that
- * (non)existence is part of what the verdict rests on.
- */
-function evidenceStamp(runDirPath: string, runId: string): string | undefined {
-  try {
-    // Shared rule with findSessionFile: a resumed dir's fingerprint must
-    // move when the transcript the run is READ from moves — the oldest
-    // (frozen) transcript would pin revival off forever.
-    const name = pickSessionName(readdirSync(runDirPath), runId);
-    if (!name) return undefined;
-    const stat = statSync(join(runDirPath, name));
-    let promptStamp: string;
-    try {
-      const prompt = statSync(systemPromptPath(runDirPath));
-      promptStamp = `${prompt.size}:${prompt.mtimeMs}`;
-    } catch {
-      promptStamp = "absent";
-    }
-    return `${stat.size}:${stat.mtimeMs}\u0000${promptStamp}`;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * The one production run lifecycle: every owned-run reconciliation, launch
  * failure, cancellation and sweep goes through it (see `run-lifecycle.ts`).
  */
@@ -652,7 +537,7 @@ const lifecycle: RunLifecycle = createRunLifecycle({
   // of its own is not finished, however clean its last turn ended. Read off disk
   // (every run dir under both bases), which is why it is an effect — the
   // lifecycle must not learn to enumerate the registry itself.
-  hasPendingSpawns: (rec) => hasPendingSpawns(rec),
+  hasPendingSpawns: (rec) => pendingSpawnsOf(rec, allRunCandidates(), Date.now()).length > 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -1179,222 +1064,26 @@ function paneStateLabel(pane: PaneObservation): string | null {
   return null;
 }
 
-/** Terminal text used as a failure diagnostic when the transcript has nothing. */
-async function paneDiagnostic(rec: RunRecord): Promise<string | null> {
-  if (!rec.paneId) return null;
-  // herdr reuses pane ids, so the recorded id may now belong to a different
-  // pane: read it only when it still carries the label this run was given.
-  // An unreadable label (pane gone, herdr unreachable) is treated the same —
-  // the output could be anyone's, so no pane output at all.
-  const label = await paneLabel(rec.paneId);
-  if (label !== `${rec.agent} ${rec.runId}`) return null;
-  return readAgent(rec.paneId, 40);
-}
-
-/**
- * A finite `startedAt` for a record: `startedAt` is non-optional on the
- * type, but a truncated or hand-edited meta.json can still load a record
- * without one (or with a non-numeric one), and arithmetic on it would then
- * yield NaN. Fall back to now (elapsed ≈ 0) so headers and lists stay
- * readable; `Math.max(0, …)` at the call sites keeps a stale `finishedAt`
- * from rendering a negative elapsed (finishedAt older than startedAt).
- */
-function startedAtOf(rec: RunRecord, now: number = Date.now()): number {
-  return Number.isFinite(rec.startedAt) ? rec.startedAt : now;
-}
-
-function formatResultHeader(rec: RunRecord): string {
-  const startedAt = startedAtOf(rec);
-  const elapsed = rec.finishedAt
-    ? `${Math.max(0, Math.round((rec.finishedAt - startedAt) / 1000))}s`
-    : "…";
-  const healthCheckOf = healthCheckOfId(rec);
-  const role = healthCheckOf ? `health check of ${healthCheckOf} — ${rec.status}` : rec.status;
-  return `=== ${rec.runId} (${rec.agent}) — ${role} [${elapsed}] ===`;
-}
-
-/**
- * Run ids proven to have been delivered as a `done` notice to the run whose
- * answer a spawns block follows — always empty, and deliberately so.
- *
- * The plan was to read them off the session transcript: a `[subagent … done]`
- * input recorded there would be a fact, not a claim. pi does not record one.
- * An `input` hook that answers `handled` (this module's, in every process that
- * loads it) returns before pi creates a message, and session persistence hangs
- * off `message_end`, so a swallowed notice is nowhere on disk — verified against
- * the installed `agent-session.js` and an empty `grep` over a live session. The
- * one durable trace is the briefing the notice was folded into, and a briefing
- * header is text a model can also write, so it is not evidence either.
- *
- * Empty therefore means every finished child is labelled "delivery not
- * provable from disk" — always true, and stated because nothing on disk proves
- * the verdict reached the run whose text is printed above it. The label says
- * what the disk supports (no proof of delivery), not that the block above
- * omitted it: after the pending-spawn deferral a delegating worker settles
- * *because* its graders' verdicts reached it, which the old "not reflected"
- * claim asserted the opposite of.
- */
-const COLLECTED_DONE_IDS: ReadonlySet<string> = new Set();
-
-function truncate(text: string): string {
-  if (text.length <= RESULT_MAX_CHARS) return text;
-  return `${text.slice(0, RESULT_MAX_CHARS)}\n…[truncated; full transcript: see run dir]`;
-}
-
-/**
- * Appends the child's mid-run reports (the child → orchestrator leg) to a
- * result output block, when there are any. A report that was also delivered
- * live to this session shows up here too — the log is the durable copy.
- */
-async function pushReports(rec: RunRecord, out: string[]): Promise<void> {
-  const reports = await readReports(dirFor(rec.runId));
-  if (reports.length === 0) return;
-  out.push(
-    `--- reports sent to you by ${rec.agent} during the run (${reports.length}) ---\n${reports
-      .map((r) => `- ${r.message}`)
-      .join("\n")}`,
-  );
-}
-
 // ---------------------------------------------------------------------------
-// Briefings (the text a notice becomes)
+// Briefings (the text a notice becomes) — every renderer lives in briefing.ts
 // ---------------------------------------------------------------------------
 
 /**
- * Pushes one completed run's block (header, optional inference note, salvage
- * note, todos line, answer text, diagnostics, reports)
- * onto the caller's output array. The caller must have already brought the
- * record up to date (`lifecycle.read`, or a sweep) — except the display-only
- * foreign-record path, which passes its inference note: the status is inferred
- * from on-disk evidence, not settled by this pane.
+ * The briefing blocks bound to this process: answers and reports read from the
+ * run dir through `dirFor`, the candidate memo the spawns block insists on
+ * re-scanning, and the two herdr pane reads the pane diagnostic guards with.
+ * The factory does no work at construction, so this is only closures — and the
+ * ledger's declared `renderer: ReleaseRenderer` is what proves this object
+ * still is a renderer, with no forwarding literal to keep in step here.
  */
-async function renderResultBlock(
-  rec: RunRecord,
-  out: string[],
-  /** Pre-fetched result, when the caller already ran the no-answer gate. */
-  result?: RunResult,
-  /** Display-only note under the header (the foreign-record inference label). */
-  note?: string,
-): Promise<void> {
-  out.push(formatResultHeader(rec));
-  if (note) out.push(note);
-  const resolved = result ?? (await extractRunResult(dirFor(rec.runId), rec.runId));
-  // A salvaged answer is labelled rather than passed off as a clean report: the
-  // orchestrator should know it is reading something the child stranded in the
-  // wrong place, because it may be truncated and the delegation may be worth
-  // re-running. A clean answer in the right place gets no label at all.
-  const salvageNote: Record<string, string> = {
-    "done-arguments":
-      "(recovered from this run's subagent_done arguments — the child passed its answer to the tool instead of writing it as a message, so it is very likely truncated)",
-    "truncated-answer":
-      "(this is the child's final answer, but it does not close its `<result>` element — most likely cut off by the output limit, so treat it as incomplete)",
-    "earlier-message":
-      "(recovered from an earlier message — the child answered and then kept working, so its final message was not the answer)",
-    "non-conforming":
-      "(NOT AN ANSWER — this run produced no report, only this line. Everything it concluded is lost; re-delegate the task rather than relying on this.)",
-  };
-  if (resolved.salvagedFrom) out.push(salvageNote[resolved.salvagedFrom]);
-  // The child's checklist rides the briefing itself: what the run settled
-  // is orchestrator-relevant even when its prose is one line. Counts come
-  // from extractRunResult's single pass (the shared parseTodoState rule),
-  // so this costs no extra read.
-  const td = resolved.todos;
-  if (td && td.total > 0) {
-    const bits = [`${td.done}/${td.total} done`];
-    if (td.inProgress) bits.push(`${td.inProgress} in progress`);
-    if (td.blocked) bits.push(`${td.blocked} blocked`);
-    if (td.pending) bits.push(`${td.pending} pending`);
-    out.push(`todos: ${bits.join(", ")}`);
-  }
-  out.push(resolved.answered ? truncate(resolved.text) : "(no final answer in transcript)");
-  // What this run launched, as of now, on the line right after its answer — so
-  // it lands just past the child's closing `</result>` in what the receiver
-  // reads, and outside the element. To `out` ONLY: never the transcript, the
-  // sidecar or `system-prompt.md`, which are evidence the completion predicates
-  // read, and a line written into any of them would become a new candidate
-  // answer. A fresh scan rather than the memo: the header says "snapshot at",
-  // and a record set left over from the last tick could be a minute old.
-  invalidateRunScan();
-  const spawns = renderSpawnsBlock(rec, allRunCandidates(), COLLECTED_DONE_IDS, Date.now(), hasExitSidecar);
-  if (spawns) out.push(spawns);
-  if (rec.status === "failed" && !resolved.answered) {
-    const diag = await paneDiagnostic(rec);
-    if (diag) out.push(`\n--- pane output ---\n${truncate(diag)}`);
-  }
-  await pushReports(rec, out);
-}
-
-/**
- * Renders one completed run's block as a single string (joined with "\n").
- * Used by the wake briefing where each block is an independent paragraph.
- */
-async function doneBlock(rec: RunRecord, result?: RunResult): Promise<string> {
-  const out: string[] = [];
-  await renderResultBlock(rec, out, result);
-  return out.join("\n");
-}
-
-/**
- * A released target's block when its result read threw: the real header —
- * so the block stays discoverable by the `=== sub-xxxx` header every release
- * assertion pins — plus a pointer to `subagent_tasks`. `readReports` never
- * throws, so the mid-run reports ride the degraded block too.
- */
-async function degradedBlock(rec: RunRecord): Promise<string> {
-  const out: string[] = [
-    formatResultHeader(rec),
-    `result block unavailable; read it with subagent_tasks (action "result", ids ["${rec.runId}"])`,
-  ];
-  await pushReports(rec, out);
-  return out.join("\n");
-}
-
-/**
- * Minimal briefing used when composing the full one threw.
- *
- * Deliberately does no I/O: this is the path taken *because* I/O failed, and a
- * wake that says only "something happened, go and look" still beats an
- * orchestrator that sleeps through a finished child.
- */
-function fallbackBriefing(
-  batch: readonly Notice[],
-  swept: readonly RunRecord[],
-  /**
-   * Targets whose release a failed compose for their health check carried:
-   * neither a fresh notice nor a swept record, so the caller surfaces them
-   * here explicitly.
-   */
-  releasedTargets: ReadonlyArray<ReleasedTarget>,
-): string {
-  const ids = new Set<string>();
-  const lines: string[] = [];
-  for (const n of batch) {
-    if (!ids.has(n.runId)) {
-      ids.add(n.runId);
-      lines.push(`- ${n.runId} (${n.agent}) ${n.kind}${n.text ? `: ${n.text}` : ""}`);
-    }
-  }
-  for (const r of swept) {
-    if (!ids.has(r.runId)) {
-      ids.add(r.runId);
-      lines.push(`- ${r.runId} (${r.agent}) ${r.status}`);
-    }
-  }
-  for (const t of releasedTargets) {
-    if (!ids.has(t.runId)) {
-      ids.add(t.runId);
-      lines.push(
-        t.kind === "unregistered"
-          ? `- ${t.runId} — release carried by the failed health check's briefing; this id is not in my registry, so I have no record of it — read it from its run dir, or with subagent_tasks (action "result") if it exists`
-          : `- ${t.runId} (${t.agent}) ${t.status} — release carried by the failed health check's briefing`,
-      );
-    }
-  }
-  return (
-    `[subagent update — delivered automatically, not typed by the user]\n\n${lines.join("\n")}\n\n` +
-    `I could not read the run details. Use subagent_tasks (action "result") on the ids above to collect them.`
-  );
-}
+const briefing = createBriefing({
+  extractResult: (rec) => extractRunResult(dirFor(rec.runId), rec.runId),
+  reports: (rec) => readReports(dirFor(rec.runId)),
+  runCandidates: allRunCandidates,
+  invalidateRunScan,
+  paneLabel,
+  readAgent,
+});
 
 // ---------------------------------------------------------------------------
 // Extension entry point
@@ -1642,12 +1331,12 @@ export default function (pi: ExtensionAPI): void {
       dirFor,
       findOnDisk: findRunRecordInAnyBase,
       probe: probeAgent,
-      completionEvidence,
+      completionEvidence: evidence.completionEvidence,
       now: () => Date.now(),
     }),
     spawnHealthCheck: spawnHealthCheckRun,
     extractRunResult: (rec) => extractRunResult(dirFor(rec.runId), rec.runId),
-    renderer: { done: doneBlock, degraded: degradedBlock, fallback: fallbackBriefing },
+    renderer: briefing,
   });
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
   let livenessTimer: ReturnType<typeof setInterval> | undefined;
@@ -2093,7 +1782,7 @@ async function dispatchTasks(
         // untouched. The displayed herdr state comes from that same probe.
         const owned = isOwnedBy(rec, ownerPane);
         const observation = owned ? await lifecycle.read(rec) : undefined;
-        if (!owned && rec.status === "running") {
+        if (foreignRunningRecord(rec, ownerPane)) {
           // A foreign (or legacy) record is never settled by this pane —
           // settling is a write, and the write is the owner's — so
           // `running` is its on-disk state, not a live probe. The run may
@@ -2102,20 +1791,14 @@ async function dispatchTasks(
           // that), so answer from the completion evidence already on disk:
           // display-only, no transition, no meta write, no pane close; the
           // `result` arm below nests the same evidence test.
-          const evidence = await completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
-          if (evidence.finished) {
-            lines.push(
-              `${rec.runId} (${rec.agent}): done (${
-                evidence.from === "sidecar"
-                  ? "the .exit sidecar is on disk"
-                  : "final answer in transcript"
-              }, not settled by this pane)`,
-            );
+          const verdict = await evidence.completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
+          if (verdict.finished) {
+            lines.push(`${rec.runId} (${rec.agent}): done (${evidence.inferredFromClause(verdict.from)})`);
             details[rec.runId] = {
               status: "done",
               herdr: null,
               owned: false,
-              inferredFrom: evidence.from,
+              inferredFrom: verdict.from,
             };
             continue;
           }
@@ -2137,18 +1820,17 @@ async function dispatchTasks(
       const lines: string[] = [];
       const details: Record<string, unknown> = {};
       for (const rec of recs) {
-        if (rec.status !== "running" || !rec.paneId) {
-          const why =
-            rec.status !== "running"
-              ? `not running (${rec.status})`
-              : launchingRunIds.has(rec.runId)
-                ? "still launching"
-                : "no pane recorded";
-          lines.push(`${rec.runId} (${rec.agent}): ${why} — message not delivered`);
+        const blocked = undeliverableClause(rec, launchingRunIds);
+        // `blocked === undefined` already means "running with a pane recorded"
+        // (`undeliverableClause`'s contract), but that is not something the type
+        // checker can see through the helper, so the pane is read once here.
+        const paneId = rec.paneId;
+        if (blocked !== undefined || paneId === undefined) {
+          lines.push(`${rec.runId} (${rec.agent}): ${blocked ?? "no pane recorded"} — message not delivered`);
           details[rec.runId] = { delivered: false, status: rec.status };
           continue;
         }
-        const sent = await sendPrompt(rec.paneId, text);
+        const sent = await sendPrompt(paneId, text);
         lines.push(
           sent.ok
             ? `${rec.runId} (${rec.agent}): message delivered to pane ${rec.paneId}`
@@ -2173,7 +1855,7 @@ async function dispatchTasks(
         const owned = isOwnedBy(rec, ownerPane);
         const observation = owned ? await lifecycle.read(rec) : undefined;
         if (rec.status === "running") {
-          if (!owned) {
+          if (foreignRunningRecord(rec, ownerPane)) {
             // A foreign (or legacy) record is never settled by this pane —
             // settling is a write (the transition, the meta save, the pane
             // close), and the write is the owner's — so `running` is its
@@ -2183,14 +1865,11 @@ async function dispatchTasks(
             // the completion evidence already on disk, display-only: the
             // record is not touched, so the owning pane's process stays the
             // one to settle it. The label says the status is inferred.
-            const evidence = await completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
-            if (evidence.finished) {
-              const note =
-                evidence.from === "sidecar"
-                  ? "completed (the .exit sidecar is on disk, not settled by this pane)"
-                  : "completed (final answer in transcript, not settled by this pane)";
-              await renderResultBlock(rec, out, evidence.result, note);
-              details[rec.runId] = { status: "done", owned: false, inferredFrom: evidence.from };
+            const verdict = await evidence.completionEvidence(dirFor(rec.runId), rec.runId, rec.paneId);
+            if (verdict.finished) {
+              const note = `completed (${evidence.inferredFromClause(verdict.from)})`;
+              await briefing.renderResultBlock(rec, out, verdict.result, note);
+              details[rec.runId] = { status: "done", owned: false, inferredFrom: verdict.from };
               continue;
             }
           }
@@ -2209,11 +1888,11 @@ async function dispatchTasks(
           );
           // Mid-run reports are the only thing a running task has to show; they
           // are why asking early is still worth something.
-          await pushReports(rec, out);
+          await briefing.pushReports(rec, out);
           details[rec.runId] = { status: "running" };
           continue;
         }
-        await renderResultBlock(rec, out, observation ? await observation.result() : undefined);
+        await briefing.renderResultBlock(rec, out, observation ? await observation.result() : undefined);
         details[rec.runId] = { status: rec.status };
       }
       return { content: [{ type: "text", text: unknownNote + out.join("\n\n") }], details };
@@ -2260,15 +1939,7 @@ async function dispatchTasks(
           read: lifecycle.read,
         });
         if (!r.interrupted) {
-          const why =
-            r.error ??
-            (r.status !== "running"
-              ? `not running (${r.status})`
-              : !rec.paneId
-                ? launchingRunIds.has(rec.runId)
-                  ? "still launching"
-                  : "no pane recorded"
-                : "unknown");
+          const why = r.error ?? undeliverableClause(rec, launchingRunIds, r.status) ?? "unknown";
           out.push(`${rec.runId} (${rec.agent}): interrupt not sent — ${why}`);
         } else if (r.delivered) {
           out.push(`${rec.runId} (${rec.agent}): interrupted; replacement prompt delivered to pane ${rec.paneId}`);

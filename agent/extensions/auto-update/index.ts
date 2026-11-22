@@ -14,6 +14,17 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { originalEntry, runningCompiled } from "../lib/runtime.js";
 
+import {
+	CHECK_INTERVAL_MS,
+	createUpdateStatusMemo,
+	describeUpdate,
+	type UpdateMemo,
+	type UpdateMemoStore,
+	type UpdateStatus,
+} from "./status.js";
+// Re-exported so `startup-fetch.ts`'s import of the type from `./auto-update/index.js` keeps resolving.
+export type { UpdateStatus };
+
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 /** Pi-Bolt's npm package: its version is the one to compare when pi is compiled. */
 const PIBOLT_PACKAGE_NAME = "pi-bolt";
@@ -37,16 +48,15 @@ export function updateCommand(compiled: boolean = runningCompiled()): { bin: str
 export function parsePiBoltVersion(stdout: string): string | null {
 	return /Pi-Bolt (\d+\.\d+\.\d+[^\s,)]*)/.exec(stdout)?.[1] ?? null;
 }
-const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours between checks
-
 
 export default function (pi: ExtensionAPI) {
 	// Check for updates on session start (shares one memoised check with
 	// startup-fetch.ts, so a cold start runs `npm view` once).
 	pi.on("session_start", async (_event, ctx) => {
 		const result = await getUpdateStatus(pi);
-		if (result.status !== "available") return;
-		ctx.ui.setStatus("auto-update", `⬆ ${result.latestVersion} available`);
+		const d = describeUpdate(result);
+		if (!d.updatePending) return;
+		ctx.ui.setStatus("auto-update", `⬆ ${d.latestVersion} available`);
 	});
 
 	// Command to perform the update
@@ -131,12 +141,19 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			if (params.action === "check") {
 				const status = await getUpdateStatus(pi, true);
-				const text =
-					status.status === "error"
-						? "Could not check for pi updates."
-						: status.status === "current"
-							? "pi is up to date."
-							: `Update available: ${status.currentVersion} → ${status.latestVersion}. Use /update command to install.`;
+				const d = describeUpdate(status);
+				let text: string;
+				switch (d.variant) {
+					case "error":
+						text = "Could not check for pi updates.";
+						break;
+					case "current":
+						text = "pi is up to date.";
+						break;
+					case "available":
+						text = `Update available: ${d.currentVersion} → ${d.latestVersion}. Use /update command to install.`;
+						break;
+				}
 				return { content: [{ type: "text" as const, text }], details: {} };
 			}
 
@@ -199,16 +216,24 @@ async function getCurrentVersion(pi: ExtensionAPI): Promise<string | null> {
 	}
 }
 
-export type UpdateStatus =
-	| { status: "current"; currentVersion: string }
-	| { status: "available"; currentVersion: string; latestVersion: string }
-	| { status: "error" };
-
 // On globalThis, not module scope: the extension loader re-imports modules on
 // /reload (moduleCache: false), which would otherwise reset the memo.
 const MEMO_KEY = Symbol.for("dotpi.auto-update.status");
-type Memo = { at: number; promise: Promise<UpdateStatus> };
-const memoStore = globalThis as unknown as Record<symbol, Memo | undefined>;
+const memoStore = globalThis as unknown as Record<symbol, UpdateMemo | undefined>;
+
+const globalMemoStore: UpdateMemoStore = {
+	read: () => memoStore[MEMO_KEY],
+	write: (m) => {
+		memoStore[MEMO_KEY] = m;
+	},
+};
+
+const updateStatusMemo = createUpdateStatusMemo<ExtensionAPI>({
+	compute: computeUpdateStatus,
+	now: () => Date.now(),
+	store: globalMemoStore,
+	intervalMs: CHECK_INTERVAL_MS,
+});
 
 /**
  * Memoised, three-way update check: it tells "could not check" apart from
@@ -218,14 +243,7 @@ const memoStore = globalThis as unknown as Record<symbol, Memo | undefined>;
  * paths do — a manual update request deserves a fresh answer.
  */
 export function getUpdateStatus(pi: ExtensionAPI, force = false): Promise<UpdateStatus> {
-	const memo = memoStore[MEMO_KEY];
-	if (!force && memo && Date.now() - memo.at < CHECK_INTERVAL_MS) return memo.promise;
-	const promise = computeUpdateStatus(pi).then((r) => {
-		if (r.status === "error" && memoStore[MEMO_KEY]?.promise === promise) memoStore[MEMO_KEY] = undefined;
-		return r;
-	});
-	memoStore[MEMO_KEY] = { at: Date.now(), promise };
-	return promise;
+	return updateStatusMemo(pi, force);
 }
 
 async function computeUpdateStatus(pi: ExtensionAPI): Promise<UpdateStatus> {

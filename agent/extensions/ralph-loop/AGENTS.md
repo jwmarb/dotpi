@@ -7,12 +7,12 @@ the internals. Line refs were checked on 2026-11-10.
 
 | File | Owns |
 |---|---|
-| `index.ts` (754) | Session wiring only: loop state, footer, the three `registerCommand`s (`:728-744`), and the `agent_settled` handler (`:334`), which is the whole contract |
-| `lib.ts` (849) | Pure logic with **zero imports**: `parseArgs` (`:180`, the one place verify mode is decided), `detectCompletion` (`:264`), fingerprinting, prompt rendering, verdict parsing, and `decideVerificationTransition` (`:628`) |
-| `gate-agent.ts` (105) | `resolveGateAgent` (`:68`) reads `agents/<name>.md` via `join(agentsDir(), …)` (`:79`) and returns `{chain, tools, promptBody}`. It is the one seam both gates use |
-| `gate.ts` (251) | Static gate (`oracle`): `captureBaseline` (`:108`), `withChainEnv` (`:70`), `runGate` |
-| `runtime-gate.ts` (320) | Runtime gate (`verifier`, `RUNTIME_TIMEOUT_MS` 600 s `:61`, `parseRuntimeVerdict` `:74`). The docker-run recipe is *prompt text* for the verifier. This code never runs the tests itself |
-| `image.ts` (612) | `ensureImage` (`:513`): project profile and digest, web detection, Dockerfile synthesis, base-image build. Docker is used only for `image inspect`/`version`/`build` |
+| `index.ts` | Session wiring only: loop state, footer, the three `registerCommand`s (`:728-744`), and the `agent_settled` handler (`:334`), which is the whole contract |
+| `lib.ts` | Pure logic with **zero imports**: `parseArgs` (`:180`, the one place verify mode is decided), `detectCompletion` (`:264`), fingerprinting, prompt rendering, verdict parsing, and `decideVerificationTransition` (`:628`) |
+| `gate-agent.ts` | `resolveGateAgent` (`:68`) reads `agents/<name>.md` via `join(agentsDir(), …)` (`:79`) and returns `{chain, tools, promptBody}`. It is the one seam both gates use |
+| `gate.ts` | Static gate (`oracle`): `captureBaseline` (`:108`), `withChainEnv` (`:70`), `runGate` |
+| `runtime-gate.ts` | Runtime gate (`verifier`, `RUNTIME_TIMEOUT_MS` 600 s `:61`, `parseRuntimeVerdict` `:74`). The docker-run recipe is *prompt text* for the verifier. This code never runs the tests itself |
+| `image.ts` | `ensureImage` (`:513`): project profile and digest, web detection, Dockerfile synthesis, base-image build. Docker is used only for `image inspect`/`version`/`build` |
 | `lib.test.ts` | The only suite (it also imports `index.js` for `GATE_FALLBACK_MODEL`) |
 
 ## THE SETTLE HANDLER (`index.ts:334-404`), in order

@@ -1,6 +1,10 @@
 # Architecture review — outcome (2026-10-31)
 
 > Historical note: the persona/profile material in this file was removed from the codebase on 2026-11-21.
+The removed material includes `quant-prompt.ts` and `lib/profiles.test.ts`, both deleted in
+`8381785`. They were live when the rulings below were written, so the C2 line naming
+`quant-prompt` and the C6 line naming `lib/profiles.test.ts` name files that no longer
+exist — read them as history, not as a current inventory.
 This file is the lasting record of this review. The visual report was
 `/tmp/architecture-review-20261031-091303.html`, a scratch file that is not kept.
 Earlier records are `architecture-review-2026-10.md`, `-10-14.md` and `-10-17.md`.
@@ -61,6 +65,14 @@ pass, both on the host and in `ralph-verify/dotpi-bun:1.4.2`.
   Mount `~/.bun/install/global`, `~/.bun`, `~/.local/bin` (at `/tmp/.local/bin`) and
   the repo (at `/tmp/.pi`) read-only, with `HOME=/tmp` and `TMPDIR=/var/tmp`. Use a
   non-login shell, because `bash -lc` resets `PATH`.
+  **Corrected 2026-11-22: that recipe produces eleven false failures on green code.**
+  `lib/layout.ts` resolves the agent dir from `os.homedir()`, so `HOME=/tmp` makes the
+  live skills/agents tree absent and `lib/skill-catalogue.test.ts` fails its own
+  non-vacuity guard; the repo at `/tmp/pi` also breaks `tsconfig.json`'s
+  `../../../../.bun` alias. Mount the repo at its host-identical path *and* at
+  `~/.pi`, mount `~/.local/bin` where `HOME` points (its absence fails three
+  `startup-fetch` tests, which discover `catimg`/`chafa`), and set `HOME` to the real
+  home. The working invocation is in `architecture-review-2026-11-22.md`.
 - **Planner scope.** Give a planner one area per run.
 - **`/tmp` quota.** The `/tmp` tmpfs has a per-user quota. When it is full,
   `check.sh` fails with EDQUOT, so export `TMPDIR=$HOME/.cache/test-tmp`.
