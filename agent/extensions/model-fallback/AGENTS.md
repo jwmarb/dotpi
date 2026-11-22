@@ -7,9 +7,9 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
 
 | File | Owns |
 |---|---|
-| `index.ts` (753) | Entry (`:226`). Registers the virtual model and `/fallback-chain` (`:720`), runs `route()`, the leases, the footer, and the gateway recovery handler |
-| `lib.ts` (2084) | Pure domain, imports nothing (load-safe for `startup-fetch`): chain parsing (`parseChainReport` `:517`, `readChain` `:1815`), `advance` (`:820`), concurrency policy (`readConcurrency` `:1697`, `applyConcurrency` `:1085`, `pickFreeIndex` `:1001`, the lease-reservation loop `reserveRoute` `:1197`), sanitisation, limits |
-| `concurrency.ts` (304) | Filesystem, cross-process per-model leases. `leaseDir` (`:80`), `LEASE_DIR_ENV` = `PI_MODEL_FALLBACK_LEASE_DIR` (`:53`), TTL 900 s (`:46`) |
+| `index.ts` | Entry (`:226`). Registers the virtual model and `/fallback-chain` (`:720`), runs `route()`, the leases, the footer, and the gateway recovery handler |
+| `lib.ts` | Pure domain, imports nothing (load-safe for `startup-fetch`): chain parsing (`parseChainReport` `:517`, `parseChainEnvReport` `:570`, `readChain` `:1862`), `advance` (`:820`), concurrency policy (`readConcurrency` `:1697`, `applyConcurrency` `:1085`, `pickFreeIndex` `:1001`, the lease-reservation loop `reserveRoute` `:1197`), sanitisation, limits |
+| `concurrency.ts` | Filesystem, cross-process per-model leases. `leaseDir` (`:80`), `LEASE_DIR_ENV` = `PI_MODEL_FALLBACK_LEASE_DIR` (`:53`), TTL 900 s (`:46`) |
 | `../lib/settings.ts` (consumer, not a file here) | The non-throwing load-time `modelFallback` read — `readSettingsKey(SETTINGS_KEY)` at `index.ts:236`. A project `.pi/settings.json` overrides the agent one |
 | `served.ts` (63) | The process-global snapshot of the chain actually registered |
 | `footer.ts` (411) | Replacement footer that shows the routed physical model, using `fitLines` |
@@ -50,8 +50,13 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
   `ref|level` (`parseChainItem`, `lib.ts:244`). A `settings.json` *string* containing `|` is not a pin: `parseChainReport` (`lib.ts:517`) drops it and
   `planRegistration` warns, as it does for any other dropped entry and for a `chain` that is not an array.
   `levelFor` (`lib.ts:344`) applies a pin only after the routable index is chosen.
-- `PI_FALLBACK_CHAIN` is load-time input and wins when parseable. A malformed non-empty value warns and falls back to
-  settings. `enabled: false` does **not** suppress a valid env chain, since a child launched on `fallback/auto` must register.
+- `PI_FALLBACK_CHAIN` is load-time input. A value with **no** parseable entry warns and falls back to settings; a value
+  whose entries **partly** parse registers the survivors and warns naming each dropped token (`parseChainEnvReport`
+  `lib.ts:570`). The partial case is loud on purpose: the child is the only process that can see its own inherited
+  value, and a silent shrink would change which models answer with nothing to show for it.
+  Env drops are the **only** chain drops reported here: `settings.json` drops stay silent whenever the env chain is
+  non-empty, because the same stale entries would otherwise complain once per child process.
+  `enabled: false` does **not** suppress a valid env chain, since a child launched on `fallback/auto` must register.
 - Physical resolution uses `ctx.modelRegistry` (not `agent/models.json` directly) and skips virtual models, so a
   `fallback/auto` entry in a chain is skipped rather than recursively routed. `contextWindow`/`maxTokens` are only
   the virtual model's advertised startup limits.
