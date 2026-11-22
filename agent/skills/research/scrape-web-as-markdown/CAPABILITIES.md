@@ -59,7 +59,7 @@ group here that is fixable locally.
 | --- | --- | --- |
 | `firecrawl developer` | 404 — `POST /v2/developer/search is not a Firecrawl API endpoint` | no GitHub issue/PR index; the route does not exist |
 | `firecrawl research` (papers) | 404 — route does not exist | ~43M-abstract index is cloud-only |
-| `alexandria`, `find-tools` | `{"tools":[]}` + `"Some tool discovery results are unavailable."` | why `--sources web` is mandatory |
+| `alexandria`, `find-tools` | `{"tools":[]}` + `"Some tool discovery results are unavailable."` | why `--sources web` is mandatory; keyless `firecrawl search` without it, and the positional `firecrawl search alexandria "…"`, are both refused before they run by the `firecrawl-cli` extension — the second one needs its argument dropped, not the flag added |
 | `firecrawl agent` | 500 | cloud product surface ([oss-vs-cloud][osc]) |
 | `interact` / browser sandbox | 503 — `Browser feature is not configured (HANGAR_URL is missing).` | |
 | `monitor` | 500 | |
@@ -75,8 +75,9 @@ scrape fine.
 
 Empty is ambiguous here — three different causes look identical:
 
-1. **Your own flags.** Missing `--sources web`, or `--categories developer` (cloud-only, returns
-   nothing). Fix the command first.
+1. **Your own flags.** Missing `--sources web` — for a keyless `search` now refused before the
+   command runs — or `--categories developer` and the other cloud-only flags, which stay manual.
+   Fix the command first.
 2. **The instrument.** Run a control query that must match (`huggingface`, or the bare library
    name). If the control is also empty, say so up front and report findings as coverage-limited.
 3. **Genuine absence.** Only conclude this after 1 and 2 are ruled out — and still write it as

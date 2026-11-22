@@ -51,6 +51,17 @@ Pass `--sources web` on **every** search. The default sources include `alexandri
 index, and without the flag every search dies with *"Alexandria requires a Firecrawl API key."*
 That error means the flag is missing — not that the topic has no results.
 
+pi enforces that here. With `FIRECRAWL_API_URL` set and `FIRECRAWL_API_KEY` unset, the
+`firecrawl-cli` extension reads the command the way a shell would and refuses two shapes
+**before they run**: a `firecrawl search` with no `--sources` (the refusal names the flag), and
+the positional `firecrawl search alexandria "…"` (which no flag rescues — drop the argument).
+Neither refusal is a Firecrawl error or an auth failure. It reads argv, so quoting a flag name
+or a query changes nothing, and it allows everything it cannot read for certain — a wrapper like
+`env`, an expanded argument like `"$SRC"`, an unclosed quote — rather than guessing. It never
+rewrites a command, so a shape it missed runs as typed and dies the same way. It covers `search`
+only: the cloud-only features in [CAPABILITIES.md](CAPABILITIES.md) stay hollow or 404, and every
+limit in that file applies unchanged.
+
 ```bash
 # Find pages.
 firecrawl search "<query>" --sources web --limit 5
