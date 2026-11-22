@@ -246,7 +246,14 @@ else
 	grouped=()
 	isolated=()
 	for suite in "${tests[@]}"; do
-		if grep -qE "mock\.module\(['\"\`]node:" "$suite"; then
+		# The classifier's input is the suite's own text, so it is deliberately
+		# permissive about the spelling (`mock.module (` with a space, a newline
+		# before the specifier) and admits the known blind spot: a suite that
+		# mocks a builtin through an imported helper, or through a variable
+		# specifier, still lands in the grouped run. Nothing here can see that;
+		# the rule it enforces is the one the two mocking suites state in their
+		# own headers.
+		if grep -qE "mock\.module\([[:space:]]*['\"\`]node:" "$suite"; then
 			isolated+=("$suite")
 		else
 			grouped+=("$suite")

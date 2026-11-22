@@ -864,7 +864,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (!writeSetting(sub, value)) {
-					ctx.ui.notify(`could not write ${settingsFile()}`, "error");
+					ctx.ui.notify(
+						`could not write ${settingsFile()} — check that it is valid JSON and writable`,
+						"error",
+					);
 					return;
 				}
 				setFetchHeader(pi, ctx, false, sub === "mode");

@@ -36,7 +36,7 @@
  *
  * ## One write rule (the writes)
  *
- * Both writers answer a user command, so they must not be able to cost pi its
+ * The one writer (`patchSettingsKey`) answers a user command, so it must not be
  * next start: a half-written `settings.json` is not a reported error but a
  * startup failure — pi's loader is a plain `JSON.parse`, and every load-time
  * reader in this repo would then see "no configuration". So a write goes to
@@ -119,7 +119,7 @@ function writeBase(): Record<string, unknown> | undefined {
 	}
 }
 
-/** Write `data` over the global settings file, atomically. Internal to the two writers. */
+/** Write `data` over the global settings file, atomically. Internal to the seam. */
 function writeGlobal(data: Record<string, unknown>): boolean {
 	const file = settingsFile();
 	const tmp = `${file}.${process.pid}.tmp`;
@@ -158,21 +158,6 @@ export function readSettings(cwd: string = process.cwd()): Record<string, unknow
  */
 export function readSettingsKey(key: string, cwd: string = process.cwd()): unknown {
 	return readSettings(cwd)[key];
-}
-
-/**
- * Set one top-level key of the GLOBAL settings file, keeping the other keys.
- *
- * The project file is never written, and its value for `key` — if it has one —
- * keeps shadowing what is written here until it is removed.
- *
- * @returns `false` (nothing written) when the file could not be replaced, or when
- * its existing contents are not a JSON object (a write would discard them).
- */
-export function writeSettingsKey(key: string, value: unknown): boolean {
-	const base = writeBase();
-	if (!base) return false;
-	return writeGlobal({ ...base, [key]: value });
 }
 
 /**

@@ -198,45 +198,6 @@ describe("completionEvidence", () => {
   });
 });
 
-describe("readEvidence", () => {
-  test("reports the facts, and skips the transcript when the sidecar decided", async () => {
-    const { counts, state, reader } = world();
-    state.sidecar = true;
-
-    const facts = await reader.readEvidence(DIR_A, RUN, "pane-1");
-    expect(facts).toEqual({
-      hasSidecar: true,
-      stamp: STAMP,
-      result: undefined,
-      hasPendingSpawns: false,
-    });
-    expect(counts.extract).toBe(0);
-  });
-
-  test("reads the transcript when nothing else decided", async () => {
-    const { counts, state, reader } = world();
-    state.answer = answer();
-    state.candidates = [{ rec: child({ runId: "sub-bbbb" }), dir: "/runs-a/sub-bbbb" }];
-
-    const facts = await reader.readEvidence(DIR_A, RUN, "pane-1");
-    expect(facts).toEqual({
-      hasSidecar: false,
-      stamp: STAMP,
-      result: state.answer,
-      hasPendingSpawns: true,
-    });
-    expect(counts.extract).toBe(1);
-    expect(counts.stamp).toBe(1);
-  });
-
-  test("is a facts read, not a verdict: it never consults the memo", async () => {
-    const { counts, reader } = world();
-
-    await reader.readEvidence(DIR_A, RUN);
-    await reader.readEvidence(DIR_A, RUN);
-    expect(counts.extract).toBe(2);
-  });
-});
 
 describe("inferredFromClause", () => {
   test("names the two sources with the exact display wording", async () => {

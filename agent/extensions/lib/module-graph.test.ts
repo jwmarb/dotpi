@@ -29,12 +29,15 @@
  * Run from the repo root: `bun test agent/extensions/lib/module-graph.test.ts`
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { agentDir } from "./layout.js";
 
 const EXT_ROOT = join(agentDir(), "extensions");
+/** The same directory reached from this file's own URL, for the checkout pin below. */
+const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LIB_DIR = join(EXT_ROOT, "lib");
 const AGENTS_MD = join(EXT_ROOT, "AGENTS.md");
 
@@ -233,6 +236,20 @@ function findCycle(edges: Map<string, Set<string>>): string[] | null {
 }
 
 describe("the lib/ table in agent/extensions/AGENTS.md", () => {
+  test("is this checkout's table: the walk root is the directory this file lives in", () => {
+    // `agentDir()` follows HOME and PI_CODING_AGENT_DIR, so on a machine where
+    // those point at another valid tree the rest of this file would compare that
+    // tree's table against that tree's imports and go green - true, but not about
+    // the code you just edited. The non-vacuity guard cannot see that difference.
+    expect(
+      realpathSync(EXT_ROOT),
+      [
+        `this suite walks ${EXT_ROOT}, which is not the checkout it lives in (${CHECKOUT_ROOT}).`,
+        "It would otherwise assert another tree's invariants and pass. Run it from the repo,",
+        "or point HOME/PI_CODING_AGENT_DIR at this checkout.",
+      ].join("\n"),
+    ).toBe(realpathSync(CHECKOUT_ROOT));
+  });
   test("walks a real tree: modules and rows both exist (the non-vacuity guard)", () => {
     // Without this, a typo'd root or a renamed heading yields zero modules and zero
     // rows, every set below compares equal, and the whole file goes green doing

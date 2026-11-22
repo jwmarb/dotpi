@@ -16,12 +16,12 @@
  * Run from the repo root: `bun test agent/extensions/lib/settings.test.ts`
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ENV_AGENT_DIR, settingsFile } from "./layout.js";
-import { patchSettingsKey, readSettings, readSettingsKey, writeSettingsKey } from "./settings.js";
+import { patchSettingsKey, readSettings, readSettingsKey } from "./settings.js";
 
 /** UTF-8 BOM, which pi's own loader tolerates and this seam must too. */
 const BOM = "\uFEFF";
@@ -107,45 +107,6 @@ describe("readSettings / readSettingsKey", () => {
 	});
 });
 
-describe("writeSettingsKey", () => {
-	test("roundtrips a key, keeps the other keys, leaves no temp file", () => {
-		writeGlobal(JSON.stringify({ other: 1, modelFallback: { chain: ["a/1"] } }));
-		expect(writeSettingsKey("startupFetch", { style: "quad" })).toBe(true);
-		expect(globalJson()).toEqual({ other: 1, modelFallback: { chain: ["a/1"] }, startupFetch: { style: "quad" } });
-		expect(readdirSync(agent).filter((f) => f.endsWith(".tmp"))).toEqual([]);
-		expect(readdirSync(agent)).toEqual(["settings.json"]);
-	});
-
-	test("creates the global file when absent", () => {
-		expect(existsSync(globalFile())).toBe(false);
-		expect(writeSettingsKey("startupFetch", { style: "half" })).toBe(true);
-		expect(globalJson()).toEqual({ startupFetch: { style: "half" } });
-	});
-
-	test("a BOM the read tolerated is dropped by the write", () => {
-		writeGlobal(BOM + JSON.stringify({ other: 1 }));
-		expect(writeSettingsKey("k", 1)).toBe(true);
-		expect(readFileSync(globalFile(), "utf-8").startsWith(BOM)).toBe(false);
-		expect(globalJson()).toEqual({ other: 1, k: 1 });
-	});
-
-	test("does not absorb a project override", () => {
-		writeGlobal(JSON.stringify({ startupFetch: { mode: "cycle" } }));
-		writeProject({ startupFetch: { style: "braille" } });
-		expect(writeSettingsKey("startupFetch", { style: "half" })).toBe(true);
-		// The global file holds only what the caller passed: no project field crept in.
-		expect(globalJson()).toEqual({ startupFetch: { style: "half" } });
-		expect(projectJson()).toEqual({ startupFetch: { style: "braille" } });
-		// And the project still shadows the global file it never touched.
-		expect(readSettingsKey("startupFetch", cwd)).toEqual({ style: "braille" });
-	});
-
-	test("a whole-value write replaces the namespace, not just its fields", () => {
-		writeGlobal(JSON.stringify({ startupFetch: { mode: "cycle", height: 30 } }));
-		expect(writeSettingsKey("startupFetch", { style: "braille" })).toBe(true);
-		expect(globalJson()).toEqual({ startupFetch: { style: "braille" } });
-	});
-});
 
 describe("patchSettingsKey", () => {
 	test("shallow-merges into the existing global namespace", () => {
@@ -187,6 +148,12 @@ describe("patchSettingsKey", () => {
 		expect(globalJson()).toEqual({ startupFetch: { style: "quad" } });
 		expect(readSettingsKey("startupFetch", cwd)).toEqual({ style: "braille" });
 	});
+	test("a BOM the read tolerated is dropped by the write", () => {
+		writeGlobal(BOM + JSON.stringify({ other: 1 }));
+		expect(patchSettingsKey("startupFetch", { style: "quad" })).toBe(true);
+		expect(readFileSync(globalFile(), "utf-8").startsWith(BOM)).toBe(false);
+		expect(globalJson()).toEqual({ other: 1, startupFetch: { style: "quad" } });
+	});
 
 	test("an existing file that does not parse is refused, not overwritten", () => {
 		// `readOne` reports a broken file as no configuration; rewriting from that
@@ -194,12 +161,11 @@ describe("patchSettingsKey", () => {
 		// refuses, and the broken file is left for its owner to fix.
 		writeGlobal("{ broken");
 		expect(patchSettingsKey("startupFetch", { style: "quad" })).toBe(false);
-		expect(writeSettingsKey("startupFetch", { style: "quad" })).toBe(false);
 		expect(readFileSync(settingsFile(), "utf-8")).toBe("{ broken");
 	});
 	test("a missing file is an empty base, so the first write creates it", () => {
 		rmSync(settingsFile(), { force: true });
-		expect(writeSettingsKey("startupFetch", { style: "quad" })).toBe(true);
+		expect(patchSettingsKey("startupFetch", { style: "quad" })).toBe(true);
 		expect(globalJson()).toEqual({ startupFetch: { style: "quad" } });
 	});
 	test("a file holding a non-object is refused too", () => {

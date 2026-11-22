@@ -116,14 +116,6 @@ export interface RunEvidenceDeps {
   now(): number;
 }
 
-/** The raw facts behind a verdict — a facts read, never a cached answer. */
-export interface EvidenceFacts {
-  hasSidecar: boolean;
-  stamp: string | undefined;
-  /** Absent when the sidecar already decided: the transcript need not be read. */
-  result: RunResult | undefined;
-  hasPendingSpawns: boolean;
-}
 
 /**
  * A cheap fingerprint of a run's completion evidence: its session file's and
@@ -158,11 +150,6 @@ export function evidenceStamp(runDirPath: string, runId: string): string | undef
 
 /** What {@link createEvidenceReader} answers. */
 export interface EvidenceReader {
-  /**
-   * The inputs a verdict would be made of, read fresh every call and cached
-   * nowhere: for a caller that needs the facts themselves rather than the rule.
-   */
-  readEvidence(dir: string, runId: string, paneId?: string): Promise<EvidenceFacts>;
   /** THE verdict — {@link completionSignal} over this module's three inputs. */
   completionEvidence(dir: string, runId: string, paneId?: string): Promise<CompletionEvidence>;
   /** The display clause naming the evidence a verdict rested on. */
@@ -185,21 +172,6 @@ export function createEvidenceReader(deps: RunEvidenceDeps): EvidenceReader {
    */
   const hasPendingSpawns = (runId: string, paneId?: string): boolean =>
     pendingSpawnsOf({ runId, paneId }, deps.allRunCandidates(), deps.now()).length > 0;
-
-  const readEvidence = async (
-    dir: string,
-    runId: string,
-    paneId?: string,
-  ): Promise<EvidenceFacts> => {
-    const hasSidecar = deps.hasExitSidecar(dir, runId);
-    const stamp = deps.evidenceStamp(dir, runId);
-    // The transcript is the expensive read, and a sidecar already settles the
-    // question, so it is skipped when the sidecar decided.
-    const result = hasSidecar
-      ? undefined
-      : await deps.extractRunResult(dir, runId, EVIDENCE_TAIL_BYTES);
-    return { hasSidecar, stamp, result, hasPendingSpawns: hasPendingSpawns(runId, paneId) };
-  };
 
   const completionEvidence = async (
     dir: string,
@@ -231,5 +203,5 @@ export function createEvidenceReader(deps: RunEvidenceDeps): EvidenceReader {
       ? "the .exit sidecar is on disk, not settled by this pane"
       : "final answer in transcript, not settled by this pane";
 
-  return { readEvidence, completionEvidence, inferredFromClause };
+  return { completionEvidence, inferredFromClause };
 }

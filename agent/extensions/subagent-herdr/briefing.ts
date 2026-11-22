@@ -9,8 +9,9 @@
  * `allRunCandidates`, `extractRunResult` and the herdr pane primitives straight
  * out of the surrounding scope.
  *
- * Here the wording is all they own. **This module imports no pi, no `herdr.ts`
- * and no `node:`**, and does no work at load: `scripts/check.sh` imports every
+ * Here the wording is all they own. **This module directly imports no pi, no
+ * `herdr.ts` and no `node:` module** (its `rundir.ts`/`release-ledger.ts`
+ * imports reach `node:fs` transitively), and does no work at load: `scripts/check.sh` imports every
  * extension source standalone, so only declarations and pure functions may sit
  * at its top level — the shape `auto-update/status.ts` establishes. Every read a
  * block needs arrives through {@link BriefingEffects}, bound in `index.ts`,
