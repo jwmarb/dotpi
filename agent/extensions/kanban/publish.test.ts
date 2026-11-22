@@ -14,7 +14,10 @@
  *
  * Run from the repo root: `bun test agent/extensions/kanban/`
  * Note: bun's `mock.module` is process-wide — in the same `bun test` invocation
- * no other suite may call `fs.renameSync`, or run this file in its own invocation.
+ * no other suite may call `fs.renameSync`, so this file is run in its own invocation:
+ * `scripts/check.sh` section 3 partitions on `mock.module("node:` and gives every such
+ * suite its own invocation (today: this file and `subagent-herdr/child-done.test.ts`).
+ * Run it alone by hand as below, or expect unrelated suites to fail under this mock.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";

@@ -20,7 +20,7 @@ have their own AGENTS.md.
 | `pi-bolt-host.ts` | No-op unless compiled. Under Pi-Bolt it gives pi-blackhole a resolvable host package |
 | `sessions.ts` | `/sessions`: session list from pi's `SessionManager.list()` |
 | `sleep.ts` | `sleep` tool: bounded pause, edge-triggered wake. Minimal template (`:205` → `:206`) |
-| `startup-fetch.ts` | `/fetch`, `/builtin-header`: neofetch-style header. Reads/writes `settings.json` `startupFetch` |
+| `startup-fetch.ts` | `/fetch`, `/builtin-header`: neofetch-style header. Reads `settings.json` `startupFetch` through `lib/settings.ts` (so a project `.pi/settings.json` overrides it) and writes it with `patchSettingsKey` (global file only) |
 | `thinking-indicator.ts` | alt+t spinner + `setHiddenThinkingLabel`. Most hooks of any single file |
 | `todo.ts` | `todo` tool + `/todos`. **Registered only in a subagent child** (`PI_SUBAGENT_RUN_ID`, `:166`) |
 | `auto-update/` | `/update` + `pi_update` tool. The pure `compareSemver` (semver prerelease order) and `planUpdateCheck` are tested in `lib/auto-update.test.ts`; a failed check is reported as an error, never as "up to date" |
@@ -31,6 +31,7 @@ have their own AGENTS.md.
 | Module | Owns · imported by |
 |---|---|
 | `layout.ts` | Agent-dir path resolution. Never throws. Imported by nearly everything |
+| `settings.ts` | The load-safe `settings.json` seam. Reads merge project `.pi/settings.json` over the agent file with a **whole-object replace per key**; `{}` and never a throw. Both writers target the **global file only** and write it atomically (`<file>.<pid>.tmp` + `renameSync`), so a project's own key is never copied into the user's config — and a project pin therefore shadows those writes · model-fallback, startup-fetch |
 | `project-layer.ts` | `projectRoots` (pi's two facts) + `TrustRequiringSnapshot` as the entry points, `resourceRoots` the low-level form; project-first agents/skills dirs for a cwd (`cwd/.pi`, trust-bypass rationale in its header) · dynamic-prompt, subagent-herdr |
 | `agents.ts` | `agents/*.md` + SKILL.md list grammar, lineage · dynamic-prompt, ralph-loop, subagent-herdr |
 | `runtime.ts` | Pi-Bolt detection, `piExecutable()` · auto-update, kanban, ralph-loop, subagent-herdr, startup-fetch, pi-bolt-host |
@@ -42,7 +43,7 @@ have their own AGENTS.md.
 | `dotenv.ts`, `git-env.ts` | `.env` parser; git env scrub · firecrawl-cli, litellm; changed-files, init |
 | single-consumer | `skill-categories.ts` (dynamic-prompt), `startup-images.ts` + `distro-logos.ts` (startup-fetch; logo arrays are **generated** art, do not hand-edit), `trade-journal-store.ts` (trade-journal; kept here as the journal grammar) |
 
-The lib graph has no cycles: 16 modules + 23 suites (`ls lib/*.ts`), and suite names do not map 1:1 to modules —
+The lib graph has no cycles: 17 modules + 24 suites (`ls lib/*.ts`), and suite names do not map 1:1 to modules —
 `skill-catalogue.test.ts` walks the live tree, and
 `dynamic-prompt.test.ts`/`sessions.test.ts`/`sleep.test.ts`/`init.test.ts`/`changed-files.test.ts`/`startup-fetch.test.ts`
 test top-level files through `../<name>.js`.

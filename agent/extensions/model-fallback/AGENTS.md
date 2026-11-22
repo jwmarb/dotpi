@@ -10,7 +10,7 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
 | `index.ts` (753) | Entry (`:226`). Registers the virtual model and `/fallback-chain` (`:720`), runs `route()`, the leases, the footer, and the gateway recovery handler |
 | `lib.ts` (2084) | Pure domain, imports nothing (load-safe for `startup-fetch`): chain parsing (`parseChainReport` `:517`, `readChain` `:1815`), `advance` (`:820`), concurrency policy (`readConcurrency` `:1697`, `applyConcurrency` `:1085`, `pickFreeIndex` `:1001`, the lease-reservation loop `reserveRoute` `:1197`), sanitisation, limits |
 | `concurrency.ts` (304) | Filesystem, cross-process per-model leases. `leaseDir` (`:80`), `LEASE_DIR_ENV` = `PI_MODEL_FALLBACK_LEASE_DIR` (`:53`), TTL 900 s (`:46`) |
-| `settings.ts` (72) | The non-throwing load-time `modelFallback` reader. A project `.pi/settings.json` overrides the agent one |
+| `../lib/settings.ts` (consumer, not a file here) | The non-throwing load-time `modelFallback` read — `readSettingsKey(SETTINGS_KEY)` at `index.ts:236`. A project `.pi/settings.json` overrides the agent one |
 | `served.ts` (63) | The process-global snapshot of the chain actually registered |
 | `footer.ts` (411) | Replacement footer that shows the routed physical model, using `fitLines` |
 | `lib`/`concurrency`/`footer`.test.ts | The three suites |
@@ -30,9 +30,9 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
 
 ## INVARIANTS
 
-- **Load-time settings come from `settings.ts`, never `pi.getSettings()`** — registration runs at import, before the
-  session API exists. The chain is then fixed for the process and published through `served.ts`, so sibling readers
-  must not re-read settings (`startup-fetch.ts:37` imports `FALLBACK_MODEL_REF`).
+- **Load-time settings come from `../lib/settings.ts` (`readSettingsKey`), never `pi.getSettings()`** — registration
+  runs at import, before the session API exists. The chain is then fixed for the process and published through
+  `served.ts`, so sibling readers must not re-read settings (`startup-fetch.ts:37` imports `FALLBACK_MODEL_REF`).
 - **Only terminal assistant-error text is sanitised.** `sanitizeProviderError` (`lib.ts:1510`) and `sanitizeModelRef`
   (`lib.ts:1370`) break retry keywords and 3-digit status-like runs, because pi decides retryability by regexing the
   error text. An unsanitised exhaustion message reads as retryable and lapses the chain forever. Hop notices are
@@ -63,7 +63,9 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
 - `served.ts` keeps the published chain on a `globalThis` `Symbol.for` key (`:46`) because pi loads extensions with
   `moduleCache: false` (`:18-21`); each load clears it first (`index.ts:229-231`) so a `/reload` that disables the router
   leaves no stale chain for `startup-fetch`.
-- `tsconfig.json`'s `include` lists only the six source files: the three `*.test.ts` suites are run by bun but never typechecked.
+- `tsconfig.json`'s `include` lists only the five source files; `../lib/settings.ts` arrives as an import, not an
+  include entry (a name listed there that no longer exists fails the whole scope with TS6053). The three
+  `*.test.ts` suites are run by bun but never typechecked.
 - `index.ts:29` points to "the measured transcript" in this file; no such transcript exists here (dangling comment).
 
 ## ANTI-PATTERNS

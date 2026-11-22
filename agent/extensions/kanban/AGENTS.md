@@ -44,7 +44,7 @@ Line refs were checked on 2026-11-10. The files change often, so grep for the ex
 
 ```sh
 bun test agent/extensions/kanban/lib.test.ts agent/extensions/kanban/gate.test.ts
-bun test agent/extensions/kanban/publish.test.ts   # alone: mock.module("node:fs") is process-wide
+bun test agent/extensions/kanban/publish.test.ts   # alone: mock.module("node:fs") is process-wide; check.sh §3 isolates it
 cd agent/extensions/kanban && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json   # tests not in include
 ```
 

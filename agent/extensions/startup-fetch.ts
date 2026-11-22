@@ -19,10 +19,11 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { convertToPng, InteractiveMode, resizeImage, VERSION } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, getCellDimensions, getImageDimensions, renderImage, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import { basename, extname, isAbsolute, join } from "node:path";
 import { agentDir, settingsFile } from "./lib/layout.js";
+import { patchSettingsKey, readSettingsKey } from "./lib/settings.js";
 import { pickLogo, renderLogo, truecolor } from "./lib/distro-logos.js";
 import { chooseImage, IMAGE_MODES, type ImageMode, listImages, parseMode, readState, writeState } from "./lib/startup-images.js";
 import { getUpdateStatus, type UpdateStatus, updateCommand } from "./auto-update/index.js";
@@ -248,18 +249,19 @@ const STYLE_HELP: Record<ArtStyle, string> = {
 export const parseStyle = (raw: unknown): ArtStyle =>
 	typeof raw === "string" && (ART_STYLES as readonly string[]).includes(raw) ? (raw as ArtStyle) : "half";
 
-/** `startupFetch` in settings.json; read per header build so edits apply on /reload. */
-export function readConfig(file = settingsFile()): FetchConfig {
-	let raw: Record<string, unknown> = {};
-	try {
-		raw = JSON.parse(readFileSync(file, "utf-8")).startupFetch ?? {};
-	} catch {}
-	const image = typeof raw.image === "string" && raw.image ? raw.image.replace(/^~(?=\/|$)/, os.homedir()) : undefined;
-	const h = Number(raw.height);
+/**
+ * The `startupFetch` panel config, coerced. The raw value comes from
+ * `lib/settings.ts`, so a project `.pi/settings.json` overrides the agent file's for
+ * this whole key. Read per header build so edits apply on `/reload`.
+ */
+export function readConfig(raw: unknown = readSettingsKey("startupFetch")): FetchConfig {
+	const cfg = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+	const image = typeof cfg.image === "string" && cfg.image ? cfg.image.replace(/^~(?=\/|$)/, os.homedir()) : undefined;
+	const h = Number(cfg.height);
 	return {
-		mode: parseMode(raw.mode),
+		mode: parseMode(cfg.mode),
 		image,
-		style: parseStyle(raw.style),
+		style: parseStyle(cfg.style),
 		height: Number.isInteger(h) && h >= 4 && h <= 40 ? h : 13,
 	};
 }
@@ -310,17 +312,18 @@ export function warnOnce(pick: ImagePick, notify: (m: string) => void, msg: stri
 	notify(msg);
 }
 
-/** Set `startupFetch.<key>` in settings.json, keeping the rest. (No temp+rename: kanban/publish.test.ts mocks renameSync suite-wide.) */
-export function writeSetting(key: string, value: unknown, file = settingsFile()): boolean {
-	try {
-		const d = JSON.parse(readFileSync(file, "utf-8"));
-		const cur = d.startupFetch;
-		d.startupFetch = { ...(cur && typeof cur === "object" && !Array.isArray(cur) ? cur : {}), [key]: value };
-		writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
-		return true;
-	} catch {
-		return false;
-	}
+/**
+ * Set one `startupFetch` field, keeping the rest of the namespace and the rest of
+ * the file. `patchSettingsKey` writes the GLOBAL settings file atomically
+ * (temp + rename), which is safe here because a half-written `settings.json` would
+ * cost pi its next start rather than just this panel.
+ *
+ * The honest caveat: the read is project-over-global with a whole-object replace, so
+ * a repo that pins `startupFetch` in its own `.pi/settings.json` shadows this write —
+ * `/fetch style` there reports success and shows nothing until the pin is removed.
+ */
+export function writeSetting(key: string, value: unknown): boolean {
+	return patchSettingsKey("startupFetch", { [key]: value });
 }
 
 // catimg wraps its output in cursor save/hide/show (CSI s, ?25l, ?25h); only
