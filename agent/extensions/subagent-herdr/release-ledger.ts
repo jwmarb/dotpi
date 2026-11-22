@@ -240,6 +240,44 @@ export function ownsRunningRecord(recs: readonly RunRecord[], paneId: string | u
   return recs.some((rec) => rec.status === "running" && isOwnedBy(rec, paneId));
 }
 
+/**
+ * Is this a **running** record that is not this pane's? The conjunction the two
+ * `subagent_tasks` display arms ask before they infer a run's status from the
+ * completion evidence on disk instead of settling it: foreign ({@link isOwnedBy}
+ * false) AND still `running`.
+ *
+ * Spelled once because the arms must not drift apart, and because neither leg
+ * answers on its own: an owned `running` record is the owner's to probe and
+ * settle, and a foreign *terminal* one is already answered by its own status.
+ */
+export function foreignRunningRecord(rec: RunRecord, paneId: string | undefined): boolean {
+  return !isOwnedBy(rec, paneId) && rec.status === "running";
+}
+
+/**
+ * Why no message can reach this record, or `undefined` when delivery is possible.
+ *
+ * The order is the one both arms asked it in: a status that is not `running`
+ * first, then a record with no pane — where a launch this process is still
+ * driving (`launching`) is its own honest answer, and is consulted only once the
+ * missing pane is established. "no pane recorded" for a run that is merely still
+ * starting would tell the orchestrator to give up on a child that exists.
+ *
+ * `status` overrides the record's when the caller already observed a fresher one:
+ * the interrupt arm reads the status back from the reconcile its seam ran, and
+ * that seam may leave the record it was handed still `running`.
+ */
+export function undeliverableClause(
+  rec: RunRecord,
+  launching: ReadonlySet<string>,
+  status?: RunRecord["status"],
+): "still launching" | "no pane recorded" | `not running (${RunRecord["status"]})` | undefined {
+  const s = status ?? rec.status;
+  if (s !== "running") return `not running (${s})`;
+  if (!rec.paneId) return launching.has(rec.runId) ? "still launching" : "no pane recorded";
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // The spawns block: what a finished run left behind it
 // ---------------------------------------------------------------------------

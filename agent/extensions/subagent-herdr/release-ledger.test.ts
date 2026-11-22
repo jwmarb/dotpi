@@ -12,12 +12,14 @@ import { DEFER_MAX_MS, deferWithin, withinLifetime } from "./rundir.js";
 import type { LifecycleTransition, RunObservation, SweepResult } from "./run-lifecycle.js";
 import {
   createReleaseLedger,
+  foreignRunningRecord,
   LIVENESS_BACKSTOP_MS,
   MAX_DEGRADED_RELEASE_ATTEMPTS,
   NOTICE_COALESCE_MS,
   ownsRunningRecord,
   renderSpawnsBlock,
   SPAWNS_BLOCK_MAX_LINES,
+  undeliverableClause,
   withRerouteNote,
   type HealthCheckSpawnOutcome,
   type ReleaseLedgerDeps,
@@ -860,6 +862,57 @@ describe("ownsRunningRecord: who is allowed to tick", () => {
     expect(w.sweeps[0]).toEqual(["sub-1306"]);
     expect(w.find("sub-1307").status).toBe("running");
     expect(w.find("sub-1308").status).toBe("running");
+  });
+});
+
+describe("foreignRunningRecord / undeliverableClause: the query arms' two questions", () => {
+  // Both are conjunctions the `subagent_tasks` arms used to spell inline, so the
+  // assertions are the truth table itself — including which leg answers first.
+
+  test("foreignRunningRecord is the conjunction, not either leg", () => {
+    // foreign + running: the case the evidence inference exists for.
+    expect(foreignRunningRecord(rec({ runId: "sub-1401", ownerPane: FOREIGN }), OWN)).toBe(true);
+    // own + running: the owner's to probe and settle.
+    expect(foreignRunningRecord(rec({ runId: "sub-1402" }), OWN)).toBe(false);
+    // foreign + terminal: its own status already answers the question.
+    expect(
+      foreignRunningRecord(rec({ runId: "sub-1403", ownerPane: FOREIGN, status: "done", finishedAt: NOW }), OWN),
+    ).toBe(false);
+    // A legacy record (no `ownerPane`) is foreign to every pane, and so is one
+    // read by a process that does not know its own pane.
+    expect(foreignRunningRecord(rec({ runId: "sub-1404", ownerPane: undefined }), OWN)).toBe(true);
+    expect(foreignRunningRecord(rec({ runId: "sub-1405" }), undefined)).toBe(true);
+  });
+
+  test("undeliverableClause names the three reasons, and nothing when delivery is possible", () => {
+    const launching = new Set(["sub-1410"]);
+    expect(undeliverableClause(rec({ runId: "sub-1406", status: "failed" }), launching)).toBe(
+      "not running (failed)",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1410", paneId: undefined }), launching)).toBe(
+      "still launching",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1407", paneId: undefined }), launching)).toBe(
+      "no pane recorded",
+    );
+    expect(undeliverableClause(rec({ runId: "sub-1408" }), launching)).toBeUndefined();
+  });
+
+  test("the status leg answers before the paneless one", () => {
+    // A cancelled launch is both: the arms said "not running (cancelled)", never
+    // "no pane recorded", and `launching` is consulted only after `!paneId`.
+    const launched = new Set(["sub-1411"]);
+    expect(
+      undeliverableClause(rec({ runId: "sub-1411", paneId: undefined, status: "cancelled" }), launched),
+    ).toBe("not running (cancelled)");
+  });
+
+  test("it answers from the observed status argument, not the record in hand", () => {
+    // The interrupt arm's case: the never-throws seam reconciled the run and
+    // reported `done`, while the record it was handed is still `running`.
+    const running = rec({ runId: "sub-1412" });
+    expect(undeliverableClause(running, new Set(), "done")).toBe("not running (done)");
+    expect(running.status).toBe("running");
   });
 });
 
