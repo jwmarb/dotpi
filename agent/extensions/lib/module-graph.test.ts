@@ -29,7 +29,7 @@
  * Run from the repo root: `bun test agent/extensions/lib/module-graph.test.ts`
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -241,14 +241,21 @@ describe("the lib/ table in agent/extensions/AGENTS.md", () => {
     // those point at another valid tree the rest of this file would compare that
     // tree's table against that tree's imports and go green - true, but not about
     // the code you just edited. The non-vacuity guard cannot see that difference.
+    //
+    // Identity is device+inode, not realpath: a container may bind the same
+    // checkout at two paths (`~/.pi` and the host path), and realpath cannot
+    // collapse a bind mount even though both names reach one directory. Two
+    // genuinely different trees never share an inode.
+    const here = statSync(EXT_ROOT);
+    const mine = statSync(CHECKOUT_ROOT);
     expect(
-      realpathSync(EXT_ROOT),
+      `${here.dev}:${here.ino}`,
       [
         `this suite walks ${EXT_ROOT}, which is not the checkout it lives in (${CHECKOUT_ROOT}).`,
         "It would otherwise assert another tree's invariants and pass. Run it from the repo,",
         "or point HOME/PI_CODING_AGENT_DIR at this checkout.",
       ].join("\n"),
-    ).toBe(realpathSync(CHECKOUT_ROOT));
+    ).toBe(`${mine.dev}:${mine.ino}`);
   });
   test("walks a real tree: modules and rows both exist (the non-vacuity guard)", () => {
     // Without this, a typo'd root or a renamed heading yields zero modules and zero
