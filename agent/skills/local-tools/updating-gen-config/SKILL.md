@@ -1,6 +1,7 @@
 ---
 name: updating-gen-config
 description: "Use when a LiteLLM router config (a gen_config script that emits litellm-config.yaml) has manually-added model entries missing details — no model_info, no max_input_tokens/max_output_tokens, or no per-token costs for an externally-served model — and they need to be filled in. Triggers: 'fill in the new model in gen_config', 'complete an incomplete litellm entry', 'research litellm details for a model', 'add context/costs to a router config model'."
+disable-model-invocation: true
 ---
 
 # Updating a gen_config router script

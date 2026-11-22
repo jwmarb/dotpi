@@ -1,6 +1,7 @@
 ---
 name: creating-infographic-animations
 description: Use when creating silent educational infographic animations — Kurzgesagt- or Infographic Show-style explainers, animated SVG diagrams, scene-based visual storytelling with next-button navigation and on-screen explanations, no narration or audio, built with SVG + JavaScript (GSAP) in the browser.
+disable-model-invocation: true
 ---
 
 # Creating Infographic Animations

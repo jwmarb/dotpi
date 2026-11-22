@@ -1,6 +1,7 @@
 ---
 name: pdf-to-latex
 description: Use when converting a PDF document into LaTeX source — "convert this PDF to LaTeX", "recreate this paper/report as .tex", "re-typeset the PDF", "make a LaTeX version of this document". Assumes a vision-capable agent.
+disable-model-invocation: true
 ---
 
 # PDF to LaTeX

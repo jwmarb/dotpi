@@ -1,6 +1,7 @@
 ---
 name: latex-study-guide
 description: Write exam study material in LaTeX. Use when making a note sheet or cheat sheet (dense, one printed sheet), or a study guide (multi-page teaching document for a quiz or exam), or when adding to either.
+disable-model-invocation: true
 ---
 
 # LaTeX study material

@@ -1,6 +1,6 @@
 ---
 name: fundamental-analysis
-description: Fundamental and business-quality analysis on a company for long-term investing — business model and moat, balance-sheet strength, cash-flow quality, returns on capital, dilution, valuation multiples, peer comparison, and a written investment thesis with review triggers. Use when the user asks whether a company is a good long-term investment, for a fundamental read, business-model or moat analysis, balance-sheet health, debt or liquidity, free cash flow, ROIC, margins, revenue growth, earnings quality, whether a stock is cheap or expensive, P/E or P/B or EV/EBITDA, how it compares to peers, dividend safety, or to record and recall an investment thesis.
+description: Fundamental and business-quality analysis on a company for long-term investing — business model and moat, balance-sheet strength, cash-flow quality, returns on capital, dilution, valuation multiples, peer comparison, and a written investment thesis with review triggers. Use when the user asks whether a company is a good long-term investment, for a fundamental read, business-model or moat analysis, balance-sheet health, debt or liquidity, free cash flow, ROIC, or margins.
 ---
 
 # Fundamental Analysis
