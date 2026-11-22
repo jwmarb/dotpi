@@ -16,6 +16,7 @@ import { join } from "node:path";
 import {
   DEFER_MAX_MS,
   REVIVAL_WINDOW_MS,
+  deferWithin,
   hasExitSidecar,
   isTerminalRecord,
   launchedBy,
@@ -24,6 +25,7 @@ import {
   readRunRecordFromDisk,
   runDirBasesOf,
   type RunRecord,
+  withinLifetime,
 } from "./rundir.js";
 
 const NOW = 1_700_000_000_000;
@@ -259,6 +261,62 @@ describe("pendingSpawnsOf", () => {
     expect(
       pendingSpawnsOf({ runId: "sub-aaaa", paneId: "w1:p7" }, [c], NOW + DEFER_MAX_MS + 1),
     ).toEqual([]);
+  });
+});
+
+describe("deferWithin", () => {
+  test("the bound is the record's own age, and the exact boundary is excluded", () => {
+    expect(deferWithin(record({ runId: "sub-bbbb", startedAt: NOW - DEFER_MAX_MS + 1 }), NOW)).toBe(true);
+    expect(deferWithin(record({ runId: "sub-bbbb", startedAt: NOW - DEFER_MAX_MS }), NOW)).toBe(false);
+    expect(deferWithin(record({ runId: "sub-bbbb", startedAt: NOW - DEFER_MAX_MS - 1000 }), NOW)).toBe(false);
+  });
+
+  test("a record that cannot say when it started is not within", () => {
+    expect(deferWithin(record({ runId: "sub-bbbb", startedAt: Number.NaN }), NOW)).toBe(false);
+    expect(
+      deferWithin(record({ runId: "sub-bbbb", startedAt: undefined as unknown as number }), NOW),
+    ).toBe(false);
+  });
+
+  test("pendingSpawnsOf defers on exactly this predicate", () => {
+    // One expression, so the predicate and the rule cannot disagree about when
+    // the wait ran out: the same five records, the same clock, one verdict.
+    const base = mkdtempSync(join(tmpdir(), "rundir-defer-"));
+    for (const startedAt of [
+      NOW - DEFER_MAX_MS + 1,
+      NOW - DEFER_MAX_MS,
+      NOW - DEFER_MAX_MS - 1000,
+      Number.NaN,
+      undefined as unknown as number,
+    ]) {
+      const c = candidate(base, { runId: "sub-bbbb", parentRunId: "sub-aaaa", startedAt });
+      expect(deferWithin(c.rec, NOW)).toBe(pendingSpawnsOf({ runId: "sub-aaaa" }, [c], NOW).length === 1);
+    }
+  });
+});
+
+describe("withinLifetime", () => {
+  test("a parent that cannot say when it started imposes no window", () => {
+    expect(withinLifetime(record({ runId: "sub-bbbb", startedAt: 0 }), undefined)).toBe(true);
+  });
+
+  test("the window is inclusive at the parent's own start", () => {
+    expect(withinLifetime(record({ runId: "sub-bbbb", startedAt: 1000 }), 1000)).toBe(true);
+    expect(withinLifetime(record({ runId: "sub-bbbb", startedAt: 999 }), 1000)).toBe(false);
+  });
+
+  test("a child that cannot say when it started is outside a defined window", () => {
+    expect(withinLifetime(record({ runId: "sub-bbbb", startedAt: Number.NaN }), 1000)).toBe(false);
+    expect(
+      withinLifetime(record({ runId: "sub-bbbb", startedAt: undefined as unknown as number }), 1000),
+    ).toBe(false);
+  });
+
+  test("a non-finite parent start is NOT the no-window case", () => {
+    // Pinned as written: the caller maps a non-finite parent `startedAt` to
+    // `undefined` before asking, so this arm asks "is any start >= NaN?".
+    // Reading it as no-window instead would be a behavior change.
+    expect(withinLifetime(record({ runId: "sub-bbbb", startedAt: 1000 }), Number.NaN)).toBe(false);
   });
 });
 

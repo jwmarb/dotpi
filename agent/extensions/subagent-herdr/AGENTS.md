@@ -9,14 +9,14 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
 | File | Owns |
 |---|---|
 | `index.ts` (2332) | Entry — the only module pi loads here (`before_agent_start` `:1457`, `session_start` `:1471`, tools `:1515`/`:1592`, `input` `:1845`, `session_shutdown` `:1862`). Registers the tools, spawn (with the bounded launch-time Enter recovery, and the `parentRunId` stamp at `:980`), the briefing renderers (the spawns block rides at `:1330`), the `input` hook that swallows child notices, the coalesced wake, and the 60 s liveness tick (ownership-gated for children at `:1939`) |
-| `rundir.ts` (1094) | **The contract, spelled once**: run-dir paths, `RunRecord` (`:296`, persisted verbatim as `meta.json`, with `parentRunId` at `:367`), `RunStatus` (derived from `RUN_STATUSES`, `:216`), `RUN_ID_PATTERN`, the wake-notice grammar, the ancestry grammar, the answer predicate `qualifiesAsAnswer` with `visibleTextOf`, the transcript-selection rule `pickSessionName`, and **the one pending-spawn rule** `pendingSpawnsOf` (`:497`) with `DEFER_MAX_MS` (`:421`) and the record-level terminal test `isTerminalRecord` (`:257`) |
+| `rundir.ts` (1153) | **The contract, spelled once**: run-dir paths, `RunRecord` (`:296`, persisted verbatim as `meta.json`, with `parentRunId` at `:367`), `RunStatus` (derived from `RUN_STATUSES`, `:216`), `RUN_ID_PATTERN`, the wake-notice grammar, the ancestry grammar, the answer predicate `qualifiesAsAnswer` with `visibleTextOf`, the transcript-selection rule `pickSessionName`, **the one parent shape** `ParentRef` (`:438`) that both detectors pass, and **the one pending-spawn rule** `pendingSpawnsOf` (`:503`) with `DEFER_MAX_MS` (`:421`) spelled once as `deferWithin` (`:533`) — the age clause the ledger's spawns-block fallback shares — alongside the ledger's lifetime clause `withinLifetime` (`:546`), and the record-level terminal test `isTerminalRecord` (`:257`) |
 | `lib.ts` (1459) | Pure launch/result contract: `admitSpawn` (`:1261`: refuses a `cwd` that is not a usable string path, then agent lookup → `lineageRejection` → `childFallbackChain`), `normalizeChildCwd` (`:1211`), `buildChildArgv` (`:285`), `buildChildEnv` (`:166`), the trust pair `childApproveFlag`/`childTrustDecisionSaved` (`:346`/`:373`), `rootsForRun` (`:415`), result extraction (`extractRunResult` `:792`), skill selection (`selectSkills` `:446`, `discoverSkills` `:582`), `buildHealthCheckTask` (`:1061`), `herdrAgentName` (`:1366`), `projectLayerNotices` (`:1442`) |
 | `run-lifecycle.ts` (464) | Pi-free. Has the one completion predicate `completionSignal` (`:139`, three inputs: sidecar, result, pending spawns), is the sole writer of `status`/`finishedAt`/`failedAttempts`, and owns `settleFromSidecar` (`:452`; interface `:206`) — the only way a sidecar-proven `running` record becomes `done`. Handles per-run serialization and gone-pane settle retries |
 | `settle-stuck.ts` (201) | Pi-free start-up settle: `settleStuckRecords`, `settleOrphans` (`:172`, a running child whose parent is terminal, past `STUCK_SIDECAR_MIN_AGE_MS` = 6 backstops, settled through the lifecycle) and `isOrphanSettleable` |
-| `release-ledger.ts` (1103) | Pi-free wake policy: coalescing (`NOTICE_COALESCE_MS` 1.2 s `:150`), dedup, the health-check/target release pairing (`MAX_DEGRADED_RELEASE_ATTEMPTS` `:184`), and `LIVENESS_BACKSTOP_MS` 60 s (`:164`). Every briefing branch adds the reroute note through `withRerouteNote`. Also `ownsRunningRecord` (`:236`, the child-tick gate) and `renderSpawnsBlock` (`:295`). Takes `now` and has no timers |
+| `release-ledger.ts` (1099) | Pi-free wake policy: coalescing (`NOTICE_COALESCE_MS` 1.2 s `:153`), dedup, the health-check/target release pairing (`MAX_DEGRADED_RELEASE_ATTEMPTS` `:187`), and `LIVENESS_BACKSTOP_MS` 60 s (`:167`). Every briefing branch adds the reroute note through `withRerouteNote`. Also `ownsRunningRecord` (`:239`, the child-tick gate) and `renderSpawnsBlock` (`:298`). Takes `now` and has no timers |
 | `parent-proof.ts` (192) | Pi-free running-parent proof for reroutes: `createParentProof(effects)` with the positive-only, TTL-bounded memo, plus `WAKE_PROBE_TIMEOUT_MS`/`PARENT_PROOF_TTL_MS` (re-exported by `index.ts`) |
 | `herdr.ts` (594) | The only herdr seam, a CLI wrapper (`HERDR_TIMEOUT_MS` 30 s). The measured herdr behaviours are in its header. It also exports the pane primitives that kanban uses |
-| `child-done.ts` (1681) | The child half, loaded with `-e`: `subagent_done`/`subagent_report`/`subagent_ask` (card children only), the answer gate, the truncation continuation, the **pending-spawn deferral** (`agent_end` returns early at `:853`; `subagent_done` refuses at `:748`), the `.exit` sidecar, and the detached notice |
+| `child-done.ts` (1683) | The child half, loaded with `-e`: `subagent_done`/`subagent_report`/`subagent_ask` (card children only), the answer gate, the truncation continuation, the **pending-spawn deferral** (`agent_end` returns early at `:854`; `subagent_done` refuses at `:749`), the `.exit` sidecar, and the detached notice |
 | `package.json` / `tsconfig.json` | Dev-only `typescript` + `@types/node`, with no `main`/`scripts`/runtime deps. The tsconfig has **no `paths`** |
 
 ## CONVENTIONS (local)
@@ -45,8 +45,9 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
   **never closes**, because the scrollback is the failure evidence.
 - **The run dir is global to every pi process, and ownership is per pane** (`ownerPane` = `HERDR_PANE_ID`). Only the
   owner sweeps or ticks. Unknown runs are adopted from disk on demand. Load and adoption use `hasRunId`
-  (`rundir.ts:634`), which checks only `runId`; `isRunRecord` (`:648`) is strict (`status` ∈ `RUN_STATUSES`) and
-  only kanban's reader uses it.
+  (`rundir.ts:682`), which narrows to `RunIdBearing` (`:664`) — the run id and nothing else — and widen the
+  survivor through `asRunRecord` (`:697`), the one documented unvalidated cast at that boundary; `isRunRecord`
+  (`:707`) stays the strict reader guard (`status` ∈ `RUN_STATUSES`) and only kanban's reader uses it.
 - **A `running` record a sidecar proves finished belongs to no pane any more.** The owner settles it on its next tick;
   at factory start the root process settles the ones owners never came back for — sidecar `at` older than
   `STUCK_SIDECAR_MIN_AGE_MS` (6 backstops), `done` at the sidecar's own time, and it closes no pane. Records whose
@@ -60,8 +61,7 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
   `worker` waiting on its `librarian`) to end its turn and be woken by the run it launched, and a clean `agent_end`
   holding a `<result>` used to read as completion — it shut the waiting worker down (measured while workers still
   launched graders: 83 of 116 nested graders reported after their worker was closed). Both detectors
-  defer on **one** rule, `pendingSpawnsOf` (`rundir.ts:474`): the child returns from `agent_end` with no sidecar, notice,
-  defer on **one** rule, `pendingSpawnsOf` (`rundir.ts:497`): the child returns from `agent_end` with no sidecar, notice,
+  defer on **one** rule, `pendingSpawnsOf` (`rundir.ts:503`): the child returns from `agent_end` with no sidecar, notice,
   Unfinished means **no `.exit` sidecar AND a status that is not terminal** (`isTerminalRecord`: `done`,
   `cancelled`, `failed` *with* `failedAttempts`, or a bare `failed` **once** `REVIVAL_WINDOW_MS` (6 min) has
   passed since it settled (`finishedAt`) — while that window runs the bare `failed` is still the lifecycle's

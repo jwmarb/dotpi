@@ -55,6 +55,7 @@ import { completionSignal, type RunObservation } from "./run-lifecycle.js";
 import {
   ANCESTRY_ENV,
   ancestorLabel,
+  asRunRecord,
   CARD_ID_PATTERN,
   exitPath,
   formatExitSidecar,
@@ -1802,6 +1803,16 @@ describe("rundir record shapes", () => {
       expect(isRunRecord({ runId: "sub-1", status })).toBe(true);
     }
     expect(isRunStatus("unknown")).toBe(false);
+  });
+
+  test("asRunRecord widens a run-id-only record without checking or copying", () => {
+    // The load/adoption tolerance `hasRunId` grants is carried into the registry
+    // by this one cast: the same object comes back, and the strict reader guard
+    // still refuses the record. Tolerance moved location; it did not grow.
+    const truncated = { runId: "sub-1" };
+    expect(hasRunId(truncated)).toBe(true);
+    expect(asRunRecord(truncated)).toBe(truncated);
+    expect(isRunRecord(truncated)).toBe(false);
   });
 
   test("readRunRecordFromDisk adopts a record with no status", () => {

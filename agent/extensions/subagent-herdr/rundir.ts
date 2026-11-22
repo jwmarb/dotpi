@@ -432,6 +432,12 @@ export const DEFER_MAX_MS = 75 * 60 * 1000;
 export const REVIVAL_WINDOW_MS = 6 * 60_000;
 
 /**
+ * The parent half of the pending-spawn relation: the asking run, identified by
+ * its run id, plus the pane its un-stamped (legacy) children were recorded to.
+ */
+export type ParentRef = { runId: string; paneId?: string };
+
+/**
  * Was `rec` launched by `parent`?
  *
  * `parentRunId` decides whenever the record carries a usable one; the legacy
@@ -444,7 +450,7 @@ export const REVIVAL_WINDOW_MS = 6 * 60_000;
  * Exported because the pending-spawn predicate and the spawns block a parent
  * renders must agree on exactly one parent relation.
  */
-export function launchedBy(rec: RunRecord, parent: { runId: string; paneId?: string }): boolean {
+export function launchedBy(rec: RunRecord, parent: ParentRef): boolean {
 	const parentId = typeof rec.parentRunId === "string" ? rec.parentRunId : undefined;
 	if (parentId !== undefined) return parentId === parent.runId;
 	const owner = typeof rec.ownerPane === "string" ? rec.ownerPane : undefined;
@@ -495,7 +501,7 @@ export function launchedBy(rec: RunRecord, parent: { runId: string; paneId?: str
  *   evaluated at the same instant as the {@link DEFER_MAX_MS} bound.
  */
 export function pendingSpawnsOf(
-	run: { runId: string; paneId?: string },
+	run: ParentRef,
 	candidates: readonly { rec: RunRecord; dir: string }[],
 	now: number,
 	hasSidecar: (dir: string, runId: string) => boolean = hasExitSidecar,
@@ -509,12 +515,41 @@ export function pendingSpawnsOf(
 		if (!launchedBy(rec, run)) continue;
 		if (hasSidecar(dir, rec.runId)) continue;
 		if (isTerminal(rec, now)) continue;
-		const startedAt = rec.startedAt;
-		if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) continue;
-		if (now - startedAt >= DEFER_MAX_MS) continue;
+		if (!deferWithin(rec, now)) continue;
 		pending.push(rec);
 	}
 	return pending;
+}
+
+/**
+ * Is `rec` young enough to still hold its parent: inside {@link DEFER_MAX_MS},
+ * measured from the pending child's own `startedAt`? The bound is one
+ * expression so the pending-spawn predicate and the spawns-block fallback that
+ * mirrors it cannot drift.
+ *
+ * A `startedAt` that is missing or not a finite number is NOT within: a record
+ * too broken to say when it started cannot hold anything open.
+ */
+export function deferWithin(rec: RunRecord, now: number): boolean {
+	return (
+		typeof rec.startedAt === "number" &&
+		Number.isFinite(rec.startedAt) &&
+		now - rec.startedAt < DEFER_MAX_MS
+	);
+}
+
+/**
+ * Did `rec` start within the parent's lifetime, i.e. at or after `parentStart`?
+ * The ledger's attribution clause for a pane id reused across herdr sessions.
+ * An undefined `parentStart` means no window, so every candidate is inside it.
+ */
+export function withinLifetime(rec: RunRecord, parentStart: number | undefined): boolean {
+	if (parentStart === undefined) return true;
+	return (
+		typeof rec.startedAt === "number" &&
+		Number.isFinite(rec.startedAt) &&
+		rec.startedAt >= parentStart
+	);
 }
 
 /**
@@ -531,6 +566,7 @@ export function pendingSpawnsOf(
  * `hasRunId`, not the strict {@link isRunRecord}: a reader must not drop a
  * record whose `status` is missing or unrecognised (an older or truncated
  * `meta.json`).
+ * The survivor is widened through {@link asRunRecord}.
  *
  * Synchronous on purpose: the input hook that reaches it is synchronous, and
  * the read is one small file.
@@ -546,7 +582,7 @@ export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord
 	} catch {
 		return undefined;
 	}
-	return hasRunId(parsed) && parsed.runId === runId ? parsed : undefined;
+	return hasRunId(parsed) && parsed.runId === runId ? asRunRecord(parsed) : undefined;
 }
 
 /**
@@ -624,6 +660,9 @@ export function printableAgent(agent: unknown): string {
 	return typeof agent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(agent) ? agent : "?";
 }
 
+/** What {@link hasRunId} proves about a parsed value: it carries a `runId`. */
+export type RunIdBearing = { runId: string };
+
 /**
  * Does this parsed JSON carry a usable `runId`? The load and adoption guard.
  *
@@ -634,13 +673,29 @@ export function printableAgent(agent: unknown): string {
  * `healthCheckOf` is ignored (treated as absent) rather than record-fatal:
  * the reading sites in index.ts guard with `typeof rec.healthCheckOf ===
  * "string"` checks, so a corrupted value cannot key a bogus registry entry.
+ *
+ * It narrows to {@link RunIdBearing} and nothing more: every other field is
+ * unvalidated *by design*, so a caller that needs a {@link RunRecord} widens at
+ * the load boundary through {@link asRunRecord} and keeps its own `typeof`
+ * guards where it reads each field.
  */
-export function hasRunId(value: unknown): value is RunRecord {
+export function hasRunId(value: unknown): value is RunIdBearing {
 	return (
 		typeof value === "object" &&
 		value !== null &&
 		typeof (value as { runId?: unknown }).runId === "string"
 	);
+}
+
+/**
+ * Widen a {@link RunIdBearing} read from disk to a {@link RunRecord}: the one
+ * deliberate unvalidated cast in the extension, applied where a record enters
+ * the process from the world-writable run dir. Readers keep their own `typeof`
+ * guards on every field they consult; a reader that *renders* `status` must
+ * gate with {@link isRunRecord} instead of widening through this.
+ */
+export function asRunRecord(value: RunIdBearing): RunRecord {
+	return value as RunRecord;
 }
 
 /**

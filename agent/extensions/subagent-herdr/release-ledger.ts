@@ -52,13 +52,16 @@
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
 import {
   DEFER_MAX_MS,
+  deferWithin,
   isRunStatus,
   launchedBy,
   printableAgent,
   rerouteMarker,
   RUN_ID_PATTERN,
+  withinLifetime,
   type Notice,
   type NoticeReroute,
+  type ParentRef,
   type RunRecord,
 } from "./rundir.js";
 import type { RunLifecycle, RunObservation } from "./run-lifecycle.js";
@@ -299,7 +302,7 @@ export function renderSpawnsBlock(
   now: number,
   hasSidecar: (dir: string, runId: string) => boolean,
 ): string | undefined {
-  const parent = { runId: rec.runId, ...(typeof rec.paneId === "string" ? { paneId: rec.paneId } : {}) };
+  const parent: ParentRef = { runId: rec.runId, ...(typeof rec.paneId === "string" ? { paneId: rec.paneId } : {}) };
   const parentStart = typeof rec.startedAt === "number" && Number.isFinite(rec.startedAt) ? rec.startedAt : undefined;
   const launched = candidates.filter(({ rec: c }) => c.runId !== rec.runId && launchedBy(c, parent));
   // The lifetime window keeps a reused pane id from attributing stale records;
@@ -307,22 +310,15 @@ export function renderSpawnsBlock(
   // block exists to say why a delegating worker is (or was) running, and
   // `pendingSpawnsOf` selects on the unfiltered relation, so a run it is
   // holding open must not render no block at all.
-  const inLifetime = (c: RunRecord): boolean =>
-    parentStart === undefined
-      ? true
-      : typeof c.startedAt === "number" && Number.isFinite(c.startedAt) && c.startedAt >= parentStart;
-  const withinLifetime = launched.filter(({ rec: c }) => inLifetime(c));
+  const inWindow = launched.filter(({ rec: c }) => withinLifetime(c, parentStart));
   // The fallback is bounded the same way `pendingSpawnsOf` is: it cannot be
   // holding a record older than `DEFER_MAX_MS`, so the block must not print
   // one as this child's launch — a reused pane id is exactly the threat the
   // lifetime window exists for.
   const children =
-    withinLifetime.length > 0
-      ? withinLifetime
-      : launched.filter(
-          ({ rec: c }) =>
-            typeof c.startedAt === "number" && Number.isFinite(c.startedAt) && now - c.startedAt < DEFER_MAX_MS,
-        );
+    inWindow.length > 0
+      ? inWindow
+      : launched.filter(({ rec: c }) => deferWithin(c, now));
   children.sort((a, b) => (a.rec.runId < b.rec.runId ? -1 : a.rec.runId > b.rec.runId ? 1 : 0));
   if (children.length === 0) return undefined;
 

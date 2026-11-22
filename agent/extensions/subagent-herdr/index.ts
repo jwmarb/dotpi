@@ -167,6 +167,7 @@ import {
 import { agentDir } from "../lib/layout.js";
 import { projectRoots, type ResourceRoots, TrustRequiringSnapshot } from "../lib/project-layer.js";
 import {
+  asRunRecord,
   ancestorLabel,
   CARD_ID_PATTERN,
   EVIDENCE_TAIL_BYTES,
@@ -177,6 +178,7 @@ import {
   listRunCandidates,
   metaPath,
   pendingSpawnsOf,
+  type ParentRef,
   readExitSidecarAt,
   readRunRecordFromDisk,
   pickSessionName,
@@ -184,6 +186,7 @@ import {
   parseNotice,
   RUN_ID_PATTERN,
   type RunRecord,
+  type RunIdBearing,
   runDir,
   runDirBasesOf,
   runsDir,
@@ -415,7 +418,7 @@ function loadRegistry(): void {
       // what the equality keeps a planted `runId` of `../x` off; the pattern
       // keeps a dir whose name is not a run id off.
       if (hasRunId(parsed) && RUN_ID_PATTERN.test(parsed.runId) && parsed.runId === d) {
-        runs.set(parsed.runId, parsed);
+        runs.set(parsed.runId, asRunRecord(parsed));
       }
     } catch {
       // Partial dir (crashed mid-spawn): ignored.
@@ -461,7 +464,7 @@ const allRunCandidates = (): { rec: RunRecord; dir: string }[] => {
  * question, which is the point of the shared predicate: a worker must not be
  * settled by its parent while its own graders are still out.
  */
-const hasPendingSpawns = (run: { runId: string; paneId?: string }): boolean =>
+const hasPendingSpawns = (run: ParentRef): boolean =>
   pendingSpawnsOf(run, allRunCandidates(), Date.now()).length > 0;
 
 /**

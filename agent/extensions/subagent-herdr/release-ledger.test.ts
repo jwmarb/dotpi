@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import type { HealthCheckTrigger, RunResult } from "./lib.js";
 import type { Notice, RunRecord } from "./rundir.js";
-import { DEFER_MAX_MS } from "./rundir.js";
+import { DEFER_MAX_MS, deferWithin, withinLifetime } from "./rundir.js";
 import type { LifecycleTransition, RunObservation, SweepResult } from "./run-lifecycle.js";
 import {
   createReleaseLedger,
@@ -969,6 +969,32 @@ describe("renderSpawnsBlock: what a finished run left behind it", () => {
       dir: "/runs/sub-b011",
     };
     expect(renderSpawnsBlock(legacyParent, [ancient], new Set(), NOW, noSidecars)).toBeUndefined();
+  });
+
+  test("a child exactly at the deferral bound is not printed on the fallback", () => {
+    // The boundary itself, not just past it: `deferWithin` excludes
+    // `NOW - DEFER_MAX_MS`, and the fallback prints only what `pendingSpawnsOf`
+    // could be holding, so neither reaches this child.
+    const legacyParent = rec({ runId: "sub-a003", paneId: "w1:p7", startedAt: NOW - 60_000 });
+    const boundary = {
+      rec: rec({ runId: "sub-b012", ownerPane: "w1:p7", startedAt: NOW - DEFER_MAX_MS }),
+      dir: "/runs/sub-b012",
+    };
+    expect(deferWithin(boundary.rec, NOW)).toBe(false);
+    expect(renderSpawnsBlock(legacyParent, [boundary], new Set(), NOW, noSidecars)).toBeUndefined();
+  });
+
+  test("the lifetime window includes a child that started at its parent's own instant", () => {
+    // Inclusive lower edge: the window starts at the parent's `startedAt`, so a
+    // record stamped in the same instant is its launch, not pane reuse.
+    const legacyParent = rec({ runId: "sub-a004", paneId: "w1:p7", startedAt: NOW - 60_000 });
+    const sameInstant = {
+      rec: rec({ runId: "sub-b013", ownerPane: "w1:p7", startedAt: NOW - 60_000 }),
+      dir: "/runs/sub-b013",
+    };
+    expect(withinLifetime(sameInstant.rec, legacyParent.startedAt)).toBe(true);
+    const text = renderSpawnsBlock(legacyParent, [sameInstant], new Set(), NOW, noSidecars)!;
+    expect(text).toContain("sub-b013");
   });
 
   test("a long fan-out is bounded and says how many it left out", () => {

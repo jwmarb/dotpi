@@ -98,6 +98,7 @@ import {
   listRunCandidates,
   type NoticeKind,
   pendingSpawnsOf,
+  type ParentRef,
   printableAgent,
   parseAncestry,
   qualifiesAsAnswer,
@@ -1285,7 +1286,8 @@ export function pendingSpawnsOfEnv(
   // Nothing on disk can have been stamped with an id this process does not have,
   // and an id that is not an id is an env someone else set.
   if (!runId || !RUN_ID_PATTERN.test(runId)) return [];
-  return pendingSpawnsOf({ runId, paneId: env.HERDR_PANE_ID }, listRunCandidates(bases), now).map((r) => ({
+  const parent: ParentRef = { runId, paneId: env.HERDR_PANE_ID };
+  return pendingSpawnsOf(parent, listRunCandidates(bases), now).map((r) => ({
     runId: r.runId,
     agent: printableAgent(r.agent),
   }));
