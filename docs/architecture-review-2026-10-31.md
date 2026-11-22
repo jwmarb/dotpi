@@ -65,6 +65,14 @@ pass, both on the host and in `ralph-verify/dotpi-bun:1.4.2`.
   Mount `~/.bun/install/global`, `~/.bun`, `~/.local/bin` (at `/tmp/.local/bin`) and
   the repo (at `/tmp/.pi`) read-only, with `HOME=/tmp` and `TMPDIR=/var/tmp`. Use a
   non-login shell, because `bash -lc` resets `PATH`.
+  **Corrected 2026-11-22: that recipe produces eleven false failures on green code.**
+  `lib/layout.ts` resolves the agent dir from `os.homedir()`, so `HOME=/tmp` makes the
+  live skills/agents tree absent and `lib/skill-catalogue.test.ts` fails its own
+  non-vacuity guard; the repo at `/tmp/pi` also breaks `tsconfig.json`'s
+  `../../../../.bun` alias. Mount the repo at its host-identical path *and* at
+  `~/.pi`, mount `~/.local/bin` where `HOME` points (its absence fails three
+  `startup-fetch` tests, which discover `catimg`/`chafa`), and set `HOME` to the real
+  home. The working invocation is in `architecture-review-2026-11-22.md`.
 - **Planner scope.** Give a planner one area per run.
 - **`/tmp` quota.** The `/tmp` tmpfs has a per-user quota. When it is full,
   `check.sh` fails with EDQUOT, so export `TMPDIR=$HOME/.cache/test-tmp`.
