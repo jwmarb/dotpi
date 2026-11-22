@@ -13,6 +13,7 @@ have their own AGENTS.md.
 | `changed-files.ts` | `/changed-files`, `/diff`: session change widget (emits the event kanban listens to) |
 | `display-file.ts` | `display_file` tool: spawns the platform opener detached |
 | `dynamic-prompt.ts` | `before_agent_start`: replaces pi's system prompt. Registers no tool. |
+| `firecrawl-cli.ts` | `tool_call` guard that refuses, before the shell sees them, a keyless `firecrawl search` with no `--sources` and the positional `firecrawl search alexandria "…"` (`bash` and `powershell`; allow-when-uncertain, never a rewrite). The `loadDotenv` + `FIRECRAWL_API_URL`/quiet-defaults plumbing is why the file exists at all. The decision is the pure `guardFirecrawlSearch` in `lib/firecrawl-search.ts`. Registers no tool. |
 | `git-hooks.ts` | On the `session_start` reason `startup` only (`:37`): arms `core.hooksPath`, then runs `setup-deps.ps1` on Windows or `setup-deps.sh` |
 | `init.ts` | `/init`: deterministic AGENTS.md tiering. Its `NESTED_LINE_RANGE` constant is the line budget these files obey |
 | `litellm.ts` | `async`. Fetches the model catalog at load and registers nothing if the host is unreachable. The pure `buildModels`/`thinkingLevelMapFor` are tested in `lib/litellm.test.ts`, and a reply with no `data` now warns |
@@ -42,6 +43,7 @@ have their own AGENTS.md.
 | `skill-tree.ts` | Skill walker — the one place that knows skills live under a category · subagent-herdr |
 | `skill-activation.ts` | Skill-owned tool gating · dynamic-prompt |
 | `dotenv.ts` | `.env` parser · firecrawl-cli, litellm |
+| `firecrawl-search.ts` | the keyless-`--sources` gate decision — `guardFirecrawlSearch(command, {hasApiKey, hasApiUrl})`, which tokenizes the line into argv segments the way a shell would before it judges anything, allow-when-uncertain by design, tested in `lib/firecrawl-search.test.ts`; neither refusal text is exported · firecrawl-cli |
 | `git-env.ts` | git env scrub · changed-files, init |
 | `skill-categories.ts` | Category grouping for the skills catalogue · dynamic-prompt |
 | `startup-images.ts` | Inline-image helpers for the startup header · startup-fetch |
