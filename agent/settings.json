@@ -10,7 +10,6 @@
     "+builtin:mcp",
     "+builtin:codemode",
     "-builtin:llama.cpp",
-    "-builtin:tool-search",
     "-builtin:herdr"
   ],
   "images": {

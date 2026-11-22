@@ -1,15 +1,9 @@
 /**
  * The prompt-input derivation shared by every prompt builder in this repo.
  *
- * Three builders exist: `dynamic-prompt.ts` (orchestrator),
- * `quant-trader/extensions/quant-prompt.ts` (quant), and — under an in-session
- * `/agent` switch — whichever of those two the *target* profile owns, called
- * from `persona/index.ts`. Each used to assemble its own inputs, and the switch
- * path assembled them from the *process's* `systemPromptOptions` rather than the
- * target's, so the skills and AGENTS.md it had just derived for the target were
- * thrown away and the prompt re-listed the home profile's. This module is that
- * derivation once, so a caller that has retargeted the inputs cannot quietly
- * ignore them.
+ * The builder is `dynamic-prompt.ts` (orchestrator); this module is the one
+ * derivation of the inputs it assembles, so a caller's derived inputs cannot
+ * quietly be ignored.
  *
  * Pi-free and pure: no disk, no env, no mutation of its inputs. A caller does
  * its own loading (roster, skill owners, activation) and hands the results in.
@@ -55,8 +49,8 @@ export const KANBAN_TOOL = "kanban";
 
 /**
  * One discovered skill. `pathCategory` is optional because pi's own skill list
- * has no such field: a caller that already knows the category (a switched
- * profile's library walk) passes it, and everyone else lets
+ * has no such field: a caller that already knows the category (e.g. one that
+ * resolved it on an earlier walk) passes it, and everyone else lets
  * {@link derivePromptInputs} read it off the path.
  */
 export interface PromptSkill {
@@ -64,6 +58,11 @@ export interface PromptSkill {
   description: string;
   filePath: string;
   pathCategory?: string;
+  /**
+   * pi's `disable-model-invocation` frontmatter flag, carried through so a
+   * caller's catalogue renderer can hide the skill without re-reading the file.
+   */
+  disableModelInvocation?: boolean;
 }
 
 /** Everything the derivation reads. Each caller supplies its own loads. */
@@ -105,6 +104,7 @@ export interface DerivedPromptInputs {
     description: string;
     filePath: string;
     pathCategory: string | undefined;
+    disableModelInvocation: boolean | undefined;
   }>;
   contextInventory: Array<{ path: string }>;
   guidelines: string[];
@@ -142,23 +142,23 @@ export function derivePromptInputs(o: DeriveInputsOptions): DerivedPromptInputs 
   // The category comes from the skill's own path when it has one, so the tree
   // on disk is the source of truth and refiling a skill needs no code edit.
   // Against the ordered roots, each skill is categorized under the FIRST root
-  // its path lies under (a project skill against the project dir, a profile
-  // skill against the profile dir); a skill under no root falls through
+  // its path lies under (a project skill against the project dir, an agent
+  // skill against the agent dir); a skill under no root falls through
   // against the first root and yields no category, as it does against a single
-  // library. A caller that already resolved a category (the switched profile's
-  // own library walk) keeps its answer.
+  // library. A caller that already resolved a category keeps its answer.
   const libraries = Array.isArray(o.skillsLibrary) ? o.skillsLibrary : [o.skillsLibrary];
   const skillInventory = o.skills.map((skill) => {
     const matched = libraries.find((lib) => isUnder(lib, skill.filePath));
     // A flat project skill (`<root>/<skill>/SKILL.md`, no category dir) has no
     // path category of its own; the synthetic "project" label keeps it out of
     // the "other" catch-all. Only the project root (never the LAST one, the
-    // profile's) gets it — a flat profile skill stays uncategorized.
+    // agent's) gets it — a flat agent skill stays uncategorized.
     const category = skill.pathCategory ?? categoryFromPath(matched ?? libraries[0]!, skill.filePath);
     return {
       name: skill.name,
       description: skill.description,
       filePath: skill.filePath,
+      disableModelInvocation: skill.disableModelInvocation,
       pathCategory: category ?? (matched !== undefined && matched !== libraries[libraries.length - 1] ? "project" : undefined),
     };
   });

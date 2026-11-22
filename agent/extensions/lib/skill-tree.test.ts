@@ -108,8 +108,8 @@ describe("isUnder", () => {
 
   test("unresolved dots are honored textually — callers pass resolved paths", () => {
     // Pure string logic: "/a/b/../c" is textually under "/a/b/". The callers
-    // (agents.ts resolves, persona realpaths) pass normalized paths, so the
-    // dot case never reaches the function in the wild.
+    // (agents.ts:159 and project-layer.ts resourceRoots resolve) pass
+    // normalized paths, so the dot case never reaches the function in the wild.
     expect(isUnder("/a/b", "/a/b/../c")).toBe(true);
   });
 

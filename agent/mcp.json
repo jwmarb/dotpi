@@ -7,7 +7,27 @@
       },
       "description": "Robinhood trading: account positions, quotes, and order history.",
       "timeout": 60,
-      "exposure": "direct"
+      "exposure": "deferred",
+      "toolExposure": {
+        "get_accounts": "direct",
+        "get_equity_quotes": "direct",
+        "get_equity_positions": "direct",
+        "get_portfolio": "direct"
+      }
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "description": "GitHub: issues, pull requests, and file contents.",
+      "exposure": "deferred",
+      "toolExposure": {
+        "issue_read": "direct",
+        "list_issues": "direct",
+        "pull_request_read": "direct",
+        "get_file_contents": "direct"
+      }
     }
   }
 }

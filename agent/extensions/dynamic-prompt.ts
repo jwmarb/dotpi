@@ -16,9 +16,9 @@ import {
   type AgentInfo,
   type DelegationRoster,
 } from './lib/agents.js';
-import { profileDir, skillsDir } from './lib/layout.js';
+import { agentDir, skillsDir } from './lib/layout.js';
+import { promptMcpServersSection } from './lib/mcp-config.js';
 import { projectRoots, TrustRequiringSnapshot, type ResourceRoots } from './lib/project-layer.js';
-import { personaOverride } from './lib/persona.js';
 // The kanban board's per-call title cap (`MAX_ADD_PER_CALL`, "up to 20 titles per
 // call") is restated as a numeral in this file's prose; change the cap, change it here.
 import { KANBAN_TOOL, QUESTIONNAIRE_TOOL, derivePromptInputs } from './lib/prompt-inputs.js';
@@ -96,7 +96,7 @@ export default function (pi: ExtensionAPI) {
   // pi's two facts cross as data, and the pi import stays at the edge.
   function computeRoots(cwd: string, isTrusted: boolean): ResourceRoots {
     return projectRoots({
-      profileDir: profileDir(),
+      profileDir: agentDir(),
       cwd,
       isProjectTrusted: isTrusted,
       hasTrustRequiringResources: trustSnapshot.get(cwd),
@@ -125,11 +125,7 @@ export default function (pi: ExtensionAPI) {
   // telling it to call a tool that stays invisible for the whole rest of the run.
   pi.on('tool_call', async (event) => {
     const activated = activation.noteToolCall(event.toolName, event.input);
-    // A persona switch owns the active set: the persona extension declares it and
-    // hard-blocks everything outside it, so the additive refresh below is skipped
-    // — running it would widen pi's set beyond the switch's declaration, and the
-    // switch's own `tool_call` block would then refuse every widened tool.
-    if (activated.length > 0 && !personaOverride()) await refreshActiveTools();
+    if (activated.length > 0) await refreshActiveTools();
     return undefined;
   });
 
@@ -140,10 +136,7 @@ export default function (pi: ExtensionAPI) {
    * it can never withdraw a tool another extension is relying on. Guarded because
    * `getActiveTools`/`setActiveTools` live on the `pi` API object, not on an
    * event's `ctx` — older hosts may not have them, and a missing one must not
-   * throw inside an event handler. It is also skipped under a persona switch —
-   * the persona extension owns the active set there, and an additive refresh would
-   * widen it beyond the switch's declaration (which the switch's block then
-   * refuses); the call site guards on `personaOverride()`.
+   * throw inside an event handler.
    */
   async function refreshActiveTools(): Promise<void> {
     if (typeof pi.getActiveTools !== 'function' || typeof pi.setActiveTools !== 'function') return;
@@ -172,12 +165,6 @@ export default function (pi: ExtensionAPI) {
     // `prompt` exists only on user-triggered runs (1.2.0's `BeforeAgentStartEvent`
     // is a user/custom discriminated union); a custom-triggered turn has none to scan.
     activation.notePrompt(event.messageType === 'user' ? event.prompt : '');
-
-    // A persona switch takes over the prompt: the switched profile's own
-    // prompt extension builds it, so this one yields, leaving the run to the
-    // switched builder. With no override `personaOverride()` is undefined and
-    // the path below is byte-identical to the pre-switch code.
-    if (personaOverride()) return undefined;
 
     // Everything that touches disk or env is loaded here; promptInputs is pure.
     // The roster carries agents shipped by ACTIVE skills only, so an unrelated
@@ -212,7 +199,22 @@ export default function (pi: ExtensionAPI) {
       opts.selectedTools = inputs.selectedTools;
     }
 
-    const orchestratorPrompt = buildOrchestratorPrompt(inputs.buildOptions);
+    // The MCP note is SYNTHESIZED from the config files, not carried over from
+    // pi's `mcp_servers` section. Two independent reasons core's text cannot be
+    // used here: `before_agent_start` handlers run in extension registration
+    // order and user extensions register before the builtin ones, so the MCP
+    // extension has not written `sections.mcp_servers` yet when this handler
+    // reads it; and even were it read in time, the forced prompt below would
+    // suppress core's section anyway. Same source pi's own `renderServersSection`
+    // (the config, pre-connection), so the model still learns which servers exist
+    // and that `tool_search` is how to reach their tools. No indirect server (or
+    // an unreadable config) yields '' and a prompt byte-identical to before.
+    const orchestratorPrompt = buildOrchestratorPrompt({
+      ...inputs.buildOptions,
+      // pi loaded `mcp.json` from this process's own profile, which is exactly
+      // what `agentDir()` resolves.
+      mcpServersSection: promptMcpServersSection(agentDir()),
+    });
 
     // Replace the default prompt entirely with the orchestrator prompt
     return { systemPrompt: orchestratorPrompt };
@@ -233,7 +235,7 @@ export interface PromptInputsOptions {
     selectedTools?: readonly string[];
     toolSnippets?: Readonly<Record<string, string>>;
     promptGuidelines?: readonly string[];
-    skills?: ReadonlyArray<{ name: string; description: string; filePath: string }>;
+    skills?: ReadonlyArray<{ name: string; description: string; filePath: string; disableModelInvocation?: boolean }>;
     contextFiles?: ReadonlyArray<{ path: string }>;
     customPrompt?: string;
     appendSystemPrompt?: string;
@@ -267,9 +269,8 @@ export interface PromptInputsResult {
 
 /**
  * Assembles the orchestrator prompt's inputs from what the handler loaded. The
- * derivation itself — gating, the three inventories, the capability flags — is
- * shared with the quant builder and the persona takeover and lives in
- * {@link derivePromptInputs}; this wrapper only adds the fields that are
+ * derivation itself — gating, the three inventories, the capability flags —
+ * lives in {@link derivePromptInputs}; this wrapper only adds the fields that are
  * specific to `buildOrchestratorPrompt` (the roster and the caller's own text).
  * Pure and synchronous — no disk, no env, and the input `selectedTools` is
  * never mutated (the handler assigns the result).
@@ -300,6 +301,9 @@ export function promptInputs(opts: PromptInputsOptions): PromptInputsResult {
       // plus a retry. Same rule as the spawn guard, via `delegationRoster`.
       agentInventory: opts.roster.spawnable,
       toolInventory: d.toolInventory,
+      // Unfiltered on purpose: the `disableModelInvocation` filter belongs at
+      // the render site (`buildOrchestratorPrompt`), so the pass-through here
+      // stays complete.
       skillInventory: d.skillInventory,
       contextInventory: d.contextInventory,
       guidelines: d.guidelines,
@@ -426,13 +430,15 @@ export function buildOrchestratorPrompt(opts: {
   /**
    * Every discovered skill. `pathCategory` is set when the skill's location
    * declares its category (a local one); package and project skills leave it
-   * undefined and are grouped by name instead.
+   * undefined and are grouped by name instead. `disableModelInvocation` is
+   * pi's frontmatter flag, and the catalogue hides the skills that carry it.
    */
   skillInventory: Array<{
     name: string;
     description: string;
     filePath: string;
     pathCategory?: string;
+    disableModelInvocation?: boolean;
   }>;
   contextInventory: Array<{ path: string }>;
   guidelines: string[];
@@ -462,6 +468,15 @@ export function buildOrchestratorPrompt(opts: {
   cwd: string;
   /** Absolute path to this repo's skills library, for the path-rule sentence. */
   skillsLibrary: string;
+  /**
+   * The indirect-MCP-servers note: one line per configured server whose tools are
+   * deferred (behind `tool_search` or codemode), synthesized from `mcp.json` by
+   * `lib/mcp-config.ts` — this extension forces the whole
+   * prompt and core's own `mcp_servers` section is both suppressed and written too
+   * late to read (see the handler). Absent or blank renders nothing, and the text
+   * is rendered verbatim.
+   */
+  mcpServersSection?: string;
   /**
    * The clock, for the `Current date:` footer. Injected rather than read so a
    * test can pin the footer without freezing time globally; production omits it
@@ -898,8 +913,18 @@ still open instead.
   // Not a free win either way: a prompt that pushes skills can over-apply one to
   // a task it does not fit, which is why the last rules keep the file (not the
   // name) authoritative and keep the task above the skill in a real conflict.
+  //
+  // Skills whose frontmatter sets `disable-model-invocation` are not advertised:
+  // pi's own formatter hides them the same way (dist/core/skills.js filters
+  // `disableModelInvocation`), since the model must not open them — they stay
+  // callable via /skill:name. Listing them would spend tokens on invitations to
+  // refuse. The length check reads the filtered list too, so a library where
+  // every skill is demoted renders no section at all.
+  const catalogSkills = opts.skillInventory.filter(
+    (s) => s.disableModelInvocation !== true,
+  );
   const skillSection =
-    opts.skillInventory.length > 0
+    catalogSkills.length > 0
       ? `
 ## Available Skills
 
@@ -915,7 +940,7 @@ routing signal, the file is the method. The human can also invoke one with
 Most live at \`${opts.skillsLibrary}/<category>/<name>/SKILL.md\`; the ones that do
 not carry their path inline below.
 
-${renderSkillCategories(opts.skillInventory, opts.skillsLibrary)}
+${renderSkillCategories(catalogSkills, opts.skillsLibrary)}
 
 **How to use this catalogue:**
 - **Check it before you plan.** For any task beyond a one-line answer, scan for a
@@ -932,6 +957,19 @@ ${renderSkillCategories(opts.skillInventory, opts.skillsLibrary)}
 - If a skill's guidance genuinely conflicts with the task, the task wins — but
   state which skill you set aside and why.
 - A skill may own tools that appear only once it is loaded.
+`
+      : '';
+
+  // --- MCP servers section ---
+  // pi's own servers section, re-emitted because the forced prompt above left
+  // core no place to render it. The text is pi's and stays pi's: it already
+  // names each server and the route to its tools.
+  const mcpSection =
+    opts.mcpServersSection && opts.mcpServersSection.trim().length > 0
+      ? `
+## MCP Servers
+
+${opts.mcpServersSection.trim()}
 `
       : '';
 
@@ -1031,5 +1069,5 @@ When given a task:
 - If you're unsure, read relevant files before making assumptions${opts.hasQuestionnaire ? `\n- If reading the code cannot resolve the uncertainty, ask via the \`${QUESTIONNAIRE_TOOL}\` tool instead of assuming` : ''}
 - Communicate your plan to the user for complex or risky operations
 
-${askUserSection}${toolSection}${agentSection}${boardSection}${planningSection}${delegationSection}${qualityPassSection}${skillSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
+${askUserSection}${toolSection}${agentSection}${boardSection}${planningSection}${delegationSection}${qualityPassSection}${skillSection}${mcpSection}${contextSection}${guidelinesSection}${customSection}${appendSection}${footer}`;
 }

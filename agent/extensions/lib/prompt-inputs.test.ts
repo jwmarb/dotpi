@@ -3,9 +3,9 @@
  *
  * These are the derivation tests that used to sit inside
  * `lib/dynamic-prompt.test.ts`'s `promptInputs` block. They moved here when the
- * derivation became shared by three builders — the orchestrator wrapper, the
- * quant handler, and the persona takeover — because a test of the shared rules
- * belongs beside the shared module, not beside one of its callers. What stays in
+ * derivation became shared library code used by the orchestrator's prompt
+ * wrapper, because a test of the shared rules belongs beside the shared module,
+ * not beside its caller. What stays in
  * `dynamic-prompt.test.ts` is only what the wrapper adds: the roster and the
  * caller's own text reaching `buildOptions`.
  *
@@ -152,10 +152,37 @@ describe("derivePromptInputs", () => {
     ]);
   });
 
+  // The four-field `toEqual` above cannot see this field: `toEqual` ignores
+  // undefined-valued keys, so a derivation that dropped it entirely would still
+  // pass it. `toStrictEqual` is what pins the copy.
+  test("the disableModelInvocation flag is carried through", () => {
+    const out = inputs({
+      skills: [
+        { name: "plain", description: "d", filePath: `${LIB}/review/plain/SKILL.md` },
+        {
+          name: "hidden",
+          description: "d",
+          filePath: `${LIB}/review/hidden/SKILL.md`,
+          disableModelInvocation: true,
+        },
+      ],
+    });
+    expect(out.skillInventory[1]).toStrictEqual({
+      name: "hidden",
+      description: "d",
+      filePath: `${LIB}/review/hidden/SKILL.md`,
+      disableModelInvocation: true,
+      pathCategory: "review",
+    });
+    // A skill without the flag stays undefined, not false: the renderer's test is
+    // `!== true`, and a derivation that invented `false` would read as a value.
+    expect(out.skillInventory[0].disableModelInvocation).toBeUndefined();
+  });
+
   test("an explicit pathCategory is kept; a skill outside the library gets undefined", () => {
-    // The switched profile's library walk already resolved each category, and a
+    // A caller that already resolved each category passes it through, and a
     // path resolved against another root must not be re-derived against this
-    // process's library — that is the field the takeover passes through.
+    // process's library.
     const out = inputs({
       skills: [
         { name: "demo", description: "d", filePath: "/elsewhere/demo/SKILL.md", pathCategory: "local" },

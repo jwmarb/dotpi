@@ -24,14 +24,13 @@
  * Run: `bun test agent/extensions/lib/dynamic-prompt.test.ts`
  */
 import { describe, expect, test, afterAll, beforeAll } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import dynamicExtension, { buildOrchestratorPrompt, promptInputs, type PromptInputsOptions } from "../dynamic-prompt.js";
 import { agentsDir } from "./layout.js";
 import { discoverAgents, type AgentInfo } from "./agents.js";
-import { setPersonaOverride } from "./persona.js";
 import { KANBAN_COLUMNS, SETTLE_DISPOSITION, SETTLE_EXEMPT_COLUMNS } from "../kanban/lib.js";
 import { fileURLToPath } from "node:url";
 /** A minimal valid call; each test overrides only what it is about. */
@@ -1298,6 +1297,94 @@ describe("the skill catalogue", () => {
       p.indexOf("**architecture-and-design**"),
     );
   });
+  // pi's `disable-model-invocation` frontmatter flag: such a skill is reachable
+  // through `/skill:name` only, so advertising it spends tokens on an invitation
+  // to refuse. pi's own formatter hides them the same way.
+  test("a disableModelInvocation skill is not advertised, its sibling is", () => {
+    const p = build({
+      skillInventory: [
+        {
+          name: "rust-style",
+          description: "Idiomatic Rust",
+          filePath: `${lib}/language-style/rust-style/SKILL.md`,
+          pathCategory: "language-style",
+        },
+        {
+          name: "auto-update",
+          description: "Refreshes the fleet on startup",
+          filePath: `${lib}/local/auto-update/SKILL.md`,
+          pathCategory: "local",
+          disableModelInvocation: true,
+        },
+      ],
+      skillsLibrary: lib,
+    });
+    expect(p).toContain("- **rust-style** — Idiomatic Rust");
+    expect(p).not.toContain("auto-update");
+    expect(p).not.toContain("Refreshes the fleet on startup");
+  });
+
+  test("a library where every skill is demoted renders no catalogue at all", () => {
+    // The length check reads the FILTERED list, or an all-demoted library would
+    // render the heading, the intro and a `Most live at` path over nothing.
+    const p = build({
+      skillInventory: [
+        {
+          name: "auto-update",
+          description: "d",
+          filePath: `${lib}/local/auto-update/SKILL.md`,
+          pathCategory: "local",
+          disableModelInvocation: true,
+        },
+      ],
+      skillsLibrary: lib,
+    });
+    expect(p).not.toContain("## Available Skills");
+    expect(p).not.toContain("default opening move");
+  });
+
+});
+
+describe("the MCP servers section", () => {
+  // Any section body will do at this level: what is pinned here is that the builder
+  // renders whatever it is handed, after the skills catalogue and before Project
+  // Context. It is NOT what the handler supplies — the handler never reads pi's
+  // `systemPromptOptions.sections` (the builtin MCP extension writes that key in its
+  // own `before_agent_start` handler, which runs after ours); it synthesizes the
+  // text with `promptMcpServersSection` from the agent dir's config files. The
+  // `the MCP note is synthesized from the agent dir's config files` and
+  // `pi's own mcp_servers section is no longer the source` tests pin that wiring.
+  const servers =
+    "MCP servers whose tools are not declared to you. Load the tools of `tool_search` servers with `tool_search`.\n- mcp_robinhood (tool_search): Trading.";
+
+  test("renders pi's text, after the skills catalogue and before Project Context", () => {
+    const p = build({
+      skillInventory: [
+        {
+          name: "rust-style",
+          description: "d",
+          filePath: "/home/u/.pi/agent/skills/language-style/rust-style/SKILL.md",
+        },
+      ],
+      contextInventory: [{ path: "/work/repo/AGENTS.md" }],
+      mcpServersSection: servers,
+    });
+    expect(p).toContain("## MCP Servers");
+    expect(p).toContain(servers);
+    // Forcing the prompt removed core's placement, so it is pinned here: with the
+    // resources the model reaches for, not after the context files.
+    expect(p.indexOf("## Available Skills")).toBeLessThan(p.indexOf("## MCP Servers"));
+    expect(p.indexOf("## MCP Servers")).toBeLessThan(p.indexOf("## Project Context"));
+  });
+
+  test("absent when the section is absent, empty, or whitespace", () => {
+    // The MCP handler has not run, or no server is deferred: the prompt is then
+    // byte-identical to the one this builder shipped before the field existed.
+    const before = build();
+    expect(build({ mcpServersSection: undefined })).toBe(before);
+    expect(build({ mcpServersSection: "" })).toBe(before);
+    expect(build({ mcpServersSection: "  \n " })).toBe(before);
+  });
 });
 
 describe("caller-supplied text", () => {
@@ -1507,9 +1594,8 @@ describe("healthcheck agent visibility in the inventory", () => {
 describe("promptInputs", () => {
   // Only what the WRAPPER contributes is asserted here. The derivation itself —
   // gating, the three inventories, the guidelines, the capability flags — moved
-  // to `lib/prompt-inputs.test.ts` when it became shared by the orchestrator, the
-  // quant handler and the persona takeover, and a test of a shared rule belongs
-  // beside the shared module.
+  // to `lib/prompt-inputs.test.ts` when it became shared library code, and a test
+  // of a shared rule belongs beside the shared module.
   const agent = (name: string): AgentInfo => ({
     name,
     description: `${name} agent`,
@@ -1577,9 +1663,7 @@ describe("promptInputs", () => {
 });
 
 describe("the before_agent_start handler", () => {
-  // The persona yield lives in the handler, not in `buildOrchestratorPrompt`,
-  // so this is the only layer that can pin it. The env is pointed at a temp
-  // profile tree, so the inventories come from the (empty) stub dirs — not
+  // agent dir tree, so the inventories come from the (empty) stub dirs — not
   // from `agent/agents/` and `agent/skills/`, which other work is reshaping
   // in parallel.
   let agentRoot: string;
@@ -1599,7 +1683,7 @@ describe("the before_agent_start handler", () => {
   });
 
   /** Runs the extension's `before_agent_start` handler against a fake event. */
-  async function start(selectedTools: string[]) {
+  async function start(selectedTools: string[], sections?: Record<string, string>) {
     const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
     dynamicExtension({
       on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
@@ -1617,10 +1701,11 @@ describe("the before_agent_start handler", () => {
         skills: [],
         contextFiles: [],
         promptGuidelines: [],
+        sections,
       },
     };
     // The handler reads trust from the event's ctx; an untrusted stub cwd keeps
-    // the roots profile-only, so the scan this test asserts on is unchanged.
+    // the roots agent-dir-only, so the scan this test asserts on is unchanged.
     const ctx = { cwd: "/work/repo", isProjectTrusted: () => false } as never;
     const result = await startHandler!(event as never, ctx);
     return {
@@ -1629,25 +1714,8 @@ describe("the before_agent_start handler", () => {
     };
   }
 
-  test("yields to a persona switch: undefined, and the run's tool list untouched", async () => {
-    setPersonaOverride({
-      name: "quant-trader",
-      dir: join(agentRoot, "quant-trader"),
-      deniedTools: new Set(["write", "edit"]),
-    });
-    try {
-      const { result, selectedTools } = await start(["read", "bash", "write"]);
-      expect(result).toBeUndefined();
-      // The handler returned before the gate, so the run's tool list is exactly
-      // what pi offered it.
-      expect(selectedTools).toEqual(["read", "bash", "write"]);
-    } finally {
-      setPersonaOverride(undefined);
-    }
-  });
 
-  test("with no switch, returns the orchestrator prompt the builder tests expect", async () => {
-    setPersonaOverride(undefined);
+  test("returns the orchestrator prompt the builder tests expect", async () => {
     const { result, selectedTools } = await start(["read", "bash"]);
     expect(result).toBeDefined();
     const prompt = (result as { systemPrompt: string }).systemPrompt;
@@ -1655,6 +1723,66 @@ describe("the before_agent_start handler", () => {
     expect(prompt).toContain("## Core Responsibilities");
     // No skill-owned tools in the stub tree, so the gate leaves the list alone.
     expect(selectedTools).toEqual(["read", "bash"]);
+  });
+
+  test("the MCP note is synthesized from the agent dir's config files", async () => {
+    // Core's `mcp_servers` section is not available to this handler: the builtin
+    // MCP extension writes it in its own `before_agent_start` handler, which runs
+    // after this one because handlers run in registration order and user
+    // extensions register first. So the note is derived from the config files
+    // themselves (`lib/mcp-config.ts`) — and this fixture proves the handler needs
+    // nothing but them: the agent dir tree has no MCP section in its event, only
+    // `mcp.json`.
+    const mcpFile = join(agentRoot, "mcp.json");
+    writeFileSync(
+      mcpFile,
+      JSON.stringify({
+        mcpServers: {
+          robinhood: {
+            url: "https://r.test/mcp",
+            exposure: "deferred",
+            toolExposure: { get_accounts: "direct" },
+          },
+        },
+      }),
+    );
+    let prompt: string;
+    let directOnly: string;
+    try {
+      prompt = ((await start(["read", "bash"])).result as { systemPrompt: string }).systemPrompt;
+      // A server configured `direct` contributes nothing, so the deferred one
+      // stays listed while it disappears.
+      writeFileSync(
+        mcpFile,
+        JSON.stringify({ mcpServers: { robinhood: { url: "https://r.test/mcp", exposure: "direct" } } }),
+      );
+      directOnly = ((await start(["read", "bash"])).result as { systemPrompt: string }).systemPrompt;
+    } finally {
+      rmSync(mcpFile, { force: true });
+    }
+    expect(prompt).toContain("## MCP Servers");
+    expect(prompt).toContain(
+      "- `mcp__robinhood` — tools are NOT declared to you; load them with `tool_search`; declared directly: `mcp__robinhood__get_accounts`",
+    );
+    expect(directOnly).not.toContain("mcp__robinhood");
+    // No MCP config at all leaves the prompt byte-identical to the no-MCP case
+    // (the files are deleted above; the stub tree never had them).
+    const plain = ((await start(["read", "bash"])).result as { systemPrompt: string }).systemPrompt;
+    expect(plain).not.toContain("## MCP Servers");
+    expect(plain).not.toContain("mcp__robinhood");
+  });
+
+  test("pi's own mcp_servers section is no longer the source", async () => {
+    // The pass-through this replaces looked like a fix and was dead code. Pinned
+    // so a future edit cannot quietly re-introduce the dependency on a section
+    // that is written after this handler returns.
+    const coreText =
+      "MCP servers whose tools are not declared to you.\n- mcp_robinhood (tool_search): Trading.";
+    const withCore = await start(["read", "bash"], { mcp_servers: coreText });
+    const prompt = (withCore.result as { systemPrompt: string }).systemPrompt;
+    expect(prompt).toContain("# Orchestrator Agent");
+    expect(prompt).not.toContain("mcp_robinhood");
+    expect(prompt).not.toContain("## MCP Servers");
   });
 /**
    * The `start` helper with a real project cwd and a chosen trust state: the
@@ -1757,7 +1885,6 @@ describe("the before_agent_start handler", () => {
   });
 
   test("the trust gate's second half is frozen per session: a settings.json written mid-session does not open it until the next session_start", async () => {
-    setPersonaOverride(undefined);
     const tmp = agentsOnlyTree();
     const session = oneSession();
     // Turn 1: an agents-only `.pi` carries no trust-requiring resource, so the
@@ -1775,11 +1902,6 @@ describe("the before_agent_start handler", () => {
   });
 });
 describe("the tool_call handler", () => {
-  // W3: under a persona switch the persona extension owns the active set, so the
-  // skill-gating refresh must not widen it. The refresh is additive — it unions
-  // skill-owned tools into pi's active set — so running it under a switch would add
-  // tools the switch never declared, which the switch's own `tool_call` block then
-  // refuses. The call site skips it on `personaOverride()`.
   let agentRoot: string;
   let originalAgentDir: string | undefined;
 
@@ -1802,7 +1924,7 @@ describe("the tool_call handler", () => {
   });
 
   /** Fires the extension's `tool_call` handler with a skill load; returns the setActiveTools calls. */
-  async function fireSkillLoad(override: boolean): Promise<string[][]> {
+  async function fireSkillLoad(): Promise<string[][]> {
     const handlers = new Map<string, (event: never, ctx: never) => Promise<unknown>>();
     let active = ["read", "bash"];
     const setActiveCalls: string[][] = [];
@@ -1816,53 +1938,37 @@ describe("the tool_call handler", () => {
         setActiveCalls.push([...tools]);
       },
     } as never);
-    if (override) {
-      setPersonaOverride({
-        name: "quant-trader",
-        dir: join(agentRoot, "quant-trader"),
-        deniedTools: new Set(["write", "edit"]),
-      });
-    }
-    try {
-      // Prime the module-scoped `lastRoots` for THIS suite's agentRoot: the
-      // `tool_call` refresh reads `lastRoots?.skillsDirs`, and a stale value from
-      // an earlier suite would scan the wrong (empty) skills dir.
-      await handlers.get("before_agent_start")!(
-        {
-          messageType: "user",
-          prompt: "",
-          systemPromptOptions: {
-            cwd: agentRoot,
-            selectedTools: ["read", "bash"],
-            skills: [],
-            contextFiles: [],
-            promptGuidelines: [],
-          },
-        } as never,
-        { cwd: agentRoot, isProjectTrusted: () => false } as never,
-      );
-      const handler = handlers.get("tool_call");
-      expect(handler).toBeDefined();
-      await handler!(
-        {
-          toolName: "read",
-          input: { path: join(agentRoot, "skills", "research", "trade-journal", "SKILL.md") },
-        } as never,
-        undefined as never,
-      );
-    } finally {
-      if (override) setPersonaOverride(undefined);
-    }
+    // Prime the module-scoped `lastRoots` for THIS suite's agentRoot: the
+    // `tool_call` refresh reads `lastRoots?.skillsDirs`, and a stale value from
+    // an earlier suite would scan the wrong (empty) skills dir.
+    await handlers.get("before_agent_start")!(
+      {
+        messageType: "user",
+        prompt: "",
+        systemPromptOptions: {
+          cwd: agentRoot,
+          selectedTools: ["read", "bash"],
+          skills: [],
+          contextFiles: [],
+          promptGuidelines: [],
+        },
+      } as never,
+      { cwd: agentRoot, isProjectTrusted: () => false } as never,
+    );
+    const handler = handlers.get("tool_call");
+    expect(handler).toBeDefined();
+    await handler!(
+      {
+        toolName: "read",
+        input: { path: join(agentRoot, "skills", "research", "trade-journal", "SKILL.md") },
+      } as never,
+      undefined as never,
+    );
     return setActiveCalls;
   }
 
-  test("override set → a skill activation does NOT call setActiveTools", async () => {
-    const calls = await fireSkillLoad(true);
-    expect(calls).toEqual([]);
-  });
-
-  test("cleared → a skill activation calls setActiveTools with the owned tool", async () => {
-    const calls = await fireSkillLoad(false);
+  test("a skill activation calls setActiveTools with the owned tool", async () => {
+    const calls = await fireSkillLoad();
     expect(calls).toHaveLength(1);
     expect(calls[0]).toContain("trade_journal");
   });
