@@ -5,7 +5,7 @@
  * salvage label, the child's todo counts, its answer, a snapshot of the runs it
  * launched, its pane's scrollback when it failed with nothing to say, and its
  * mid-run reports. Before this module those renderers sat in `index.ts` beside
- * the registry, the timers and pi, reading `dirFor`, `readReports`,
+ * the registry, the timers and pi, reading `dirFor`, `reports`,
  * `allRunCandidates`, `extractRunResult` and the herdr pane primitives straight
  * out of the surrounding scope.
  *
@@ -84,7 +84,7 @@ export function formatResultHeader(rec: RunRecord): string {
  *
  * The plan was to read them off the session transcript: a `[subagent … done]`
  * input recorded there would be a fact, not a claim. pi does not record one.
- * An `input` hook that answers `handled` (this module's, in every process that
+ * An `input` hook that answers `handled` (in `index.ts`, every process that
  * loads it) returns before pi creates a message, and session persistence hangs
  * off `message_end`, so a swallowed notice is nowhere on disk — verified against
  * the installed `agent-session.js` and an empty `grep` over a live session. The
@@ -243,8 +243,9 @@ export function createBriefing(effects: BriefingEffects): Briefing {
   /**
    * A released target's block when its result read threw: the real header —
    * so the block stays discoverable by the `=== sub-xxxx` header every release
-   * assertion pins — plus a pointer to `subagent_tasks`. `readReports` never
-   * throws, so the mid-run reports ride the degraded block too.
+   * assertion pins — plus a pointer to `subagent_tasks`. The injected
+   * `reports` read never throws, so the mid-run reports ride the degraded
+   * block too.
    */
   async function degradedBlock(rec: RunRecord): Promise<string> {
     const out: string[] = [
