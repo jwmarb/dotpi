@@ -5,7 +5,7 @@
   "showPreCompactionMessage": true,
   "compactionSummaryMode": "default",
   "midRunCompaction": "resume",
-  "compactAfterRatio": 0.65,
+  "compactAfterRatio": 0.8,
   "compactAfterPreset": "default",
   "retainedToolOutputMaxTokens": 32000,
   "recallResponseMaxChars": 48000,
@@ -27,29 +27,29 @@
   "dropperPressureThreshold": 0.7,
   "dropperPoolFullnessThreshold": 0.1,
   "agentMaxTurns": 16,
-  "workerAttemptTimeoutMs": 600000,
+  "workerAttemptTimeoutMs": 3000000,
   "providerIdleTimeoutMs": 120000,
 
   "model": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
+    "id": "thinkingmachines/inkling-2-mini",
     "contextWindow": 262144
   },
   "observerModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
+    "id": "thinkingmachines/inkling-2-mini",
     "contextWindow": 262144
   },
   "observerFallbackModels": [],
   "reflectorModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
+    "id": "thinkingmachines/inkling-2-mini",
     "contextWindow": 262144
   },
   "reflectorFallbackModels": [],
   "dropperModel": {
     "provider": "litellm",
-    "id": "qwen/qwen3.8-flash-next",
+    "id": "thinkingmachines/inkling-2-mini",
     "contextWindow": 262144
   },
   "dropperFallbackModels": [],
