@@ -352,6 +352,19 @@ describe("gpu / disk / updates", () => {
 		expect(updateLines(theme, { update: { kind: "checking" }, notices: { packages: ["x"] } }).join("\n")).not.toContain("changelog");
 		expect(updateLines(theme, { update: { status: "available", currentVersion: "1", latestVersion: "2.0.0" }, notices: {} }).join("\n")).toContain("2.0.0");
 	});
+	test("updateLines: under Pi-Bolt the arrow follows auto-update's verdict, not a 'current' status", () => {
+		// The release row's `latest` is a Pi-Bolt version while `current` may be Pi's.
+		// A "current" npm verdict therefore must not print Pi's number beside a
+		// Pi-Bolt release: the arrow is dropped instead. An "available" verdict is
+		// auto-update's own current, so that one is shown.
+		const notices = { release: { version: "9.9.9" } };
+		const currentStatus = { status: "current", currentVersion: "1.2.3" } as const;
+		const available = { status: "available", currentVersion: "1.2.3", latestVersion: "2.0.0" } as const;
+		expect(updateLines(theme, { update: currentStatus, notices }, true).join("\n")).not.toContain("1.2.3");
+		expect(updateLines(theme, { update: available, notices }, true).join("\n")).toContain("v1.2.3 →");
+		// Not compiled: the arrow falls back to VERSION, as it always has.
+		expect(updateLines(theme, { update: currentStatus, notices }, false).join("\n")).toContain("→");
+	});
 	test("captureNotices: captures with a listener, falls through without one", () => {
 		const drawn: unknown[] = [];
 		const proto: Record<string, unknown> = {

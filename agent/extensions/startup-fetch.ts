@@ -27,6 +27,7 @@ import { patchSettingsKey, readSettingsKey } from "./lib/settings.js";
 import { pickLogo, renderLogo, truecolor } from "./lib/distro-logos.js";
 import { chooseImage, IMAGE_MODES, type ImageMode, listImages, parseMode, readState, writeState } from "./lib/startup-images.js";
 import { getUpdateStatus, type UpdateStatus, updateCommand } from "./auto-update/index.js";
+import { describeUpdate } from "./auto-update/status.js";
 import { runningCompiled } from "./lib/runtime.js";
 // The `Model` row resolves a `fallback/auto` selection through `computeDisplay`,
 // the footer's own resolver, against the chain the router *published* when it
@@ -553,11 +554,12 @@ function diskRows(cwd: string): [string, string][] {
 
 function updateText(theme: Theme, u: UpdateState): string {
 	if ("kind" in u) return theme.fg("dim", "checking…");
-	switch (u.status) {
+	const d = describeUpdate(u);
+	switch (d.variant) {
 		case "current":
 			return theme.fg("success", "up to date");
 		case "available":
-			return theme.fg("warning", `⬆ ${u.latestVersion} available (see Updates)`);
+			return theme.fg("warning", `⬆ ${d.latestVersion} available (see Updates)`);
 		case "error":
 			return theme.fg("dim", "unknown (check failed)");
 	}
@@ -569,15 +571,20 @@ function updateText(theme: Theme, u: UpdateState): string {
  * pi's own release check (with its release note), else from auto-update's
  * npm check. Empty when nothing is pending (or still checking).
  */
-export function updateLines(theme: Theme, s: Pick<Snapshot, "update" | "notices">): string[] {
+export function updateLines(
+	theme: Theme,
+	s: Pick<Snapshot, "update" | "notices">,
+	compiled: boolean = runningCompiled(),
+): string[] {
 	const rows: string[] = [];
 	const bullet = theme.fg("warning", "⬆");
 	const cmd = (c: string) => `${theme.fg("dim", "· run")} ${theme.fg("accent", c)}`;
-	const latest = s.notices.release?.version ?? (!("kind" in s.update) && s.update.status === "available" ? s.update.latestVersion : undefined);
+	const d = "kind" in s.update ? undefined : describeUpdate(s.update);
+	const latest = s.notices.release?.version ?? d?.latestVersion;
 	if (latest) {
 		// Under Pi-Bolt `latest` is a Pi-Bolt release and VERSION the Pi it is built on, so show auto-update's own current.
 		// Under Pi-Bolt it never falls back to VERSION (Pi's number, not Pi-Bolt's): the arrow is dropped instead.
-		const current = !("kind" in s.update) && s.update.status === "available" ? s.update.currentVersion : runningCompiled() ? undefined : VERSION;
+		const current = d?.updatePending ? d.currentVersion : compiled ? undefined : VERSION;
 		const from = current ? `${theme.fg("dim", `v${current} →`)} ` : "";
 		rows.push(`${bullet} ${theme.bold("pi")} ${from}${theme.fg("warning", latest)} ${cmd(updateCommand().display)}`);
 		const note = s.notices.release?.note?.trim().split("\n")[0];
