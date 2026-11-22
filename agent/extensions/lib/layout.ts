@@ -100,7 +100,7 @@ export function settingsFile(): string {
 // `mcpConfigFile()` was removed too: nothing but its own test ever called it.
 // `agent/mcp.json` is read by pi's built-in MCP extension, and read AGAIN (read-only)
 // by extensions/lib/mcp-config.ts, which synthesizes the MCP-servers note for the
-// forced orchestrator/takeover prompts.
+// forced orchestrator prompts.
 
 /**
  * The repo root: the working tree that contains the agent directory.

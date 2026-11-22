@@ -163,7 +163,6 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | `agent/mcp.json`                  | MCP servers for the builtin MCP extension — keys as placeholders, from `agent/.env`     |
 | `agent/.env`                      | The only file with live credentials (gitignored; template is `agent/.env.example`)      |
 | `agent/docker/`                   | Tracked reference image for runtime verification                                       |
-| `orchestrator`                    | Symlink to `agent` — a stable alias for the default tree, which is never moved       |
 | `docs/model-configuration.md`     | User guide to model configuration: `settings.json`, agent frontmatter, pi-blackhole workers          |
 | `.githooks/`                      | Tracked `pre-commit`, `post-checkout`, `post-merge` hooks                              |
 | `scripts/setup-deps.sh`           | Installs each extension's npm dependencies                                             |

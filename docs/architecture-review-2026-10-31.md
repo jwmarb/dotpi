@@ -1,6 +1,10 @@
 # Architecture review — outcome (2026-10-31)
 
 > Historical note: the persona/profile material in this file was removed from the codebase on 2026-11-21.
+The removed material includes `quant-prompt.ts` and `lib/profiles.test.ts`, both deleted in
+`8381785`. They were live when the rulings below were written, so the C2 line naming
+`quant-prompt` and the C6 line naming `lib/profiles.test.ts` name files that no longer
+exist — read them as history, not as a current inventory.
 This file is the lasting record of this review. The visual report was
 `/tmp/architecture-review-20261031-091303.html`, a scratch file that is not kept.
 Earlier records are `architecture-review-2026-10.md`, `-10-14.md` and `-10-17.md`.
