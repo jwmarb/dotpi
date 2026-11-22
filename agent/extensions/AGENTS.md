@@ -23,7 +23,7 @@ have their own AGENTS.md.
 | `startup-fetch.ts` | `/fetch`, `/builtin-header`: neofetch-style header. Reads `settings.json` `startupFetch` through `lib/settings.ts` (so a project `.pi/settings.json` overrides it) and writes it with `patchSettingsKey` (global file only) |
 | `thinking-indicator.ts` | alt+t spinner + `setHiddenThinkingLabel`. Most hooks of any single file |
 | `todo.ts` | `todo` tool + `/todos`. **Registered only in a subagent child** (`PI_SUBAGENT_RUN_ID`, `:166`) |
-| `auto-update/` | `/update` + `pi_update` tool. The pure `compareSemver` (semver prerelease order) and `planUpdateCheck` are tested in `lib/auto-update.test.ts`; a failed check is reported as an error, never as "up to date" |
+| `auto-update/` | `/update` + `pi_update` tool. `index.ts` owns the check decision — `compareSemver` (semver prerelease order) and `planUpdateCheck`, tested in `lib/auto-update.test.ts`; a failed check is reported as an error, never as "up to date". `status.ts` owns the vocabulary shared by every update surface — `UpdateStatus`, `describeUpdate`, and the memoised check factory `createUpdateStatusMemo` (`CHECK_INTERVAL_MS`), tested in its own `lib/auto-update-status.test.ts` — the decision only: each surface writes its own sentence |
 | `trade-journal/` | `trade_journal` tool. `AGENTIC_TRADING_JOURNAL` overrides the journal dir |
 
 ## lib/ — module → consumers (no AGENTS.md of its own, by decision)
@@ -81,8 +81,11 @@ test top-level files through `../<name>.js`.
   grader phrase derives from the filtered `graders` roster, and every `worker`/receipt phrase is gated on
   `hasWorker`.
 - **Sibling imports resolve through the realpath.**
-- **Typecheck:** `tsconfig.json` covers `*.ts` + `lib/*.ts` only (`auto-update/` and `trade-journal/` are not
-  typechecked). Its `paths` is a literal relative `../../../../.bun/install/global/…`, and `typeRoots` borrows
+- **Typecheck:** `tsconfig.json`'s `include` is `*.ts` + `lib/*.ts`, so no subdirectory is named there — but tsc still
+  checks what an included file imports: `startup-fetch.ts` pulls `auto-update/index.ts` and `auto-update/status.ts`
+  into the program, while `trade-journal/index.ts`, imported by nothing, is genuinely unchecked. The check is
+  `tsc -p tsconfig.json --listFilesOnly`, not this sentence. Its `paths` is a literal relative
+  `../../../../.bun/install/global/…`, and `typeRoots` borrows
   `subagent-herdr/node_modules/@types`.
 
 ## ANTI-PATTERNS
