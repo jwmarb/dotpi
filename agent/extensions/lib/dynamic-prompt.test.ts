@@ -598,12 +598,14 @@ describe("the kanban board section is gated on the tool existing", () => {
   test("skips itself for trivial work, and names the cap the model will hit", () => {
     // Every sibling section carries an explicit escape ("Go direct when", "Stay direct
     // when", "Name any skip"), and this section's only threshold was a step count — so a
-    // three-trivial-step request became a board the user has to look at. The per-call cap
-    // is the one a planner's plan runs into: the tool refuses and says so, and the prose
-    // names the number the model can actually hit rather than the 200-card one it cannot.
+    // three-trivial-step request became a board the user has to look at. The per-call cap is
+    // the one a planner's plan runs into, and the prose points at the cap instead of restating
+    // it: the model learns the real number from the tool's own refusal, which interpolates
+    // `MAX_ADD_PER_CALL` (`kanban/lib.ts:224`). Do not re-add a numeral here — asserting on the
+    // pointer keeps raising that cap a one-line change with nothing to resync.
     const s = board({ hasKanban: true });
     expect(s).toContain("Skip the board for a single step, or for trivial work");
-    expect(s).toContain("up to 20 titles per call");
+    expect(s).toContain("refuses a call over its per-card cap");
     // The board stores no edges and reorders a card to the end on every move, so it
     // cannot keep a dependency order; the planner's own order is the one to copy.
     expect(s).toContain("in the order you intend to do them");
