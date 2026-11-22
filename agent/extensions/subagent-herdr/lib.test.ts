@@ -12,9 +12,7 @@ import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 
 import { discoverAgents, discoverSkillAgents, parseAgentFile, type AgentInfo } from "../lib/agents.js";
 import { ENV_AGENT_DIR, agentsDir, skillsDir } from "../lib/layout.js";
-import { setPersonaOverride } from "../lib/persona.js";
 import { resourceRoots } from "../lib/project-layer.js";
-import { LEASE_DIR_ENV } from "../model-fallback/concurrency.js";
 import { FALLBACK_MODEL_REF } from "../model-fallback/lib.js";
 import { CARD_ID_PATTERN as BOARD_CARD_ID_PATTERN } from "../kanban/lib.js";
 import {
@@ -1335,9 +1333,8 @@ describe("buildChildEnv", () => {
     expect(pinned.PI_FALLBACK_CHAIN).toBe("qwen/qwen3.8-27b|high");
   });
   test("forwards the parent's profile dir so the child resolves the same profile", () => {
-    // The child must run the same persona, fleet, and skill catalogue as the
-    // parent, so the profile dir crosses when — and only when — the parent has
-    // one set.
+    // The child must run the same fleet and skill catalogue as the parent, so
+    // the profile dir crosses when — and only when — the parent has one set.
     const prev = process.env[ENV_AGENT_DIR];
     process.env[ENV_AGENT_DIR] = "/tmp/fakeprofile";
     try {
@@ -1364,20 +1361,6 @@ describe("buildChildEnv", () => {
     }
   });
 
-  test("an in-session profile switch crosses to the child, and so does the lease dir", () => {
-    // The switch retargets the fleet without moving the process's own dir, so
-    // the child's profile dir must come from the switch, not the env var —
-    // and the router's machine-wide cap leases in the process's own cache,
-    // which the child must share rather than split.
-    setPersonaOverride({ name: "q", dir: "/tmp/q", deniedTools: new Set() });
-    try {
-      const env = buildChildEnv({ runId: "sub-0017", agent: "worker" }, "w5:p1", "/runs/sub-0017");
-      expect(env[ENV_AGENT_DIR]).toBe("/tmp/q");
-      expect(env[LEASE_DIR_ENV]).toBeDefined();
-    } finally {
-      setPersonaOverride(undefined);
-    }
-  });
 
 });
 
@@ -2506,7 +2489,7 @@ describe("launchAttempt fallback chain handoff", () => {
 // ---------------------------------------------------------------------------
 
 describe("launchAttempt approve-flag wiring", () => {
-  // The trust-store lookup inside launchAttempt resolves against profileDir(),
+  // The trust-store lookup inside launchAttempt resolves against agentDir(),
   // so PI_CODING_AGENT_DIR is repointed at a temp dir for the suite's duration
   // (restored in afterAll, mirroring wake.test.ts): the real
   // ~/.pi/agent/trust.json is never read or written.

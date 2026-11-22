@@ -9,7 +9,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import todo from "../todo.js";
-import { setPersonaOverride } from "../lib/persona.js";
 import kanban from "./index.js";
 
 interface ToolStub {
@@ -46,7 +45,6 @@ const saved = process.env.PI_SUBAGENT_RUN_ID;
 afterEach(() => {
 	if (saved === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
 	else process.env.PI_SUBAGENT_RUN_ID = saved;
-	setPersonaOverride(undefined);
 });
 
 describe("role gate", () => {
@@ -77,27 +75,21 @@ describe("role gate", () => {
 		expect(t.seen.events).not.toContain("agent_before_settle");
 	});
 
-	test("the settle guard stands down while the active persona denies kanban", async () => {
+	test("the settle guard holds the turn open while cards are unaccounted", async () => {
 		delete process.env.PI_SUBAGENT_RUN_ID;
-		setPersonaOverride({ name: "quant", dir: "/quant", deniedTools: new Set(["kanban"]) });
 		const k = stubApi();
 		kanban(k.api);
 
-		// One card on the board: with no stand-down this is exactly the state that
-		// holds the turn open.
+		// One card on the board: the guard must not let the turn settle.
 		const tool = k.seen.toolObjs.find((t) => t.name === "kanban");
 		await tool!.execute!("t1", { op: "add", titles: ["a card"] }, undefined, undefined, { hasUI: false });
 
-		// Denied: the guard is inert — the turn settles.
-		expect(await k.seen.handlers["agent_before_settle"]({ outcome: "completed", entries: [] })).toBeUndefined();
-
-		// Cleared: the same unaccounted board is guarded again.
-		setPersonaOverride(undefined);
-		const active = (await k.seen.handlers["agent_before_settle"]({ outcome: "completed", entries: [] })) as
-			| { entries: Array<{ type: string; customType?: string }>; continue: boolean }
-			| undefined;
-		expect(active?.continue).toBe(true);
-		expect(active?.entries).toHaveLength(1);
-		expect(active?.entries?.[0]).toMatchObject({ type: "custom_message", customType: "kanban-reminder" });
+		const result = (await k.seen.handlers["agent_before_settle"]({
+			outcome: "completed",
+			entries: [],
+		})) as { entries: Array<{ type: string; customType?: string }>; continue: boolean } | undefined;
+		expect(result?.continue).toBe(true);
+		expect(result?.entries).toHaveLength(1);
+		expect(result?.entries?.[0]).toMatchObject({ type: "custom_message", customType: "kanban-reminder" });
 	});
 });

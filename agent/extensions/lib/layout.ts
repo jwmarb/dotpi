@@ -33,23 +33,11 @@
  * (0.70.5 and 0.75.4 agree): `PI_CODING_AGENT_DIR` with `~` expansion, else
  * `~/.pi/agent`.
  *
- * ## Which accessors follow a profile switch
- *
- * The in-session `/agent` switch (see `lib/persona.ts`) retargets a running
- * session to another profile directory without moving the process. The
- * accessors split on that line: `agentsDir()` and `skillsDir()` follow the
- * switch (the fleet and the skills library are what a switch retargets),
- * while `agentDir()`, `envFile()`, `envExampleFile()`, `settingsFile()` and
- * `repoRoot()` do not — every run, cache, session and credential path stays
- * in the process's real profile.
- *
  * @module lib/layout
  */
 
 import os from "node:os";
 import path from "node:path";
-
-import { personaOverride } from "./persona.js";
 
 /** The env var pi reads to relocate its agent directory. */
 export const ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
@@ -79,30 +67,14 @@ export function agentDir(): string {
 	return path.join(os.homedir(), ".pi", "agent");
 }
 
-/**
- * The profile directory fleet and skill accessors resolve against.
- *
- * A `/agent` switch retargets this to the target profile's directory (its
- * realpath); without a switch it is exactly {@link agentDir}. Callers that
- * want the process's own profile — run dirs, caches, credentials — keep
- * using `agentDir()` and never come through here; the deliberate exceptions
- * are subagent-herdr's switched-profile run-dir reads — `adoptRunFromDisk`'s
- * rescue retry and the ledger's `parentRunIsFinished` parent lookup, both of
- * which read through `runDirBases()` in `subagent-herdr/index.ts` — which find
- * a run whose in-session profile switch moved its run dir off this process's own.
- */
-export function profileDir(): string {
-	return personaOverride()?.dir ?? agentDir();
-}
-
 /** Subagent definitions (`<name>.md`, Markdown + YAML frontmatter). */
 export function agentsDir(): string {
-	return path.join(profileDir(), "agents");
+	return path.join(agentDir(), "agents");
 }
 
 /** The skills library, one directory per skill. */
 export function skillsDir(): string {
-	return path.join(profileDir(), "skills");
+	return path.join(agentDir(), "skills");
 }
 
 // `runsDir()` used to live here and had no production caller: every use resolved
@@ -126,7 +98,9 @@ export function settingsFile(): string {
 }
 
 // `mcpConfigFile()` was removed too: nothing but its own test ever called it.
-// `agent/mcp.json` is read by pi's built-in MCP extension, not by this repo.
+// `agent/mcp.json` is read by pi's built-in MCP extension, and read AGAIN (read-only)
+// by extensions/lib/mcp-config.ts, which synthesizes the MCP-servers note for the
+// forced orchestrator/takeover prompts.
 
 /**
  * The repo root: the working tree that contains the agent directory.

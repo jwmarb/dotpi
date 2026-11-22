@@ -3,13 +3,12 @@
 # it is machine-written, changes on every run, and would bury the config it sits
 # beside. The rule of thumb: if deleting it costs nothing but a re-run, ignore it.
 #
-# Machine-state and secret paths are pinned to a leading `*/` (any profile
-# directory: agent/, quant-trader/, the orchestrator symlink, ...), because the
-# same files a profile generates must be ignored in every profile, not just the
-# one this repo started with.
+# Machine-state and secret paths are pinned to a leading `*/` (any agent dir:
+# agent/, the orchestrator symlink, ...), because the same files a run generates
+# must be ignored in every agent dir, not just the one this repo started with.
 
 # ---- Secrets ----------------------------------------------------------------
-# The real .env: the ONLY file in a profile holding live credentials, plus the
+# The real .env: the ONLY file in the agent dir holding live credentials, plus the
 # provider base URL. Everything agent/extensions/litellm.ts and firecrawl-cli.ts
 # need is read from it — LITELLM_API_KEY and LITELLM_BASE_URL for the litellm
 # provider, FIRECRAWL_API_URL for the librarian's research CLI.
@@ -19,7 +18,7 @@
 */.env.*
 !*/.env.example
 # NOTE: agent/extensions/litellm.ts used to be ignored here because it
-# hardcoded a key. It now reads from a profile .env, so it is committed. This is
+# hardcoded a key. It now reads from the agent dir's .env, so it is committed. This is
 # the change the old comment on litellm.ts anticipated: its doc comments always
 # claimed LITELLM_API_KEY came from the environment, and now that is true.
 # Credential stores. Empty right now, which is exactly why they are easy to
@@ -27,7 +26,7 @@
 */auth.json
 */models-store.json
 # Per-server OAuth state (registered client + tokens) from an mcp.json "oauth" entry.
-# pi's built-in MCP extension keeps this in the mcp-auth.json FILE; a profile's
+# pi's built-in MCP extension keeps this in the mcp-auth.json FILE; an agent dir's
 # mcp-auth/ directory is the old local extension's, kept ignored so a leftover
 # never lands in git.
 */mcp-auth.json
@@ -136,7 +135,7 @@ stage-tag.js
 .vscode/
 
 # ---- Startup-panel images ---------------------------------------------------
-# A profile's images/ is the user's picture folder for startup-fetch.ts (which
+# An agent dir's images/ is the user's picture folder for startup-fetch.ts (which
 # one shows: settings.json startupFetch.mode/image). Personal and usually
 # third-party art, so the pictures stay local; only the README is tracked so
 # a fresh clone has the folder. The cycle/random state file is machine state.
@@ -144,8 +143,8 @@ stage-tag.js
 !/*/images/README.md
 
 # The four rules above (plans, bin, cache, images) are machine state that lives at
-# a PROFILE ROOT, so they are anchored to one path component. Two top-level trees
-# in this repo are SOURCE, not profile state, and must never be swallowed by them:
+# an AGENT DIR ROOT, so they are anchored to one path component. Two top-level trees
+# in this repo are SOURCE, not agent-dir state, and must never be swallowed by them:
 # docs/ (notes, diagrams, adr) and scripts/ (a tool under scripts/bin/ is a
 # committed file). plans/bin/cache are DIRECTORY patterns, so they are negated as
 # directories — a negated file cannot be re-included while its parent directory is

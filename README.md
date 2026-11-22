@@ -163,12 +163,10 @@ Both live in `agent/.env` (template: [agent/.env.example](agent/.env.example)), 
 | `agent/mcp.json`                  | MCP servers for the builtin MCP extension — keys as placeholders, from `agent/.env`     |
 | `agent/.env`                      | The only file with live credentials (gitignored; template is `agent/.env.example`)      |
 | `agent/docker/`                   | Tracked reference image for runtime verification                                       |
-| `orchestrator`                    | Symlink to `agent` — a stable alias for the default profile, which is never moved       |
-| `quant-trader/`                   | pi profile: curated skills + own 4-agent fleet + own prompt extension — run with `pi-quant` (see Profiles below) |
+| `orchestrator`                    | Symlink to `agent` — a stable alias for the default tree, which is never moved       |
 | `docs/model-configuration.md`     | User guide to model configuration: `settings.json`, agent frontmatter, pi-blackhole workers          |
 | `.githooks/`                      | Tracked `pre-commit`, `post-checkout`, `post-merge` hooks                              |
 | `scripts/setup-deps.sh`           | Installs each extension's npm dependencies                                             |
-| `scripts/pi-profile.sh`           | Profile launchers `pi-p` / `pi-quant` / `pi-bolt-p` (sourced from `~/.bashrc`)          |
 | `agent/sessions/`, `agent/subagent-runs/`, `agent/npm/`, `agent/git/`, … | Machine state — all gitignored                                   |
 
 ## Extensions 🧩
@@ -211,7 +209,7 @@ A child delegated a **kanban card** works by the list it keeps: it builds the ca
 
 ### Repo-local agents and skills (`<REPO_ROOT>/.pi/`)
 
-Run pi from a checkout that carries its own `.pi/` and that tree layers over the active profile, project first:
+Run pi from a checkout that carries its own `.pi/` and that tree layers over the global `agent/` tree, project first:
 
 ```
 <REPO_ROOT>/.pi/
@@ -222,47 +220,9 @@ Run pi from a checkout that carries its own `.pi/` and that tree layers over the
 └── SYSTEM.md, prompts/, themes/, extensions/   # pi core
 ```
 
-Agents resolve first-wins by name — project agent, then profile agent, then agents shipped by project skills, then by profile skills — and the roster's **From** column shows `project` / `project skill: x`. Nothing in the project layer loads until pi trusts the project (the prompt on first run, or `--approve`). pi does not treat `agents/` alone as needing trust, so a `.pi/` holding *only* `agents/` would never be asked about: it is **ignored** until it also has a trust-requiring file such as `settings.json`. Delegated children in the same repo inherit the decision (`--approve`/`--no-approve`); a child in a *different* directory gets `--no-approve` when that directory is trust-requiring with no saved decision (a saved one is honored), and the `ralph-loop` gate's reviewer/verifier always stay the global ones.
+Agents resolve first-wins by name — project agent, then the global `agent/agents/` one, then agents shipped by project skills, then by global skills — and the roster's **From** column shows `project` / `project skill: x`. Nothing in the project layer loads until pi trusts the project (the prompt on first run, or `--approve`). pi does not treat `agents/` alone as needing trust, so a `.pi/` holding *only* `agents/` would never be asked about: it is **ignored** until it also has a trust-requiring file such as `settings.json`. Delegated children in the same repo inherit the decision (`--approve`/`--no-approve`); a child in a *different* directory gets `--no-approve` when that directory is trust-requiring with no saved decision (a saved one is honored), and the `ralph-loop` gate's reviewer/verifier always stay the global ones.
 
-Prefer skills nested under `.pi/agents/` (`.pi/agents/skills/<skill>/SKILL.md`)? pi core loads them from `.pi/settings.json` → `{ "skills": ["agents/skills"] }` (project paths resolve from `.pi/`; live-checked: listed under `--approve`, absent under `--no-approve`). Such a dir is pi-catalogue-only, though: skill-shipped agents, `tools:` gating and a persona-switched prompt scan `.pi/skills/` alone, so keep a skill there when it ships agents or tools.
-
-## Profiles 🛰
-
-A *profile* is an agent directory under the repo root, and pi runs it as its whole configuration. The switch is `PI_CODING_AGENT_DIR` — an env var **both** the bun `pi` and the Pi-Bolt executable read, and the only mechanism that works on both (neither exposes an `--agent-dir` flag at 1.4.0). Bare `pi` and bare `pi-bolt` need no launcher: they are the default orchestrator, `~/.pi/agent` — canonical, never moved. Non-default personas launch from `scripts/pi-profile.sh` (sourced from `~/.bashrc`):
-
-| Profile           | Launcher                                                | Fleet                                                              |
-| ----------------- | ------------------------------------------------------- | ------------------------------------------------------------------ |
-| `agent` (default) | `pi` / `pi-bolt` | ten in `agent/agents/`: nine the model can delegate to, plus `healthcheck`, which pi spawns itself, not the model |
-| `quant-trader`    | `pi-quant` (= `pi-p quant-trader`) · `pi-bolt-p quant-trader` | the four in `quant-trader/agents/`: market-scout, backtester, risk-check, scribe |
-
-A profile **symlinks into** `agent/` — curated skills, per-item extension symlinks, shared prompts/themes — and owns only its differences: its own fleet, its own prompt extension (`quant-prompt.ts`; the orchestrator's `dynamic-prompt.ts` never loads in a non-orchestrator profile), and a `settings.json` copy.
-
-### In-session switching (`/agent`)
-
-The table above is what a *launch* picks. A running session can switch its own profile in place — no relaunch — with the `/agent` command, owned by `agent/extensions/persona/`.
-
-| Form | Effect |
-| --- | --- |
-| `/agent` | List the profiles. `●` marks the active one, `(home)` marks this process's own profile. |
-| `/agent <name>` | Switch to that profile. |
-| `/agent -` | Switch back to this process's own profile. |
-
-A *narrowing* switch (fewer tools) applies silently. A *widening* switch — one that re-enables tools such as `edit`/`write` — asks for a UI confirm, and is refused outright in a session with no UI (a subagent child, or `--print`) — with one exception: resuming a session restores a recorded widening without asking when the entry has `widened && confirmed` and its `homeTools` match the current active tools; the trust boundary is that session files are local, user-owned and gitignored, and a subagent child cannot write a persona entry, so a recorded confirmation is the user's own. Restoring the process's own home profile is never treated as widening.
-
-A switch retargets the session's **system prompt**, its **subagent fleet**, the **skills** it scans, its **active tool set**, and the **MCP servers** in `persona-mcp.json` — a switch that *adds* servers makes their tools usable through a server rule (the hard block and the declaration filter pass them by server name), including a server that connects after the switch; a switch *away* drops them, because pi 1.4.0 reports MCP tools with sourceInfo `builtin:mcp` and the switch's server check runs before its builtin keep. It does not move the process: `PI_CODING_AGENT_DIR`, sessions, `.env`, and `subagent-runs/` stay in the home profile.
-
-**`github` MCP now lives in `agent/persona-mcp.json`, not `agent/mcp.json`.** The persona extension registers and unregisters it at runtime, so `pi mcp list` no longer shows it, `/mcp` enable/disable for it is session-only, and re-adding it to `mcp.json` silently overrides the runtime registration. Its credential is still a `${GITHUB_TOKEN}` reference, resolved from `agent/.env`.
-
-**What an in-place switch cannot do** — it retargets, it does not re-load:
-- Load the target profile's extensions, or unload this profile's. Extensions load at startup; a dropped tool is hidden from the model *and* blocked at `tool_call`, but its extension's handlers and slash commands (e.g. `/kanban`) stay live.
-- Remove the home profile's `AGENTS.md` text already in the transcript.
-- Swap the model fallback chain (read at load).
-- Disconnect servers declared in `mcp.json` — only `persona-mcp.json` ones.
-- Affect subagent children already running.
-- Make the target profile's skills first-class for `/skill:` completion — load one by `read`-ing its `SKILL.md` path.
-- Run `ralph-loop`'s verify gate under a `quant` switch: the gate resolves its grader agents via `agentsDir()`, and `quant-trader/agents/` has no `reviewer`/`verifier`.
-
-Verified 2026-10-30 — `/agent` in `agent/extensions/persona/index.ts` (`:806`), active/home markers `:826-827`, no-UI widening refusal `:394`, home-not-widening `:391`, recorded-widening restore `:568-569`; shared state in `agent/extensions/lib/persona.ts`; fleet/skills follow the switch in `agent/extensions/lib/layout.ts`; `github` in `agent/persona-mcp.json`; the ralph-loop gate in `agent/extensions/ralph-loop/gate-agent.ts:73`.
+Prefer skills nested under `.pi/agents/` (`.pi/agents/skills/<skill>/SKILL.md`)? pi core loads them from `.pi/settings.json` → `{ "skills": ["agents/skills"] }` (project paths resolve from `.pi/`; live-checked: listed under `--approve`, absent under `--no-approve`). Such a dir is pi-catalogue-only, though: skill-shipped agents and `tools:` gating scan `.pi/skills/` alone, so keep a skill there when it ships agents or tools.
 
 ## Skills 🃏
 
@@ -334,13 +294,16 @@ A test file may **not** sit directly in `agent/extensions/` — pi auto-loads ev
 *location*, not its imports: a test in `lib/` imports `../<extension>.js` and exercises a
 top-level extension's logic directly.
 
-Typecheck has one scope per subdirectory extension that declares a `tsconfig.json` (there is
-no root one). `check.sh` discovers and runs them all; by hand:
+Typecheck has one scope per directory that declares a `tsconfig.json`; `check.sh` discovers
+and runs them all — five in the current tree (`agent/extensions/` and its `kanban/`,
+`model-fallback/`, `ralph-loop/` and `subagent-herdr/` subdirectories). By hand:
 
 ```sh
-cd agent/extensions/subagent-herdr && ./node_modules/.bin/tsc -p tsconfig.json
-cd agent/extensions/model-fallback && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
-cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions                 && ./subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/kanban          && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/model-fallback  && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/ralph-loop      && ../subagent-herdr/node_modules/.bin/tsc -p tsconfig.json
+cd agent/extensions/subagent-herdr  && ./node_modules/.bin/tsc -p tsconfig.json
 ```
 
 ## Conventions 📏
@@ -353,7 +316,7 @@ cd agent/extensions/ralph-loop     && ../subagent-herdr/node_modules/.bin/tsc -p
 
 ## Pi-Bolt ⚡
 
-[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably. A profile runs under both the same way — `PI_CODING_AGENT_DIR` is read by both binaries — and a profile needs the `piBolt` keys in **its own** `settings.json` for Pi-Bolt parity (`quant-trader/settings.json` carries its own copy); the `migrate-pi-bolt` twin's `--check` remains the parity checker.
+[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is pi compiled ahead of time: it starts faster, streams with less CPU and uses less memory. This config runs under both. They share `~/.pi/agent`, so `pi` and `pi-bolt` can be used interchangeably; the `migrate-pi-bolt` twin's `--check` remains the parity checker.
 
 Both installers ask which of the two to set up, and the recommendation is **Pi-Bolt**: ahead-of-time compilation is what buys the faster start, the cheaper streaming and the smaller footprint. Pick **plain pi** instead while you are editing the harness itself — Pi-Bolt compiles the extensions into its executable, so an edited one runs from its source with a warning until you re-compile it, and that re-compile loop is pure overhead when you touch an extension every few minutes. That reasoning is Linux/macOS-only: as of Pi-Bolt 1.0.9 upstream refuses `pi-bolt compile` on Windows, so there an edited extension loads from source under either binary — and Pi-Bolt's default build has no JIT, so it loads interpreted where plain pi's runtime would JIT it. The further case for plain pi on Windows is that one runtime then runs everything, including the subagent children Pi-Bolt leaves on bun. The choice is not permanent either way: `pi` is installed first and stays installed (unless you pass `--no-pi`), both binaries read the same `~/.pi/agent`, and picking plain pi never uninstalls a Pi-Bolt that is already there. Unattended runs take the conservative answer — `--yes`, or a piped run with no terminal to ask through, installs plain pi unless `--pi-bolt` is also given.
 
@@ -394,8 +357,7 @@ Two things are genuinely Linux/macOS-only and degrade on Windows: the `--verify`
 
 - **Test/host version skew.** `bun test` resolves the packages pi normally injects by walking up to `~/node_modules`, which lags the running pi (0.75.4 vs 0.85.1 today). A test that passes here can still disagree with the live host.
 - **Runtime verification needs Docker.** Without a working daemon the `--verify` gate returns `inconclusive` and the loop stops rather than assuming success — "I could not run it" never reads as "it works".
-- **Top-level extensions are in no typecheck scope.** `lib/` and every top-level `*.ts` are covered only by pi loading them; the two `tsc -p` scopes reach `mcp/` and `subagent-herdr/` alone.
-- **Top-level tests are not type-checked either.** A top-level `*.test.ts` lives in a `test/` subdirectory (the extension root itself is load-time — see `agent/extensions/AGENTS.md`), and both `tsconfig.json` files exclude `*.test.ts` and only `include` the `lib/` subpackages. bun runs them and `check.sh` §3 discovers them, but nothing type-checks them — a type slip in a top-level test surfaces at `bun test` runtime, not at `typecheck`. `quant-trader/extensions/test/` has the same property: it is a test home, not a load root, and its `*.test.ts` files sit outside both tsconfigs' `include` globs.
+- **Tests are not type-checked.** Every tsconfig scope excludes `*.test.ts`, so no scope typechecks the test suites. bun runs them and `check.sh` discovers them, but a type slip in a test surfaces at `bun test` runtime, not at `typecheck`.
 
 ## Credits 🙏
 

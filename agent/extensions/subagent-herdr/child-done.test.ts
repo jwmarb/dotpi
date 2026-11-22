@@ -39,7 +39,8 @@ import childDone, {
   TOOL_STALL_MS,
   WATCHDOG_TICK_MS,
 } from "./child-done.js";
-import { formatNotice } from "./rundir.js";
+import { formatNotice, runsDir } from "./rundir.js";
+import { agentDir, ENV_AGENT_DIR } from "../lib/layout.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 describe("askExecute: the card child's guidance budget", () => {
@@ -2325,6 +2326,36 @@ describe("pendingSpawnsOfEnv: what a child believes about its own spawns", () =>
   };
 
   const NOW = 1_700_000_000_000;
+
+  test("with no bases argument it scans this process's own runs dir", () => {
+    const previous = process.env[ENV_AGENT_DIR];
+    const agent = mkdtempSync(join(tmpdir(), "child-done-default-bases-"));
+    process.env[ENV_AGENT_DIR] = agent;
+    try {
+      const dir = join(runsDir(agentDir()), "sub-2222");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "meta.json"),
+        JSON.stringify({
+          runId: "sub-2222",
+          agent: "reviewer",
+          task: "t",
+          cwd: "/w",
+          status: "running",
+          startedAt: NOW - 60_000,
+          parentRunId: "sub-1111",
+        }),
+      );
+      // The default is `runDirBasesOf(runsDir(agentDir()))`: with nothing passed,
+      // the record under the agent dir's runs dir is what gets scanned.
+      expect(pendingSpawnsOfEnv({ PI_SUBAGENT_RUN_ID: "sub-1111" }, NOW)).toEqual([
+        { runId: "sub-2222", agent: "reviewer" },
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = previous;
+    }
+  });
 
   test("a process with no run id of its own has nothing pending", () => {
     const bases = [makeRunsDir([{ runId: "sub-2222", parentRunId: "sub-1111" }], NOW)];

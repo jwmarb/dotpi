@@ -88,7 +88,7 @@ export function projectConfigDir(cwd: string): string {
  * below compares real locations.
  *
  * @param o.profileDir - The profile's agent directory (`layout.ts`'s
- *   `profileDir()`), the layer the project layer narrows.
+ *   `agentDir()`), the layer the project layer narrows.
  * @param o.cwd - The process working directory.
  * @param o.projectTrusted - `isProjectTrusted() &&
  *   hasTrustRequiringProjectResources(cwd)`, computed by the caller.
@@ -147,7 +147,7 @@ function realIdentity(p: string): string {
  * so no call site can inline it and drift.
  *
  * @param opts.profileDir - The profile's agent directory (`layout.ts`'s
- *   `profileDir()`).
+ *   `agentDir()`).
  * @param opts.cwd - The process working directory.
  * @param opts.isProjectTrusted - pi's `isProjectTrusted()`.
  * @param opts.hasTrustRequiringResources - pi's

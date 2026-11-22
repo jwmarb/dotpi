@@ -109,7 +109,7 @@ import {
   systemPromptPath,
   visibleTextOf,
 } from "./rundir.js";
-import { agentDir, profileDir } from "../lib/layout.js";
+import { agentDir } from "../lib/layout.js";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -1279,7 +1279,7 @@ export function createChildWatchdog(
 export function pendingSpawnsOfEnv(
   env: NodeJS.ProcessEnv,
   now: number,
-  bases = runDirBasesOf(runsDir(agentDir()), runsDir(profileDir())),
+  bases = runDirBasesOf(runsDir(agentDir())),
 ): readonly { runId: string; agent: string }[] {
   const runId = env.PI_SUBAGENT_RUN_ID;
   // Nothing on disk can have been stamped with an id this process does not have,

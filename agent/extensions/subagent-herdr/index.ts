@@ -164,8 +164,7 @@ import {
   type AgentInfo,
   delegationRoster,
 } from "../lib/agents.js";
-import { agentDir, profileDir } from "../lib/layout.js";
-import { personaOverride } from "../lib/persona.js";
+import { agentDir } from "../lib/layout.js";
 import { projectRoots, type ResourceRoots, TrustRequiringSnapshot } from "../lib/project-layer.js";
 import {
   ancestorLabel,
@@ -243,18 +242,21 @@ const RUNS_DIR = runsDir(agentDir());
 
 /**
  * The run dir of a run adopted from a directory that is not this process's
- * own (see {@link adoptRunFromDisk}). An in-session profile switch retargets
- * the children's run dir to the switched profile, so an adopted run's
- * transcript, sidecar and meta live there — every read and write for that run
- * must go there, not where this process's dir says they should.
+ * own (see {@link adoptRunFromDisk}). A run adopted under a different runs
+ * dir keeps its transcript, sidecar and meta there — every read and write for
+ * that run must go there, not where this process's dir says they should.
+ *
+ * No production path can populate this today (one agent dir means every base is
+ * the process's own, so `dir !== dirFor` never holds); it stays, with its tests,
+ * for a future foreign-base caller.
  */
 const adoptedRunDirs = new Map<string, string>();
 
 /**
  * This run's directory, derived from its id rather than stored on the record.
  * A run this process spawned lives under its own agent dir; a run adopted
- * from a switched profile's runs dir is answered from `adoptedRunDirs`, where
- * its files actually are.
+ * from another runs dir is answered from `adoptedRunDirs`, where its files
+ * actually are.
  */
 const dirFor = (runId: string): string => adoptedRunDirs.get(runId) ?? runDir(agentDir(), runId);
 
@@ -425,13 +427,11 @@ loadRegistry();
 
 /**
  * The bases a run this process may never have spawned can live in: this
- * process's own runs dir, plus the switched profile's dir when an in-session
- * profile switch retargeted the children's run dir there. The two deliberate
- * exceptions to own-dir reads in `../lib/layout.ts` — `adoptRunFromDisk`'s
- * rescue retry and the ledger's `parentRunIsFinished` parent lookup — both
- * read through these.
+ * process's own runs dir. The two deliberate exceptions to own-dir reads in
+ * `../lib/layout.ts` — `adoptRunFromDisk`'s rescue retry and the ledger's
+ * `parentRunIsFinished` parent lookup — both read through this.
  */
-const runDirBases = (): string[] => runDirBasesOf(RUNS_DIR, runsDir(profileDir()));
+const runDirBases = (): string[] => runDirBasesOf(RUNS_DIR);
 
 /**
  * Every run record on disk under {@link runDirBases}, with its directory.
@@ -526,9 +526,9 @@ const findRunRecordInAnyBase = (runId: string): { rec: RunRecord; dir: string } 
  * `createParentProof` in parent-proof.ts.
  *
  * The dir is in the key, not left to `dirFor`: `agentDir()` reads
- * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a profile
- * switch, no `adoptedRunDirs` entry) must not serve a verdict stamped in
- * the other dir.
+ * `PI_CODING_AGENT_DIR` at call time, so an id whose dir moves (a restart in
+ * a different agent dir, no `adoptedRunDirs` entry) must not serve a verdict
+ * stamped in the other dir.
  */
 type CompletionEvidence =
   | { finished: true; from: "sidecar" | "answer"; result?: RunResult }
@@ -578,15 +578,10 @@ const completionEvidence = async (
  *
  * The id gate lives in `readRunRecordFromDisk` (the reader derives the dir
  * from the id and validates it), so a model-supplied `../x` never reaches the
- * filesystem through this path. `RUNS_DIR` is this process's own dir, and an
- * in-session profile switch retargets a child's run dir to the switched
- * profile, so a miss here is retried through `profileDir()` — the one other
- * dir the retry covers. Without the retry, a rerouted grandchild notice would
- * brief as an unregistered run. A run found in the switched dir is recorded in
- * `adoptedRunDirs`, so `dirFor` keeps its transcript, sidecar and meta reads
- * where they actually are. (A switch inside a *child's own* session would put
- * a great-grandchild's run dir in a third dir neither base looks, so that
- * notice briefs as unregistered — low likelihood, deep chain.)
+ * filesystem through this path. `RUNS_DIR` is this process's own dir and the
+ * only base scanned; a record found in it is recorded in `adoptedRunDirs` when
+ * it is not where `dirFor` would look, so `dirFor` keeps its transcript,
+ * sidecar and meta reads where they actually are.
  */
 function adoptRunFromDisk(runId: string): RunRecord | undefined {
   const existing = runs.get(runId);
@@ -804,18 +799,16 @@ export async function launchAttempt(
       // Mirrors `rootsForRun`: a record that does not say it was trusted was
       // not; presence of `projectDir` is not a trust grant.
       projectTrusted: rec.projectTrusted === true,
-      // The store must be the CHILD's, not this process's: `buildChildEnv`
-      // retargets the child's PI_CODING_AGENT_DIR to profileDir() (the persona
-      // override, else this process's dir), so under a `/agent` switch the
-      // child reads `<profile>/trust.json` and `agentDir()` would consult the
-      // parent's file. `get` walks to the nearest ancestor entry; `null` is
-      // "no saved decision".
+      // The child inherits this process's agent dir (`buildChildEnv` forwards
+      // PI_CODING_AGENT_DIR when set), so its trust store is the one `agentDir()`
+      // names. `get` walks to the nearest ancestor entry; `null` is "no saved
+      // decision".
       childTrustRequired: hasTrustRequiringProjectResources(rec.cwd),
       // A throwing lookup counts as "no saved decision" (`childTrustDecisionSaved`
       // fails closed): a malformed trust.json or a contended store lock must never
       // hand a foreign child silent trust, and pi's own trust resolution has no
       // fallback for a store that throws here.
-      childTrustSaved: childTrustDecisionSaved(() => new ProjectTrustStore(profileDir()).get(rec.cwd)),
+      childTrustSaved: childTrustDecisionSaved(() => new ProjectTrustStore(agentDir()).get(rec.cwd)),
     }),
   });
   // Registered under a *run-scoped* name: herdr agent names are globally
@@ -1037,7 +1030,7 @@ async function launchRegisteredRun(
   // says it was; a record without one falls back to its admission
   // cwd profile-only. `rec.cwd` is the admission cwd — the same one the
   // child pane opens in.
-  const roots = rootsForRun(rec, profileDir());
+  const roots = rootsForRun(rec, agentDir());
 
   // The child's system prompt. Its body is the agent definition verbatim, plus
   // a skills catalogue when the agent declared one: pi builds `## Available
@@ -1050,13 +1043,8 @@ async function launchRegisteredRun(
   if (agent.skills && agent.skills.length > 0) {
     // pi's own resolved list covers packages and project scope and has the
     // human's resource filters already applied; scanning `agent/skills/` is the
-    // fallback for the case where no turn has started yet. Under a profile
-    // switch the process's catalogue is the *home* profile's, not the
-    // target's, so the switch always scans the (retargeted) skills dir
-    // instead of reusing it.
-    const available = personaOverride()
-      ? await discoverSkills(roots.skillsDirs)
-      : (piSkillCatalogue ?? (await discoverSkills(roots.skillsDirs)));
+    // fallback for the case where no turn has started yet.
+    const available = piSkillCatalogue ?? (await discoverSkills(roots.skillsDirs));
     const selected = selectSkills(agent.skills, available);
     const canRead = !agent.tools || agent.tools.length === 0 ||
       agent.tools.some((t) => READING_TOOLS.has(t));
@@ -1173,7 +1161,7 @@ async function spawnHealthCheckRun(
     // cross-cwd check gets the GRANTED dir's project roots, not roots for
     // the target's own cwd — and with a different `.pi`, the strongest flag
     // is `--no-approve`.
-    rootsForRun(target, profileDir()),
+    rootsForRun(target, agentDir()),
   );
 }
 
@@ -1484,7 +1472,7 @@ export default function (pi: ExtensionAPI): void {
         // No project agents dir: nothing to notice.
       }
       const roots = projectRoots({
-        profileDir: profileDir(),
+        profileDir: agentDir(),
         cwd: ctx.cwd,
         isProjectTrusted: trusted,
         hasTrustRequiringResources: trustRequired,
@@ -1557,7 +1545,7 @@ export default function (pi: ExtensionAPI): void {
         { agent, task, cwd, model, card, origin: { kind: "tool-delegation" } },
         ctx.cwd,
         projectRoots({
-          profileDir: profileDir(),
+          profileDir: agentDir(),
           cwd: ctx.cwd,
           isProjectTrusted: ctx.isProjectTrusted(),
           hasTrustRequiringResources: trustSnapshot.get(ctx.cwd),
@@ -1902,20 +1890,20 @@ export default function (pi: ExtensionAPI): void {
   // start is the migration. Fire-and-forget: a slow disk must not hold up the
   // factory, and the lifecycle's per-run queue orders it against any sweep.
   if (!childRunId) {
-    // Scoped to THIS profile's run dir — not `allRunCandidates()`, which also
+    // Scoped to THIS process's live agent dir — not `allRunCandidates()`, which
     // scans the import-time `RUNS_DIR` constant. That constant is the real
     // `~/.pi/agent/subagent-runs` whenever a module instance was imported with
     // `PI_CODING_AGENT_DIR` unset (the suites import this way), and a settle is
     // a WRITE: scanning it from a factory pointed at a temp dir would rewrite
-    // live records from a test run. In production the two bases coincide, so
-    // nothing real is missed.
+    // live records from a test run. In production the two coincide, so nothing
+    // real is missed.
     //
     // The pass writes through `dirFor` (and its `adoptedRunDirs`), so a scan
-    // that reads from a switched profile's dir must record the adoption, the
-    // same way `allRunCandidates` does. Without it, `saveMeta` would write to
+    // that reads from another dir must record the adoption, the same way
+    // `allRunCandidates` does. Without it, `saveMeta` would write to
     // `runDir(agentDir(), id)` — the other dir — and die silently in its
     // catch, after the in-memory copy is already `done`.
-    const stuck = listRunCandidates([runsDir(profileDir())]);
+    const stuck = listRunCandidates([runsDir(agentDir())]);
     for (const { rec, dir } of stuck) {
       if (dir !== dirFor(rec.runId) && !adoptedRunDirs.has(rec.runId)) adoptedRunDirs.set(rec.runId, dir);
     }

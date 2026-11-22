@@ -1,5 +1,6 @@
 # Architecture review — outcome (2026-10-31)
 
+> Historical note: the persona/profile material in this file was removed from the codebase on 2026-11-21.
 This file is the lasting record of this review. The visual report was
 `/tmp/architecture-review-20261031-091303.html`, a scratch file that is not kept.
 Earlier records are `architecture-review-2026-10.md`, `-10-14.md` and `-10-17.md`.

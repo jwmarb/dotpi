@@ -555,7 +555,7 @@ export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord
  * The candidate set {@link pendingSpawnsOf} and the spawns block are evaluated
  * over. This process's in-memory registry is *not* enough: the runs dir is
  * global to every pi process, a nested child's record may have been written by
- * a process that has since exited, and a profile switch moves the dir — so
+ * a process that has since exited, and a different agent dir moves it — so
  * "does this run have unfinished spawns?" is a question about disk, asked of
  * {@link runDirBases}-shaped bases by whoever holds them.
  *
@@ -566,7 +566,7 @@ export function readRunRecordFromDisk(runsDir: string, runId: string): RunRecord
  *
  * Deduped by run id with the first base winning — the same rule
  * `findRunRecordInAnyBase` applies — so a record present in both this process's
- * dir and a switched profile's dir is counted once.
+ * dir and a foreign base is counted once.
  */
 export function listRunCandidates(bases: readonly string[]): { rec: RunRecord; dir: string }[] {
 	const out: { rec: RunRecord; dir: string }[] = [];
@@ -591,8 +591,9 @@ export function listRunCandidates(bases: readonly string[]): { rec: RunRecord; d
 
 /**
  * The bases a process enumerates run records from, in the one order every
- * caller has to agree on: this process's own runs dir, then the switched
- * profile's dir when an in-session profile switch retargeted children there.
+ * caller has to agree on: this process's own runs dir, then — when a caller
+ * names a different one — the runs dir a run was adopted from. Defaults to a
+ * single base, which is every production call: only the process's own dir.
  *
  * {@link listRunCandidates} dedupes with the first base winning, so an order two
  * callers disagree about is a record one caller sees and the other does not — and
@@ -601,8 +602,11 @@ export function listRunCandidates(bases: readonly string[]): { rec: RunRecord; d
  * agent dir; a child calls it with the dir it would spawn into. Same function,
  * same answer, by construction.
  */
-export function runDirBasesOf(ownRunsDir: string, switchedRunsDir: string): string[] {
-	return ownRunsDir === switchedRunsDir ? [ownRunsDir] : [ownRunsDir, switchedRunsDir];
+// `otherRunsDir` has no production caller today — one agent dir means the
+// default is every base — but it stays for a future foreign-base caller, and
+// the two-base ordering above is what its tests pin.
+export function runDirBasesOf(ownRunsDir: string, otherRunsDir: string = ownRunsDir): string[] {
+	return ownRunsDir === otherRunsDir ? [ownRunsDir] : [ownRunsDir, otherRunsDir];
 }
 
 /**

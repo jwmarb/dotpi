@@ -17,7 +17,7 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
 | `parent-proof.ts` (192) | Pi-free running-parent proof for reroutes: `createParentProof(effects)` with the positive-only, TTL-bounded memo, plus `WAKE_PROBE_TIMEOUT_MS`/`PARENT_PROOF_TTL_MS` (re-exported by `index.ts`) |
 | `herdr.ts` (594) | The only herdr seam, a CLI wrapper (`HERDR_TIMEOUT_MS` 30 s). The measured herdr behaviours are in its header. It also exports the pane primitives that kanban uses |
 | `child-done.ts` (1681) | The child half, loaded with `-e`: `subagent_done`/`subagent_report`/`subagent_ask` (card children only), the answer gate, the truncation continuation, the **pending-spawn deferral** (`agent_end` returns early at `:853`; `subagent_done` refuses at `:748`), the `.exit` sidecar, and the detached notice |
-| `package.json` / `tsconfig.json` | Dev-only `typescript` + `@types/node`, with no `main`/`scripts`/runtime deps. The tsconfig has **no `paths`** (`persona/` is the only other scope without one) |
+| `package.json` / `tsconfig.json` | Dev-only `typescript` + `@types/node`, with no `main`/`scripts`/runtime deps. The tsconfig has **no `paths`** |
 
 ## CONVENTIONS (local)
 
@@ -37,7 +37,6 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
   list replaces pi's selection.
 - **Children run `--model fallback/auto`** with `PI_FALLBACK_CHAIN` (`CHAIN_ENV`) built by `childFallbackChain` from
   the agent's `model` + `fallback_models`. The chain-item grammar (`ref|level`) is owned by `../model-fallback/lib.ts`.
-  Under a persona switch, `buildChildEnv` also sets `LEASE_DIR_ENV` to `leaseDir()` (`lib.ts:195`), so the child's concurrency leases use the parent's lease dir.
 - **Children inherit the project layer's trust explicitly.** The roster and skills come from `projectRoots` (`../lib/project-layer.ts`); `RunRecord.projectDir` is read at launch and when a health check is created (revival only extracts results), and `projectTrusted` is what grants trust — a record lacking it re-derives profile-only. A model-chosen relative `cwd` is normalized against the parent's cwd before admission (`normalizeChildCwd`), so the record, the pane, and the trust flag all see one absolute path. `childApproveFlag` adds `--approve`/`--no-approve` for a same-`projectDir` child (trusted/untrusted) and `--no-approve` for a foreign cwd that is trust-requiring with no saved decision (a saved one is honored silently; `--approve` never crosses to a foreign cwd) — an unflagged child in an unwatched pane answers its default-"Trust" prompt from herdr's keystrokes and *persists* trust. The parent's own layer state rides `projectLayerNotices` at `session_start` — once per fresh parent session, child-skipped, `console.error` fallback when there is no UI.
 - **Ancestry is stamped by processes, not trusted from models** (`PI_SUBAGENT_LINEAGE`, `PI_SUBAGENT_ANCESTRY`).
   When a child's parent has finished, its notice is rerouted to the nearest surviving ancestor, bounded by `timeout(1)`.
@@ -51,7 +50,7 @@ gets a run dir under `agent/subagent-runs/`. Line refs were checked on 2026-11-1
 - **A `running` record a sidecar proves finished belongs to no pane any more.** The owner settles it on its next tick;
   at factory start the root process settles the ones owners never came back for — sidecar `at` older than
   `STUCK_SIDECAR_MIN_AGE_MS` (6 backstops), `done` at the sidecar's own time, and it closes no pane. Records whose
-  `ownerPane` is this process are left to the sweep. It scans only **this profile's** run dir (not
+  `ownerPane` is this process are left to the sweep. It scans only **this process's own** run dir (not
   `allRunCandidates()`, whose import-time base is the real dir in a test process), and it writes only
   `status`/`finishedAt` — idempotent, so running it on every root start *is* the migration.
 - **Health checks diagnose, they do not complete runs.** A `stalled`/unanswered target spawns at most one read-only

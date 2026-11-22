@@ -12,12 +12,12 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 | Question | Answer |
 |---|---|
 | Which agents exist, on what model | `agents/*.md` — 10: explorer, healthcheck, librarian, oracle, planner, reviewer, spiker, summarizer, verifier, worker. Read frontmatter for models; never copy a table here |
-| Which skills exist / are slash-only | `find agent/skills -name SKILL.md`; `grep -rl 'disable-model-invocation: true' agent/skills` (9 today). 12 category dirs; `skills/other/` holds only the ignored `uarizona-hpc` |
+| Which skills exist / are slash-only | `find agent/skills -name SKILL.md`; `grep -rl 'disable-model-invocation: true' agent/skills` — count with the grep, never keep a number here. 12 category dirs; `skills/other/` holds only the ignored `uarizona-hpc` |
 | Skill with its own tool/agents | `technical-analysis` alone (`tools: trade_journal`, 3 `agents/*.md`, no `openai.yaml`); `automate-browser` has `allowed-tools:` + `hidden: true`. Other `agents/` dirs hold `openai.yaml` only (presentation, defines no agents) |
 | Prompt templates | `prompts/git-commit.md` (`name: git-commits`) |
-| Builtins / packages / router | `settings.json`: `+builtin:mcp`, `+codemode`, `-llama.cpp`, `-tool-search`, `-herdr`; `defaultProvider/defaultModel` = `fallback/auto`; `modelFallback.*`; `packages`; `piBolt.*` |
+| Builtins / packages / router | `settings.json`: `+builtin:mcp`, `+codemode`, `-llama.cpp`, `-herdr`; `defaultProvider/defaultModel` = `fallback/auto`; `modelFallback.*`; `packages`; `piBolt.*` |
 | Provider overrides | `models.json` — `providers.<name>.{baseUrl, api, apiKey, models[{id, contextWindow, maxTokens}]}`; `eagle` → `http://eagle.lan:8080/v1` (LAN host, not portable) |
-| MCP servers | `mcp.json`: only `robinhood`, `exposure: "direct"`, OAuth (`oauth.clientName`). `persona-mcp.json`: `github` with `Authorization: Bearer ${GITHUB_TOKEN}`, `exposure: "direct"` |
+| MCP servers | `mcp.json`: `robinhood` (OAuth, `exposure: "deferred"` + a 4-getter `toolExposure` pin — `get_accounts`, `get_equity_quotes`, `get_equity_positions`, `get_portfolio` direct) and `github` (static `Authorization: Bearer ${GITHUB_TOKEN}` header, `exposure: "deferred"` + a 4-tool `toolExposure` pin — `issue_read`, `list_issues`, `pull_request_read`, `get_file_contents` direct) |
 | Secret key names | `.env.example` (`LITELLM_API_KEY`, `LITELLM_BASE_URL`, `FIRECRAWL_API_URL`, `GITHUB_TOKEN`); real `.env` is ignored |
 | Theme keys | `themes/tokyo-night.json` (`$schema` → pi's bundled `theme-schema.json`) |
 | Verifier container | `docker/verify-base.Dockerfile` — `node:24-slim`, `AGENT_BROWSER_VERSION=0.38.1`, no CMD/ENTRYPOINT; parent of generated `verify-images/<proj>-<hash>/` |
@@ -32,7 +32,14 @@ grammars are pinned by `extensions/lib/agents.test.ts` and `skill-catalogue.test
 - **MCP is pi's built-in extension** (`+builtin:mcp`); no local `extensions/mcp/`. `${VAR}` expands
   in `headers`/`env` only — `url` is validated before expansion, so a secret URL needs
   `pi.registerMcpServer()` from an extension. OAuth tokens land in ignored `mcp-auth.json`
-  (`mcp-auth/` is old leftovers). Manage with `/mcp`.
+  (`mcp-auth/` is old leftovers). Manage with `/mcp`. The forced orchestrator/takeover
+  prompts suppress core's sections, so `dynamic-prompt.ts` synthesizes the
+  indirect-MCP-servers note from `mcp.json` at prompt time
+  (`extensions/lib/mcp-config.ts`).
+  What is NOT in `extensions` is load-bearing too: there is no `-builtin:tool-search`, so
+  `tool_search` registers — disable that builtin and a `deferred` server's tools become
+  unreachable (pi warns "they cannot be called") and this note advertises a route that does
+  not exist. The price of keeping it is `tool_search`'s schema declared in every prompt.
 - **Agent frontmatter vocabulary** (parsed only by `extensions/lib/agents.ts`): `name`,
   `description`, `tools`, `model`, `fallback_models`, `skills`, `callable_by`. snake_case —
   a camelCase key silently never matches. Body = child system prompt verbatim (+ skills catalogue).

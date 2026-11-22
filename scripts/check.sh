@@ -95,11 +95,6 @@ echo "${bold}Checking every extension source file${off} ${dim}(a parse error her
 # in those is just as fatal. Tests are excluded: they are run below by the test
 # runner, which reports failures far better than an import.
 #
-# quant-trader/extensions is a profile: symlinks into agent/extensions plus its
-# own quant-prompt.ts. `-type f` keeps the symlinks out of the list — without it,
-# find returns them and the agent's extensions get imported a second time under
-# symlink paths, the module-resolution skew section 3's comment documents.
-#
 # In staged mode the list comes from the index itself (git ls-files), not from
 # the disk: a deleted file must not be checked, and an untracked file is not
 # part of this commit.
@@ -126,13 +121,11 @@ echo "${bold}Checking every extension source file${off} ${dim}(a parse error her
 # loaded at startup, fails on `bun:test`, and pi refuses to start — the same
 # startup-fatal shape this script exists to catch. Tests belong in a
 # subdirectory (`lib/`, `ralph-loop/`, `subagent-herdr/`), which pi enters only
-# via `index.ts`. A profile's extensions dir (quant-trader/extensions) is
-# discovered the same way, so it gets the same guard. Checked before the loop
-# so the message names the cause.
+# via `index.ts`. Checked before the loop so the message names the cause.
 while IFS= read -r file; do
 	case "$file" in
-	agent/extensions/*.test.ts | quant-trader/extensions/*.test.ts)
-		if [ "$(dirname "$file")" = "agent/extensions" ] || [ "$(dirname "$file")" = "quant-trader/extensions" ]; then
+	agent/extensions/*.test.ts)
+		if [ "$(dirname "$file")" = "agent/extensions" ]; then
 			fails=$((fails + 1))
 			note "$red" "FAIL" "$file"
 			printf '        %s\n' "a top-level test file is auto-loaded as an extension and will break pi's startup"
@@ -168,10 +161,10 @@ while IFS= read -r file; do
 done < <(
 	if [ "$staged" -eq 1 ]; then
 		# -s prints the mode; 120000 is a symlink, the staged twin of find's -type f.
-		git -C "$REPO" ls-files -s -- 'agent/extensions' 'quant-trader/extensions' |
+		git -C "$REPO" ls-files -s -- 'agent/extensions' |
 			awk '$1 != "120000" { sub(/^[^\t]*\t/, ""); print }'
 	else
-		find agent/extensions quant-trader/extensions -name '*.ts' -type f -not -path '*/node_modules/*' | sort
+		find agent/extensions -name '*.ts' -type f -not -path '*/node_modules/*' | sort
 	fi
 )
 
@@ -202,7 +195,7 @@ else
 			note "$red" "FAIL" "$dir"
 			printf '%s' "$err" | head -5 | while IFS= read -r line; do printf '        %s\n' "$line"; done
 		fi
-	done < <(find agent/extensions quant-trader/extensions -name tsconfig.json -type f -not -path '*/node_modules/*' | sort)
+	done < <(find agent/extensions -name tsconfig.json -type f -not -path '*/node_modules/*' | sort)
 fi
 
 # ---------------------------------------------------------------------------
@@ -230,7 +223,7 @@ echo "${bold}Running this repo's tests${off} ${dim}(agent/git is vendored and gi
 # bun honours before this walk-up (Bun 1.4.4); the skew argument above holds either
 # way, since it is about *which* copy the walk-up reaches.
 cd "$REPO" || exit 1
-mapfile -t tests < <(find agent/extensions quant-trader/extensions -name '*.test.ts' -type f -not -path '*/node_modules/*' | sort)
+mapfile -t tests < <(find agent/extensions -name '*.test.ts' -type f -not -path '*/node_modules/*' | sort)
 if [ ${#tests[@]} -eq 0 ]; then
 	# Not "nothing to do": this repo has suites, so finding none means the
 	# discovery broke.

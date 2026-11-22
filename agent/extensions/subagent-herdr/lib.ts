@@ -15,10 +15,6 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { type AgentInfo, type AgentShadow, frontmatterOf } from "../lib/agents.js";
 import { ENV_AGENT_DIR } from "../lib/layout.js";
-import { personaOverride } from "../lib/persona.js";
-// The lease dir's env name is owned by the extension that reads it, so the
-// crossing child and the router cannot drift apart.
-import { LEASE_DIR_ENV, leaseDir } from "../model-fallback/concurrency.js";
 import { resourceRoots, type ResourceRoots } from "../lib/project-layer.js";
 import { findSkills, findSkillsIn } from "../lib/skill-tree.js";
 // The chain env var's name is owned by the extension that reads it, so the two
@@ -123,14 +119,11 @@ export interface ChildLaunchOptions {
  * process's `HERDR_PANE_ID`), and the child's report tool prompts it. The
  * other vars let the child's extensions identify the run without guessing.
  *
- * `PI_CODING_AGENT_DIR` crosses only when the parent has it set, or an
- * in-session profile switch is active: the child must resolve the same
- * profile as its parent, or it silently runs a different persona, agent
- * fleet, and skill catalogue — a child spawned from a non-default profile
- * would load the default profile's extensions, agents, and skills. The
- * switch wins over the env var, because it retargets the fleet without
- * moving the process's own dir. An unset var with no switch stays unset, so
- * the default profile's resolution is untouched.
+ * `PI_CODING_AGENT_DIR` crosses only when the parent has it set: the child
+ * must resolve the same profile as its parent, or it silently runs a different
+ * agent fleet and skill catalogue — a child spawned from a non-default profile
+ * would load the default profile's extensions, agents, and skills. An unset var
+ * stays unset, so the default profile's resolution is untouched.
  *
  * `runDir` is passed alongside the record rather than read off it: the path is
  * derived from the run id (see `rundir.ts`), so the record does not carry it,
@@ -179,20 +172,12 @@ export function buildChildEnv(
     PI_SUBAGENT_LINEAGE: formatLineage(childLineage),
   };
   if (parentPaneId) env.PI_SUBAGENT_PARENT_PANE = parentPaneId;
-  // The child must resolve the same profile as its parent (same persona, fleet,
-  // and skill catalogue). An unset var stays unset — forwarding an empty value
-  // would make the child resolve an empty agent dir, and the default profile's
-  // resolution must be untouched when the parent has no override.
-  // The in-session switch retargets the fleet without moving the process's
-  // dir, so when it is active the child's profile dir comes from the switch,
-  // not the env var — the env var is the process's profile and would send the
-  // child back home.
-  const dir = personaOverride()?.dir ?? process.env[ENV_AGENT_DIR];
+  // The child must resolve the same profile as its parent (same fleet and skill
+  // catalogue). An unset var stays unset — forwarding an empty value would make
+  // the child resolve an empty agent dir, and the default profile's resolution
+  // must be untouched when the parent has no override.
+  const dir = process.env[ENV_AGENT_DIR];
   if (dir) env[ENV_AGENT_DIR] = dir;
-  // The router's machine-wide concurrency cap leases in the process's own
-  // agent-dir cache; a child on the target profile would lease under its own
-  // dir and the cap would split, so the lease dir crosses with the switch.
-  if (personaOverride()) env[LEASE_DIR_ENV] = leaseDir();
   // The child always launches on `fallback/auto`, so the chain must cross
   // whenever it is non-empty — a single unpinned entry included: without the
   // var the child's router registers nothing and `fallback/auto` is
@@ -359,7 +344,7 @@ export function childApproveFlag(opts: {
 /**
  * `childTrustSaved` for {@link childApproveFlag}: does the child's trust store
  * hold a decision for `cwd`? `lookup` is injected (pi's
- * `new ProjectTrustStore(profileDir()).get`) so this stays pure and testable.
+ * `new ProjectTrustStore(agentDir()).get`) so this stays pure and testable.
  *
  * Fails CLOSED: a throwing lookup — a malformed trust.json, the store lock held
  * past pi's ~200ms budget, a failed mkdir — counts as "no saved decision", so
@@ -410,7 +395,7 @@ function realIdentity(p: string): string {
  * @param rec - The persisted record; only `cwd` and `projectDir` /
  *   `projectTrusted` are read.
  * @param profileDir - The profile's agent directory (`layout.ts`'s
- *   `profileDir()`).
+ *   `agentDir()`).
  */
 export function rootsForRun(rec: { cwd: string; projectDir?: unknown; projectTrusted?: unknown }, profileDir: string): ResourceRoots {
   if (typeof rec.projectDir !== "string") return resourceRoots({ profileDir, cwd: rec.cwd, projectTrusted: false });

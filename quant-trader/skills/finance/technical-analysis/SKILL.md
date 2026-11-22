@@ -1,1 +1,0 @@
-../../../../agent/skills/finance/technical-analysis/SKILL.md

@@ -70,6 +70,8 @@ The user-facing surface (`fallback/auto`, `/fallback-chain`, the `settings.json`
 
 - **Adding a chain entry without raising `retry.maxRetries`.** The live profile is exactly at budget (4 entries ×
   `maxCycles` 10 = `maxRetries` 40): a fifth entry trips the shortfall warning and pi stops retrying mid-lap.
-- **Restating the handoff.** Consumers import from here, one-way: `subagent-herdr/lib.ts:21` (`LEASE_DIR_ENV`,
-  `leaseDir`) and `:26-34` (`CHAIN_ENV`, `FALLBACK_MODEL_REF`, `formatChainItem`, …), `subagent-herdr/index.ts:162`,
-  `ralph-loop/gate.ts:34`, `runtime-gate.ts:36`, `gate-agent.ts:33`, `startup-fetch.ts:33-43` (lib + `served.ts`).
+- **Restating the handoff.** Consumers import from here, one-way: `subagent-herdr/lib.ts:22-30`
+  (`CHAIN_ENV`, `FALLBACK_MODEL_REF`, `formatChainItem`, …), `subagent-herdr/index.ts:162`,
+  `ralph-loop/gate.ts:34`, `runtime-gate.ts:36`, `gate-agent.ts:33`, `startup-fetch.ts:35-43` (lib + `served.ts`).
+  `LEASE_DIR_ENV`/`leaseDir` are **not** part of this list: they are read only inside this
+  extension, and `subagent-herdr/lib.ts` no longer imports them.

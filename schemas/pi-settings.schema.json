@@ -250,7 +250,7 @@
             },
             "packagesOverlay": {
               "type": "boolean",
-              "description": "When true, `piBolt.packages` replaces the effective `packages` list — additions minus removals — instead of merging into it, which is what keeps the replaced name out of the declared set. It takes effect only together with an array `packages`, and the persona extension applies the same rule when it works out which sources a profile declares."
+              "description": "When true, `piBolt.packages` replaces the effective `packages` list — additions minus removals — instead of merging into it, which is what keeps the replaced name out of the declared set. It takes effect only together with an array `packages`."
             }
           }
         }

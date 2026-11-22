@@ -1,1 +1,0 @@
-../../agent/extensions/thinking-indicator.ts

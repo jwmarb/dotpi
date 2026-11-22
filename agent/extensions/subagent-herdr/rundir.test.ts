@@ -22,6 +22,7 @@ import {
   pendingSpawnsOf,
   readExitSidecarAt,
   readRunRecordFromDisk,
+  runDirBasesOf,
   type RunRecord,
 } from "./rundir.js";
 
@@ -471,5 +472,18 @@ describe("RunRecord.projectDir round-trip", () => {
     const loaded = readRunRecordFromDisk(runsDir, "sub-d3d3");
     expect(loaded?.projectDir).toBe("/r/.pi");
     expect(loaded?.projectTrusted).toBeUndefined();
+  });
+});
+
+describe("runDirBasesOf", () => {
+  // One base is the production shape now that a persona switch is gone; the
+  // second is kept for a future caller that adopts another process's runs dir.
+  test("one argument yields that single base", () => {
+    expect(runDirBasesOf("/a")).toEqual(["/a"]);
+  });
+
+  test("a distinct second argument is appended, once", () => {
+    expect(runDirBasesOf("/a", "/b")).toEqual(["/a", "/b"]);
+    expect(runDirBasesOf("/a", "/a")).toEqual(["/a"]);
   });
 });
